@@ -936,17 +936,35 @@ class WGCCaptureEngine:
             except queue.Empty:
                 break
 
-        try:
-            self.capture = WindowsCapture(
-                cursor_capture=False,
-                draw_border=False,
-                monitor_index=None,
-                window_name=None,
-                window_hwnd=self.hwnd,
-            )
+        capture_kwargs: dict[str, object] = {
+            "cursor_capture": False,
+            "monitor_index": None,
+            "window_name": None,
+            "window_hwnd": self.hwnd,
+        }
+
+        def start_with_options(options: dict[str, object]) -> None:
+            self.capture = WindowsCapture(**options)
             self.capture.event(self.on_frame_arrived)
             self.capture.event(self.on_closed)
             self.capture_control = self.capture.start_free_threaded()
+
+        try:
+            try:
+                start_with_options({**capture_kwargs, "draw_border": False})
+            except Exception as exc:
+                error_text = str(exc).lower()
+                if "capture border" not in error_text and "draw_border" not in error_text:
+                    raise
+
+                self.log(
+                    "[캡처 안내] 현재 플랫폼이 WGC 캡처 테두리 토글을 지원하지 않아 "
+                    "draw_border 옵션 없이 다시 시도합니다."
+                )
+                self.capture = None
+                self.capture_control = None
+                start_with_options(capture_kwargs)
+
             self.started = True
             self.log(f"[캡처 시작] WGC 세션을 시작했습니다. HWND={self.hwnd}")
             return True
