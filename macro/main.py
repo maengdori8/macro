@@ -27,6 +27,11 @@ from pathlib import Path
 from tkinter import scrolledtext
 from typing import Any, Callable, Optional
 
+import base64
+import hashlib
+import hmac
+import struct
+
 import cv2
 import numpy as np
 
@@ -101,9 +106,6 @@ CURVED_CLICK_MIN_STEPS = 30
 CURVED_CLICK_MAX_STEPS = 50
 CURVED_CLICK_MOVE_DURATION_SECONDS = 0.5
 
-# True로 바꾸면 매칭 점수, 좌표 보정, 곡선 이동 같은 상세 로그를 다시 볼 수 있습니다.
-DETAILED_DEBUG_LOGS = False
-
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
@@ -112,6 +114,10 @@ DEFAULT_REGION_X = 0
 DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
+
+LICENSE_SECRET_KEY = b"macro-automation-license-key-2026-xK9mP2vL"
+LICENSE_FILE = "license.key"
+LICENSE_VALID_DAYS = {1, 7, 30, 99999}
 
 TARGET_CONFIG_FILENAME = "targets.json"
 DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
@@ -136,6 +142,77 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_target": "all",
     },
 ]
+
+def verify_license_key(key: str) -> dict:
+    """라이센스 키를 검증하고 정보를 반환합니다. 실패 시 ValueError를 발생시킵니다."""
+    clean = key.replace("-", "").replace(" ", "").upper()
+    padding = (8 - len(clean) % 8) % 8
+    clean += "=" * padding
+    try:
+        raw = base64.b32decode(clean)
+    except Exception:
+        raise ValueError("잘못된 키 형식입니다.")
+
+    if len(raw) != 16:
+        raise ValueError("잘못된 키 형식입니다.")
+
+    payload = raw[:8]
+    stored_sig = raw[8:]
+    expected_sig = hmac.new(LICENSE_SECRET_KEY, payload, hashlib.sha256).digest()[:8]
+
+    if not hmac.compare_digest(stored_sig, expected_sig):
+        raise ValueError("유효하지 않은 라이센스 키입니다.")
+
+    created, days = struct.unpack(">II", payload)
+    if days not in LICENSE_VALID_DAYS:
+        raise ValueError("유효하지 않은 라이센스 키입니다.")
+
+    expires = created + days * 86400
+    now = int(time.time())
+    remaining = expires - now
+    if remaining <= 0:
+        raise ValueError("만료된 라이센스 키입니다.")
+
+    return {
+        "created": created,
+        "days": days,
+        "expires": expires,
+        "remaining_seconds": remaining,
+    }
+
+
+def load_saved_license(base_dir: Path) -> Optional[str]:
+    """저장된 라이센스 키 파일을 읽습니다."""
+    license_path = base_dir / LICENSE_FILE
+    if license_path.exists():
+        try:
+            return license_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
+    return None
+
+
+def save_license_key(base_dir: Path, key: str) -> None:
+    """라이센스 키를 파일에 저장합니다."""
+    license_path = base_dir / LICENSE_FILE
+    license_path.write_text(key.strip(), encoding="utf-8")
+
+
+def format_remaining_time(seconds: int) -> str:
+    """남은 시간을 사람이 읽기 쉬운 형태로 변환합니다."""
+    if seconds <= 0:
+        return "만료됨"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    if days > 365:
+        return f"{days}일 남음"
+    if days > 0:
+        return f"{days}일 {hours}시간 남음"
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}시간 {minutes}분 남음"
+    return f"{minutes}분 남음"
+
 
 LogCallback = Callable[[str], None]
 
@@ -662,13 +739,6 @@ def post_curved_click(
         client_height,
     )
 
-    if DETAILED_DEBUG_LOGS:
-        log(
-            f"[곡선 시작] start={start_pos}, control={control_pos}, "
-            f"end={end_pos}, steps={steps}, duration={move_duration:.3f}s, "
-            f"step_delay={step_delay:.3f}s"
-        )
-
     for index in range(steps):
         t = index / (steps - 1)
         move_x, move_y = _clamp_client_point(
@@ -676,8 +746,6 @@ def post_curved_click(
             client_width,
             client_height,
         )
-        if DETAILED_DEBUG_LOGS:
-            log(f"[곡선 이동] {index + 1}/{steps} client=({move_x}, {move_y})")
         post_mouse_move(
             hwnd,
             move_x,
@@ -802,8 +870,7 @@ def wgc_to_client(
             client_screen_x, client_screen_y = win32gui.ClientToScreen(hwnd, (0, 0))
             capture_origin = _get_wgc_capture_origin(hwnd, frame_size)
             if capture_origin is None:
-                if DETAILED_DEBUG_LOGS:
-                    log("[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다.")
+                log("[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다.")
                 client_x, client_y = x, y
             else:
                 origin_x, origin_y = capture_origin
@@ -817,8 +884,6 @@ def wgc_to_client(
             )
             return None
 
-        if DETAILED_DEBUG_LOGS and (client_x, client_y) != (x, y):
-            log(f"[좌표 보정] WGC=({x}, {y}) -> client=({client_x}, {client_y})")
         return client_x, client_y
     except Exception as exc:
         log(f"[좌표 오류] WGC 좌표를 클라이언트 좌표로 변환하지 못했습니다: {exc}")
@@ -863,7 +928,6 @@ class WGCCaptureEngine:
         self.latest_frame: Optional[np.ndarray] = None
         self.capture: Optional[Any] = None
         self.capture_control: Optional[Any] = None
-        self.frame_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
         self.frame_lock = threading.Lock()
         self.first_frame_event = threading.Event()
         self.closed_event = threading.Event()
@@ -879,29 +943,19 @@ class WGCCaptureEngine:
         """WGC 캡처 스레드에서 프레임이 도착할 때마다 최신 BGRA 배열을 저장합니다."""
 
         try:
-            # windows-capture 2.x의 Frame.frame_buffer는 BGRA uint8 NumPy 배열입니다.
-            image_bgra = np.asarray(frame.frame_buffer).copy()
+            image_bgra = np.asarray(frame.frame_buffer)
             if image_bgra.size == 0:
                 return
 
+            frame_copy = image_bgra.copy()
             with self.frame_lock:
-                self.latest_frame = image_bgra
-
-            try:
-                if self.frame_queue.full():
-                    self.frame_queue.get_nowait()
-                self.frame_queue.put_nowait(image_bgra)
-            except queue.Empty:
-                pass
-            except queue.Full:
-                pass
+                self.latest_frame = frame_copy
 
             self.first_frame_event.set()
             if not self.logged_first_frame:
                 self.logged_first_frame = True
                 self.log(
-                    f"[캡처 수신] WGC 첫 프레임 "
-                    f"{int(frame.width)}x{int(frame.height)}"
+                    f"[캡처] WGC {int(frame.width)}x{int(frame.height)}"
                 )
         except Exception as exc:
             self.log(f"[캡처 오류] WGC 프레임 처리 중 문제가 발생했습니다: {exc}")
@@ -935,12 +989,6 @@ class WGCCaptureEngine:
         with self.frame_lock:
             self.latest_frame = None
 
-        while True:
-            try:
-                self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
-
         capture_kwargs: dict[str, object] = {
             "cursor_capture": False,
             "monitor_index": None,
@@ -971,7 +1019,6 @@ class WGCCaptureEngine:
                 start_with_options(capture_kwargs)
 
             self.started = True
-            self.log(f"[캡처 시작] WGC 세션을 시작했습니다. HWND={self.hwnd}")
             return True
         except Exception as exc:
             self.log(f"[캡처 오류] WGC 캡처 세션을 시작하지 못했습니다: {exc}")
@@ -985,17 +1032,6 @@ class WGCCaptureEngine:
 
         if timeout > 0 and not self.first_frame_event.wait(timeout):
             return None
-
-        latest_from_queue: Optional[np.ndarray] = None
-        while True:
-            try:
-                latest_from_queue = self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        if latest_from_queue is not None:
-            with self.frame_lock:
-                self.latest_frame = latest_from_queue
 
         with self.frame_lock:
             if self.latest_frame is None:
@@ -1203,19 +1239,10 @@ class InactiveManager:
             self.log(f"[캡처 오류] 지원하지 않는 WGC 프레임 형태입니다: {frame_bgra.shape}")
             return None
 
-        color_channels = frame_bgra[:, :, :3]
-        if np.all(color_channels == 0):
+        sampled = frame_bgra[::16, ::16, :3]
+        if sampled.max() == 0:
             self._log_capture_wait("[캡처 오류] WGC 캡처 이미지가 완전히 검은색입니다.")
             return None
-
-        mean_value = float(color_channels.mean())
-        std_value = float(color_channels.std())
-        if mean_value < 1.0 and std_value < 1.0:
-            self._log_capture_wait("[캡처 오류] WGC 캡처 결과가 거의 검은 화면입니다.")
-            return None
-
-        if std_value < 0.2:
-            self._log_capture_wait("[주의] WGC 캡처 결과가 거의 단색입니다.")
 
         try:
             if frame_bgra.shape[2] >= 4:
@@ -1297,8 +1324,6 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            if DETAILED_DEBUG_LOGS:
-                self.log(f"[클릭 Down] HWND={self.hwnd}, client=({client_x}, {client_y})")
             return post_mouse_down(
                 self.hwnd,
                 client_x,
@@ -1327,8 +1352,6 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            if DETAILED_DEBUG_LOGS:
-                self.log(f"[클릭 Up] HWND={self.hwnd}, client=({client_x}, {client_y})")
             return post_mouse_up(
                 self.hwnd,
                 client_x,
@@ -1373,21 +1396,10 @@ class InactiveManager:
                     max(0, int(right - left) // 2),
                     max(0, int(bottom - top) // 2),
                 )
-                if DETAILED_DEBUG_LOGS:
-                    self.log(f"[곡선 시작점] 이전 가상 위치가 없어 client 중심 {start_client}에서 시작합니다.")
             except Exception:
                 start_client = end_client
-                if DETAILED_DEBUG_LOGS:
-                    self.log("[곡선 시작점] 시작점 계산 실패로 목적지에서 시작합니다.")
 
         try:
-            if DETAILED_DEBUG_LOGS:
-                self.log(
-                    f"[곡선 클릭 준비] HWND={self.hwnd}, "
-                    f"start_wgc=({int(start_x)}, {int(start_y)}), "
-                    f"end_wgc=({int(end_x)}, {int(end_y)}), "
-                    f"start_client={start_client}, end_client={end_client}"
-                )
             post_curved_click(
                 self.hwnd,
                 start_client[0],
@@ -1484,13 +1496,6 @@ class InactiveManager:
                 if target.message_lparam is None and control_hwnd is not None:
                     lparam = control_hwnd
 
-            if DETAILED_DEBUG_LOGS:
-                self.log(
-                    f"[메시지 전송] {target.name}, message={target.message}({message_id}), "
-                    f"mode={mode_name}, targets={target_hwnds}, "
-                    f"wParam={wparam}, lParam={lparam}"
-                )
-
             sent_count = 0
             for target_hwnd in target_hwnds:
                 try:
@@ -1502,15 +1507,14 @@ class InactiveManager:
                         use_send_message=use_send_message,
                     )
                     sent_count += 1
-                except Exception as exc:
-                    self.log(f"[메시지 경고] HWND={target_hwnd} 전송 실패: {exc}")
+                except Exception:
+                    pass
 
             if sent_count <= 0:
-                self.log("[메시지 오류] 메시지를 전송한 HWND가 없습니다.")
+                self.log(f"[오류] {target.name} 메시지 전송 실패")
                 return False
 
-            if DETAILED_DEBUG_LOGS:
-                self.log(f"[메시지 완료] {target.name}, count={sent_count}")
+            self.log(f"[메시지] {target.name} {target.message}")
             return True
         except Exception as exc:
             self.log(f"[메시지 오류] Win32 메시지 액션 중 문제가 발생했습니다: {exc}")
@@ -1540,18 +1544,13 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            if DETAILED_DEBUG_LOGS:
-                self.log(
-                    f"[클릭 전송] HWND={self.hwnd}, "
-                    f"WGC=({int(x)}, {int(y)}), client=({client_x}, {client_y}), "
-                    f"hover={MOUSE_HOVER_BEFORE_CLICK_SECONDS:.2f}s"
-                )
             post_mouse_click(
                 self.hwnd,
                 client_x,
                 client_y,
                 use_send_message=use_send_message,
             )
+            self.log(f"[클릭] ({client_x},{client_y})")
             return True
         except Exception as exc:
             self.log(f"[오류] 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
@@ -1589,8 +1588,16 @@ class InactiveManager:
 class AutomationApp:
     """tkinter UI와 자동화 스레드를 관리합니다."""
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, license_key: Optional[str] = None):
         self.root = root
+        self.license_key = license_key
+        self.license_info: Optional[dict] = None
+        if license_key:
+            try:
+                self.license_info = verify_license_key(license_key)
+            except ValueError:
+                pass
+
         self.root.title("비활성 창 이미지 자동화 테스트")
         self.root.geometry("980x760+80+80")
         self.root.minsize(900, 640)
@@ -1638,6 +1645,9 @@ class AutomationApp:
         self._poll_ui_queue()
 
         self.log("프로그램을 시작했습니다.")
+        if self.license_info:
+            remaining = format_remaining_time(self.license_info["remaining_seconds"])
+            self.log(f"[라이센스] {self.license_info['days']}일권 인증됨 - {remaining}")
         self.log("F8: 시작, F9 또는 ESC: 중지")
         self.log("대상 창은 백그라운드에 있어도 되지만 최소화되어 있으면 안 됩니다.")
         if self.ui_preview_only:
@@ -2090,6 +2100,15 @@ class AutomationApp:
     def start_automation(self) -> None:
         """시작 버튼 또는 F8 키로 자동화 스레드를 시작합니다."""
 
+        if self.license_key:
+            try:
+                self.license_info = verify_license_key(self.license_key)
+            except ValueError as e:
+                self.log(f"[라이센스] {e} 프로그램을 재시작하고 새 키를 입력하세요.")
+                self.set_status("라이센스 만료")
+                self._set_button_state(running=False)
+                return
+
         if self.ui_preview_only:
             self.log("[UI 미리보기] Mac에서는 자동화 루프를 실행하지 않습니다.")
             self.log("              Windows에서 실행하면 시작 버튼과 F8이 자동화를 시작합니다.")
@@ -2262,8 +2281,6 @@ class AutomationApp:
                     screen_gray = None
 
                 if screen_gray is None:
-                    self.queue_status("오류 발생")
-                    self.queue_log(f"[대기] 캡처 실패로 {LOOP_SLEEP_SECONDS}초 후 다시 시도합니다.")
                     self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
@@ -2282,16 +2299,10 @@ class AutomationApp:
                     base_x, base_y = center
                     x, y = self.apply_click_jitter(target, base_x, base_y)
                     self.queue_status("이미지 감지 성공")
-                    if DETAILED_DEBUG_LOGS:
-                        self.queue_log(
-                            f"[감지] {target.name} "
-                            f"(점수: {score:.3f}, 위치: {base_x}, {base_y})"
-                        )
-                        if (x, y) != (base_x, base_y):
-                            self.queue_log(
-                                f"[클릭 좌표] {target.name} "
-                                f"(기준: {base_x}, {base_y}, 보정: {x}, {y})"
-                            )
+                    self.queue_log(
+                        f"[감지] {target.name} "
+                        f"(점수: {score:.3f}, 위치: {base_x},{base_y})"
+                    )
 
                     if target.action == "key":
                         action_ok = self.dispatch_key_press(manager, target)
@@ -2312,11 +2323,8 @@ class AutomationApp:
                             "key": "키 입력 완료",
                             "message": "메시지 완료",
                         }
-                        action_label = status_by_action.get(target.action, "클릭 완료")
-                        self.queue_status(action_label)
-                        self.queue_log(f"[동작 완료] {target.name}: {action_label}")
+                        self.queue_status(status_by_action.get(target.action, "클릭 완료"))
                         if target.wait_after_click > 0:
-                            self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
                             self.interruptible_sleep(target.wait_after_click)
 
                     # 한 루프에서 하나만 클릭합니다.
@@ -2384,16 +2392,11 @@ class AutomationApp:
                 self.queue_log("[캡처 오류] 화면 영역 캡처 결과가 비어 있습니다.")
                 return None
 
-            if np.all(image_rgb == 0):
+            if image_rgb[0, 0].sum() == 0 and np.all(image_rgb[::16, ::16] == 0):
                 self.queue_log("[캡처 오류] 화면 영역 캡처 결과가 완전히 검은색입니다.")
                 return None
 
-            if DETAILED_DEBUG_LOGS:
-                self.queue_log(f"[캡처 성공] 화면 영역 x={x}, y={y}, w={width}, h={height}")
-            screen_gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-            if DETAILED_DEBUG_LOGS:
-                cv2.imwrite(str(Path(__file__).resolve().parent / "debug_capture.png"), screen_gray)
-            return screen_gray
+            return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         except Exception as exc:
             self.queue_log(f"[캡처 오류] 화면 영역 캡처 중 문제가 발생했습니다: {exc}")
             return None
@@ -2422,13 +2425,9 @@ class AutomationApp:
             )
             return False
 
-        if DETAILED_DEBUG_LOGS:
-            self.queue_log(
-                f"[키 요청] {target.name} 감지로 "
-                f"'{target.key.upper()}' 키를 vgamepad 버튼으로 보냅니다."
-            )
         try:
             send_gamepad_button(button)
+            self.queue_log(f"[키] {target.key.upper()}")
             return True
         except Exception as exc:
             self.queue_log(f"[오류] vgamepad 버튼 입력 중 문제가 발생했습니다: {exc}")
@@ -2445,11 +2444,6 @@ class AutomationApp:
             self.queue_log("[오류] Win32 메시지 액션에는 대상 창 HWND가 필요합니다.")
             return False
 
-        if DETAILED_DEBUG_LOGS:
-            self.queue_log(
-                f"[메시지 요청] {target.name} 감지로 "
-                f"{target.message} 메시지를 {target.message_mode}로 보냅니다."
-            )
         return manager.send_win32_message_action(target)
 
     def dispatch_click(
@@ -2501,21 +2495,12 @@ class AutomationApp:
 
         try:
             original_x, original_y = pyautogui.position()
-            if DETAILED_DEBUG_LOGS:
-                self.queue_log(
-                    f"[클릭 전송] 화면 좌표=({screen_x}, {screen_y}), "
-                    f"복귀 좌표=({original_x}, {original_y})"
-                )
-
-            # 입력 렉과 포커스 흔들림을 줄이기 위해 순간이동 대신 짧은 고정 시간으로 이동합니다.
             pyautogui.moveTo(screen_x, screen_y, duration=0.15)
             time.sleep(MOUSE_HOVER_BEFORE_CLICK_SECONDS)
-
             pyautogui.click()
             time.sleep(0.05)
-
-            # 사용자의 원래 작업 위치를 최대한 보존합니다.
             pyautogui.moveTo(original_x, original_y, duration=0.15)
+            self.queue_log(f"[클릭] ({screen_x},{screen_y})")
             return True
         except pyautogui.FailSafeException:
             self.queue_log("[긴급 중단] PyAutoGUI FAILSAFE가 감지되었습니다.")
@@ -2856,9 +2841,6 @@ def find_template_center(
         )
         return None, 0.0
 
-    if DETAILED_DEBUG_LOGS:
-        cv2.imwrite(str(Path(__file__).resolve().parent / "debug_screen.png"), screen_gray)
-
     result = cv2.matchTemplate(
         screen_gray,
         target.image_gray,
@@ -2867,26 +2849,180 @@ def find_template_center(
     _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(result)
     score = float(max_value)
 
+    if score < target.threshold:
+        return None, score
+
     top_left_x, top_left_y = max_location
     center_x = top_left_x + target_width // 2
     center_y = top_left_y + target_height // 2
 
-    if DETAILED_DEBUG_LOGS:
-        log(
-            f"[매칭] {target.name} "
-            f"(점수: {score:.3f}, 위치: {center_x}, {center_y}, 기준: {target.threshold:.2f})"
-        )
-
-    if score < target.threshold:
-        return None, score
-
     return (center_x, center_y), score
+
+class LicenseDialog:
+    """라이센스 키 입력/검증 다이얼로그입니다."""
+
+    def __init__(self, root: tk.Tk, base_dir: Path):
+        self.root = root
+        self.base_dir = base_dir
+        self.result: Optional[str] = None
+
+        self.root.title("라이센스 인증")
+        self.root.geometry("480x340+200+200")
+        self.root.resizable(False, False)
+
+        bg = "#1E1E1E"
+        panel_bg = "#252526"
+        input_bg = "#111827"
+        text_color = "#F9FAFB"
+        accent = "#7AB7FF"
+        error_color = "#FF6B6B"
+        success_color = "#69DB7C"
+
+        self.root.configure(bg=bg)
+
+        main_frame = tk.Frame(self.root, bg=bg, padx=24, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            main_frame,
+            text="라이센스 인증",
+            bg=bg,
+            fg=accent,
+            font=("Arial", 16, "bold"),
+        ).pack(pady=(0, 16))
+
+        tk.Label(
+            main_frame,
+            text="라이센스 키를 입력하세요",
+            bg=bg,
+            fg=text_color,
+            font=("Arial", 10),
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        self.key_var = tk.StringVar()
+        self.key_entry = tk.Entry(
+            main_frame,
+            textvariable=self.key_var,
+            bg=input_bg,
+            fg=text_color,
+            insertbackground=text_color,
+            font=("Consolas", 12),
+            relief=tk.SOLID,
+            bd=1,
+            width=40,
+        )
+        self.key_entry.pack(fill=tk.X, pady=(0, 12))
+        self.key_entry.bind("<Return>", lambda _e: self._activate())
+
+        self.message_var = tk.StringVar()
+        self.message_label = tk.Label(
+            main_frame,
+            textvariable=self.message_var,
+            bg=bg,
+            fg=text_color,
+            font=("Arial", 9),
+            wraplength=420,
+            justify=tk.LEFT,
+        )
+        self.message_label.pack(fill=tk.X, pady=(0, 16))
+
+        btn_frame = tk.Frame(main_frame, bg=bg)
+        btn_frame.pack(fill=tk.X)
+
+        self.activate_btn = tk.Button(
+            btn_frame,
+            text="인증하기",
+            command=self._activate,
+            bg=accent,
+            fg="#000000",
+            font=("Arial", 11, "bold"),
+            relief=tk.FLAT,
+            padx=20,
+            pady=6,
+            cursor="hand2",
+        )
+        self.activate_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+
+        self.exit_btn = tk.Button(
+            btn_frame,
+            text="종료",
+            command=self.root.destroy,
+            bg="#3C3C3C",
+            fg=text_color,
+            font=("Arial", 11),
+            relief=tk.FLAT,
+            padx=20,
+            pady=6,
+            cursor="hand2",
+        )
+        self.exit_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.info_label = tk.Label(
+            main_frame,
+            text="",
+            bg=bg,
+            fg="#888888",
+            font=("Arial", 8),
+        )
+        self.info_label.pack(side=tk.BOTTOM, pady=(12, 0))
+
+        self._error_color = error_color
+        self._success_color = success_color
+        self._bg = bg
+
+        saved_key = load_saved_license(self.base_dir)
+        if saved_key:
+            self.key_var.set(saved_key)
+            self._try_auto_activate(saved_key)
+        else:
+            self.key_entry.focus_set()
+
+    def _try_auto_activate(self, key: str) -> None:
+        try:
+            info = verify_license_key(key)
+            remaining = format_remaining_time(info["remaining_seconds"])
+            self.message_var.set(f"저장된 라이센스가 유효합니다. ({info['days']}일권, {remaining})")
+            self.message_label.configure(fg=self._success_color)
+            self.root.after(800, lambda: self._launch_app(key))
+        except ValueError:
+            self.message_var.set("저장된 라이센스가 만료되었거나 유효하지 않습니다. 새 키를 입력하세요.")
+            self.message_label.configure(fg=self._error_color)
+            self.key_var.set("")
+            self.key_entry.focus_set()
+
+    def _activate(self) -> None:
+        key = self.key_var.get().strip()
+        if not key:
+            self.message_var.set("라이센스 키를 입력하세요.")
+            self.message_label.configure(fg=self._error_color)
+            return
+
+        try:
+            info = verify_license_key(key)
+        except ValueError as e:
+            self.message_var.set(str(e))
+            self.message_label.configure(fg=self._error_color)
+            return
+
+        remaining = format_remaining_time(info["remaining_seconds"])
+        self.message_var.set(f"인증 성공! ({info['days']}일권, {remaining})")
+        self.message_label.configure(fg=self._success_color)
+        save_license_key(self.base_dir, key)
+        self.root.after(600, lambda: self._launch_app(key))
+
+    def _launch_app(self, key: str) -> None:
+        self.result = key
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        AutomationApp(self.root, license_key=key)
+
 
 def main() -> None:
     """프로그램 진입점입니다."""
 
     root = tk.Tk()
-    AutomationApp(root)
+    base_dir = Path(__file__).resolve().parent
+    LicenseDialog(root, base_dir)
     root.mainloop()
 
 if __name__ == "__main__":

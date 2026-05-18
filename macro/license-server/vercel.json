@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "routes": [
+    { "handle": "filesystem" },
+    {
+      "src": "/admin",
+      "dest": "/admin.html"
+    },
+    {
+      "src": "/api/verify",
+      "methods": ["POST"],
+      "dest": "/api/verify.js"
+    },
+    {
+      "src": "/api/admin",
+      "methods": ["GET", "POST", "DELETE", "PATCH"],
+      "dest": "/api/admin.js"
+    }
+  ]
+}
