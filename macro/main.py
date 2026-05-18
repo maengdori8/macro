@@ -3,18 +3,17 @@ Windows inactive-window image matching and click GUI example.
 
 목적:
 - tkinter UI에서 대상 창 제목을 입력하고 자동화를 시작/중지합니다.
-- 특정 Windows 창이 다른 창 뒤에 가려져 있어도 클라이언트 영역을 캡처합니다.
+- Windows Graphics Capture로 대상 창이 다른 창 뒤에 가려져 있어도 캡처합니다.
 - OpenCV 템플릿 매칭으로 target_A/B/C.png를 찾습니다.
 - 실제 마우스 커서를 움직이지 않고 PostMessage로 클릭 메시지를 보냅니다.
 주의:
 - 최소화된 창은 지원하지 않습니다.
-- 일부 프로그램은 PrintWindow 캡처 또는 PostMessage 클릭을 지원하지 않을 수 있습니다.
+- 일부 프로그램은 Windows Graphics Capture 또는 PostMessage 클릭을 지원하지 않을 수 있습니다.
 - 허가된 사내 프로그램, 개인 학습, RPA 테스트 목적의 예시 코드입니다.
 """
 
 from __future__ import annotations
 
-import ctypes
 import platform
 import queue
 import random
@@ -24,7 +23,7 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import scrolledtext
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -44,15 +43,23 @@ try:
     import win32api  # type: ignore[reportMissingModuleSource]
     import win32con  # type: ignore[reportMissingModuleSource]
     import win32gui  # type: ignore[reportMissingModuleSource]
-    import win32ui  # type: ignore[reportMissingModuleSource]
 except ImportError as exc:
     win32api = None
     win32con = None
     win32gui = None
-    win32ui = None
     WIN32_IMPORT_ERROR = exc
 else:
     WIN32_IMPORT_ERROR = None
+
+try:
+    # windows-capture는 Windows Graphics Capture API를 감싼 Windows 전용 패키지입니다.
+    from windows_capture import Frame, WindowsCapture  # type: ignore[reportMissingModuleSource]
+except (ImportError, OSError) as exc:
+    Frame = Any
+    WindowsCapture = None
+    WINDOWS_CAPTURE_IMPORT_ERROR = exc
+else:
+    WINDOWS_CAPTURE_IMPORT_ERROR = None
 
 
 # UI 입력칸의 기본값입니다. 사용자는 프로그램 실행 후 UI에서 수정할 수 있습니다.
@@ -64,6 +71,9 @@ LOOP_SLEEP_SECONDS = 0.5
 
 # 대상 창을 찾지 못했을 때 재검색하는 간격입니다.
 WINDOW_RETRY_SECONDS = 2.0
+
+# WGC 세션 시작 뒤 첫 프레임을 기다리는 최대 시간입니다.
+WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 
 # 매칭 영역 중심 주변에서 클릭 좌표를 약간 조정합니다.
 # 허가된 UI 테스트에서 고정 좌표 취약성을 줄이기 위한 안정화 값입니다.
@@ -95,19 +105,178 @@ class TargetImage:
     image_gray: Optional[np.ndarray] = field(default=None, repr=False)
 
 
+class WGCCaptureEngine:
+    """windows-capture 기반 비동기 WGC 창 캡처 엔진입니다."""
+
+    def __init__(self, hwnd: int, logger: Optional[LogCallback] = None):
+        self.hwnd = int(hwnd)
+        self.logger = logger or print
+        self.latest_frame: Optional[np.ndarray] = None
+        self.capture: Optional[Any] = None
+        self.capture_control: Optional[Any] = None
+        self.frame_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self.frame_lock = threading.Lock()
+        self.first_frame_event = threading.Event()
+        self.closed_event = threading.Event()
+        self.started = False
+        self.logged_first_frame = False
+
+    def log(self, message: str) -> None:
+        """콘솔 또는 GUI 로그 영역으로 메시지를 보냅니다."""
+
+        self.logger(message)
+
+    def on_frame_arrived(self, frame: Frame, _capture_control: Any = None) -> None:
+        """WGC 캡처 스레드에서 프레임이 도착할 때마다 최신 BGRA 배열을 저장합니다."""
+
+        try:
+            # windows-capture 2.x의 Frame.frame_buffer는 BGRA uint8 NumPy 배열입니다.
+            image_bgra = np.asarray(frame.frame_buffer).copy()
+            if image_bgra.size == 0:
+                return
+
+            with self.frame_lock:
+                self.latest_frame = image_bgra
+
+            try:
+                if self.frame_queue.full():
+                    self.frame_queue.get_nowait()
+                self.frame_queue.put_nowait(image_bgra)
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass
+
+            self.first_frame_event.set()
+            if not self.logged_first_frame:
+                self.logged_first_frame = True
+                self.log(
+                    f"[캡처 수신] WGC 첫 프레임 "
+                    f"{int(frame.width)}x{int(frame.height)}"
+                )
+        except Exception as exc:
+            self.log(f"[캡처 오류] WGC 프레임 처리 중 문제가 발생했습니다: {exc}")
+
+    def on_closed(self) -> None:
+        """WGC 캡처 세션이 닫혔을 때 호출됩니다."""
+
+        self.closed_event.set()
+        self.log("[캡처 종료] WGC 캡처 세션이 닫혔습니다.")
+
+    def start_capture(self) -> bool:
+        """WindowsCapture를 블로킹 없이 전용 캡처 스레드에서 시작합니다."""
+
+        if WindowsCapture is None:
+            self.log("[오류] windows-capture 모듈을 불러올 수 없습니다.")
+            self.log("       Windows 환경에서 requirements.txt를 다시 설치하세요.")
+            self.log(f"       원본 오류: {WINDOWS_CAPTURE_IMPORT_ERROR}")
+            return False
+
+        if self.capture_control is not None:
+            try:
+                if not self.capture_control.is_finished():
+                    return True
+            except Exception:
+                self.stop_capture()
+
+        self.first_frame_event.clear()
+        self.closed_event.clear()
+        self.logged_first_frame = False
+
+        with self.frame_lock:
+            self.latest_frame = None
+
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            self.capture = WindowsCapture(
+                cursor_capture=False,
+                draw_border=False,
+                monitor_index=None,
+                window_name=None,
+                window_hwnd=self.hwnd,
+            )
+            self.capture.event(self.on_frame_arrived)
+            self.capture.event(self.on_closed)
+            self.capture_control = self.capture.start_free_threaded()
+            self.started = True
+            self.log(f"[캡처 시작] WGC 세션을 시작했습니다. HWND={self.hwnd}")
+            return True
+        except Exception as exc:
+            self.log(f"[캡처 오류] WGC 캡처 세션을 시작하지 못했습니다: {exc}")
+            self.capture = None
+            self.capture_control = None
+            self.started = False
+            return False
+
+    def get_latest_frame(self, timeout: float = 0.0) -> Optional[np.ndarray]:
+        """최신 WGC 프레임을 BGRA NumPy 배열 복사본으로 반환합니다."""
+
+        if timeout > 0 and not self.first_frame_event.wait(timeout):
+            return None
+
+        latest_from_queue: Optional[np.ndarray] = None
+        while True:
+            try:
+                latest_from_queue = self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest_from_queue is not None:
+            with self.frame_lock:
+                self.latest_frame = latest_from_queue
+
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+
+    def stop_capture(self) -> None:
+        """실행 중인 WGC 세션을 안전하게 중지합니다."""
+
+        capture_control = self.capture_control
+        self.capture_control = None
+        self.capture = None
+        self.started = False
+        self.first_frame_event.clear()
+
+        with self.frame_lock:
+            self.latest_frame = None
+
+        if capture_control is None:
+            return
+
+        try:
+            if not capture_control.is_finished():
+                capture_control.stop()
+        except Exception as exc:
+            self.log(f"[주의] WGC 캡처 세션 정리 중 문제가 발생했습니다: {exc}")
+
+
 class InactiveManager:
-    """비활성 Windows 창 캡처와 메시지 클릭을 담당합니다."""
+    """비활성 Windows 창 WGC 캡처와 메시지 클릭을 담당합니다."""
 
     def __init__(self, window_title: str, logger: Optional[LogCallback] = None):
         self.window_title = window_title
         self.hwnd: Optional[int] = None
         self.window_text: str = ""
         self.logger = logger or print
+        self.capture_engine: Optional[WGCCaptureEngine] = None
+        self.last_capture_wait_log_time = 0.0
 
         if WIN32_IMPORT_ERROR is not None:
             self.log("[오류] pywin32 모듈을 불러올 수 없습니다.")
             self.log("       이 프로그램은 Windows + pywin32 환경에서 실행해야 합니다.")
             self.log(f"       원본 오류: {WIN32_IMPORT_ERROR}")
+
+        if WINDOWS_CAPTURE_IMPORT_ERROR is not None:
+            self.log("[오류] windows-capture 모듈을 불러올 수 없습니다.")
+            self.log("       WGC 캡처에는 Windows + windows-capture 환경이 필요합니다.")
+            self.log(f"       원본 오류: {WINDOWS_CAPTURE_IMPORT_ERROR}")
 
         if platform.system() != "Windows":
             self.log("[주의] 현재 OS는 Windows가 아닙니다.")
@@ -178,7 +347,10 @@ class InactiveManager:
         for hwnd, title in matches:
             self.log(f"       HWND={hwnd}, 제목='{title}'")
 
+        previous_hwnd = self.hwnd
         self.hwnd, self.window_text = matches[0]
+        if previous_hwnd is not None and previous_hwnd != self.hwnd:
+            self.stop_capture()
         self.log(f"[선택] HWND={self.hwnd}, 제목='{self.window_text}' 창을 사용합니다.")
         return True
 
@@ -215,148 +387,81 @@ class InactiveManager:
 
     def capture_client_area(self) -> Optional[np.ndarray]:
         """
-        대상 창의 클라이언트 영역을 캡처하고 GrayScale NumPy 배열로 반환합니다.
+        WGC 최신 프레임을 가져와 OpenCV 템플릿 매칭용 GrayScale 배열로 반환합니다.
 
-        GDI 리소스 흐름:
-        1. GetWindowDC로 원본 창 DC 핸들을 얻습니다.
-        2. win32ui.CreateDCFromHandle로 pywin32 DC 객체를 만듭니다.
-        3. CreateCompatibleDC로 메모리 DC를 만듭니다.
-        4. CreateCompatibleBitmap으로 캡처 결과를 담을 HBITMAP을 만듭니다.
-        5. PrintWindow(PW_CLIENTONLY)로 클라이언트 영역만 메모리 DC에 그립니다.
-        6. GetBitmapBits로 BGRA/BGR 바이트를 NumPy 배열로 변환합니다.
-        7. finally에서 HBITMAP, compatible DC, 원본 DC를 반드시 해제합니다.
+        windows-capture는 별도 프레임 스레드에서 BGRA 버퍼를 밀어주므로,
+        여기서는 WGCCaptureEngine의 최신 프레임만 읽고 cv2.cvtColor로 변환합니다.
         """
 
         if not self.is_valid_window():
+            self.stop_capture()
             return None
 
-        left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-        width = right - left
-        height = bottom - top
+        if self.hwnd is None:
+            self.log("[오류] WGC 캡처를 시작할 대상 HWND가 없습니다.")
+            return None
 
-        hwnd_dc = None
-        source_dc = None
-        memory_dc = None
-        bitmap = None
-        old_bitmap = None
+        if self.capture_engine is None:
+            self.capture_engine = WGCCaptureEngine(self.hwnd, logger=self.log)
+
+        if not self.capture_engine.start_capture():
+            return None
+
+        if self.capture_engine.closed_event.is_set():
+            self.log("[주의] WGC 캡처 세션이 닫혔습니다. 대상 창을 다시 찾습니다.")
+            self.stop_capture()
+            return None
+
+        frame_bgra = self.capture_engine.get_latest_frame(
+            timeout=WGC_FIRST_FRAME_TIMEOUT_SECONDS,
+        )
+        if frame_bgra is None:
+            self._log_capture_wait("[대기] WGC 첫 프레임 또는 최신 프레임을 아직 받지 못했습니다.")
+            return None
+
+        if frame_bgra.ndim != 3 or frame_bgra.shape[2] < 3:
+            self.log(f"[캡처 오류] 지원하지 않는 WGC 프레임 형태입니다: {frame_bgra.shape}")
+            return None
+
+        color_channels = frame_bgra[:, :, :3]
+        if np.all(color_channels == 0):
+            self._log_capture_wait("[캡처 오류] WGC 캡처 이미지가 완전히 검은색입니다.")
+            return None
+
+        mean_value = float(color_channels.mean())
+        std_value = float(color_channels.std())
+        if mean_value < 1.0 and std_value < 1.0:
+            self._log_capture_wait("[캡처 오류] WGC 캡처 결과가 거의 검은 화면입니다.")
+            return None
+
+        if std_value < 0.2:
+            self._log_capture_wait("[주의] WGC 캡처 결과가 거의 단색입니다.")
 
         try:
-            # 원본 창 DC를 얻습니다. PrintWindow는 이 DC와 호환되는 메모리 DC에 그립니다.
-            hwnd_dc = win32gui.GetWindowDC(self.hwnd)
-            if not hwnd_dc:
-                self.log("[오류] GetWindowDC가 실패했습니다.")
-                return None
-
-            # HDC 핸들을 pywin32 DC 객체로 감쌉니다.
-            source_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-
-            # 화면이 아니라 메모리에 그릴 compatible DC를 만듭니다.
-            memory_dc = source_dc.CreateCompatibleDC()
-
-            # 클라이언트 영역 크기만큼 compatible bitmap을 만듭니다.
-            bitmap = win32ui.CreateBitmap()
-            bitmap.CreateCompatibleBitmap(source_dc, width, height)
-
-            # bitmap을 memory_dc에 선택해야 PrintWindow 결과가 bitmap에 기록됩니다.
-            old_bitmap = memory_dc.SelectObject(bitmap)
-
-            for flag_name, flag_value in self._print_window_flag_candidates():
-                self.log(f"[캡처 시도] PrintWindow 플래그={flag_name}")
-                printed = self._print_window(
-                    self.hwnd,
-                    memory_dc.GetSafeHdc(),
-                    flag_value,
-                )
-                if printed != 1:
-                    self.log(
-                        f"[캡처 오류] PrintWindow 실패 "
-                        f"(플래그: {flag_name}, 결과값: {printed})"
-                    )
-                    continue
-
-                bitmap_info = bitmap.GetInfo()
-                bitmap_bytes = bitmap.GetBitmapBits(True)
-                image_bgr = self._bitmap_bytes_to_bgr(bitmap_bytes, bitmap_info)
-                if image_bgr is None:
-                    continue
-
-                if image_bgr.size == 0:
-                    self.log(f"[캡처 오류] 캡처 결과가 비어 있습니다. (플래그: {flag_name})")
-                    continue
-
-                if np.all(image_bgr == 0):
-                    self.log(
-                        f"[캡처 오류] 캡처 이미지가 완전히 검은색입니다. "
-                        f"(플래그: {flag_name})"
-                    )
-                    continue
-
-                mean_value = float(image_bgr.mean())
-                std_value = float(image_bgr.std())
-                if mean_value < 1.0 and std_value < 1.0:
-                    self.log(
-                        f"[캡처 오류] 캡처 결과가 거의 검은 화면입니다. "
-                        f"(플래그: {flag_name})"
-                    )
-                    continue
-
-                if std_value < 0.2:
-                    self.log(
-                        f"[주의] 캡처 결과가 거의 단색입니다. "
-                        f"(플래그: {flag_name})"
-                    )
-                    self.log("       정상 화면인지, 빈 화면이 캡처된 것인지 확인이 필요합니다.")
-
-                self.log(f"[캡처 성공] 클라이언트 영역 {width}x{height}, 플래그={flag_name}")
-
-                # OpenCV 템플릿 매칭을 위해 GrayScale로 변환합니다.
-                return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-
-            self.log("[캡처 오류] 모든 PrintWindow 플래그 재시도가 실패했습니다.")
-            self.log("       대상 앱이 백그라운드 캡처를 지원하지 않거나 다른 캡처 방식이 필요할 수 있습니다.")
-            self.save_printwindow_failure_debug_screenshot()
-            return None
-
+            if frame_bgra.shape[2] >= 4:
+                return cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2GRAY)
+            return cv2.cvtColor(frame_bgra, cv2.COLOR_BGR2GRAY)
         except Exception as exc:
-            self.log(f"[오류] 클라이언트 영역 캡처 중 예외가 발생했습니다: {exc}")
+            self.log(f"[캡처 오류] WGC 프레임을 GrayScale로 변환하지 못했습니다: {exc}")
             return None
 
-        finally:
-            # SelectObject로 바꿔 끼운 bitmap을 원래 객체로 되돌립니다.
-            # 이 과정을 거치면 bitmap 삭제 시 GDI 리소스가 더 안전하게 정리됩니다.
-            try:
-                if memory_dc is not None and old_bitmap is not None:
-                    memory_dc.SelectObject(old_bitmap)
-            except Exception:
-                pass
+    def stop_capture(self) -> None:
+        """실행 중인 WGC 캡처 엔진을 정리합니다."""
 
-            # HBITMAP 해제: 캡처 루프마다 새로 생성되므로 반드시 삭제해야 합니다.
-            try:
-                if bitmap is not None:
-                    win32gui.DeleteObject(bitmap.GetHandle())
-            except Exception:
-                pass
+        if self.capture_engine is None:
+            return
 
-            # 메모리 compatible DC 해제.
-            try:
-                if memory_dc is not None:
-                    memory_dc.DeleteDC()
-            except Exception:
-                pass
+        self.capture_engine.stop_capture()
+        self.capture_engine = None
 
-            # CreateDCFromHandle로 만든 DC 객체 해제.
-            try:
-                if source_dc is not None:
-                    source_dc.DeleteDC()
-            except Exception:
-                pass
+    def _log_capture_wait(self, message: str) -> None:
+        """반복 루프에서 같은 캡처 메시지가 과도하게 쌓이지 않게 합니다."""
 
-            # GetWindowDC로 얻은 원본 DC 핸들은 ReleaseDC로 반환해야 합니다.
-            try:
-                if hwnd_dc is not None:
-                    win32gui.ReleaseDC(self.hwnd, hwnd_dc)
-            except Exception:
-                pass
+        now = time.monotonic()
+        if now - self.last_capture_wait_log_time < 2.0:
+            return
+        self.last_capture_wait_log_time = now
+        self.log(message)
 
     def post_click(self, x: int, y: int) -> bool:
         """
@@ -413,125 +518,6 @@ class InactiveManager:
 
         return WIN32_IMPORT_ERROR is None
 
-    def _print_window(self, hwnd: int, hdc: int, flags: int) -> int:
-        """pywin32의 PrintWindow를 우선 사용하고, 없으면 ctypes로 호출합니다."""
-
-        if hasattr(win32gui, "PrintWindow"):
-            return int(win32gui.PrintWindow(hwnd, hdc, flags))
-
-        # 오래된 pywin32에서 PrintWindow 래퍼가 없을 때의 보조 경로입니다.
-        return int(ctypes.windll.user32.PrintWindow(hwnd, hdc, flags))
-
-    def save_printwindow_failure_debug_screenshot(self) -> None:
-        """
-        PrintWindow가 실패했을 때 당시 전체 화면을 디버깅용으로 저장합니다.
-
-        이 함수는 GDI 리소스를 직접 건드리지 않습니다. GDI 해제는 capture_client_area()
-        finally 블록이 담당하므로 여기서는 pyautogui 전체 화면 스냅샷만 시도합니다.
-        """
-
-        self.log("[시스템 경고] PrintWindow API가 모든 플래그에서 실패했습니다.")
-        self.log("               원인: 권한 부족(UIPI), 하드웨어 가속, 또는 대상 창의 그래픽 차단 가능성.")
-
-        if pyautogui is None:
-            self.log("[디버그] pyautogui를 불러올 수 없어 전체 화면 디버그 저장을 건너뜁니다.")
-            self.log(f"         원본 오류: {PYAUTOGUI_IMPORT_ERROR}")
-            return
-
-        try:
-            debug_path = Path(__file__).resolve().parent / "DEBUG_PRINTWINDOW_FAILED.png"
-            fallback_screenshot = pyautogui.screenshot()
-            fallback_screenshot.save(debug_path)
-            self.log(
-                "[디버그] PrintWindow 실패 당시 전체 화면을 "
-                f"'{debug_path.name}'로 저장했습니다."
-            )
-        except Exception as exc:
-            self.log(f"[디버그] 임시 스크린샷 저장마저 실패했습니다: {exc}")
-
-    def _print_window_flag_candidates(self) -> list[tuple[str, int]]:
-        """
-        PrintWindow 플래그 후보를 반환합니다.
-
-        앱마다 응답하는 PrintWindow 플래그가 달라서 여러 방식을 순차 시도합니다.
-        PW_CLIENTONLY는 클라이언트 영역 중심이고, PW_RENDERFULLCONTENT는 일부
-        Chromium/Electron/스크롤 가능 창에서 더 나은 결과를 주는 경우가 있습니다.
-        """
-
-        pw_client_only = getattr(win32con, "PW_CLIENTONLY", 0x00000001)
-        pw_render_full_content = getattr(win32con, "PW_RENDERFULLCONTENT", 0x00000002)
-        candidates = [
-            ("PW_CLIENTONLY", pw_client_only),
-            (
-                "PW_CLIENTONLY|PW_RENDERFULLCONTENT",
-                pw_client_only | pw_render_full_content,
-            ),
-            ("PW_RENDERFULLCONTENT", pw_render_full_content),
-            ("0", 0),
-        ]
-
-        # 혹시 같은 값이 중복될 경우 로그가 헷갈리지 않도록 제거합니다.
-        deduped: list[tuple[str, int]] = []
-        seen_values: set[int] = set()
-        for name, value in candidates:
-            if value in seen_values:
-                continue
-            deduped.append((name, value))
-            seen_values.add(value)
-
-        return deduped
-
-    def _bitmap_bytes_to_bgr(
-        self,
-        bitmap_bytes: bytes,
-        bitmap_info: dict[str, int],
-    ) -> Optional[np.ndarray]:
-        """
-        HBITMAP의 raw bytes를 OpenCV BGR 배열로 변환합니다.
-
-        Windows bitmap은 환경에 따라 BGRA(4채널) 또는 BGR(3채널)에 가까운 형태로
-        반환될 수 있습니다. bmBitsPixel, bmWidthBytes를 확인해서 명확히 처리합니다.
-        """
-
-        try:
-            width = int(bitmap_info["bmWidth"])
-            height = int(bitmap_info["bmHeight"])
-            bits_per_pixel = int(bitmap_info["bmBitsPixel"])
-            row_bytes = int(bitmap_info["bmWidthBytes"])
-            bytes_per_pixel = bits_per_pixel // 8
-
-            if width <= 0 or height <= 0:
-                self.log("[오류] bitmap 크기가 올바르지 않습니다.")
-                return None
-
-            if bytes_per_pixel not in (3, 4):
-                self.log(f"[오류] 지원하지 않는 bitmap 비트 깊이입니다: {bits_per_pixel} bpp")
-                return None
-
-            expected_without_padding = width * height * bytes_per_pixel
-            raw_array = np.frombuffer(bitmap_bytes, dtype=np.uint8)
-
-            if len(bitmap_bytes) == expected_without_padding:
-                shaped = raw_array.reshape((height, width, bytes_per_pixel))
-            else:
-                # scanline padding이 포함된 경우 row_bytes 기준으로 행을 나눈 뒤,
-                # 실제 픽셀 영역만 잘라냅니다.
-                shaped_rows = raw_array.reshape((height, row_bytes))
-                pixel_bytes = shaped_rows[:, : width * bytes_per_pixel]
-                shaped = pixel_bytes.reshape((height, width, bytes_per_pixel))
-
-            if bytes_per_pixel == 4:
-                # compatible bitmap의 4채널 값은 보통 BGRA/BGRX 순서입니다.
-                # OpenCV 매칭은 BGR/GrayScale이면 충분하므로 알파 채널을 제거합니다.
-                return cv2.cvtColor(shaped, cv2.COLOR_BGRA2BGR)
-
-            # 3채널 bitmap은 OpenCV가 사용하는 BGR 순서로 취급합니다.
-            return shaped.copy()
-
-        except Exception as exc:
-            self.log(f"[오류] bitmap 데이터를 NumPy 배열로 변환하지 못했습니다: {exc}")
-            return None
-
     def _make_lparam(self, x: int, y: int) -> int:
         """
         Windows 마우스 메시지 lParam을 만듭니다.
@@ -575,7 +561,7 @@ class AutomationApp:
             name: tk.StringVar(value=f"{value:.2f}")
             for name, value in self.threshold_values.items()
         }
-        self.capture_mode_var = tk.StringVar(value="printwindow")
+        self.capture_mode_var = tk.StringVar(value="wgc")
         self.click_mode_var = tk.StringVar(value="postmessage")
         self.region_vars = {
             "x": tk.IntVar(value=DEFAULT_REGION_X),
@@ -729,9 +715,9 @@ class AutomationApp:
         ).pack(side=tk.LEFT)
         tk.Radiobutton(
             capture_row,
-            text="비활성 PrintWindow",
+            text="비활성 WGC",
             variable=self.capture_mode_var,
-            value="printwindow",
+            value="wgc",
             command=self.on_capture_mode_changed,
             bg=panel_bg,
             fg=text_color,
@@ -1072,7 +1058,7 @@ class AutomationApp:
             self.click_mode_var.set("mouse")
 
         window_title = self.window_title_var.get().strip()
-        if capture_mode == "printwindow" and not window_title:
+        if capture_mode == "wgc" and not window_title:
             self.log("[오류] 대상 창 제목을 입력하세요.")
             self.set_status("오류 발생")
             return
@@ -1167,6 +1153,8 @@ class AutomationApp:
         이 함수는 직접 라벨/로그 위젯을 수정하지 않고 queue에 메시지만 넣습니다.
         """
 
+        manager: Optional[InactiveManager] = None
+
         try:
             self.queue_status("대상 이미지 로드 중")
             base_dir = Path(__file__).resolve().parent
@@ -1176,14 +1164,13 @@ class AutomationApp:
                 self.queue_log("[종료] 타겟 이미지 준비에 실패하여 실행을 중단합니다.")
                 return
 
-            manager: Optional[InactiveManager] = None
-            if capture_mode == "printwindow" or click_mode == "postmessage":
+            if capture_mode == "wgc" or click_mode == "postmessage":
                 manager = InactiveManager(window_title, logger=self.queue_log)
 
             while not self.stop_event.is_set():
                 self.apply_current_thresholds(targets)
 
-                if capture_mode == "printwindow" and manager is not None and not manager.is_valid_window():
+                if capture_mode == "wgc" and manager is not None and not manager.is_valid_window():
                     self.queue_status("대상 창 검색 중")
                     manager.find_window()
 
@@ -1254,6 +1241,8 @@ class AutomationApp:
             self.queue_log(f"[치명적 오류] 예상하지 못한 문제가 발생했습니다: {exc}")
 
         finally:
+            if manager is not None:
+                manager.stop_capture()
             self.stop_event.set()
             self.queue_status("종료됨")
             self.queue_log("[종료] 자동화 루프가 종료되었습니다.")
@@ -1286,7 +1275,7 @@ class AutomationApp:
         화면의 지정 영역만 캡처해서 GrayScale NumPy 배열로 반환합니다.
 
         이 모드는 대상 창이 실제 화면에 보이는 상태일 때 사용하는 현실적 타협 모드입니다.
-        PrintWindow와 달리 전체 화면 캡처에서 영역을 잘라오기 때문에 렌더링 호환성이 높지만,
+        WGC와 달리 전체 화면 캡처에서 영역을 잘라오기 때문에 렌더링 호환성이 높지만,
         창이 다른 창에 가려지면 가려진 화면 그대로 캡처됩니다.
         """
 
