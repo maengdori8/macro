@@ -1,0 +1,56 @@
+{
+  "targets": [
+    {
+      "name": "target_A",
+      "filename": "target_A.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_B",
+      "filename": "target_B.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_C",
+      "filename": "target_C.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_D",
+      "filename": "target_D.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_E",
+      "filename": "target_E.png",
+      "action": "key",
+      "key": "s",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_F",
+      "filename": "target_F.png",
+      "action": "key",
+      "key": "esc",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
+      "name": "target_G_example",
+      "filename": "target_G.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0,
+      "enabled": false
+    }
+  ]
+}

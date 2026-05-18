@@ -4,7 +4,7 @@ Windows inactive-window image matching and click GUI example.
 목적:
 - tkinter UI에서 대상 창 제목을 입력하고 자동화를 시작/중지합니다.
 - Windows Graphics Capture로 대상 창이 다른 창 뒤에 가려져 있어도 캡처합니다.
-- OpenCV 템플릿 매칭으로 target_A/B/C/D/E/F.png를 찾습니다.
+- targets.json에 설정한 이미지들을 OpenCV 템플릿 매칭으로 찾습니다.
 - 실제 마우스 커서를 움직이지 않고 PostMessage로 클릭 메시지를 보냅니다.
 주의:
 - 최소화된 창은 지원하지 않습니다.
@@ -15,6 +15,7 @@ Windows inactive-window image matching and click GUI example.
 from __future__ import annotations
 
 import ctypes
+import json
 import platform
 import queue
 import random
@@ -100,7 +101,15 @@ DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
-TARGET_NAMES = ("target_A", "target_B", "target_C", "target_D", "target_E", "target_F")
+TARGET_CONFIG_FILENAME = "targets.json"
+DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
+    {"name": "target_A", "filename": "target_A.png", "action": "click"},
+    {"name": "target_B", "filename": "target_B.png", "action": "click"},
+    {"name": "target_C", "filename": "target_C.png", "action": "click"},
+    {"name": "target_D", "filename": "target_D.png", "action": "click"},
+    {"name": "target_E", "filename": "target_E.png", "action": "key", "key": "s"},
+    {"name": "target_F", "filename": "target_F.png", "action": "key", "key": "esc"},
+]
 
 LogCallback = Callable[[str], None]
 
@@ -1352,10 +1361,13 @@ class AutomationApp:
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         initial_status = "UI 미리보기" if self.ui_preview_only else "대기 중"
         self.status_var = tk.StringVar(value=initial_status)
+        self.base_dir = Path(__file__).resolve().parent
+        self.target_definitions = load_target_definitions(self.base_dir)
+        self.target_names = tuple(target.name for target in self.target_definitions)
         self.threshold_lock = threading.Lock()
         self.threshold_values = {
-            name: 0.8
-            for name in TARGET_NAMES
+            target.name: target.threshold
+            for target in self.target_definitions
         }
         self.threshold_vars = {
             name: tk.DoubleVar(value=value)
@@ -1621,7 +1633,7 @@ class AutomationApp:
             font=("Arial", 12, "bold"),
         ).pack(anchor=tk.W, pady=(0, 6))
 
-        for name in TARGET_NAMES:
+        for name in self.target_names:
             row = tk.Frame(threshold_frame, bg=panel_bg)
             row.pack(fill=tk.X, pady=2)
 
@@ -1764,7 +1776,7 @@ class AutomationApp:
 
         threshold_text = "\n".join(
             f"{name} 임계값: {self.get_threshold(name):.2f}"
-            for name in TARGET_NAMES
+            for name in self.target_names
         )
         self.preview_threshold_button = tk.Button(
             main_frame,
@@ -1772,7 +1784,7 @@ class AutomationApp:
             anchor=tk.W,
             justify=tk.LEFT,
             relief=tk.GROOVE,
-            height=len(TARGET_NAMES),
+            height=len(self.target_names),
         )
         self.preview_threshold_button.pack(fill=tk.X, pady=(0, 12))
 
@@ -1862,7 +1874,12 @@ class AutomationApp:
             self.click_mode_var.set("mouse")
 
         window_title = self.window_title_var.get().strip()
-        if capture_mode == "wgc" and not window_title:
+        needs_window = (
+            capture_mode == "wgc"
+            or click_mode == "postmessage"
+            or any(target.action == "key" for target in self.target_definitions)
+        )
+        if needs_window and not window_title:
             self.log("[오류] 대상 창 제목을 입력하세요.")
             self.set_status("오류 발생")
             return
@@ -1961,8 +1978,11 @@ class AutomationApp:
 
         try:
             self.queue_status("대상 이미지 로드 중")
-            base_dir = Path(__file__).resolve().parent
-            targets = load_targets(base_dir, self.queue_log)
+            targets = load_targets(
+                self.base_dir,
+                self.queue_log,
+                definitions=self.target_definitions,
+            )
             if targets is None:
                 self.queue_status("오류 발생")
                 self.queue_log("[종료] 타겟 이미지 준비에 실패하여 실행을 중단합니다.")
@@ -2009,7 +2029,7 @@ class AutomationApp:
 
                 found_any = False
 
-                # 요구사항대로 target_A -> target_F 순서로 탐지합니다.
+                # targets.json에 적힌 순서대로 탐지합니다.
                 for target in targets:
                     if self.stop_event.is_set():
                         break
@@ -2311,40 +2331,126 @@ class AutomationApp:
             self.title_entry.configure(state=tk.NORMAL)
 
 
+def _target_from_config(config: dict[str, object], index: int) -> Optional[TargetImage]:
+    """targets.json 항목 하나를 TargetImage 설정으로 변환합니다."""
+
+    if bool(config.get("enabled", True)) is False:
+        return None
+
+    filename_value = config.get("filename")
+    if not filename_value:
+        raise ValueError(f"{index + 1}번째 타겟에 filename이 없습니다.")
+
+    filename = str(filename_value)
+    name = str(config.get("name") or Path(filename).stem)
+    action = str(config.get("action", "click")).strip().lower()
+    if action not in ("click", "key"):
+        raise ValueError(f"{name}의 action은 click 또는 key여야 합니다: {action!r}")
+
+    key_value = config.get("key")
+    key = str(key_value).strip() if key_value is not None else None
+    if action == "key" and not key:
+        raise ValueError(f"{name}은 key action이라 key 값이 필요합니다.")
+
+    threshold = float(config.get("threshold", 0.8))
+    threshold = max(0.0, min(1.0, threshold))
+    wait_after_click = float(
+        config.get("wait_after_action", config.get("wait_after_click", 0.0))
+    )
+
+    return TargetImage(
+        name=name,
+        filename=filename,
+        wait_after_click=max(0.0, wait_after_click),
+        threshold=threshold,
+        action=action,
+        key=key,
+    )
+
+
+def load_target_definitions(
+    base_dir: Path,
+    logger: Optional[LogCallback] = None,
+) -> list[TargetImage]:
+    """targets.json에서 타겟 설정을 읽고, 없으면 기본 설정을 사용합니다."""
+
+    log = logger or print
+    config_path = base_dir / TARGET_CONFIG_FILENAME
+    raw_targets: object = DEFAULT_TARGET_CONFIGS
+
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as config_file:
+                raw_config = json.load(config_file)
+            raw_targets = raw_config.get("targets", raw_config) if isinstance(raw_config, dict) else raw_config
+        except Exception as exc:
+            log(f"[설정 오류] {config_path} 파일을 읽지 못했습니다: {exc}")
+            log("[설정 안내] 기본 타겟 설정을 대신 사용합니다.")
+            raw_targets = DEFAULT_TARGET_CONFIGS
+    else:
+        log(f"[설정 안내] {TARGET_CONFIG_FILENAME}이 없어 기본 타겟 설정을 사용합니다.")
+
+    if not isinstance(raw_targets, list):
+        log("[설정 오류] 타겟 설정은 리스트이거나 {'targets': [...]} 형태여야 합니다.")
+        raw_targets = DEFAULT_TARGET_CONFIGS
+
+    targets: list[TargetImage] = []
+    for index, raw_target in enumerate(raw_targets):
+        if not isinstance(raw_target, dict):
+            log(f"[설정 오류] {index + 1}번째 타겟 설정이 객체가 아니라 건너뜁니다.")
+            continue
+        try:
+            target = _target_from_config(raw_target, index)
+        except Exception as exc:
+            log(f"[설정 오류] {index + 1}번째 타겟 설정을 건너뜁니다: {exc}")
+            continue
+        if target is not None:
+            targets.append(target)
+
+    if targets:
+        return targets
+
+    log("[설정 오류] 사용할 타겟이 없어 기본 타겟 설정을 사용합니다.")
+    return [
+        target
+        for target in (
+            _target_from_config(config, index)
+            for index, config in enumerate(DEFAULT_TARGET_CONFIGS)
+        )
+        if target is not None
+    ]
+
+
+def clone_target_definition(target: TargetImage) -> TargetImage:
+    """이미지 배열 없이 타겟 설정만 복사합니다."""
+
+    return TargetImage(
+        name=target.name,
+        filename=target.filename,
+        wait_after_click=target.wait_after_click,
+        threshold=target.threshold,
+        action=target.action,
+        key=target.key,
+    )
+
+
 def load_targets(
     base_dir: Path,
     logger: Optional[LogCallback] = None,
+    definitions: Optional[list[TargetImage]] = None,
 ) -> Optional[list[TargetImage]]:
-    """target_A/B/C/D/E/F.png를 GrayScale 이미지로 미리 로드합니다."""
+    """설정된 타겟 이미지를 GrayScale 이미지로 미리 로드합니다."""
 
     log = logger or print
-    targets = [
-        TargetImage(name="target_A", filename="target_A.png", wait_after_click=0.0),
-        TargetImage(name="target_B", filename="target_B.png", wait_after_click=0.0),
-        TargetImage(name="target_C", filename="target_C.png", wait_after_click=0.0),
-        TargetImage(name="target_D", filename="target_D.png", wait_after_click=0.0),
-        TargetImage(
-            name="target_E",
-            filename="target_E.png",
-            wait_after_click=0.0,
-            action="key",
-            key="s",
-        ),
-        TargetImage(
-            name="target_F",
-            filename="target_F.png",
-            wait_after_click=0.0,
-            action="key",
-            key="esc",
-        ),
-    ]
+    target_definitions = definitions or load_target_definitions(base_dir, logger=log)
+    targets = [clone_target_definition(target) for target in target_definitions]
 
     for target in targets:
         image_path = base_dir / target.filename
 
         if not image_path.exists():
             log(f"[오류] 이미지 파일을 찾을 수 없습니다: {image_path}")
-            log(f"       main.py와 같은 폴더에 {target.filename} 파일을 넣어주세요.")
+            log(f"       targets.json의 filename을 확인하거나 파일을 같은 폴더에 넣어주세요.")
             return None
 
         try:
@@ -2366,7 +2472,7 @@ def load_targets(
         log(
             f"[이미지 로드] {target.filename}, "
             f"크기={target.image_gray.shape[1]}x{target.image_gray.shape[0]}, "
-            f"임계값={target.threshold:.2f}"
+            f"임계값={target.threshold:.2f}, action={target.action}"
         )
 
     return targets
