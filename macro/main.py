@@ -86,10 +86,10 @@ CLICK_MESSAGE_DELAY_SECONDS = 0.05
 # 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
 MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
 
-# PostMessage 가상 마우스 이동 단계와 지연입니다.
+# PostMessage 가상 마우스 이동 단계와 전체 이동 시간입니다.
 CURVED_CLICK_MIN_STEPS = 30
 CURVED_CLICK_MAX_STEPS = 50
-CURVED_CLICK_MOVE_DELAY_SECONDS = 0.01
+CURVED_CLICK_MOVE_DURATION_SECONDS = 0.5
 
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -291,7 +291,7 @@ def post_curved_click(
     end_y: int,
     *,
     steps: Optional[int] = None,
-    move_delay: float = CURVED_CLICK_MOVE_DELAY_SECONDS,
+    move_duration: float = CURVED_CLICK_MOVE_DURATION_SECONDS,
     down_up_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
     use_send_message: bool = False,
     logger: Optional[LogCallback] = None,
@@ -314,6 +314,7 @@ def post_curved_click(
     if steps is None:
         steps = random.randint(CURVED_CLICK_MIN_STEPS, CURVED_CLICK_MAX_STEPS)
     steps = max(2, int(steps))
+    step_delay = max(0.0, float(move_duration)) / max(1, steps - 1)
 
     start_pos = _clamp_client_point((start_x, start_y), client_width, client_height)
     end_pos = _clamp_client_point((end_x, end_y), client_width, client_height)
@@ -325,7 +326,8 @@ def post_curved_click(
 
     log(
         f"[곡선 시작] start={start_pos}, control={control_pos}, "
-        f"end={end_pos}, steps={steps}, delay={move_delay:.3f}s"
+        f"end={end_pos}, steps={steps}, duration={move_duration:.3f}s, "
+        f"step_delay={step_delay:.3f}s"
     )
 
     for index in range(steps):
@@ -342,8 +344,8 @@ def post_curved_click(
             move_y,
             use_send_message=use_send_message,
         )
-        if move_delay > 0:
-            time.sleep(move_delay)
+        if index < steps - 1 and step_delay > 0:
+            time.sleep(step_delay)
 
     final_x, final_y = end_pos
     post_mouse_down(hwnd, final_x, final_y, use_send_message=use_send_message)
@@ -1786,8 +1788,9 @@ class AutomationApp:
 
                     if self.dispatch_click(manager, click_mode, capture_mode, region, x, y):
                         self.queue_status("클릭 완료")
-                        self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
-                        self.interruptible_sleep(target.wait_after_click)
+                        if target.wait_after_click > 0:
+                            self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
+                            self.interruptible_sleep(target.wait_after_click)
 
                     # 한 루프에서 하나만 클릭합니다.
                     break
@@ -2041,9 +2044,9 @@ def load_targets(
 
     log = logger or print
     targets = [
-        TargetImage(name="target_A", filename="target_A.png", wait_after_click=10.0),
-        TargetImage(name="target_B", filename="target_B.png", wait_after_click=5.0),
-        TargetImage(name="target_C", filename="target_C.png", wait_after_click=3.0),
+        TargetImage(name="target_A", filename="target_A.png", wait_after_click=0.0),
+        TargetImage(name="target_B", filename="target_B.png", wait_after_click=0.0),
+        TargetImage(name="target_C", filename="target_C.png", wait_after_click=0.0),
     ]
 
     for target in targets:
