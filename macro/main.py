@@ -1528,6 +1528,8 @@ def find_template_center(
         )
         return None, 0.0
 
+    cv2.imwrite(str(Path(__file__).resolve().parent / "debug_screen.png"), screen_gray)
+
     result = cv2.matchTemplate(
         screen_gray,
         target.image_gray,
@@ -1535,6 +1537,10 @@ def find_template_center(
     )
     _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(result)
     score = float(max_value)
+    debug_message = f"[디버그] {target.name} 검사 중... 산출된 최고 유사도 점수: {score:.3f}"
+    print(debug_message)
+    if logger is not None:
+        log(debug_message)
 
     top_left_x, top_left_y = max_location
     center_x = top_left_x + target_width // 2
