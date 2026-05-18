@@ -45,12 +45,18 @@
       "wait_after_action": 0.0
     },
     {
-      "name": "target_G_example",
+      "name": "target_G",
       "filename": "target_G.png",
+      "action": "key",
+      "key": "esc",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },    {
+      "name": "target_H",
+      "filename": "target_H.png",
       "action": "click",
       "threshold": 0.8,
-      "wait_after_action": 0.0,
-      "enabled": false
+      "wait_after_action": 0.0
     }
   ]
 }
