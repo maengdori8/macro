@@ -113,6 +113,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "action": "key",
         "key": "s",
         "key_mode": "sendmessage",
+        "key_target": "all",
     },
     {
         "name": "target_F",
@@ -120,6 +121,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "action": "key",
         "key": "esc",
         "key_mode": "sendmessage",
+        "key_target": "all",
     },
 ]
 
@@ -204,6 +206,8 @@ def _char_code_from_key(key: str) -> Optional[int]:
     normalized = key.strip().lower()
     if normalized in ("esc", "escape"):
         return 0x1B
+    if len(normalized) == 1:
+        return ord(normalized)
     return None
 
 
@@ -263,13 +267,65 @@ def _get_thread_focus_hwnd(hwnd: int) -> Optional[int]:
     return None
 
 
-def _get_keyboard_target_hwnd(hwnd: int) -> int:
-    """키 메시지를 보낼 대상 HWND를 고릅니다."""
+def _get_child_windows(hwnd: int, limit: int = 80) -> list[int]:
+    """대상 창의 자식 HWND 목록을 가져옵니다."""
+
+    if win32gui is None:
+        return []
+
+    children: list[int] = []
+
+    def enum_child(child_hwnd: int, _extra: object) -> bool:
+        if len(children) >= limit:
+            return False
+        try:
+            if win32gui.IsWindow(child_hwnd):
+                children.append(int(child_hwnd))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(int(hwnd), enum_child, None)
+    except Exception:
+        return children
+
+    return children
+
+
+def _unique_hwnds(hwnds: list[int]) -> list[int]:
+    """순서를 유지하면서 HWND 중복을 제거합니다."""
+
+    seen: set[int] = set()
+    result: list[int] = []
+    for hwnd in hwnds:
+        hwnd = int(hwnd)
+        if hwnd in seen:
+            continue
+        seen.add(hwnd)
+        result.append(hwnd)
+    return result
+
+
+def _get_keyboard_target_hwnds(hwnd: int, target_scope: str = "all") -> list[int]:
+    """키 메시지를 보낼 대상 HWND 목록을 고릅니다."""
 
     focus_hwnd = _get_thread_focus_hwnd(hwnd)
+    target_scope = target_scope.strip().lower()
+
+    if target_scope == "top":
+        return [int(hwnd)]
+    if target_scope == "focus":
+        return [focus_hwnd or int(hwnd)]
+    if target_scope != "all":
+        raise ValueError(f"지원하지 않는 key_target입니다: {target_scope!r}")
+
+    targets = []
     if focus_hwnd is not None:
-        return focus_hwnd
-    return int(hwnd)
+        targets.append(focus_hwnd)
+    targets.append(int(hwnd))
+    targets.extend(_get_child_windows(hwnd))
+    return _unique_hwnds(targets)
 
 
 def _send_keyboard_message(
@@ -361,20 +417,29 @@ def post_key_press(
     *,
     press_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
     use_send_message: bool = False,
+    target_scope: str = "all",
     logger: Optional[LogCallback] = None,
 ) -> bool:
     """실제 키보드 입력 없이 대상 HWND에 키 Down/Up 메시지를 보냅니다."""
 
     log = logger or print
-    target_hwnd = _get_keyboard_target_hwnd(hwnd)
-    if target_hwnd != int(hwnd):
-        log(f"[키 대상] top_hwnd={hwnd}, focus_hwnd={target_hwnd}")
+    target_hwnds = _get_keyboard_target_hwnds(hwnd, target_scope=target_scope)
+    log(f"[키 대상] scope={target_scope}, count={len(target_hwnds)}, hwnds={target_hwnds}")
 
-    post_key_down(target_hwnd, key, use_send_message=use_send_message)
-    post_key_char(target_hwnd, key, use_send_message=use_send_message)
-    if press_delay > 0:
-        time.sleep(press_delay)
-    post_key_up(target_hwnd, key, use_send_message=use_send_message)
+    sent_count = 0
+    for target_hwnd in target_hwnds:
+        try:
+            post_key_down(target_hwnd, key, use_send_message=use_send_message)
+            post_key_char(target_hwnd, key, use_send_message=use_send_message)
+            if press_delay > 0:
+                time.sleep(press_delay)
+            post_key_up(target_hwnd, key, use_send_message=use_send_message)
+            sent_count += 1
+        except Exception as exc:
+            log(f"[키 경고] HWND={target_hwnd} 키 메시지 전송 실패: {exc}")
+
+    if sent_count <= 0:
+        raise RuntimeError("키 메시지를 보낸 HWND가 없습니다.")
     return True
 
 
@@ -728,6 +793,7 @@ class TargetImage:
     action: str = "click"
     key: Optional[str] = None
     key_mode: str = "sendmessage"
+    key_target: str = "all"
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -1266,6 +1332,7 @@ class InactiveManager:
         key: str,
         *,
         use_send_message: bool = False,
+        target_scope: str = "all",
     ) -> bool:
         """대상 창 HWND에만 메시지 방식 키 입력을 보냅니다."""
 
@@ -1276,12 +1343,13 @@ class InactiveManager:
             mode_name = "SendMessage" if use_send_message else "PostMessage"
             self.log(
                 f"[키 전송] HWND={self.hwnd}, 제목='{self.window_text}', "
-                f"key='{key.upper()}', mode={mode_name}"
+                f"key='{key.upper()}', mode={mode_name}, target={target_scope}"
             )
             post_key_press(
                 self.hwnd,
                 key,
                 use_send_message=use_send_message,
+                target_scope=target_scope,
                 logger=self.log,
             )
             self.log(f"[키 완료] WM_KEYDOWN / WM_KEYUP: {key.upper()}")
@@ -2179,9 +2247,14 @@ class AutomationApp:
         mode_name = "SendMessage" if use_send_message else "PostMessage"
         self.queue_log(
             f"[키 요청] {target.name} 감지로 대상 창에 "
-            f"'{target.key.upper()}' 키를 {mode_name}로 보냅니다."
+            f"'{target.key.upper()}' 키를 {mode_name}로 보냅니다. "
+            f"target={target.key_target}"
         )
-        return manager.post_key_press(target.key, use_send_message=use_send_message)
+        return manager.post_key_press(
+            target.key,
+            use_send_message=use_send_message,
+            target_scope=target.key_target,
+        )
 
     def dispatch_click(
         self,
@@ -2375,6 +2448,10 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
     if key_mode not in ("postmessage", "sendmessage"):
         raise ValueError(f"{name}의 key_mode는 postmessage 또는 sendmessage여야 합니다: {key_mode!r}")
 
+    key_target = str(config.get("key_target", "all")).strip().lower()
+    if key_target not in ("top", "focus", "all"):
+        raise ValueError(f"{name}의 key_target은 top, focus, all 중 하나여야 합니다: {key_target!r}")
+
     threshold = float(config.get("threshold", 0.8))
     threshold = max(0.0, min(1.0, threshold))
     wait_after_click = float(
@@ -2389,6 +2466,7 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         action=action,
         key=key,
         key_mode=key_mode,
+        key_target=key_target,
     )
 
 
@@ -2456,6 +2534,7 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         action=target.action,
         key=target.key,
         key_mode=target.key_mode,
+        key_target=target.key_target,
     )
 
 

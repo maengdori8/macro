@@ -34,6 +34,7 @@
       "action": "key",
       "key": "s",
       "key_mode": "sendmessage",
+      "key_target": "all",
       "threshold": 0.8,
       "wait_after_action": 0.0
     },
@@ -43,6 +44,7 @@
       "action": "key",
       "key": "esc",
       "key_mode": "sendmessage",
+      "key_target": "all",
       "threshold": 0.8,
       "wait_after_action": 0.0
     },
