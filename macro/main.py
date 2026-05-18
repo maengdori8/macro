@@ -86,6 +86,14 @@ CLICK_MESSAGE_DELAY_SECONDS = 0.05
 # 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
 MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
 
+# PostMessage 가상 마우스 이동 단계와 지연입니다.
+CURVED_CLICK_MIN_STEPS = 30
+CURVED_CLICK_MAX_STEPS = 50
+CURVED_CLICK_MOVE_DELAY_SECONDS = 0.01
+
+# DWM 확장 프레임 bounds 속성입니다.
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
 # 화면 영역 캡처 모드의 기본 영역입니다.
 DEFAULT_REGION_X = 0
 DEFAULT_REGION_Y = 0
@@ -104,6 +112,14 @@ def _make_mouse_lparam(x: int, y: int) -> int:
         return int(win32api.MAKELONG(x, y))
 
     return (y & 0xFFFF) << 16 | (x & 0xFFFF)
+
+
+def _require_win32con() -> Any:
+    """Windows 메시지 상수를 쓰기 전에 win32con 로드를 확인합니다."""
+
+    if win32con is None:
+        raise RuntimeError("pywin32 win32con 모듈이 필요합니다.")
+    return win32con
 
 
 def _send_mouse_message(
@@ -139,9 +155,10 @@ def post_mouse_move(
 ) -> bool:
     """대상 창의 클라이언트 영역 좌표로 WM_MOUSEMOVE를 보냅니다."""
 
+    constants = _require_win32con()
     return _send_mouse_message(
         hwnd,
-        win32con.WM_MOUSEMOVE,
+        constants.WM_MOUSEMOVE,
         0,
         x,
         y,
@@ -158,10 +175,11 @@ def post_mouse_down(
 ) -> bool:
     """대상 창의 클라이언트 영역 좌표로 마우스 왼쪽 버튼 Down을 보냅니다."""
 
+    constants = _require_win32con()
     return _send_mouse_message(
         hwnd,
-        win32con.WM_LBUTTONDOWN,
-        win32con.MK_LBUTTON,
+        constants.WM_LBUTTONDOWN,
+        constants.MK_LBUTTON,
         x,
         y,
         use_send_message=use_send_message,
@@ -177,9 +195,10 @@ def post_mouse_up(
 ) -> bool:
     """대상 창의 클라이언트 영역 좌표로 마우스 왼쪽 버튼 Up을 보냅니다."""
 
+    constants = _require_win32con()
     return _send_mouse_message(
         hwnd,
-        win32con.WM_LBUTTONUP,
+        constants.WM_LBUTTONUP,
         0,
         x,
         y,
@@ -207,6 +226,261 @@ def post_mouse_click(
         time.sleep(down_up_delay)
     post_mouse_up(hwnd, x, y, use_send_message=use_send_message)
     return True
+
+
+def get_bezier_point(
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    p3: tuple[int, int],
+    t: float,
+) -> tuple[int, int]:
+    """2차 베지에 곡선 위의 한 점을 계산합니다."""
+
+    t = max(0.0, min(1.0, float(t)))
+    one_minus_t = 1.0 - t
+    x = one_minus_t * one_minus_t * p1[0] + 2 * one_minus_t * t * p2[0] + t * t * p3[0]
+    y = one_minus_t * one_minus_t * p1[1] + 2 * one_minus_t * t * p2[1] + t * t * p3[1]
+    return int(round(x)), int(round(y))
+
+
+def _build_bezier_control_point(
+    start_pos: tuple[int, int],
+    end_pos: tuple[int, int],
+) -> tuple[int, int]:
+    """출발점과 목적지 사이에 랜덤한 휨을 가진 제어점을 만듭니다."""
+
+    start_x, start_y = start_pos
+    end_x, end_y = end_pos
+    dx = end_x - start_x
+    dy = end_y - start_y
+    distance = max(1.0, (dx * dx + dy * dy) ** 0.5)
+
+    mid_x = (start_x + end_x) / 2.0
+    mid_y = (start_y + end_y) / 2.0
+    perpendicular_x = -dy / distance
+    perpendicular_y = dx / distance
+
+    bend = random.uniform(-0.35, 0.35) * distance
+    if abs(bend) < 12.0 and distance >= 24.0:
+        bend = 12.0 if bend >= 0 else -12.0
+
+    control_x = mid_x + perpendicular_x * bend + random.uniform(-8.0, 8.0)
+    control_y = mid_y + perpendicular_y * bend + random.uniform(-8.0, 8.0)
+    return int(round(control_x)), int(round(control_y))
+
+
+def _clamp_client_point(
+    point: tuple[int, int],
+    client_width: int,
+    client_height: int,
+) -> tuple[int, int]:
+    """좌표가 클라이언트 영역 밖으로 나가지 않게 보정합니다."""
+
+    max_x = max(0, int(client_width) - 1)
+    max_y = max(0, int(client_height) - 1)
+    x = max(0, min(max_x, int(point[0])))
+    y = max(0, min(max_y, int(point[1])))
+    return x, y
+
+
+def post_curved_click(
+    hwnd: int,
+    start_x: int,
+    start_y: int,
+    end_x: int,
+    end_y: int,
+    *,
+    steps: Optional[int] = None,
+    move_delay: float = CURVED_CLICK_MOVE_DELAY_SECONDS,
+    down_up_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
+    use_send_message: bool = False,
+    logger: Optional[LogCallback] = None,
+) -> bool:
+    """클라이언트 좌표 기준으로 베지에 곡선 이동 후 왼쪽 클릭 메시지를 보냅니다."""
+
+    log = logger or print
+
+    if win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    if not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"유효하지 않은 HWND입니다: {hwnd}")
+
+    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+    client_width = int(right - left)
+    client_height = int(bottom - top)
+    if client_width <= 0 or client_height <= 0:
+        raise RuntimeError("대상 창의 클라이언트 영역 크기가 0입니다.")
+
+    if steps is None:
+        steps = random.randint(CURVED_CLICK_MIN_STEPS, CURVED_CLICK_MAX_STEPS)
+    steps = max(2, int(steps))
+
+    start_pos = _clamp_client_point((start_x, start_y), client_width, client_height)
+    end_pos = _clamp_client_point((end_x, end_y), client_width, client_height)
+    control_pos = _clamp_client_point(
+        _build_bezier_control_point(start_pos, end_pos),
+        client_width,
+        client_height,
+    )
+
+    log(
+        f"[곡선 시작] start={start_pos}, control={control_pos}, "
+        f"end={end_pos}, steps={steps}, delay={move_delay:.3f}s"
+    )
+
+    for index in range(steps):
+        t = index / (steps - 1)
+        move_x, move_y = _clamp_client_point(
+            get_bezier_point(start_pos, control_pos, end_pos, t),
+            client_width,
+            client_height,
+        )
+        log(f"[곡선 이동] {index + 1}/{steps} client=({move_x}, {move_y})")
+        post_mouse_move(
+            hwnd,
+            move_x,
+            move_y,
+            use_send_message=use_send_message,
+        )
+        if move_delay > 0:
+            time.sleep(move_delay)
+
+    final_x, final_y = end_pos
+    post_mouse_down(hwnd, final_x, final_y, use_send_message=use_send_message)
+    if down_up_delay > 0:
+        time.sleep(down_up_delay)
+    post_mouse_up(hwnd, final_x, final_y, use_send_message=use_send_message)
+    log(f"[곡선 클릭 완료] client=({final_x}, {final_y})")
+    return True
+
+
+def _same_size(
+    first: tuple[int, int],
+    second: tuple[int, int],
+    tolerance: int = 2,
+) -> bool:
+    """DPI 반올림 차이를 감안해 두 크기가 거의 같은지 확인합니다."""
+
+    return (
+        abs(int(first[0]) - int(second[0])) <= tolerance
+        and abs(int(first[1]) - int(second[1])) <= tolerance
+    )
+
+
+def _get_extended_frame_bounds(hwnd: int) -> Optional[tuple[int, int, int, int]]:
+    """DWM 확장 프레임 bounds를 반환합니다. 실패하면 None을 반환합니다."""
+
+    if not hasattr(ctypes, "windll"):
+        return None
+
+    try:
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(int(hwnd)),
+            ctypes.c_uint(DWMWA_EXTENDED_FRAME_BOUNDS),
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+        if result != 0:
+            return None
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:
+        return None
+
+
+def _get_wgc_capture_origin(
+    hwnd: int,
+    frame_size: Optional[tuple[int, int]],
+) -> Optional[tuple[int, int]]:
+    """WGC 프레임의 화면 기준 좌상단 원점을 추정합니다."""
+
+    if win32gui is None:
+        return None
+
+    extended_frame = _get_extended_frame_bounds(hwnd)
+    window_rect = win32gui.GetWindowRect(hwnd)
+
+    if frame_size is not None:
+        if extended_frame is not None:
+            ext_left, ext_top, ext_right, ext_bottom = extended_frame
+            ext_size = (int(ext_right - ext_left), int(ext_bottom - ext_top))
+            if _same_size(frame_size, ext_size):
+                return int(ext_left), int(ext_top)
+
+        win_left, win_top, win_right, win_bottom = window_rect
+        window_size = (int(win_right - win_left), int(win_bottom - win_top))
+        if _same_size(frame_size, window_size):
+            return int(win_left), int(win_top)
+
+    if extended_frame is not None:
+        return int(extended_frame[0]), int(extended_frame[1])
+
+    return int(window_rect[0]), int(window_rect[1])
+
+
+def wgc_to_client(
+    hwnd: int,
+    x: int,
+    y: int,
+    frame_size: Optional[tuple[int, int]],
+    logger: Optional[LogCallback] = None,
+) -> Optional[tuple[int, int]]:
+    """
+    WGC 캡처 프레임 좌표를 대상 창 Client Area 기준 좌표로 변환합니다.
+
+    WGC 프레임이 클라이언트 영역과 같은 크기면 x, y를 그대로 사용합니다.
+    전체 창이나 확장 프레임 기준 캡처이면 캡처 원점과 ClientToScreen(0, 0)의
+    차이를 반영해 PostMessage가 요구하는 클라이언트 좌표로 보정합니다.
+    """
+
+    log = logger or print
+
+    if win32gui is None:
+        log("[좌표 오류] pywin32 win32gui 모듈이 필요합니다.")
+        return None
+    if not win32gui.IsWindow(hwnd):
+        log(f"[좌표 오류] 유효하지 않은 HWND입니다: {hwnd}")
+        return None
+
+    x = int(x)
+    y = int(y)
+
+    try:
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        client_width = int(right - left)
+        client_height = int(bottom - top)
+        if client_width <= 0 or client_height <= 0:
+            log("[좌표 오류] 대상 창의 클라이언트 영역 크기가 0입니다.")
+            return None
+
+        if frame_size is None or _same_size(frame_size, (client_width, client_height)):
+            client_x, client_y = x, y
+        else:
+            client_screen_x, client_screen_y = win32gui.ClientToScreen(hwnd, (0, 0))
+            capture_origin = _get_wgc_capture_origin(hwnd, frame_size)
+            if capture_origin is None:
+                log("[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다.")
+                client_x, client_y = x, y
+            else:
+                origin_x, origin_y = capture_origin
+                client_x = int(round(x + origin_x - client_screen_x))
+                client_y = int(round(y + origin_y - client_screen_y))
+
+        if not (0 <= client_x < client_width and 0 <= client_y < client_height):
+            log(
+                f"[좌표 경고] WGC=({x}, {y}) -> client=({client_x}, {client_y})가 "
+                f"클라이언트 영역 {client_width}x{client_height} 밖입니다."
+            )
+            return None
+
+        if (client_x, client_y) != (x, y):
+            log(f"[좌표 보정] WGC=({x}, {y}) -> client=({client_x}, {client_y})")
+        return client_x, client_y
+    except Exception as exc:
+        log(f"[좌표 오류] WGC 좌표를 클라이언트 좌표로 변환하지 못했습니다: {exc}")
+        return None
 
 
 @dataclass
@@ -394,6 +668,8 @@ class InactiveManager:
         self.logger = logger or print
         self.capture_engine: Optional[WGCCaptureEngine] = None
         self.last_capture_wait_log_time = 0.0
+        self.virtual_mouse_wgc_pos: Optional[tuple[int, int]] = None
+        self.virtual_mouse_client_pos: Optional[tuple[int, int]] = None
 
         if WIN32_IMPORT_ERROR is not None:
             self.log("[오류] pywin32 모듈을 불러올 수 없습니다.")
@@ -478,6 +754,8 @@ class InactiveManager:
         self.hwnd, self.window_text = matches[0]
         if previous_hwnd is not None and previous_hwnd != self.hwnd:
             self.stop_capture()
+            self.virtual_mouse_wgc_pos = None
+            self.virtual_mouse_client_pos = None
         self.log(f"[선택] HWND={self.hwnd}, 제목='{self.window_text}' 창을 사용합니다.")
         return True
 
@@ -599,118 +877,32 @@ class InactiveManager:
         ClientToScreen(0, 0)의 차이를 빼서 정확한 클라이언트 좌표를 계산합니다.
         """
 
-        if not self.is_valid_window():
-            return None
         if self.hwnd is None:
             return None
 
-        x = int(x)
-        y = int(y)
-
-        try:
-            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-            client_width = int(right - left)
-            client_height = int(bottom - top)
-            frame_size = (
-                self.capture_engine.get_frame_size()
-                if self.capture_engine is not None
-                else None
-            )
-
-            if frame_size is None or self._same_size(frame_size, (client_width, client_height)):
-                return x, y
-
-            client_screen_x, client_screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
-            capture_origin = self._get_wgc_capture_origin(frame_size)
-            if capture_origin is None:
-                self._log_capture_wait(
-                    "[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다."
-                )
-                return x, y
-
-            origin_x, origin_y = capture_origin
-            client_x = int(round(x + origin_x - client_screen_x))
-            client_y = int(round(y + origin_y - client_screen_y))
-
-            if not (0 <= client_x < client_width and 0 <= client_y < client_height):
-                self.log(
-                    f"[좌표 경고] WGC=({x}, {y}) -> client=({client_x}, {client_y})가 "
-                    f"클라이언트 영역 {client_width}x{client_height} 밖입니다."
-                )
-                return None
-
-            if (client_x, client_y) != (x, y):
-                self.log(
-                    f"[좌표 보정] WGC=({x}, {y}) -> client=({client_x}, {client_y})"
-                )
-            return client_x, client_y
-        except Exception as exc:
-            self.log(f"[좌표 오류] WGC 좌표를 클라이언트 좌표로 변환하지 못했습니다: {exc}")
-            return None
-
-    def _get_wgc_capture_origin(
-        self,
-        frame_size: Optional[tuple[int, int]],
-    ) -> Optional[tuple[int, int]]:
-        """WGC 프레임의 화면 기준 좌상단 원점을 추정합니다."""
-
-        if self.hwnd is None:
-            return None
-
-        extended_frame = self._get_extended_frame_bounds()
-        window_rect = win32gui.GetWindowRect(self.hwnd)
-
-        if frame_size is not None:
-            if extended_frame is not None:
-                ext_left, ext_top, ext_right, ext_bottom = extended_frame
-                ext_size = (int(ext_right - ext_left), int(ext_bottom - ext_top))
-                if self._same_size(frame_size, ext_size):
-                    return int(ext_left), int(ext_top)
-
-            win_left, win_top, win_right, win_bottom = window_rect
-            window_size = (int(win_right - win_left), int(win_bottom - win_top))
-            if self._same_size(frame_size, window_size):
-                return int(win_left), int(win_top)
-
-        if extended_frame is not None:
-            return int(extended_frame[0]), int(extended_frame[1])
-
-        return int(window_rect[0]), int(window_rect[1])
-
-    def _get_extended_frame_bounds(self) -> Optional[tuple[int, int, int, int]]:
-        """DWM 확장 프레임 bounds를 반환합니다. 실패하면 None을 반환합니다."""
-
-        if self.hwnd is None or not hasattr(ctypes, "windll"):
-            return None
-
-        try:
-            from ctypes import wintypes
-
-            rect = wintypes.RECT()
-            result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-                wintypes.HWND(int(self.hwnd)),
-                ctypes.c_uint(9),  # DWMWA_EXTENDED_FRAME_BOUNDS
-                ctypes.byref(rect),
-                ctypes.sizeof(rect),
-            )
-            if result != 0:
-                return None
-            return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
-        except Exception:
-            return None
-
-    def _same_size(
-        self,
-        first: tuple[int, int],
-        second: tuple[int, int],
-        tolerance: int = 2,
-    ) -> bool:
-        """DPI 반올림 차이를 감안해 두 크기가 거의 같은지 확인합니다."""
-
-        return (
-            abs(int(first[0]) - int(second[0])) <= tolerance
-            and abs(int(first[1]) - int(second[1])) <= tolerance
+        frame_size = (
+            self.capture_engine.get_frame_size()
+            if self.capture_engine is not None
+            else None
         )
+        return wgc_to_client(self.hwnd, x, y, frame_size, logger=self.log)
+
+    def get_virtual_start_position(self, fallback_x: int, fallback_y: int) -> tuple[int, int]:
+        """PostMessage 곡선 이동의 WGC 기준 시작점을 반환합니다."""
+
+        if self.virtual_mouse_wgc_pos is not None:
+            return self.virtual_mouse_wgc_pos
+
+        frame_size = (
+            self.capture_engine.get_frame_size()
+            if self.capture_engine is not None
+            else None
+        )
+        if frame_size is not None:
+            frame_width, frame_height = frame_size
+            return max(0, frame_width // 2), max(0, frame_height // 2)
+
+        return int(fallback_x), int(fallback_y)
 
     def post_mouse_down(
         self,
@@ -770,6 +962,68 @@ class InactiveManager:
             self.log(f"[오류] 마우스 Up 메시지 전송 중 문제가 발생했습니다: {exc}")
             return False
 
+    def post_curved_click(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        *,
+        use_send_message: bool = False,
+    ) -> bool:
+        """
+        WGC 좌표를 클라이언트 좌표로 보정한 뒤 가상 곡선 이동과 클릭 메시지를 보냅니다.
+
+        실제 마우스 커서는 움직이지 않으며, 내부적으로 WM_MOUSEMOVE / WM_LBUTTONDOWN /
+        WM_LBUTTONUP 메시지만 대상 HWND에 전송합니다.
+        """
+
+        if not self.is_valid_window() or self.hwnd is None:
+            return False
+
+        end_client = self.wgc_to_client(end_x, end_y)
+        if end_client is None:
+            return False
+
+        start_client = self.wgc_to_client(start_x, start_y)
+        if start_client is None:
+            start_client = self.virtual_mouse_client_pos
+
+        if start_client is None:
+            try:
+                left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+                start_client = (
+                    max(0, int(right - left) // 2),
+                    max(0, int(bottom - top) // 2),
+                )
+                self.log(f"[곡선 시작점] 이전 가상 위치가 없어 client 중심 {start_client}에서 시작합니다.")
+            except Exception:
+                start_client = end_client
+                self.log("[곡선 시작점] 시작점 계산 실패로 목적지에서 시작합니다.")
+
+        try:
+            self.log(
+                f"[곡선 클릭 준비] HWND={self.hwnd}, "
+                f"start_wgc=({int(start_x)}, {int(start_y)}), "
+                f"end_wgc=({int(end_x)}, {int(end_y)}), "
+                f"start_client={start_client}, end_client={end_client}"
+            )
+            post_curved_click(
+                self.hwnd,
+                start_client[0],
+                start_client[1],
+                end_client[0],
+                end_client[1],
+                use_send_message=use_send_message,
+                logger=self.log,
+            )
+            self.virtual_mouse_wgc_pos = (int(end_x), int(end_y))
+            self.virtual_mouse_client_pos = end_client
+            return True
+        except Exception as exc:
+            self.log(f"[오류] 곡선 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
+            return False
+
     def post_click(
         self,
         x: int,
@@ -795,7 +1049,8 @@ class InactiveManager:
         client_x, client_y = client_point
         try:
             self.log(
-                f"[클릭 전송] HWND={self.hwnd}, client=({client_x}, {client_y}), "
+                f"[클릭 전송] HWND={self.hwnd}, "
+                f"WGC=({int(x)}, {int(y)}), client=({client_x}, {client_y}), "
                 f"hover={MOUSE_HOVER_BEFORE_CLICK_SECONDS:.2f}s"
             )
             post_mouse_click(
@@ -1626,7 +1881,8 @@ class AutomationApp:
             if manager is None:
                 self.queue_log("[오류] PostMessage 클릭에는 대상 창 HWND가 필요합니다.")
                 return False
-            return manager.post_click(x, y)
+            start_x, start_y = manager.get_virtual_start_position(x, y)
+            return manager.post_curved_click(start_x, start_y, x, y)
 
         if capture_mode == "region":
             screen_x = region[0] + x
