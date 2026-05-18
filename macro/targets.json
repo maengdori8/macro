@@ -51,6 +51,7 @@
       "filename": "target_G.png",
       "action": "key",
       "key": "esc",
+      "key_mode": "sendmessage",
       "threshold": 0.8,
       "wait_after_action": 0.0
     },    {
