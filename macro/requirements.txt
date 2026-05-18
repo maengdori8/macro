@@ -5,3 +5,4 @@ opencv-python
 numpy
 pyautogui
 pillow
+requests

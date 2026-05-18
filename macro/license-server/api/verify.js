@@ -11,20 +11,26 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+const MAX_HWIDS = 3;
 
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ valid: false, message: "Method Not Allowed" });
   }
 
-  const { key } = req.body || {};
+  const { key, hwid } = req.body || {};
 
   if (!key || typeof key !== "string") {
     return res.status(400).json({ valid: false, message: "키가 제공되지 않았습니다." });
   }
 
+  if (!hwid || typeof hwid !== "string") {
+    return res.status(400).json({ valid: false, message: "기기 정보가 제공되지 않았습니다." });
+  }
+
   try {
-    const doc = await db.collection("licenses").doc(key).get();
+    const docRef = db.collection("licenses").doc(key);
+    const doc = await docRef.get();
 
     if (!doc.exists) {
       return res.status(200).json({ valid: false, message: "존재하지 않는 라이센스 키입니다." });
@@ -43,6 +49,21 @@ module.exports = async function handler(req, res) {
 
     if (now > expiresAt) {
       return res.status(200).json({ valid: false, message: "만료된 라이센스 키입니다." });
+    }
+
+    const hwids = data.hwids || [];
+    const maxHwids = data.maxHwids || MAX_HWIDS;
+
+    if (!hwids.includes(hwid)) {
+      if (hwids.length >= maxHwids) {
+        return res.status(200).json({
+          valid: false,
+          message: `기기 등록 한도 초과 (${maxHwids}대). 관리자에게 초기화를 요청하세요.`,
+        });
+      }
+      await docRef.update({
+        hwids: admin.firestore.FieldValue.arrayUnion(hwid),
+      });
     }
 
     const remainingMs = expiresAt - now;

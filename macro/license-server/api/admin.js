@@ -43,6 +43,8 @@ module.exports = async function handler(req, res) {
           disabled: data.disabled || false,
           expired: now > expiresAt,
           memo: data.memo || "",
+          hwids: data.hwids || [],
+          maxHwids: data.maxHwids || 3,
         });
       });
       return res.status(200).json({ success: true, licenses });
@@ -100,7 +102,7 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "PATCH") {
-    const { key, disabled } = req.body || {};
+    const { key, disabled, resetHwids } = req.body || {};
     if (!key || typeof key !== "string") {
       return res.status(400).json({ success: false, message: "key가 필요합니다." });
     }
@@ -110,6 +112,12 @@ module.exports = async function handler(req, res) {
       if (!doc.exists) {
         return res.status(404).json({ success: false, message: "존재하지 않는 키입니다." });
       }
+
+      if (resetHwids) {
+        await col.doc(key).update({ hwids: [] });
+        return res.status(200).json({ success: true, message: "HWID가 초기화되었습니다." });
+      }
+
       await col.doc(key).update({ disabled: !!disabled });
       const action = disabled ? "비활성화" : "활성화";
       return res.status(200).json({ success: true, message: `라이센스가 ${action}되었습니다.` });

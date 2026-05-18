@@ -31,6 +31,13 @@ import base64
 import hashlib
 import hmac
 import struct
+import subprocess
+import uuid
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
 
 import cv2
 import numpy as np
@@ -114,6 +121,9 @@ DEFAULT_REGION_X = 0
 DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
+
+APP_VERSION = "1.0.0"
+VERSION_CHECK_URL = "https://macro-license.vercel.app/api/version"
 
 LICENSE_SECRET_KEY = b"macro-automation-license-key-2026-xK9mP2vL"
 LICENSE_FILE = "license.key"
@@ -212,6 +222,99 @@ def format_remaining_time(seconds: int) -> str:
     if hours > 0:
         return f"{hours}시간 {minutes}분 남음"
     return f"{minutes}분 남음"
+
+
+VERIFY_SERVER_URL = "https://macro-license.vercel.app/api/verify"
+
+
+def get_hwid() -> str:
+    """머신 고유 HWID를 생성합니다."""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["wmic", "csproduct", "get", "UUID"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line and line != "UUID":
+                    return hashlib.sha256(line.encode()).hexdigest()[:32]
+    except Exception:
+        pass
+    mac = uuid.getnode()
+    return hashlib.sha256(str(mac).encode()).hexdigest()[:32]
+
+
+def verify_license_server(key: str, hwid: str) -> dict:
+    """서버에 라이센스 키와 HWID를 검증합니다."""
+    if _requests is None:
+        return {"valid": True, "message": "서버 검증 스킵 (requests 미설치)"}
+    try:
+        resp = _requests.post(
+            VERIFY_SERVER_URL,
+            json={"key": key, "hwid": hwid},
+            timeout=10,
+        )
+        return resp.json()
+    except Exception:
+        return {"valid": True, "message": "서버 연결 실패 (오프라인 모드)"}
+
+
+def _parse_version(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except Exception:
+        return (0,)
+
+
+def check_for_update() -> Optional[dict]:
+    if _requests is None:
+        return None
+    try:
+        resp = _requests.get(VERSION_CHECK_URL, timeout=5)
+        data = resp.json()
+        remote_ver = data.get("version", "")
+        download_url = data.get("url", "")
+        if not remote_ver or not download_url:
+            return None
+        if _parse_version(remote_ver) > _parse_version(APP_VERSION):
+            return {"version": remote_ver, "url": download_url, "changelog": data.get("changelog", "")}
+    except Exception:
+        pass
+    return None
+
+
+def apply_update(download_url: str, progress_callback=None) -> bool:
+    if _requests is None or sys.platform != "win32":
+        return False
+    try:
+        current_exe = sys.executable
+        if not current_exe.endswith(".exe"):
+            return False
+        temp_path = current_exe + ".update"
+        resp = _requests.get(download_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and total > 0:
+                    progress_callback(downloaded / total)
+
+        bat_path = current_exe + ".update.bat"
+        with open(bat_path, "w", encoding="utf-8") as bat:
+            bat.write(f'@echo off\n')
+            bat.write(f'timeout /t 2 /nobreak >nul\n')
+            bat.write(f'del "{current_exe}"\n')
+            bat.write(f'move "{temp_path}" "{current_exe}"\n')
+            bat.write(f'start "" "{current_exe}"\n')
+            bat.write(f'del "%~f0"\n')
+        subprocess.Popen(["cmd", "/c", bat_path], creationflags=0x08000000)
+        return True
+    except Exception:
+        return False
 
 
 LogCallback = Callable[[str], None]
@@ -2980,6 +3083,13 @@ class LicenseDialog:
     def _try_auto_activate(self, key: str) -> None:
         try:
             info = verify_license_key(key)
+            hwid = get_hwid()
+            server_result = verify_license_server(key, hwid)
+            if not server_result.get("valid", False):
+                self.message_var.set(server_result.get("message", "서버 인증 실패"))
+                self.message_label.configure(fg=self._error_color)
+                self.key_entry.focus_set()
+                return
             remaining = format_remaining_time(info["remaining_seconds"])
             self.message_var.set(f"저장된 라이센스가 유효합니다. ({info['days']}일권, {remaining})")
             self.message_label.configure(fg=self._success_color)
@@ -3004,6 +3114,13 @@ class LicenseDialog:
             self.message_label.configure(fg=self._error_color)
             return
 
+        hwid = get_hwid()
+        server_result = verify_license_server(key, hwid)
+        if not server_result.get("valid", False):
+            self.message_var.set(server_result.get("message", "서버 인증 실패"))
+            self.message_label.configure(fg=self._error_color)
+            return
+
         remaining = format_remaining_time(info["remaining_seconds"])
         self.message_var.set(f"인증 성공! ({info['days']}일권, {remaining})")
         self.message_label.configure(fg=self._success_color)
@@ -3011,6 +3128,74 @@ class LicenseDialog:
         self.root.after(600, lambda: self._launch_app(key))
 
     def _launch_app(self, key: str) -> None:
+        update_info = check_for_update()
+        if update_info:
+            self._show_update_dialog(key, update_info)
+            return
+        self.result = key
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        AutomationApp(self.root, license_key=key)
+
+    def _show_update_dialog(self, key: str, update_info: dict) -> None:
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        bg = self._bg
+        self.root.configure(bg=bg)
+        frame = tk.Frame(self.root, bg=bg, padx=24, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame, text="업데이트 available", bg=bg, fg="#7AB7FF",
+                 font=("Arial", 16, "bold")).pack(pady=(20, 10))
+        tk.Label(frame, text=f"새 버전: {update_info['version']}  (현재: {APP_VERSION})",
+                 bg=bg, fg="#e0e0e0", font=("Arial", 11)).pack(pady=(0, 6))
+        if update_info.get("changelog"):
+            tk.Label(frame, text=update_info["changelog"], bg=bg, fg="#999",
+                     font=("Arial", 9), wraplength=400).pack(pady=(0, 16))
+
+        self._progress_var = tk.DoubleVar(value=0)
+        self._progress_bar = tk.Canvas(frame, width=400, height=20, bg="#111", highlightthickness=0)
+        self._progress_bar.pack(pady=(0, 8))
+        self._progress_label = tk.Label(frame, text="", bg=bg, fg="#999", font=("Arial", 9))
+        self._progress_label.pack(pady=(0, 16))
+
+        btn_frame = tk.Frame(frame, bg=bg)
+        btn_frame.pack()
+
+        self._update_btn = tk.Button(btn_frame, text="업데이트", bg="#7AB7FF", fg="#000",
+                                     font=("Arial", 11, "bold"), relief=tk.FLAT, padx=20, pady=6,
+                                     command=lambda: self._do_update(key, update_info))
+        self._update_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Button(btn_frame, text="건너뛰기", bg="#3C3C3C", fg="#e0e0e0",
+                  font=("Arial", 11), relief=tk.FLAT, padx=20, pady=6,
+                  command=lambda: self._skip_update(key)).pack(side=tk.LEFT)
+
+    def _do_update(self, key: str, update_info: dict) -> None:
+        self._update_btn.configure(state=tk.DISABLED, text="다운로드 중...")
+        self._progress_label.configure(text="다운로드 중...")
+
+        def progress(ratio):
+            self._progress_var.set(ratio)
+            self._progress_bar.delete("all")
+            w = int(400 * ratio)
+            self._progress_bar.create_rectangle(0, 0, w, 20, fill="#7AB7FF", outline="")
+            self._progress_label.configure(text=f"{int(ratio * 100)}%")
+            self._progress_bar.update_idletasks()
+
+        def run_update():
+            success = apply_update(update_info["url"], progress_callback=progress)
+            if success:
+                self._progress_label.configure(text="업데이트 완료! 재시작 중...")
+                self.root.after(1000, self.root.destroy)
+            else:
+                self._progress_label.configure(text="업데이트 실패. 기존 버전으로 실행합니다.")
+                self.root.after(1500, lambda: self._skip_update(key))
+
+        threading.Thread(target=run_update, daemon=True).start()
+
+    def _skip_update(self, key: str) -> None:
         self.result = key
         for widget in self.root.winfo_children():
             widget.destroy()

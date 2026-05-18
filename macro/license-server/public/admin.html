@@ -91,6 +91,25 @@
       </div>
     </div>
 
+    <div class="panel" id="versionPanel" style="display:block; padding:0; border:none; background:none; margin-bottom:20px;">
+      <h3 style="font-size:15px; margin-bottom:12px; color:#ccc;">버전 관리</h3>
+      <div class="issue-form">
+        <div style="min-width:100px; flex:0.5;">
+          <label>현재 버전</label>
+          <input type="text" id="curVersion" readonly style="color:#666;" />
+        </div>
+        <div style="min-width:100px; flex:0.5;">
+          <label>새 버전</label>
+          <input type="text" id="newVersion" placeholder="예: 1.0.1" />
+        </div>
+        <div style="flex:2;">
+          <label>다운로드 URL</label>
+          <input type="text" id="newUrl" placeholder="https://github.com/.../releases/download/..." />
+        </div>
+        <button class="btn btn-primary" onclick="updateVersion()" style="margin-bottom:14px;">업데이트</button>
+      </div>
+    </div>
+
     <table>
       <thead>
         <tr>
@@ -98,6 +117,7 @@
           <th>기간</th>
           <th>상태</th>
           <th>만료일</th>
+          <th>HWID</th>
           <th>메모</th>
           <th>관리</th>
         </tr>
@@ -134,6 +154,7 @@ async function loadLicenses() {
     document.getElementById('panel').style.display = 'block';
     renderStats(data.licenses);
     renderTable(data.licenses);
+    loadVersion();
   } catch (e) {
     showToast('서버 연결 실패', 'error');
   }
@@ -173,10 +194,12 @@ function renderTable(list) {
       <td>${l.days === 99999 ? '무제한' : l.days + '일'}</td>
       <td>${badge}</td>
       <td>${l.days === 99999 ? '-' : exp}</td>
+      <td><span style="color:${l.hwids.length >= l.maxHwids ? '#FF6B6B' : '#69DB7C'}">${l.hwids.length}/${l.maxHwids}</span></td>
       <td class="memo-text">${l.memo || '-'}</td>
       <td class="btn-group">
         <button class="btn ${toggleClass} btn-sm" onclick="toggleKey('${l.key}', ${!l.disabled})">${toggleLabel}</button>
         <button class="btn btn-danger btn-sm" onclick="deleteKey('${l.key}')">삭제</button>
+        <button class="btn btn-sm" style="background:${l.hwids.length === 0 ? '#333' : '#555'};color:${l.hwids.length === 0 ? '#666' : '#fff'};${l.hwids.length === 0 ? 'cursor:default;' : ''}" onclick="resetHwids('${l.key}')" ${l.hwids.length === 0 ? 'disabled' : ''}>HWID초기화</button>
       </td>
     </tr>`;
   }).join('');
@@ -213,6 +236,37 @@ async function toggleKey(key, disabled) {
     showToast(data.message, data.success ? 'success' : 'error');
     if (data.success) loadLicenses();
   } catch (e) { showToast('수정 실패', 'error'); }
+}
+
+async function loadVersion() {
+  try {
+    const res = await fetch('/api/version');
+    const data = await res.json();
+    document.getElementById('curVersion').value = data.version || '1.0.0';
+  } catch (e) {}
+}
+
+async function updateVersion() {
+  const version = document.getElementById('newVersion').value.trim();
+  const url = document.getElementById('newUrl').value.trim();
+  if (!version) return showToast('버전을 입력하세요.', 'error');
+  if (!url) return showToast('다운로드 URL을 입력하세요.', 'error');
+  try {
+    const res = await fetch('/api/version', { method: 'POST', headers: headers(), body: JSON.stringify({ version, url }) });
+    const data = await res.json();
+    showToast(data.message, data.success ? 'success' : 'error');
+    if (data.success) { document.getElementById('curVersion').value = version; document.getElementById('newVersion').value = ''; document.getElementById('newUrl').value = ''; }
+  } catch (e) { showToast('버전 업데이트 실패', 'error'); }
+}
+
+async function resetHwids(key) {
+  if (!confirm(`"${key}" 키의 등록된 기기를 모두 초기화하시겠습니까?`)) return;
+  try {
+    const res = await fetch(API, { method: 'PATCH', headers: headers(), body: JSON.stringify({ key, resetHwids: true }) });
+    const data = await res.json();
+    showToast(data.message, data.success ? 'success' : 'error');
+    if (data.success) loadLicenses();
+  } catch (e) { showToast('HWID 초기화 실패', 'error'); }
 }
 
 function generateRandomKey() {
