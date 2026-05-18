@@ -33,7 +33,7 @@
       "filename": "target_E.png",
       "action": "key",
       "key": "s",
-      "key_mode": "sendmessage",
+      "key_mode": "sendinput",
       "key_target": "all",
       "threshold": 0.8,
       "wait_after_action": 0.0
@@ -43,7 +43,7 @@
       "filename": "target_F.png",
       "action": "key",
       "key": "esc",
-      "key_mode": "sendmessage",
+      "key_mode": "sendinput",
       "key_target": "all",
       "threshold": 0.8,
       "wait_after_action": 0.0
@@ -53,15 +53,42 @@
       "filename": "target_G.png",
       "action": "key",
       "key": "esc",
-      "key_mode": "sendmessage",
+      "key_mode": "sendinput",
       "threshold": 0.8,
       "wait_after_action": 0.0
-    },    {
+    },
+    {
       "name": "target_H",
       "filename": "target_H.png",
       "action": "click",
       "threshold": 0.8,
       "wait_after_action": 0.0
+    },
+    {
+      "name": "bm_click_example_disabled",
+      "filename": "button_image.png",
+      "action": "message",
+      "message": "BM_CLICK",
+      "message_mode": "sendmessage",
+      "message_target": "control",
+      "control_text": "확인",
+      "control_class": "Button",
+      "threshold": 0.8,
+      "wait_after_action": 0.0,
+      "enabled": false
+    },
+    {
+      "name": "wm_command_example_disabled",
+      "filename": "menu_image.png",
+      "action": "message",
+      "message": "WM_COMMAND",
+      "message_mode": "sendmessage",
+      "message_target": "top",
+      "command_id": "0x1001",
+      "notify_code": 0,
+      "threshold": 0.8,
+      "wait_after_action": 0.0,
+      "enabled": false
     }
   ]
 }

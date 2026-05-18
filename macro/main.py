@@ -30,6 +30,15 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 
+# 필요 패키지: pip install vgamepad
+try:
+    import vgamepad as vg
+except (ImportError, OSError) as exc:
+    vg = None
+    VGAMEPAD_IMPORT_ERROR = exc
+else:
+    VGAMEPAD_IMPORT_ERROR = None
+
 try:
     import pyautogui
 except ImportError as exc:
@@ -112,7 +121,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "filename": "target_E.png",
         "action": "key",
         "key": "s",
-        "key_mode": "sendmessage",
+        "key_mode": "sendinput",
         "key_target": "all",
     },
     {
@@ -120,12 +129,48 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "filename": "target_F.png",
         "action": "key",
         "key": "esc",
-        "key_mode": "sendmessage",
+        "key_mode": "sendinput",
         "key_target": "all",
     },
 ]
 
 LogCallback = Callable[[str], None]
+
+gamepad: Optional[Any] = None
+
+KEY_TO_GAMEPAD: dict[str, Any] = {}
+if vg is not None:
+    KEY_TO_GAMEPAD = {
+        "esc": vg.XUSB_BUTTON.XUSB_GAMEPAD_START,
+        "escape": vg.XUSB_BUTTON.XUSB_GAMEPAD_START,
+        "s": vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
+    }
+
+
+def _get_gamepad() -> Any:
+    """vgamepad VX360Gamepad 인스턴스를 1회만 생성해서 재사용합니다."""
+
+    global gamepad
+
+    if vg is None:
+        raise RuntimeError(
+            "vgamepad 모듈을 불러올 수 없습니다. Windows에서 'pip install vgamepad'를 실행하세요."
+        )
+    if gamepad is None:
+        gamepad = vg.VX360Gamepad()
+    return gamepad
+
+
+def send_gamepad_button(button: Any, press_delay: float = 0.05) -> bool:
+    """vgamepad Xbox 컨트롤러 버튼을 눌렀다 뗍니다."""
+
+    pad = _get_gamepad()
+    pad.press_button(button=button)
+    pad.update()
+    time.sleep(press_delay)
+    pad.release_button(button=button)
+    pad.update()
+    return True
 
 
 def _make_mouse_lparam(x: int, y: int) -> int:
@@ -169,46 +214,6 @@ def _send_mouse_message(
     else:
         win32gui.PostMessage(hwnd, message, wparam, lparam)
     return True
-
-
-def _make_key_lparam(vk_code: int, *, key_up: bool = False) -> int:
-    """Windows 키 메시지 lParam을 만듭니다."""
-
-    scan_code = 0
-    if win32api is not None and hasattr(win32api, "MapVirtualKey"):
-        scan_code = int(win32api.MapVirtualKey(int(vk_code), 0))
-
-    lparam = 1 | (scan_code << 16)
-    if key_up:
-        lparam |= (1 << 30) | (1 << 31)
-    return int(lparam)
-
-
-def _virtual_key_from_key(key: str) -> int:
-    """키 이름을 Windows virtual-key 코드로 변환합니다."""
-
-    normalized = key.strip().lower()
-    special_keys = {
-        "esc": 0x1B,
-        "escape": 0x1B,
-    }
-    if normalized in special_keys:
-        return special_keys[normalized]
-
-    if len(normalized) != 1:
-        raise ValueError(f"지원하지 않는 키입니다: {key!r}")
-    return ord(normalized.upper())
-
-
-def _char_code_from_key(key: str) -> Optional[int]:
-    """필요할 때 함께 보낼 WM_CHAR wParam 값을 반환합니다."""
-
-    normalized = key.strip().lower()
-    if normalized in ("esc", "escape"):
-        return 0x1B
-    if len(normalized) == 1:
-        return ord(normalized)
-    return None
 
 
 def _is_child_or_same(parent_hwnd: int, child_hwnd: int) -> bool:
@@ -307,139 +312,172 @@ def _unique_hwnds(hwnds: list[int]) -> list[int]:
     return result
 
 
-def _get_keyboard_target_hwnds(hwnd: int, target_scope: str = "all") -> list[int]:
-    """키 메시지를 보낼 대상 HWND 목록을 고릅니다."""
+def _parse_optional_int(value: object, field_name: str) -> Optional[int]:
+    """JSON 숫자 또는 0x 문자열을 int로 변환합니다."""
 
-    focus_hwnd = _get_thread_focus_hwnd(hwnd)
-    target_scope = target_scope.strip().lower()
-
-    if target_scope == "top":
-        return [int(hwnd)]
-    if target_scope == "focus":
-        return [focus_hwnd or int(hwnd)]
-    if target_scope != "all":
-        raise ValueError(f"지원하지 않는 key_target입니다: {target_scope!r}")
-
-    targets = []
-    if focus_hwnd is not None:
-        targets.append(focus_hwnd)
-    targets.append(int(hwnd))
-    targets.extend(_get_child_windows(hwnd))
-    return _unique_hwnds(targets)
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name}에는 bool이 아니라 숫자를 넣어야 합니다.")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{field_name}에는 정수 값을 넣어야 합니다: {value!r}")
+        return int(value)
+    if isinstance(value, str):
+        return int(value.strip(), 0)
+    raise ValueError(f"{field_name} 값을 정수로 해석할 수 없습니다: {value!r}")
 
 
-def _send_keyboard_message(
+def _resolve_win32_message(message: object) -> int:
+    """WM_COMMAND, BM_CLICK 같은 메시지 이름 또는 숫자를 int 메시지로 변환합니다."""
+
+    if not isinstance(message, str):
+        parsed = _parse_optional_int(message, "message")
+        if parsed is not None:
+            return parsed
+
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message 값이 비어 있습니다.")
+
+    constants = _require_win32con()
+    message_name = message.strip().upper()
+    try:
+        return int(message_name, 0)
+    except ValueError:
+        pass
+
+    if hasattr(constants, message_name):
+        return int(getattr(constants, message_name))
+
+    aliases = {
+        "BM_CLICK": 0x00F5,
+        "WM_COMMAND": 0x0111,
+        "WM_CLOSE": 0x0010,
+        "WM_SETTEXT": 0x000C,
+    }
+    if message_name in aliases:
+        return aliases[message_name]
+
+    raise ValueError(f"지원하지 않는 Win32 메시지 이름입니다: {message!r}")
+
+
+def _make_command_wparam(command_id: int, notify_code: int = 0) -> int:
+    """WM_COMMAND wParam을 만듭니다."""
+
+    if win32api is not None and hasattr(win32api, "MAKELONG"):
+        return int(win32api.MAKELONG(int(command_id), int(notify_code)))
+    return ((int(notify_code) & 0xFFFF) << 16) | (int(command_id) & 0xFFFF)
+
+
+def _get_window_text_safe(hwnd: int) -> str:
+    """창 텍스트를 안전하게 가져옵니다."""
+
+    if win32gui is None:
+        return ""
+    try:
+        return win32gui.GetWindowText(int(hwnd)) or ""
+    except Exception:
+        return ""
+
+
+def _get_class_name_safe(hwnd: int) -> str:
+    """창 클래스 이름을 안전하게 가져옵니다."""
+
+    if win32gui is None:
+        return ""
+    try:
+        return win32gui.GetClassName(int(hwnd)) or ""
+    except Exception:
+        return ""
+
+
+def _get_dlg_item(hwnd: int, control_id: int) -> Optional[int]:
+    """GetDlgItem으로 자식 컨트롤 HWND를 찾습니다."""
+
+    if win32gui is None:
+        return None
+    try:
+        child_hwnd = int(win32gui.GetDlgItem(int(hwnd), int(control_id)) or 0)
+        if child_hwnd and win32gui.IsWindow(child_hwnd):
+            return child_hwnd
+    except Exception:
+        pass
+
+    if hasattr(ctypes, "windll"):
+        try:
+            child_hwnd = int(ctypes.windll.user32.GetDlgItem(int(hwnd), int(control_id)) or 0)
+            if child_hwnd and win32gui.IsWindow(child_hwnd):
+                return child_hwnd
+        except Exception:
+            pass
+
+    return None
+
+
+def _find_child_window(
+    hwnd: int,
+    *,
+    control_id: Optional[int] = None,
+    control_hwnd: Optional[int] = None,
+    control_class: Optional[str] = None,
+    control_text: Optional[str] = None,
+) -> Optional[int]:
+    """설정된 조건으로 자식 컨트롤 HWND를 찾습니다."""
+
+    if win32gui is None:
+        return None
+
+    if control_hwnd is not None:
+        try:
+            candidate = int(control_hwnd)
+            if win32gui.IsWindow(candidate) and _is_child_or_same(int(hwnd), candidate):
+                return candidate
+        except Exception:
+            return None
+
+    if control_id is not None:
+        child_hwnd = _get_dlg_item(hwnd, control_id)
+        if child_hwnd is not None:
+            return child_hwnd
+
+    class_filter = control_class.strip().lower() if control_class else None
+    text_filter = control_text.strip().lower() if control_text else None
+    if class_filter is None and text_filter is None:
+        return None
+
+    for child_hwnd in _get_child_windows(hwnd):
+        class_name = _get_class_name_safe(child_hwnd).lower()
+        window_text = _get_window_text_safe(child_hwnd).lower()
+        if class_filter is not None and class_filter not in class_name:
+            continue
+        if text_filter is not None and text_filter not in window_text:
+            continue
+        return child_hwnd
+
+    return None
+
+
+def _send_win32_message(
     hwnd: int,
     message: int,
-    vk_code: int,
-    lparam: int,
+    wparam: int = 0,
+    lparam: int = 0,
     *,
-    use_send_message: bool = False,
+    use_send_message: bool = True,
 ) -> bool:
-    """PostMessage 또는 SendMessage로 대상 HWND에 키보드 메시지를 보냅니다."""
+    """PostMessage 또는 SendMessage로 일반 Win32 메시지를 보냅니다."""
 
     if win32gui is None:
         raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
-    if not win32gui.IsWindow(hwnd):
+    if not win32gui.IsWindow(int(hwnd)):
         raise RuntimeError(f"유효하지 않은 HWND입니다: {hwnd}")
 
     if use_send_message:
-        win32gui.SendMessage(hwnd, message, int(vk_code), int(lparam))
+        win32gui.SendMessage(int(hwnd), int(message), int(wparam), int(lparam))
     else:
-        win32gui.PostMessage(hwnd, message, int(vk_code), int(lparam))
-    return True
-
-
-def post_key_down(
-    hwnd: int,
-    key: str,
-    *,
-    use_send_message: bool = False,
-) -> bool:
-    """대상 창에 WM_KEYDOWN을 보냅니다."""
-
-    constants = _require_win32con()
-    vk_code = _virtual_key_from_key(key)
-    return _send_keyboard_message(
-        hwnd,
-        constants.WM_KEYDOWN,
-        vk_code,
-        _make_key_lparam(vk_code, key_up=False),
-        use_send_message=use_send_message,
-    )
-
-
-def post_key_up(
-    hwnd: int,
-    key: str,
-    *,
-    use_send_message: bool = False,
-) -> bool:
-    """대상 창에 WM_KEYUP을 보냅니다."""
-
-    constants = _require_win32con()
-    vk_code = _virtual_key_from_key(key)
-    return _send_keyboard_message(
-        hwnd,
-        constants.WM_KEYUP,
-        vk_code,
-        _make_key_lparam(vk_code, key_up=True),
-        use_send_message=use_send_message,
-    )
-
-
-def post_key_char(
-    hwnd: int,
-    key: str,
-    *,
-    use_send_message: bool = False,
-) -> bool:
-    """대상 창에 필요한 경우 WM_CHAR를 보냅니다."""
-
-    char_code = _char_code_from_key(key)
-    if char_code is None:
-        return False
-
-    constants = _require_win32con()
-    vk_code = _virtual_key_from_key(key)
-    return _send_keyboard_message(
-        hwnd,
-        constants.WM_CHAR,
-        char_code,
-        _make_key_lparam(vk_code, key_up=False),
-        use_send_message=use_send_message,
-    )
-
-
-def post_key_press(
-    hwnd: int,
-    key: str,
-    *,
-    press_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
-    use_send_message: bool = False,
-    target_scope: str = "all",
-    logger: Optional[LogCallback] = None,
-) -> bool:
-    """실제 키보드 입력 없이 대상 HWND에 키 Down/Up 메시지를 보냅니다."""
-
-    log = logger or print
-    target_hwnds = _get_keyboard_target_hwnds(hwnd, target_scope=target_scope)
-    log(f"[키 대상] scope={target_scope}, count={len(target_hwnds)}, hwnds={target_hwnds}")
-
-    sent_count = 0
-    for target_hwnd in target_hwnds:
-        try:
-            post_key_down(target_hwnd, key, use_send_message=use_send_message)
-            post_key_char(target_hwnd, key, use_send_message=use_send_message)
-            if press_delay > 0:
-                time.sleep(press_delay)
-            post_key_up(target_hwnd, key, use_send_message=use_send_message)
-            sent_count += 1
-        except Exception as exc:
-            log(f"[키 경고] HWND={target_hwnd} 키 메시지 전송 실패: {exc}")
-
-    if sent_count <= 0:
-        raise RuntimeError("키 메시지를 보낸 HWND가 없습니다.")
+        win32gui.PostMessage(int(hwnd), int(message), int(wparam), int(lparam))
     return True
 
 
@@ -792,8 +830,19 @@ class TargetImage:
     threshold: float = 0.8
     action: str = "click"
     key: Optional[str] = None
-    key_mode: str = "sendmessage"
+    key_mode: str = "sendinput"
     key_target: str = "all"
+    message: Optional[str] = None
+    message_mode: str = "sendmessage"
+    message_target: str = "top"
+    message_wparam: Optional[int] = None
+    message_lparam: Optional[int] = None
+    command_id: Optional[int] = None
+    notify_code: int = 0
+    control_id: Optional[int] = None
+    control_hwnd: Optional[int] = None
+    control_class: Optional[str] = None
+    control_text: Optional[str] = None
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -1327,35 +1376,114 @@ class InactiveManager:
             self.log(f"[오류] 곡선 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
             return False
 
-    def post_key_press(
-        self,
-        key: str,
-        *,
-        use_send_message: bool = False,
-        target_scope: str = "all",
-    ) -> bool:
-        """대상 창 HWND에만 메시지 방식 키 입력을 보냅니다."""
+    def _resolve_message_control_hwnd(self, target: TargetImage) -> Optional[int]:
+        """타겟 설정에 맞는 자식 컨트롤 HWND를 찾습니다."""
+
+        if self.hwnd is None:
+            return None
+
+        return _find_child_window(
+            self.hwnd,
+            control_id=target.control_id,
+            control_hwnd=target.control_hwnd,
+            control_class=target.control_class,
+            control_text=target.control_text,
+        )
+
+    def _resolve_message_targets(self, target: TargetImage) -> list[int]:
+        """Win32 메시지를 보낼 HWND 목록을 만듭니다."""
+
+        if self.hwnd is None:
+            return []
+
+        message_target = target.message_target.strip().lower()
+        if message_target == "top":
+            return [self.hwnd]
+        if message_target == "focus":
+            return [_get_thread_focus_hwnd(self.hwnd) or self.hwnd]
+        if message_target == "all":
+            return _unique_hwnds([self.hwnd] + _get_child_windows(self.hwnd))
+        if message_target == "control":
+            control_hwnd = self._resolve_message_control_hwnd(target)
+            return [control_hwnd] if control_hwnd is not None else []
+
+        raise ValueError(f"지원하지 않는 message_target입니다: {message_target!r}")
+
+    def send_win32_message_action(self, target: TargetImage) -> bool:
+        """targets.json의 message 액션을 대상 창에 전송합니다."""
 
         if not self.is_valid_window() or self.hwnd is None:
             return False
+        if not target.message:
+            self.log(f"[메시지 오류] {target.name}에 message가 설정되지 않았습니다.")
+            return False
 
         try:
+            message_id = _resolve_win32_message(target.message)
+            constants = _require_win32con()
+            use_send_message = target.message_mode == "sendmessage"
             mode_name = "SendMessage" if use_send_message else "PostMessage"
+            target_hwnds = self._resolve_message_targets(target)
+
+            if not target_hwnds:
+                self.log(
+                    f"[메시지 오류] {target.name}의 message_target={target.message_target}에 "
+                    "해당하는 HWND를 찾지 못했습니다."
+                )
+                if target.control_id is not None or target.control_class or target.control_text:
+                    self.log(
+                        f"       control_id={target.control_id}, "
+                        f"control_class={target.control_class}, control_text={target.control_text}"
+                    )
+                    child_hwnds = _get_child_windows(self.hwnd, limit=20)
+                    if child_hwnds:
+                        self.log("[메시지 안내] 찾은 자식 HWND 후보:")
+                        for child_hwnd in child_hwnds:
+                            self.log(
+                                f"       HWND={child_hwnd}, "
+                                f"class='{_get_class_name_safe(child_hwnd)}', "
+                                f"text='{_get_window_text_safe(child_hwnd)}'"
+                            )
+                return False
+
+            control_hwnd = self._resolve_message_control_hwnd(target)
+            wparam = target.message_wparam if target.message_wparam is not None else 0
+            lparam = target.message_lparam if target.message_lparam is not None else 0
+
+            if message_id == int(constants.WM_COMMAND):
+                if target.command_id is not None:
+                    wparam = _make_command_wparam(target.command_id, target.notify_code)
+                if target.message_lparam is None and control_hwnd is not None:
+                    lparam = control_hwnd
+
             self.log(
-                f"[키 전송] HWND={self.hwnd}, 제목='{self.window_text}', "
-                f"key='{key.upper()}', mode={mode_name}, target={target_scope}"
+                f"[메시지 전송] {target.name}, message={target.message}({message_id}), "
+                f"mode={mode_name}, targets={target_hwnds}, "
+                f"wParam={wparam}, lParam={lparam}"
             )
-            post_key_press(
-                self.hwnd,
-                key,
-                use_send_message=use_send_message,
-                target_scope=target_scope,
-                logger=self.log,
-            )
-            self.log(f"[키 완료] WM_KEYDOWN / WM_KEYUP: {key.upper()}")
+
+            sent_count = 0
+            for target_hwnd in target_hwnds:
+                try:
+                    _send_win32_message(
+                        target_hwnd,
+                        message_id,
+                        wparam,
+                        lparam,
+                        use_send_message=use_send_message,
+                    )
+                    sent_count += 1
+                except Exception as exc:
+                    self.log(f"[메시지 경고] HWND={target_hwnd} 전송 실패: {exc}")
+
+            if sent_count <= 0:
+                self.log("[메시지 오류] 메시지를 전송한 HWND가 없습니다.")
+                return False
+
+            self.log(f"[메시지 완료] {target.name}, count={sent_count}")
             return True
         except Exception as exc:
-            self.log(f"[오류] 키 메시지 전송 중 문제가 발생했습니다: {exc}")
+            self.log(f"[메시지 오류] Win32 메시지 액션 중 문제가 발생했습니다: {exc}")
             return False
 
     def post_click(
@@ -1959,7 +2087,7 @@ class AutomationApp:
         needs_window = (
             capture_mode == "wgc"
             or click_mode == "postmessage"
-            or any(target.action == "key" for target in self.target_definitions)
+            or any(target.action == "message" for target in self.target_definitions)
         )
         if needs_window and not window_title:
             self.log("[오류] 대상 창 제목을 입력하세요.")
@@ -2073,7 +2201,7 @@ class AutomationApp:
             requires_window = (
                 capture_mode == "wgc"
                 or click_mode == "postmessage"
-                or any(target.action == "key" for target in targets)
+                or any(target.action == "message" for target in targets)
             )
 
             if requires_window:
@@ -2136,6 +2264,8 @@ class AutomationApp:
 
                     if target.action == "key":
                         action_ok = self.dispatch_key_press(manager, target)
+                    elif target.action == "message":
+                        action_ok = self.dispatch_win32_message(manager, target)
                     else:
                         action_ok = self.dispatch_click(
                             manager,
@@ -2147,7 +2277,11 @@ class AutomationApp:
                         )
 
                     if action_ok:
-                        self.queue_status("키 입력 완료" if target.action == "key" else "클릭 완료")
+                        status_by_action = {
+                            "key": "키 입력 완료",
+                            "message": "메시지 완료",
+                        }
+                        self.queue_status(status_by_action.get(target.action, "클릭 완료"))
                         if target.wait_after_click > 0:
                             self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
                             self.interruptible_sleep(target.wait_after_click)
@@ -2234,27 +2368,53 @@ class AutomationApp:
         manager: Optional[InactiveManager],
         target: TargetImage,
     ) -> bool:
-        """타겟 창에만 PostMessage 방식 키 입력을 전송합니다."""
+        """타겟 감지 시 vgamepad Xbox 컨트롤러 버튼 입력을 전송합니다."""
 
-        if manager is None:
-            self.queue_log("[오류] 키 입력에는 대상 창 HWND가 필요합니다.")
-            return False
         if not target.key:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
             return False
+        if vg is None:
+            self.queue_log("[오류] vgamepad를 불러올 수 없어 게임패드 입력을 보낼 수 없습니다.")
+            self.queue_log(f"       원본 오류: {VGAMEPAD_IMPORT_ERROR}")
+            return False
 
-        use_send_message = target.key_mode == "sendmessage"
-        mode_name = "SendMessage" if use_send_message else "PostMessage"
+        normalized_key = target.key.strip().lower()
+        button = KEY_TO_GAMEPAD.get(normalized_key)
+        if button is None:
+            self.queue_log(
+                f"[키 경고] {target.name}의 key='{target.key}'는 "
+                "vgamepad 매핑에 없어 건너뜁니다."
+            )
+            return False
+
         self.queue_log(
-            f"[키 요청] {target.name} 감지로 대상 창에 "
-            f"'{target.key.upper()}' 키를 {mode_name}로 보냅니다. "
-            f"target={target.key_target}"
+            f"[키 요청] {target.name} 감지로 "
+            f"'{target.key.upper()}' 키를 vgamepad 버튼으로 보냅니다."
         )
-        return manager.post_key_press(
-            target.key,
-            use_send_message=use_send_message,
-            target_scope=target.key_target,
+        try:
+            send_gamepad_button(button)
+            self.queue_log(f"[키 완료] vgamepad 버튼 입력: {target.key.upper()}")
+            return True
+        except Exception as exc:
+            self.queue_log(f"[오류] vgamepad 버튼 입력 중 문제가 발생했습니다: {exc}")
+            return False
+
+    def dispatch_win32_message(
+        self,
+        manager: Optional[InactiveManager],
+        target: TargetImage,
+    ) -> bool:
+        """타겟 창에 Win32 컨트롤/명령 메시지를 전송합니다."""
+
+        if manager is None:
+            self.queue_log("[오류] Win32 메시지 액션에는 대상 창 HWND가 필요합니다.")
+            return False
+
+        self.queue_log(
+            f"[메시지 요청] {target.name} 감지로 "
+            f"{target.message} 메시지를 {target.message_mode}로 보냅니다."
         )
+        return manager.send_win32_message_action(target)
 
     def dispatch_click(
         self,
@@ -2436,21 +2596,48 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
     filename = str(filename_value)
     name = str(config.get("name") or Path(filename).stem)
     action = str(config.get("action", "click")).strip().lower()
-    if action not in ("click", "key"):
-        raise ValueError(f"{name}의 action은 click 또는 key여야 합니다: {action!r}")
+    if action not in ("click", "key", "message"):
+        raise ValueError(f"{name}의 action은 click, key, message 중 하나여야 합니다: {action!r}")
 
     key_value = config.get("key")
     key = str(key_value).strip() if key_value is not None else None
     if action == "key" and not key:
         raise ValueError(f"{name}은 key action이라 key 값이 필요합니다.")
 
-    key_mode = str(config.get("key_mode", "sendmessage")).strip().lower()
-    if key_mode not in ("postmessage", "sendmessage"):
-        raise ValueError(f"{name}의 key_mode는 postmessage 또는 sendmessage여야 합니다: {key_mode!r}")
+    key_mode = str(config.get("key_mode", "sendinput")).strip().lower()
 
     key_target = str(config.get("key_target", "all")).strip().lower()
-    if key_target not in ("top", "focus", "all"):
-        raise ValueError(f"{name}의 key_target은 top, focus, all 중 하나여야 합니다: {key_target!r}")
+
+    message_value = config.get("message")
+    message = str(message_value).strip() if message_value is not None else None
+    if action == "message" and not message:
+        raise ValueError(f"{name}은 message action이라 message 값이 필요합니다.")
+
+    message_mode = str(config.get("message_mode", "sendmessage")).strip().lower()
+    if message_mode not in ("postmessage", "sendmessage"):
+        raise ValueError(f"{name}의 message_mode는 postmessage 또는 sendmessage여야 합니다: {message_mode!r}")
+
+    has_control_filter = any(
+        config.get(field) not in (None, "")
+        for field in ("control_id", "control_hwnd", "control_class", "control_text")
+    )
+    default_message_target = "control" if has_control_filter else "top"
+    message_target = str(config.get("message_target", default_message_target)).strip().lower()
+    if message_target not in ("top", "focus", "control", "all"):
+        raise ValueError(
+            f"{name}의 message_target은 top, focus, control, all 중 하나여야 합니다: {message_target!r}"
+        )
+
+    message_wparam = _parse_optional_int(config.get("wparam"), "wparam")
+    message_lparam = _parse_optional_int(config.get("lparam"), "lparam")
+    command_id = _parse_optional_int(config.get("command_id"), "command_id")
+    notify_code = _parse_optional_int(config.get("notify_code"), "notify_code") or 0
+    control_id = _parse_optional_int(config.get("control_id"), "control_id")
+    control_hwnd = _parse_optional_int(config.get("control_hwnd"), "control_hwnd")
+    control_class_value = config.get("control_class")
+    control_text_value = config.get("control_text")
+    control_class = str(control_class_value).strip() if control_class_value is not None else None
+    control_text = str(control_text_value).strip() if control_text_value is not None else None
 
     threshold = float(config.get("threshold", 0.8))
     threshold = max(0.0, min(1.0, threshold))
@@ -2467,6 +2654,17 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         key=key,
         key_mode=key_mode,
         key_target=key_target,
+        message=message,
+        message_mode=message_mode,
+        message_target=message_target,
+        message_wparam=message_wparam,
+        message_lparam=message_lparam,
+        command_id=command_id,
+        notify_code=notify_code,
+        control_id=control_id,
+        control_hwnd=control_hwnd,
+        control_class=control_class,
+        control_text=control_text,
     )
 
 
@@ -2535,6 +2733,17 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         key=target.key,
         key_mode=target.key_mode,
         key_target=target.key_target,
+        message=target.message,
+        message_mode=target.message_mode,
+        message_target=target.message_target,
+        message_wparam=target.message_wparam,
+        message_lparam=target.message_lparam,
+        command_id=target.command_id,
+        notify_code=target.notify_code,
+        control_id=target.control_id,
+        control_hwnd=target.control_hwnd,
+        control_class=target.control_class,
+        control_text=target.control_text,
     )
 
 
@@ -2639,14 +2848,12 @@ def find_template_center(
 
     return (center_x, center_y), score
 
-
 def main() -> None:
     """프로그램 진입점입니다."""
 
     root = tk.Tk()
     AutomationApp(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
