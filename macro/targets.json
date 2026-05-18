@@ -33,6 +33,7 @@
       "filename": "target_E.png",
       "action": "key",
       "key": "s",
+      "key_mode": "sendmessage",
       "threshold": 0.8,
       "wait_after_action": 0.0
     },
@@ -41,6 +42,7 @@
       "filename": "target_F.png",
       "action": "key",
       "key": "esc",
+      "key_mode": "sendmessage",
       "threshold": 0.8,
       "wait_after_action": 0.0
     },

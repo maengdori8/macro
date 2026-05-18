@@ -107,8 +107,20 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_B", "filename": "target_B.png", "action": "click"},
     {"name": "target_C", "filename": "target_C.png", "action": "click"},
     {"name": "target_D", "filename": "target_D.png", "action": "click"},
-    {"name": "target_E", "filename": "target_E.png", "action": "key", "key": "s"},
-    {"name": "target_F", "filename": "target_F.png", "action": "key", "key": "esc"},
+    {
+        "name": "target_E",
+        "filename": "target_E.png",
+        "action": "key",
+        "key": "s",
+        "key_mode": "sendmessage",
+    },
+    {
+        "name": "target_F",
+        "filename": "target_F.png",
+        "action": "key",
+        "key": "esc",
+        "key_mode": "sendmessage",
+    },
 ]
 
 LogCallback = Callable[[str], None]
@@ -715,6 +727,7 @@ class TargetImage:
     threshold: float = 0.8
     action: str = "click"
     key: Optional[str] = None
+    key_mode: str = "sendmessage"
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -1254,15 +1267,16 @@ class InactiveManager:
         *,
         use_send_message: bool = False,
     ) -> bool:
-        """대상 창 HWND에만 PostMessage 방식 키 입력을 보냅니다."""
+        """대상 창 HWND에만 메시지 방식 키 입력을 보냅니다."""
 
         if not self.is_valid_window() or self.hwnd is None:
             return False
 
         try:
+            mode_name = "SendMessage" if use_send_message else "PostMessage"
             self.log(
                 f"[키 전송] HWND={self.hwnd}, 제목='{self.window_text}', "
-                f"key='{key.upper()}'"
+                f"key='{key.upper()}', mode={mode_name}"
             )
             post_key_press(
                 self.hwnd,
@@ -2161,8 +2175,13 @@ class AutomationApp:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
             return False
 
-        self.queue_log(f"[키 요청] {target.name} 감지로 대상 창에 '{target.key.upper()}' 키를 보냅니다.")
-        return manager.post_key_press(target.key)
+        use_send_message = target.key_mode == "sendmessage"
+        mode_name = "SendMessage" if use_send_message else "PostMessage"
+        self.queue_log(
+            f"[키 요청] {target.name} 감지로 대상 창에 "
+            f"'{target.key.upper()}' 키를 {mode_name}로 보냅니다."
+        )
+        return manager.post_key_press(target.key, use_send_message=use_send_message)
 
     def dispatch_click(
         self,
@@ -2352,6 +2371,10 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
     if action == "key" and not key:
         raise ValueError(f"{name}은 key action이라 key 값이 필요합니다.")
 
+    key_mode = str(config.get("key_mode", "sendmessage")).strip().lower()
+    if key_mode not in ("postmessage", "sendmessage"):
+        raise ValueError(f"{name}의 key_mode는 postmessage 또는 sendmessage여야 합니다: {key_mode!r}")
+
     threshold = float(config.get("threshold", 0.8))
     threshold = max(0.0, min(1.0, threshold))
     wait_after_click = float(
@@ -2365,6 +2388,7 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         threshold=threshold,
         action=action,
         key=key,
+        key_mode=key_mode,
     )
 
 
@@ -2431,6 +2455,7 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         threshold=target.threshold,
         action=target.action,
         key=target.key,
+        key_mode=target.key_mode,
     )
 
 
