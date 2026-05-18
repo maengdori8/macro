@@ -246,9 +246,9 @@ def get_hwid() -> str:
 
 
 def verify_license_server(key: str, hwid: str) -> dict:
-    """서버에 라이센스 키와 HWID를 검증합니다."""
+    """서버에 라이센스 키와 HWID를 검증합니다. 서버 연결 실패 시 _offline=True 반환."""
     if _requests is None:
-        return {"valid": True, "message": "서버 검증 스킵 (requests 미설치)"}
+        return {"_offline": True}
     try:
         resp = _requests.post(
             VERIFY_SERVER_URL,
@@ -257,7 +257,7 @@ def verify_license_server(key: str, hwid: str) -> dict:
         )
         return resp.json()
     except Exception:
-        return {"valid": True, "message": "서버 연결 실패 (오프라인 모드)"}
+        return {"_offline": True}
 
 
 def _parse_version(v: str) -> tuple:
@@ -1699,7 +1699,7 @@ class AutomationApp:
             try:
                 self.license_info = verify_license_key(license_key)
             except ValueError:
-                pass
+                self.license_info = {"days": 0, "remaining_seconds": 0}
 
         self.root.title("비활성 창 이미지 자동화 테스트")
         self.root.geometry("980x760+80+80")
@@ -2204,10 +2204,18 @@ class AutomationApp:
         """시작 버튼 또는 F8 키로 자동화 스레드를 시작합니다."""
 
         if self.license_key:
-            try:
-                self.license_info = verify_license_key(self.license_key)
-            except ValueError as e:
-                self.log(f"[라이센스] {e} 프로그램을 재시작하고 새 키를 입력하세요.")
+            hwid = get_hwid()
+            sr = verify_license_server(self.license_key, hwid)
+            if sr.get("_offline"):
+                try:
+                    self.license_info = verify_license_key(self.license_key)
+                except ValueError as e:
+                    self.log(f"[라이센스] {e} 프로그램을 재시작하고 새 키를 입력하세요.")
+                    self.set_status("라이센스 만료")
+                    self._set_button_state(running=False)
+                    return
+            elif not sr.get("valid", False):
+                self.log(f"[라이센스] {sr.get('message', '인증 실패')} 프로그램을 재시작하고 새 키를 입력하세요.")
                 self.set_status("라이센스 만료")
                 self._set_button_state(running=False)
                 return
@@ -3081,24 +3089,34 @@ class LicenseDialog:
             self.key_entry.focus_set()
 
     def _try_auto_activate(self, key: str) -> None:
-        try:
-            info = verify_license_key(key)
-            hwid = get_hwid()
-            server_result = verify_license_server(key, hwid)
-            if not server_result.get("valid", False):
-                self.message_var.set(server_result.get("message", "서버 인증 실패"))
+        hwid = get_hwid()
+        server_result = verify_license_server(key, hwid)
+
+        if server_result.get("_offline"):
+            try:
+                info = verify_license_key(key)
+                remaining = format_remaining_time(info["remaining_seconds"])
+                self.message_var.set(f"저장된 라이센스가 유효합니다. ({info['days']}일권, {remaining}) [오프라인]")
+                self.message_label.configure(fg=self._success_color)
+                self.root.after(800, lambda: self._launch_app(key))
+            except ValueError:
+                self.message_var.set("저장된 라이센스가 만료되었거나 유효하지 않습니다. 새 키를 입력하세요.")
                 self.message_label.configure(fg=self._error_color)
+                self.key_var.set("")
                 self.key_entry.focus_set()
-                return
-            remaining = format_remaining_time(info["remaining_seconds"])
-            self.message_var.set(f"저장된 라이센스가 유효합니다. ({info['days']}일권, {remaining})")
-            self.message_label.configure(fg=self._success_color)
-            self.root.after(800, lambda: self._launch_app(key))
-        except ValueError:
-            self.message_var.set("저장된 라이센스가 만료되었거나 유효하지 않습니다. 새 키를 입력하세요.")
+            return
+
+        if not server_result.get("valid", False):
+            self.message_var.set(server_result.get("message", "서버 인증 실패"))
             self.message_label.configure(fg=self._error_color)
             self.key_var.set("")
             self.key_entry.focus_set()
+            return
+
+        msg = server_result.get("message", "유효한 라이센스입니다.")
+        self.message_var.set(f"저장된 라이센스가 유효합니다. {msg}")
+        self.message_label.configure(fg=self._success_color)
+        self.root.after(800, lambda: self._launch_app(key))
 
     def _activate(self) -> None:
         key = self.key_var.get().strip()
@@ -3107,22 +3125,30 @@ class LicenseDialog:
             self.message_label.configure(fg=self._error_color)
             return
 
-        try:
-            info = verify_license_key(key)
-        except ValueError as e:
-            self.message_var.set(str(e))
-            self.message_label.configure(fg=self._error_color)
-            return
-
         hwid = get_hwid()
         server_result = verify_license_server(key, hwid)
+
+        if server_result.get("_offline"):
+            try:
+                info = verify_license_key(key)
+            except ValueError as e:
+                self.message_var.set(str(e))
+                self.message_label.configure(fg=self._error_color)
+                return
+            remaining = format_remaining_time(info["remaining_seconds"])
+            self.message_var.set(f"인증 성공! ({info['days']}일권, {remaining}) [오프라인]")
+            self.message_label.configure(fg=self._success_color)
+            save_license_key(self.base_dir, key)
+            self.root.after(600, lambda: self._launch_app(key))
+            return
+
         if not server_result.get("valid", False):
             self.message_var.set(server_result.get("message", "서버 인증 실패"))
             self.message_label.configure(fg=self._error_color)
             return
 
-        remaining = format_remaining_time(info["remaining_seconds"])
-        self.message_var.set(f"인증 성공! ({info['days']}일권, {remaining})")
+        msg = server_result.get("message", "유효한 라이센스입니다.")
+        self.message_var.set(f"인증 성공! {msg}")
         self.message_label.configure(fg=self._success_color)
         save_license_key(self.base_dir, key)
         self.root.after(600, lambda: self._launch_app(key))
