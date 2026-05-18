@@ -1713,7 +1713,10 @@ class AutomationApp:
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         initial_status = "UI 미리보기" if self.ui_preview_only else "대기 중"
         self.status_var = tk.StringVar(value=initial_status)
-        self.base_dir = Path(__file__).resolve().parent
+        if getattr(sys, 'frozen', False):
+            self.base_dir = Path(sys.executable).resolve().parent
+        else:
+            self.base_dir = Path(__file__).resolve().parent
         self.target_definitions = load_target_definitions(self.base_dir)
         self.target_names = tuple(target.name for target in self.target_definitions)
         self.threshold_lock = threading.Lock()
@@ -3234,7 +3237,10 @@ def main() -> None:
     """프로그램 진입점입니다."""
 
     root = tk.Tk()
-    base_dir = Path(__file__).resolve().parent
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
     LicenseDialog(root, base_dir)
     root.mainloop()
 
