@@ -524,8 +524,8 @@ class AutomationApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("비활성 창 이미지 자동화 테스트")
-        self.root.geometry("820x560+80+80")
-        self.root.minsize(720, 480)
+        self.root.geometry("980x760+80+80")
+        self.root.minsize(900, 640)
         self.ui_preview_only = platform.system() != "Windows"
         if self.ui_preview_only:
             self.root.title("비활성 창 이미지 자동화 테스트 - UI 미리보기")
@@ -862,7 +862,7 @@ class AutomationApp:
 
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
-            height=18,
+            height=22,
             wrap=tk.WORD,
             state=tk.DISABLED,
             bg=input_bg,
@@ -870,6 +870,7 @@ class AutomationApp:
             insertbackground=text_color,
             relief=tk.SOLID,
             bd=1,
+            font=("Consolas", 10),
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
@@ -958,16 +959,25 @@ class AutomationApp:
         self.preview_threshold_button.pack(fill=tk.X, pady=(0, 12))
 
         self.preview_log_messages: list[str] = []
-        self.preview_log_var = tk.StringVar(value="로그가 여기에 표시됩니다.")
-        self.log_text = tk.Button(
+        self.preview_log_frame = tk.Frame(
             main_frame,
-            textvariable=self.preview_log_var,
-            anchor=tk.NW,
-            justify=tk.LEFT,
             relief=tk.GROOVE,
-            height=16,
+            bd=2,
         )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.preview_log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_log_rows: list[tk.Button] = []
+        for _index in range(12):
+            row = tk.Button(
+                self.preview_log_frame,
+                text="",
+                anchor=tk.W,
+                justify=tk.LEFT,
+                relief=tk.FLAT,
+                height=1,
+            )
+            row.pack(fill=tk.X, padx=6, pady=1)
+            self.preview_log_rows.append(row)
 
     def _bind_shortcuts(self) -> None:
         """UI가 활성화되어 있을 때 동작하는 단축키를 등록합니다."""
@@ -1270,7 +1280,9 @@ class AutomationApp:
                 return None
 
             self.queue_log(f"[캡처 성공] 화면 영역 x={x}, y={y}, w={width}, h={height}")
-            return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+            screen_gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+            cv2.imwrite(str(Path(__file__).resolve().parent / "debug_capture.png"), screen_gray)
+            return screen_gray
         except Exception as exc:
             self.queue_log(f"[캡처 오류] 화면 영역 캡처 중 문제가 발생했습니다: {exc}")
             return None
@@ -1369,10 +1381,13 @@ class AutomationApp:
         timestamp = time.strftime("%H:%M:%S")
         line = f"{timestamp} {message}\n"
 
-        if hasattr(self, "preview_log_var"):
+        if hasattr(self, "preview_log_rows"):
             self.preview_log_messages.append(line.rstrip())
             self.preview_log_messages = self.preview_log_messages[-12:]
-            self.preview_log_var.set("\n".join(self.preview_log_messages))
+            empty_count = 12 - len(self.preview_log_messages)
+            visible_lines = [""] * empty_count + self.preview_log_messages
+            for row, text in zip(self.preview_log_rows, visible_lines):
+                row.configure(text=text)
             return
 
         self.log_text.configure(state=tk.NORMAL)
