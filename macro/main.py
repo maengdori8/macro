@@ -14,6 +14,7 @@ Windows inactive-window image matching and click GUI example.
 
 from __future__ import annotations
 
+import ctypes
 import platform
 import queue
 import random
@@ -82,6 +83,9 @@ CLICK_JITTER_PIXELS = 3
 # WM_LBUTTONDOWN과 WM_LBUTTONUP 사이의 짧은 지연입니다.
 CLICK_MESSAGE_DELAY_SECONDS = 0.05
 
+# 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
+MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
+
 # 화면 영역 캡처 모드의 기본 영역입니다.
 DEFAULT_REGION_X = 0
 DEFAULT_REGION_Y = 0
@@ -89,6 +93,120 @@ DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
 LogCallback = Callable[[str], None]
+
+
+def _make_mouse_lparam(x: int, y: int) -> int:
+    """Windows 마우스 메시지 lParam을 클라이언트 좌표로 만듭니다."""
+
+    x = int(x)
+    y = int(y)
+    if win32api is not None and hasattr(win32api, "MAKELONG"):
+        return int(win32api.MAKELONG(x, y))
+
+    return (y & 0xFFFF) << 16 | (x & 0xFFFF)
+
+
+def _send_mouse_message(
+    hwnd: int,
+    message: int,
+    wparam: int,
+    x: int,
+    y: int,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """PostMessage 또는 SendMessage로 대상 HWND에 마우스 메시지를 보냅니다."""
+
+    if win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    if not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"유효하지 않은 HWND입니다: {hwnd}")
+
+    lparam = _make_mouse_lparam(x, y)
+    if use_send_message:
+        win32gui.SendMessage(hwnd, message, wparam, lparam)
+    else:
+        win32gui.PostMessage(hwnd, message, wparam, lparam)
+    return True
+
+
+def post_mouse_move(
+    hwnd: int,
+    x: int,
+    y: int,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창의 클라이언트 영역 좌표로 WM_MOUSEMOVE를 보냅니다."""
+
+    return _send_mouse_message(
+        hwnd,
+        win32con.WM_MOUSEMOVE,
+        0,
+        x,
+        y,
+        use_send_message=use_send_message,
+    )
+
+
+def post_mouse_down(
+    hwnd: int,
+    x: int,
+    y: int,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창의 클라이언트 영역 좌표로 마우스 왼쪽 버튼 Down을 보냅니다."""
+
+    return _send_mouse_message(
+        hwnd,
+        win32con.WM_LBUTTONDOWN,
+        win32con.MK_LBUTTON,
+        x,
+        y,
+        use_send_message=use_send_message,
+    )
+
+
+def post_mouse_up(
+    hwnd: int,
+    x: int,
+    y: int,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창의 클라이언트 영역 좌표로 마우스 왼쪽 버튼 Up을 보냅니다."""
+
+    return _send_mouse_message(
+        hwnd,
+        win32con.WM_LBUTTONUP,
+        0,
+        x,
+        y,
+        use_send_message=use_send_message,
+    )
+
+
+def post_mouse_click(
+    hwnd: int,
+    x: int,
+    y: int,
+    *,
+    use_send_message: bool = False,
+    hover_delay: float = MOUSE_HOVER_BEFORE_CLICK_SECONDS,
+    down_up_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
+) -> bool:
+    """대상 HWND의 클라이언트 좌표를 왼쪽 클릭합니다."""
+
+    post_mouse_move(hwnd, x, y, use_send_message=use_send_message)
+    if hover_delay > 0:
+        time.sleep(hover_delay)
+
+    post_mouse_down(hwnd, x, y, use_send_message=use_send_message)
+    if down_up_delay > 0:
+        time.sleep(down_up_delay)
+    post_mouse_up(hwnd, x, y, use_send_message=use_send_message)
+    return True
 
 
 @dataclass
@@ -234,6 +352,15 @@ class WGCCaptureEngine:
             if self.latest_frame is None:
                 return None
             return self.latest_frame.copy()
+
+    def get_frame_size(self) -> Optional[tuple[int, int]]:
+        """최신 WGC 프레임의 (width, height)를 반환합니다."""
+
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            height, width = self.latest_frame.shape[:2]
+            return int(width), int(height)
 
     def stop_capture(self) -> None:
         """실행 중인 WGC 세션을 안전하게 중지합니다."""
@@ -463,36 +590,219 @@ class InactiveManager:
         self.last_capture_wait_log_time = now
         self.log(message)
 
-    def post_click(self, x: int, y: int) -> bool:
+    def wgc_to_client(self, x: int, y: int) -> Optional[tuple[int, int]]:
+        """
+        WGC 프레임 기준 좌표를 PostMessage가 요구하는 클라이언트 좌표로 변환합니다.
+
+        WGC가 클라이언트 영역만 캡처하는 환경이면 좌표를 그대로 사용합니다.
+        WGC가 제목 표시줄/테두리를 포함한 전체 창을 캡처하면, 캡처 원점과
+        ClientToScreen(0, 0)의 차이를 빼서 정확한 클라이언트 좌표를 계산합니다.
+        """
+
+        if not self.is_valid_window():
+            return None
+        if self.hwnd is None:
+            return None
+
+        x = int(x)
+        y = int(y)
+
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            client_width = int(right - left)
+            client_height = int(bottom - top)
+            frame_size = (
+                self.capture_engine.get_frame_size()
+                if self.capture_engine is not None
+                else None
+            )
+
+            if frame_size is None or self._same_size(frame_size, (client_width, client_height)):
+                return x, y
+
+            client_screen_x, client_screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
+            capture_origin = self._get_wgc_capture_origin(frame_size)
+            if capture_origin is None:
+                self._log_capture_wait(
+                    "[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다."
+                )
+                return x, y
+
+            origin_x, origin_y = capture_origin
+            client_x = int(round(x + origin_x - client_screen_x))
+            client_y = int(round(y + origin_y - client_screen_y))
+
+            if not (0 <= client_x < client_width and 0 <= client_y < client_height):
+                self.log(
+                    f"[좌표 경고] WGC=({x}, {y}) -> client=({client_x}, {client_y})가 "
+                    f"클라이언트 영역 {client_width}x{client_height} 밖입니다."
+                )
+                return None
+
+            if (client_x, client_y) != (x, y):
+                self.log(
+                    f"[좌표 보정] WGC=({x}, {y}) -> client=({client_x}, {client_y})"
+                )
+            return client_x, client_y
+        except Exception as exc:
+            self.log(f"[좌표 오류] WGC 좌표를 클라이언트 좌표로 변환하지 못했습니다: {exc}")
+            return None
+
+    def _get_wgc_capture_origin(
+        self,
+        frame_size: Optional[tuple[int, int]],
+    ) -> Optional[tuple[int, int]]:
+        """WGC 프레임의 화면 기준 좌상단 원점을 추정합니다."""
+
+        if self.hwnd is None:
+            return None
+
+        extended_frame = self._get_extended_frame_bounds()
+        window_rect = win32gui.GetWindowRect(self.hwnd)
+
+        if frame_size is not None:
+            if extended_frame is not None:
+                ext_left, ext_top, ext_right, ext_bottom = extended_frame
+                ext_size = (int(ext_right - ext_left), int(ext_bottom - ext_top))
+                if self._same_size(frame_size, ext_size):
+                    return int(ext_left), int(ext_top)
+
+            win_left, win_top, win_right, win_bottom = window_rect
+            window_size = (int(win_right - win_left), int(win_bottom - win_top))
+            if self._same_size(frame_size, window_size):
+                return int(win_left), int(win_top)
+
+        if extended_frame is not None:
+            return int(extended_frame[0]), int(extended_frame[1])
+
+        return int(window_rect[0]), int(window_rect[1])
+
+    def _get_extended_frame_bounds(self) -> Optional[tuple[int, int, int, int]]:
+        """DWM 확장 프레임 bounds를 반환합니다. 실패하면 None을 반환합니다."""
+
+        if self.hwnd is None or not hasattr(ctypes, "windll"):
+            return None
+
+        try:
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(int(self.hwnd)),
+                ctypes.c_uint(9),  # DWMWA_EXTENDED_FRAME_BOUNDS
+                ctypes.byref(rect),
+                ctypes.sizeof(rect),
+            )
+            if result != 0:
+                return None
+            return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        except Exception:
+            return None
+
+    def _same_size(
+        self,
+        first: tuple[int, int],
+        second: tuple[int, int],
+        tolerance: int = 2,
+    ) -> bool:
+        """DPI 반올림 차이를 감안해 두 크기가 거의 같은지 확인합니다."""
+
+        return (
+            abs(int(first[0]) - int(second[0])) <= tolerance
+            and abs(int(first[1]) - int(second[1])) <= tolerance
+        )
+
+    def post_mouse_down(
+        self,
+        x: int,
+        y: int,
+        *,
+        use_send_message: bool = False,
+    ) -> bool:
+        """WGC 프레임 좌표를 보정한 뒤 왼쪽 버튼 Down 메시지를 보냅니다."""
+
+        if not self.is_valid_window() or self.hwnd is None:
+            return False
+
+        client_point = self.wgc_to_client(x, y)
+        if client_point is None:
+            return False
+
+        client_x, client_y = client_point
+        try:
+            self.log(f"[클릭 Down] HWND={self.hwnd}, client=({client_x}, {client_y})")
+            return post_mouse_down(
+                self.hwnd,
+                client_x,
+                client_y,
+                use_send_message=use_send_message,
+            )
+        except Exception as exc:
+            self.log(f"[오류] 마우스 Down 메시지 전송 중 문제가 발생했습니다: {exc}")
+            return False
+
+    def post_mouse_up(
+        self,
+        x: int,
+        y: int,
+        *,
+        use_send_message: bool = False,
+    ) -> bool:
+        """WGC 프레임 좌표를 보정한 뒤 왼쪽 버튼 Up 메시지를 보냅니다."""
+
+        if not self.is_valid_window() or self.hwnd is None:
+            return False
+
+        client_point = self.wgc_to_client(x, y)
+        if client_point is None:
+            return False
+
+        client_x, client_y = client_point
+        try:
+            self.log(f"[클릭 Up] HWND={self.hwnd}, client=({client_x}, {client_y})")
+            return post_mouse_up(
+                self.hwnd,
+                client_x,
+                client_y,
+                use_send_message=use_send_message,
+            )
+        except Exception as exc:
+            self.log(f"[오류] 마우스 Up 메시지 전송 중 문제가 발생했습니다: {exc}")
+            return False
+
+    def post_click(
+        self,
+        x: int,
+        y: int,
+        *,
+        use_send_message: bool = False,
+    ) -> bool:
         """
         실제 마우스 커서를 움직이지 않고 대상 창에 클릭 메시지를 보냅니다.
 
-        좌표는 캡처된 클라이언트 영역 기준입니다.
+        좌표는 WGC 캡처 프레임 기준이며, 내부에서 클라이언트 좌표로 보정합니다.
         일부 프로그램은 보안 정책, 자체 입력 처리 방식, DirectX/게임 렌더링 구조 때문에
         PostMessage 기반 클릭을 무시할 수 있습니다.
         """
 
-        if not self.is_valid_window():
+        if not self.is_valid_window() or self.hwnd is None:
             return False
 
-        try:
-            x = int(x)
-            y = int(y)
-            lparam = self._make_lparam(x, y)
+        client_point = self.wgc_to_client(x, y)
+        if client_point is None:
+            return False
 
-            self.log(f"[클릭 전송] HWND={self.hwnd}, client=({x}, {y})")
-            win32gui.PostMessage(
-                self.hwnd,
-                win32con.WM_LBUTTONDOWN,
-                win32con.MK_LBUTTON,
-                lparam,
+        client_x, client_y = client_point
+        try:
+            self.log(
+                f"[클릭 전송] HWND={self.hwnd}, client=({client_x}, {client_y}), "
+                f"hover={MOUSE_HOVER_BEFORE_CLICK_SECONDS:.2f}s"
             )
-            time.sleep(CLICK_MESSAGE_DELAY_SECONDS)
-            win32gui.PostMessage(
+            post_mouse_click(
                 self.hwnd,
-                win32con.WM_LBUTTONUP,
-                0,
-                lparam,
+                client_x,
+                client_y,
+                use_send_message=use_send_message,
             )
             self.log("[클릭 완료] WM_LBUTTONDOWN / WM_LBUTTONUP 메시지를 보냈습니다.")
             return True
@@ -526,10 +836,7 @@ class InactiveManager:
         win32api.MAKELONG이 있으면 사용하고, 없으면 동일한 방식으로 직접 구성합니다.
         """
 
-        if hasattr(win32api, "MAKELONG"):
-            return int(win32api.MAKELONG(x, y))
-
-        return (y & 0xFFFF) << 16 | (x & 0xFFFF)
+        return _make_mouse_lparam(x, y)
 
 
 class AutomationApp:
@@ -1359,7 +1666,7 @@ class AutomationApp:
 
             # 입력 렉과 포커스 흔들림을 줄이기 위해 순간이동 대신 짧은 고정 시간으로 이동합니다.
             pyautogui.moveTo(screen_x, screen_y, duration=0.15)
-            time.sleep(0.05)
+            time.sleep(MOUSE_HOVER_BEFORE_CLICK_SECONDS)
 
             pyautogui.click()
             time.sleep(0.05)
