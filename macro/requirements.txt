@@ -1,5 +1,4 @@
 pywin32; platform_system == "Windows"
-windows-capture; platform_system == "Windows"
 opencv-python
 numpy
 pyautogui
