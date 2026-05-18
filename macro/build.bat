@@ -6,7 +6,7 @@ echo 패키지 설치 중...
 python -m pip install pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow >nul 2>&1
 
 echo 빌드 중...
-python -m PyInstaller --onefile --noconsole --name macro main.py
+python -m PyInstaller --onefile --noconsole --uac-admin --name macro main.py
 
 if exist "dist\macro.exe" (
     echo.
