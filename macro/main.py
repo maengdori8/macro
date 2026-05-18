@@ -172,9 +172,83 @@ def _virtual_key_from_key(key: str) -> int:
     if normalized in special_keys:
         return special_keys[normalized]
 
-    if len(key) != 1:
+    if len(normalized) != 1:
         raise ValueError(f"지원하지 않는 키입니다: {key!r}")
-    return ord(key.upper())
+    return ord(normalized.upper())
+
+
+def _char_code_from_key(key: str) -> Optional[int]:
+    """필요할 때 함께 보낼 WM_CHAR wParam 값을 반환합니다."""
+
+    normalized = key.strip().lower()
+    if normalized in ("esc", "escape"):
+        return 0x1B
+    return None
+
+
+def _is_child_or_same(parent_hwnd: int, child_hwnd: int) -> bool:
+    """child_hwnd가 parent_hwnd 자신이거나 그 자식 창인지 확인합니다."""
+
+    if int(parent_hwnd) == int(child_hwnd):
+        return True
+    if win32gui is None:
+        return False
+    try:
+        return bool(win32gui.IsChild(int(parent_hwnd), int(child_hwnd)))
+    except Exception:
+        return False
+
+
+def _get_thread_focus_hwnd(hwnd: int) -> Optional[int]:
+    """대상 창 스레드의 포커스 HWND를 가져옵니다."""
+
+    if win32gui is None or not hasattr(ctypes, "windll"):
+        return None
+
+    try:
+        from ctypes import wintypes
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        thread_id = ctypes.windll.user32.GetWindowThreadProcessId(
+            wintypes.HWND(int(hwnd)),
+            None,
+        )
+        if not thread_id:
+            return None
+
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if not ctypes.windll.user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+            return None
+
+        focus_hwnd = int(info.hwndFocus or 0)
+        if focus_hwnd and win32gui.IsWindow(focus_hwnd) and _is_child_or_same(hwnd, focus_hwnd):
+            return focus_hwnd
+    except Exception:
+        return None
+
+    return None
+
+
+def _get_keyboard_target_hwnd(hwnd: int) -> int:
+    """키 메시지를 보낼 대상 HWND를 고릅니다."""
+
+    focus_hwnd = _get_thread_focus_hwnd(hwnd)
+    if focus_hwnd is not None:
+        return focus_hwnd
+    return int(hwnd)
 
 
 def _send_keyboard_message(
@@ -237,19 +311,49 @@ def post_key_up(
     )
 
 
+def post_key_char(
+    hwnd: int,
+    key: str,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창에 필요한 경우 WM_CHAR를 보냅니다."""
+
+    char_code = _char_code_from_key(key)
+    if char_code is None:
+        return False
+
+    constants = _require_win32con()
+    vk_code = _virtual_key_from_key(key)
+    return _send_keyboard_message(
+        hwnd,
+        constants.WM_CHAR,
+        char_code,
+        _make_key_lparam(vk_code, key_up=False),
+        use_send_message=use_send_message,
+    )
+
+
 def post_key_press(
     hwnd: int,
     key: str,
     *,
     press_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
     use_send_message: bool = False,
+    logger: Optional[LogCallback] = None,
 ) -> bool:
     """실제 키보드 입력 없이 대상 HWND에 키 Down/Up 메시지를 보냅니다."""
 
-    post_key_down(hwnd, key, use_send_message=use_send_message)
+    log = logger or print
+    target_hwnd = _get_keyboard_target_hwnd(hwnd)
+    if target_hwnd != int(hwnd):
+        log(f"[키 대상] top_hwnd={hwnd}, focus_hwnd={target_hwnd}")
+
+    post_key_down(target_hwnd, key, use_send_message=use_send_message)
+    post_key_char(target_hwnd, key, use_send_message=use_send_message)
     if press_delay > 0:
         time.sleep(press_delay)
-    post_key_up(hwnd, key, use_send_message=use_send_message)
+    post_key_up(target_hwnd, key, use_send_message=use_send_message)
     return True
 
 
@@ -1155,6 +1259,7 @@ class InactiveManager:
                 self.hwnd,
                 key,
                 use_send_message=use_send_message,
+                logger=self.log,
             )
             self.log(f"[키 완료] WM_KEYDOWN / WM_KEYUP: {key.upper()}")
             return True
