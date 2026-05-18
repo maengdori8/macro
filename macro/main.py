@@ -4,7 +4,7 @@ Windows inactive-window image matching and click GUI example.
 목적:
 - tkinter UI에서 대상 창 제목을 입력하고 자동화를 시작/중지합니다.
 - Windows Graphics Capture로 대상 창이 다른 창 뒤에 가려져 있어도 캡처합니다.
-- OpenCV 템플릿 매칭으로 target_A/B/C/D/E.png를 찾습니다.
+- OpenCV 템플릿 매칭으로 target_A/B/C/D/E/F.png를 찾습니다.
 - 실제 마우스 커서를 움직이지 않고 PostMessage로 클릭 메시지를 보냅니다.
 주의:
 - 최소화된 창은 지원하지 않습니다.
@@ -100,7 +100,7 @@ DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
-TARGET_NAMES = ("target_A", "target_B", "target_C", "target_D", "target_E")
+TARGET_NAMES = ("target_A", "target_B", "target_C", "target_D", "target_E", "target_F")
 
 LogCallback = Callable[[str], None]
 
@@ -162,10 +162,18 @@ def _make_key_lparam(vk_code: int, *, key_up: bool = False) -> int:
 
 
 def _virtual_key_from_key(key: str) -> int:
-    """단일 문자 키를 Windows virtual-key 코드로 변환합니다."""
+    """키 이름을 Windows virtual-key 코드로 변환합니다."""
+
+    normalized = key.strip().lower()
+    special_keys = {
+        "esc": 0x1B,
+        "escape": 0x1B,
+    }
+    if normalized in special_keys:
+        return special_keys[normalized]
 
     if len(key) != 1:
-        raise ValueError(f"단일 문자 키만 지원합니다: {key!r}")
+        raise ValueError(f"지원하지 않는 키입니다: {key!r}")
     return ord(key.upper())
 
 
@@ -1896,7 +1904,7 @@ class AutomationApp:
 
                 found_any = False
 
-                # 요구사항대로 target_A -> target_E 순서로 탐지합니다.
+                # 요구사항대로 target_A -> target_F 순서로 탐지합니다.
                 for target in targets:
                     if self.stop_event.is_set():
                         break
@@ -2202,7 +2210,7 @@ def load_targets(
     base_dir: Path,
     logger: Optional[LogCallback] = None,
 ) -> Optional[list[TargetImage]]:
-    """target_A/B/C/D/E.png를 GrayScale 이미지로 미리 로드합니다."""
+    """target_A/B/C/D/E/F.png를 GrayScale 이미지로 미리 로드합니다."""
 
     log = logger or print
     targets = [
@@ -2216,6 +2224,13 @@ def load_targets(
             wait_after_click=0.0,
             action="key",
             key="s",
+        ),
+        TargetImage(
+            name="target_F",
+            filename="target_F.png",
+            wait_after_click=0.0,
+            action="key",
+            key="esc",
         ),
     ]
 
