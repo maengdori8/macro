@@ -122,7 +122,7 @@ DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
 APP_VERSION = "1.0.0"
-VERSION_CHECK_URL = "https://macro-license.vercel.app/api/version"
+VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
 
 LICENSE_SECRET_KEY = b"macro-automation-license-key-2026-xK9mP2vL"
 LICENSE_FILE = "license.key"
@@ -223,7 +223,7 @@ def format_remaining_time(seconds: int) -> str:
     return f"{minutes}분 남음"
 
 
-VERIFY_SERVER_URL = "https://macro-license.vercel.app/api/verify"
+VERIFY_SERVER_URL = "https://license-server-flame-eta.vercel.app/api/verify"
 
 
 def get_hwid() -> str:
