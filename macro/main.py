@@ -30,6 +30,15 @@ import cv2
 import numpy as np
 
 try:
+    import pyautogui
+except ImportError as exc:
+    pyautogui = None
+    PYAUTOGUI_IMPORT_ERROR = exc
+else:
+    PYAUTOGUI_IMPORT_ERROR = None
+    pyautogui.FAILSAFE = True
+
+try:
     # pywin32는 Windows 전용 패키지입니다.
     # Mac 개발 환경에서는 설치되지 않는 것이 정상이라 Pylance 경고만 무시합니다.
     import win32api  # type: ignore[reportMissingModuleSource]
@@ -62,6 +71,12 @@ CLICK_JITTER_PIXELS = 3
 
 # WM_LBUTTONDOWN과 WM_LBUTTONUP 사이의 짧은 지연입니다.
 CLICK_MESSAGE_DELAY_SECONDS = 0.05
+
+# 화면 영역 캡처 모드의 기본 영역입니다.
+DEFAULT_REGION_X = 0
+DEFAULT_REGION_Y = 0
+DEFAULT_REGION_WIDTH = 1280
+DEFAULT_REGION_HEIGHT = 720
 
 LogCallback = Callable[[str], None]
 
@@ -379,6 +394,19 @@ class InactiveManager:
             self.log(f"[오류] 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
             return False
 
+    def client_to_screen(self, x: int, y: int) -> Optional[tuple[int, int]]:
+        """클라이언트 영역 기준 좌표를 화면 절대 좌표로 변환합니다."""
+
+        if not self.is_valid_window():
+            return None
+
+        try:
+            screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (int(x), int(y)))
+            return int(screen_x), int(screen_y)
+        except Exception as exc:
+            self.log(f"[오류] 클라이언트 좌표를 화면 좌표로 변환하지 못했습니다: {exc}")
+            return None
+
     def _win32_ready(self) -> bool:
         """pywin32 모듈이 정상 로드되었는지 확인합니다."""
 
@@ -519,6 +547,14 @@ class AutomationApp:
             name: tk.StringVar(value=f"{value:.2f}")
             for name, value in self.threshold_values.items()
         }
+        self.capture_mode_var = tk.StringVar(value="printwindow")
+        self.click_mode_var = tk.StringVar(value="postmessage")
+        self.region_vars = {
+            "x": tk.IntVar(value=DEFAULT_REGION_X),
+            "y": tk.IntVar(value=DEFAULT_REGION_Y),
+            "width": tk.IntVar(value=DEFAULT_REGION_WIDTH),
+            "height": tk.IntVar(value=DEFAULT_REGION_HEIGHT),
+        }
 
         self.stop_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
@@ -634,6 +670,120 @@ class AutomationApp:
             fg=accent,
         )
         self.status_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        mode_frame = tk.Frame(
+            main_frame,
+            bg=panel_bg,
+            padx=8,
+            pady=8,
+            relief=tk.SOLID,
+            bd=1,
+        )
+        mode_frame.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Label(
+            mode_frame,
+            text="캡처/클릭 모드",
+            bg=panel_bg,
+            fg=accent,
+            font=("Arial", 12, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        capture_row = tk.Frame(mode_frame, bg=panel_bg)
+        capture_row.pack(fill=tk.X, pady=2)
+        tk.Label(
+            capture_row,
+            text="캡처",
+            bg=panel_bg,
+            fg=text_color,
+            width=10,
+            anchor=tk.W,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            capture_row,
+            text="비활성 PrintWindow",
+            variable=self.capture_mode_var,
+            value="printwindow",
+            command=self.on_capture_mode_changed,
+            bg=panel_bg,
+            fg=text_color,
+            selectcolor=input_bg,
+            activebackground=panel_bg,
+            activeforeground=text_color,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            capture_row,
+            text="화면 영역 캡처",
+            variable=self.capture_mode_var,
+            value="region",
+            command=self.on_capture_mode_changed,
+            bg=panel_bg,
+            fg=text_color,
+            selectcolor=input_bg,
+            activebackground=panel_bg,
+            activeforeground=text_color,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        click_row = tk.Frame(mode_frame, bg=panel_bg)
+        click_row.pack(fill=tk.X, pady=2)
+        tk.Label(
+            click_row,
+            text="클릭",
+            bg=panel_bg,
+            fg=text_color,
+            width=10,
+            anchor=tk.W,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            click_row,
+            text="PostMessage",
+            variable=self.click_mode_var,
+            value="postmessage",
+            bg=panel_bg,
+            fg=text_color,
+            selectcolor=input_bg,
+            activebackground=panel_bg,
+            activeforeground=text_color,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            click_row,
+            text="마우스 이동 후 복귀",
+            variable=self.click_mode_var,
+            value="mouse",
+            bg=panel_bg,
+            fg=text_color,
+            selectcolor=input_bg,
+            activebackground=panel_bg,
+            activeforeground=text_color,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        region_row = tk.Frame(mode_frame, bg=panel_bg)
+        region_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(
+            region_row,
+            text="영역",
+            bg=panel_bg,
+            fg=text_color,
+            width=10,
+            anchor=tk.W,
+        ).pack(side=tk.LEFT)
+        for key, label in (
+            ("x", "X"),
+            ("y", "Y"),
+            ("width", "W"),
+            ("height", "H"),
+        ):
+            tk.Label(region_row, text=label, bg=panel_bg, fg=text_color).pack(side=tk.LEFT)
+            tk.Entry(
+                region_row,
+                textvariable=self.region_vars[key],
+                width=7,
+                bg=input_bg,
+                fg=text_color,
+                insertbackground=text_color,
+                relief=tk.SOLID,
+                bd=1,
+            ).pack(side=tk.LEFT, padx=(4, 10))
 
         threshold_frame = tk.Frame(
             main_frame,
@@ -777,6 +927,22 @@ class AutomationApp:
         )
         self.status_label.pack(fill=tk.X, pady=(0, 12))
 
+        mode_text = (
+            f"캡처 모드: {self.capture_mode_var.get()}\n"
+            f"클릭 모드: {self.click_mode_var.get()}\n"
+            f"영역: {DEFAULT_REGION_X}, {DEFAULT_REGION_Y}, "
+            f"{DEFAULT_REGION_WIDTH}, {DEFAULT_REGION_HEIGHT}"
+        )
+        self.preview_mode_button = tk.Button(
+            main_frame,
+            text=mode_text,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            relief=tk.GROOVE,
+            height=3,
+        )
+        self.preview_mode_button.pack(fill=tk.X, pady=(0, 12))
+
         threshold_text = "\n".join(
             f"{name} 임계값: {self.get_threshold(name):.2f}"
             for name in ("target_A", "target_B", "target_C")
@@ -816,6 +982,31 @@ class AutomationApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def on_capture_mode_changed(self) -> None:
+        """화면 영역 캡처 모드에서는 기본 클릭 방식을 마우스 이동/복귀로 맞춥니다."""
+
+        if self.capture_mode_var.get() == "region":
+            self.click_mode_var.set("mouse")
+            self.log("[설정] 화면 영역 캡처 모드에서는 마우스 이동 후 복귀 클릭을 사용합니다.")
+
+    def get_region_from_ui(self) -> Optional[tuple[int, int, int, int]]:
+        """UI의 영역 입력값을 안전하게 읽습니다."""
+
+        try:
+            x = int(self.region_vars["x"].get())
+            y = int(self.region_vars["y"].get())
+            width = int(self.region_vars["width"].get())
+            height = int(self.region_vars["height"].get())
+        except Exception as exc:
+            self.log(f"[오류] 화면 영역 값이 올바른 숫자가 아닙니다: {exc}")
+            return None
+
+        if width <= 0 or height <= 0:
+            self.log("[오류] 화면 영역의 W/H는 1 이상이어야 합니다.")
+            return None
+
+        return x, y, width, height
+
     def start_automation(self) -> None:
         """시작 버튼 또는 F8 키로 자동화 스레드를 시작합니다."""
 
@@ -831,8 +1022,19 @@ class AutomationApp:
             self.set_status("실행 중")
             return
 
+        capture_mode = self.capture_mode_var.get()
+        click_mode = self.click_mode_var.get()
+        region = self.get_region_from_ui()
+        if region is None:
+            self.set_status("오류 발생")
+            return
+
+        if capture_mode == "region":
+            click_mode = "mouse"
+            self.click_mode_var.set("mouse")
+
         window_title = self.window_title_var.get().strip()
-        if not window_title:
+        if capture_mode == "printwindow" and not window_title:
             self.log("[오류] 대상 창 제목을 입력하세요.")
             self.set_status("오류 발생")
             return
@@ -840,11 +1042,14 @@ class AutomationApp:
         self.stop_event.clear()
         self._set_button_state(running=True)
         self.set_status("실행 중")
-        self.log(f"[시작] 자동화를 시작합니다. 대상 창 제목='{window_title}'")
+        self.log(
+            f"[시작] 자동화를 시작합니다. "
+            f"캡처={capture_mode}, 클릭={click_mode}, 영역={region}, 창='{window_title}'"
+        )
 
         self.worker_thread = threading.Thread(
             target=self._automation_loop,
-            args=(window_title,),
+            args=(window_title, capture_mode, click_mode, region),
             daemon=True,
         )
         self.worker_thread.start()
@@ -910,7 +1115,13 @@ class AutomationApp:
             return
         self.root.destroy()
 
-    def _automation_loop(self, window_title: str) -> None:
+    def _automation_loop(
+        self,
+        window_title: str,
+        capture_mode: str,
+        click_mode: str,
+        region: tuple[int, int, int, int],
+    ) -> None:
         """
         실제 자동화 루프입니다.
 
@@ -927,12 +1138,14 @@ class AutomationApp:
                 self.queue_log("[종료] 타겟 이미지 준비에 실패하여 실행을 중단합니다.")
                 return
 
-            manager = InactiveManager(window_title, logger=self.queue_log)
+            manager: Optional[InactiveManager] = None
+            if capture_mode == "printwindow" or click_mode == "postmessage":
+                manager = InactiveManager(window_title, logger=self.queue_log)
 
             while not self.stop_event.is_set():
                 self.apply_current_thresholds(targets)
 
-                if not manager.is_valid_window():
+                if capture_mode == "printwindow" and manager is not None and not manager.is_valid_window():
                     self.queue_status("대상 창 검색 중")
                     manager.find_window()
 
@@ -945,7 +1158,14 @@ class AutomationApp:
                         continue
 
                 self.queue_status("실행 중")
-                screen_gray = manager.capture_client_area()
+                if capture_mode == "region":
+                    screen_gray = self.capture_screen_region(region)
+                elif manager is not None:
+                    screen_gray = manager.capture_client_area()
+                else:
+                    self.queue_log("[오류] 캡처 관리자가 준비되지 않았습니다.")
+                    screen_gray = None
+
                 if screen_gray is None:
                     self.queue_status("오류 발생")
                     self.queue_log(f"[대기] 캡처 실패로 {LOOP_SLEEP_SECONDS}초 후 다시 시도합니다.")
@@ -971,13 +1191,13 @@ class AutomationApp:
                         f"[감지] {target.name} "
                         f"(점수: {score:.3f}, 위치: {base_x}, {base_y})"
                     )
-                    if (x   , y) != (base_x, base_y):
+                    if (x, y) != (base_x, base_y):
                         self.queue_log(
                             f"[클릭 좌표] {target.name} "
                             f"(기준: {base_x}, {base_y}, 보정: {x}, {y})"
                         )
 
-                    if manager.post_click(x, y):
+                    if self.dispatch_click(manager, click_mode, capture_mode, region, x, y):
                         self.queue_status("클릭 완료")
                         self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
                         self.interruptible_sleep(target.wait_after_click)
@@ -1022,6 +1242,109 @@ class AutomationApp:
         jitter_y = random.randint(-max_y_jitter, max_y_jitter)
 
         return center_x + jitter_x, center_y + jitter_y
+
+    def capture_screen_region(self, region: tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """
+        화면의 지정 영역만 캡처해서 GrayScale NumPy 배열로 반환합니다.
+
+        이 모드는 대상 창이 실제 화면에 보이는 상태일 때 사용하는 현실적 타협 모드입니다.
+        PrintWindow와 달리 전체 화면 캡처에서 영역을 잘라오기 때문에 렌더링 호환성이 높지만,
+        창이 다른 창에 가려지면 가려진 화면 그대로 캡처됩니다.
+        """
+
+        if pyautogui is None:
+            self.queue_log("[오류] pyautogui를 불러올 수 없어 화면 영역 캡처를 사용할 수 없습니다.")
+            self.queue_log(f"       원본 오류: {PYAUTOGUI_IMPORT_ERROR}")
+            return None
+
+        x, y, width, height = region
+        try:
+            screenshot = pyautogui.screenshot(region=(x, y, width, height))
+            image_rgb = np.array(screenshot)
+            if image_rgb.size == 0:
+                self.queue_log("[캡처 오류] 화면 영역 캡처 결과가 비어 있습니다.")
+                return None
+
+            if np.all(image_rgb == 0):
+                self.queue_log("[캡처 오류] 화면 영역 캡처 결과가 완전히 검은색입니다.")
+                return None
+
+            self.queue_log(f"[캡처 성공] 화면 영역 x={x}, y={y}, w={width}, h={height}")
+            return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        except Exception as exc:
+            self.queue_log(f"[캡처 오류] 화면 영역 캡처 중 문제가 발생했습니다: {exc}")
+            return None
+
+    def dispatch_click(
+        self,
+        manager: Optional[InactiveManager],
+        click_mode: str,
+        capture_mode: str,
+        region: tuple[int, int, int, int],
+        x: int,
+        y: int,
+    ) -> bool:
+        """선택된 클릭 모드에 따라 클릭을 전송합니다."""
+
+        if click_mode == "postmessage":
+            if manager is None:
+                self.queue_log("[오류] PostMessage 클릭에는 대상 창 HWND가 필요합니다.")
+                return False
+            return manager.post_click(x, y)
+
+        if capture_mode == "region":
+            screen_x = region[0] + x
+            screen_y = region[1] + y
+            return self.click_mouse_and_return(screen_x, screen_y)
+
+        if manager is None:
+            self.queue_log("[오류] 마우스 클릭 좌표 변환에 대상 창 정보가 없습니다.")
+            return False
+
+        screen_point = manager.client_to_screen(x, y)
+        if screen_point is None:
+            return False
+
+        screen_x, screen_y = screen_point
+        return self.click_mouse_and_return(screen_x, screen_y)
+
+    def click_mouse_and_return(self, screen_x: int, screen_y: int) -> bool:
+        """
+        실제 마우스를 대상 위치로 부드럽게 이동해 클릭한 뒤 원래 위치로 되돌립니다.
+
+        허가된 UI 테스트 및 업무 자동화 환경에서 입력 장치 충돌을 줄이기 위한
+        안정 클릭 루틴입니다. 이 방식은 사용 중인 마우스를 잠깐 점유합니다.
+        """
+
+        if pyautogui is None:
+            self.queue_log("[오류] pyautogui를 불러올 수 없어 마우스 클릭을 사용할 수 없습니다.")
+            self.queue_log(f"       원본 오류: {PYAUTOGUI_IMPORT_ERROR}")
+            return False
+
+        try:
+            original_x, original_y = pyautogui.position()
+            self.queue_log(
+                f"[클릭 전송] 화면 좌표=({screen_x}, {screen_y}), "
+                f"복귀 좌표=({original_x}, {original_y})"
+            )
+
+            # 입력 렉과 포커스 흔들림을 줄이기 위해 순간이동 대신 짧은 고정 시간으로 이동합니다.
+            pyautogui.moveTo(screen_x, screen_y, duration=0.15)
+            time.sleep(0.05)
+
+            pyautogui.click()
+            time.sleep(0.05)
+
+            # 사용자의 원래 작업 위치를 최대한 보존합니다.
+            pyautogui.moveTo(original_x, original_y, duration=0.15)
+            self.queue_log("[클릭 완료] 마우스 클릭 후 원래 위치로 복귀했습니다.")
+            return True
+        except pyautogui.FailSafeException:
+            self.queue_log("[긴급 중단] PyAutoGUI FAILSAFE가 감지되었습니다.")
+            raise
+        except Exception as exc:
+            self.queue_log(f"[오류] 마우스 클릭 중 문제가 발생했습니다: {exc}")
+            return False
 
     def interruptible_sleep(self, seconds: float) -> bool:
         """

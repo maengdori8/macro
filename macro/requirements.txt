@@ -1,3 +1,5 @@
 pywin32; platform_system == "Windows"
 opencv-python
 numpy
+pyautogui
+pillow
