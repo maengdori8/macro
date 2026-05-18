@@ -4,7 +4,7 @@ Windows inactive-window image matching and click GUI example.
 목적:
 - tkinter UI에서 대상 창 제목을 입력하고 자동화를 시작/중지합니다.
 - Windows Graphics Capture로 대상 창이 다른 창 뒤에 가려져 있어도 캡처합니다.
-- OpenCV 템플릿 매칭으로 target_A/B/C.png를 찾습니다.
+- OpenCV 템플릿 매칭으로 target_A/B/C/D/E.png를 찾습니다.
 - 실제 마우스 커서를 움직이지 않고 PostMessage로 클릭 메시지를 보냅니다.
 주의:
 - 최소화된 창은 지원하지 않습니다.
@@ -100,6 +100,8 @@ DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
+TARGET_NAMES = ("target_A", "target_B", "target_C", "target_D", "target_E")
+
 LogCallback = Callable[[str], None]
 
 
@@ -143,6 +145,103 @@ def _send_mouse_message(
         win32gui.SendMessage(hwnd, message, wparam, lparam)
     else:
         win32gui.PostMessage(hwnd, message, wparam, lparam)
+    return True
+
+
+def _make_key_lparam(vk_code: int, *, key_up: bool = False) -> int:
+    """Windows 키 메시지 lParam을 만듭니다."""
+
+    scan_code = 0
+    if win32api is not None and hasattr(win32api, "MapVirtualKey"):
+        scan_code = int(win32api.MapVirtualKey(int(vk_code), 0))
+
+    lparam = 1 | (scan_code << 16)
+    if key_up:
+        lparam |= (1 << 30) | (1 << 31)
+    return int(lparam)
+
+
+def _virtual_key_from_key(key: str) -> int:
+    """단일 문자 키를 Windows virtual-key 코드로 변환합니다."""
+
+    if len(key) != 1:
+        raise ValueError(f"단일 문자 키만 지원합니다: {key!r}")
+    return ord(key.upper())
+
+
+def _send_keyboard_message(
+    hwnd: int,
+    message: int,
+    vk_code: int,
+    lparam: int,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """PostMessage 또는 SendMessage로 대상 HWND에 키보드 메시지를 보냅니다."""
+
+    if win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    if not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"유효하지 않은 HWND입니다: {hwnd}")
+
+    if use_send_message:
+        win32gui.SendMessage(hwnd, message, int(vk_code), int(lparam))
+    else:
+        win32gui.PostMessage(hwnd, message, int(vk_code), int(lparam))
+    return True
+
+
+def post_key_down(
+    hwnd: int,
+    key: str,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창에 WM_KEYDOWN을 보냅니다."""
+
+    constants = _require_win32con()
+    vk_code = _virtual_key_from_key(key)
+    return _send_keyboard_message(
+        hwnd,
+        constants.WM_KEYDOWN,
+        vk_code,
+        _make_key_lparam(vk_code, key_up=False),
+        use_send_message=use_send_message,
+    )
+
+
+def post_key_up(
+    hwnd: int,
+    key: str,
+    *,
+    use_send_message: bool = False,
+) -> bool:
+    """대상 창에 WM_KEYUP을 보냅니다."""
+
+    constants = _require_win32con()
+    vk_code = _virtual_key_from_key(key)
+    return _send_keyboard_message(
+        hwnd,
+        constants.WM_KEYUP,
+        vk_code,
+        _make_key_lparam(vk_code, key_up=True),
+        use_send_message=use_send_message,
+    )
+
+
+def post_key_press(
+    hwnd: int,
+    key: str,
+    *,
+    press_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
+    use_send_message: bool = False,
+) -> bool:
+    """실제 키보드 입력 없이 대상 HWND에 키 Down/Up 메시지를 보냅니다."""
+
+    post_key_down(hwnd, key, use_send_message=use_send_message)
+    if press_delay > 0:
+        time.sleep(press_delay)
+    post_key_up(hwnd, key, use_send_message=use_send_message)
     return True
 
 
@@ -493,6 +592,8 @@ class TargetImage:
     filename: str
     wait_after_click: float
     threshold: float = 0.8
+    action: str = "click"
+    key: Optional[str] = None
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -1026,6 +1127,33 @@ class InactiveManager:
             self.log(f"[오류] 곡선 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
             return False
 
+    def post_key_press(
+        self,
+        key: str,
+        *,
+        use_send_message: bool = False,
+    ) -> bool:
+        """대상 창 HWND에만 PostMessage 방식 키 입력을 보냅니다."""
+
+        if not self.is_valid_window() or self.hwnd is None:
+            return False
+
+        try:
+            self.log(
+                f"[키 전송] HWND={self.hwnd}, 제목='{self.window_text}', "
+                f"key='{key.upper()}'"
+            )
+            post_key_press(
+                self.hwnd,
+                key,
+                use_send_message=use_send_message,
+            )
+            self.log(f"[키 완료] WM_KEYDOWN / WM_KEYUP: {key.upper()}")
+            return True
+        except Exception as exc:
+            self.log(f"[오류] 키 메시지 전송 중 문제가 발생했습니다: {exc}")
+            return False
+
     def post_click(
         self,
         x: int,
@@ -1113,9 +1241,8 @@ class AutomationApp:
         self.status_var = tk.StringVar(value=initial_status)
         self.threshold_lock = threading.Lock()
         self.threshold_values = {
-            "target_A": 0.8,
-            "target_B": 0.8,
-            "target_C": 0.8,
+            name: 0.8
+            for name in TARGET_NAMES
         }
         self.threshold_vars = {
             name: tk.DoubleVar(value=value)
@@ -1381,7 +1508,7 @@ class AutomationApp:
             font=("Arial", 12, "bold"),
         ).pack(anchor=tk.W, pady=(0, 6))
 
-        for name in ("target_A", "target_B", "target_C"):
+        for name in TARGET_NAMES:
             row = tk.Frame(threshold_frame, bg=panel_bg)
             row.pack(fill=tk.X, pady=2)
 
@@ -1524,7 +1651,7 @@ class AutomationApp:
 
         threshold_text = "\n".join(
             f"{name} 임계값: {self.get_threshold(name):.2f}"
-            for name in ("target_A", "target_B", "target_C")
+            for name in TARGET_NAMES
         )
         self.preview_threshold_button = tk.Button(
             main_frame,
@@ -1532,7 +1659,7 @@ class AutomationApp:
             anchor=tk.W,
             justify=tk.LEFT,
             relief=tk.GROOVE,
-            height=3,
+            height=len(TARGET_NAMES),
         )
         self.preview_threshold_button.pack(fill=tk.X, pady=(0, 12))
 
@@ -1728,13 +1855,19 @@ class AutomationApp:
                 self.queue_log("[종료] 타겟 이미지 준비에 실패하여 실행을 중단합니다.")
                 return
 
-            if capture_mode == "wgc" or click_mode == "postmessage":
+            requires_window = (
+                capture_mode == "wgc"
+                or click_mode == "postmessage"
+                or any(target.action == "key" for target in targets)
+            )
+
+            if requires_window:
                 manager = InactiveManager(window_title, logger=self.queue_log)
 
             while not self.stop_event.is_set():
                 self.apply_current_thresholds(targets)
 
-                if capture_mode == "wgc" and manager is not None and not manager.is_valid_window():
+                if requires_window and manager is not None and not manager.is_valid_window():
                     self.queue_status("대상 창 검색 중")
                     manager.find_window()
 
@@ -1763,7 +1896,7 @@ class AutomationApp:
 
                 found_any = False
 
-                # 요구사항대로 target_A -> target_B -> target_C 순서로 탐지합니다.
+                # 요구사항대로 target_A -> target_E 순서로 탐지합니다.
                 for target in targets:
                     if self.stop_event.is_set():
                         break
@@ -1786,8 +1919,20 @@ class AutomationApp:
                             f"(기준: {base_x}, {base_y}, 보정: {x}, {y})"
                         )
 
-                    if self.dispatch_click(manager, click_mode, capture_mode, region, x, y):
-                        self.queue_status("클릭 완료")
+                    if target.action == "key":
+                        action_ok = self.dispatch_key_press(manager, target)
+                    else:
+                        action_ok = self.dispatch_click(
+                            manager,
+                            click_mode,
+                            capture_mode,
+                            region,
+                            x,
+                            y,
+                        )
+
+                    if action_ok:
+                        self.queue_status("키 입력 완료" if target.action == "key" else "클릭 완료")
                         if target.wait_after_click > 0:
                             self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
                             self.interruptible_sleep(target.wait_after_click)
@@ -1868,6 +2013,23 @@ class AutomationApp:
         except Exception as exc:
             self.queue_log(f"[캡처 오류] 화면 영역 캡처 중 문제가 발생했습니다: {exc}")
             return None
+
+    def dispatch_key_press(
+        self,
+        manager: Optional[InactiveManager],
+        target: TargetImage,
+    ) -> bool:
+        """타겟 창에만 PostMessage 방식 키 입력을 전송합니다."""
+
+        if manager is None:
+            self.queue_log("[오류] 키 입력에는 대상 창 HWND가 필요합니다.")
+            return False
+        if not target.key:
+            self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
+            return False
+
+        self.queue_log(f"[키 요청] {target.name} 감지로 대상 창에 '{target.key.upper()}' 키를 보냅니다.")
+        return manager.post_key_press(target.key)
 
     def dispatch_click(
         self,
@@ -2040,13 +2202,21 @@ def load_targets(
     base_dir: Path,
     logger: Optional[LogCallback] = None,
 ) -> Optional[list[TargetImage]]:
-    """target_A/B/C.png를 GrayScale 이미지로 미리 로드합니다."""
+    """target_A/B/C/D/E.png를 GrayScale 이미지로 미리 로드합니다."""
 
     log = logger or print
     targets = [
         TargetImage(name="target_A", filename="target_A.png", wait_after_click=0.0),
         TargetImage(name="target_B", filename="target_B.png", wait_after_click=0.0),
         TargetImage(name="target_C", filename="target_C.png", wait_after_click=0.0),
+        TargetImage(name="target_D", filename="target_D.png", wait_after_click=0.0),
+        TargetImage(
+            name="target_E",
+            filename="target_E.png",
+            wait_after_click=0.0,
+            action="key",
+            key="s",
+        ),
     ]
 
     for target in targets:
