@@ -314,6 +314,7 @@ class InactiveManager:
 
             self.log("[캡처 오류] 모든 PrintWindow 플래그 재시도가 실패했습니다.")
             self.log("       대상 앱이 백그라운드 캡처를 지원하지 않거나 다른 캡처 방식이 필요할 수 있습니다.")
+            self.save_printwindow_failure_debug_screenshot()
             return None
 
         except Exception as exc:
@@ -420,6 +421,33 @@ class InactiveManager:
 
         # 오래된 pywin32에서 PrintWindow 래퍼가 없을 때의 보조 경로입니다.
         return int(ctypes.windll.user32.PrintWindow(hwnd, hdc, flags))
+
+    def save_printwindow_failure_debug_screenshot(self) -> None:
+        """
+        PrintWindow가 실패했을 때 당시 전체 화면을 디버깅용으로 저장합니다.
+
+        이 함수는 GDI 리소스를 직접 건드리지 않습니다. GDI 해제는 capture_client_area()
+        finally 블록이 담당하므로 여기서는 pyautogui 전체 화면 스냅샷만 시도합니다.
+        """
+
+        self.log("[시스템 경고] PrintWindow API가 모든 플래그에서 실패했습니다.")
+        self.log("               원인: 권한 부족(UIPI), 하드웨어 가속, 또는 대상 창의 그래픽 차단 가능성.")
+
+        if pyautogui is None:
+            self.log("[디버그] pyautogui를 불러올 수 없어 전체 화면 디버그 저장을 건너뜁니다.")
+            self.log(f"         원본 오류: {PYAUTOGUI_IMPORT_ERROR}")
+            return
+
+        try:
+            debug_path = Path(__file__).resolve().parent / "DEBUG_PRINTWINDOW_FAILED.png"
+            fallback_screenshot = pyautogui.screenshot()
+            fallback_screenshot.save(debug_path)
+            self.log(
+                "[디버그] PrintWindow 실패 당시 전체 화면을 "
+                f"'{debug_path.name}'로 저장했습니다."
+            )
+        except Exception as exc:
+            self.log(f"[디버그] 임시 스크린샷 저장마저 실패했습니다: {exc}")
 
     def _print_window_flag_candidates(self) -> list[tuple[str, int]]:
         """
