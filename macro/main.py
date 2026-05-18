@@ -101,6 +101,9 @@ CURVED_CLICK_MIN_STEPS = 30
 CURVED_CLICK_MAX_STEPS = 50
 CURVED_CLICK_MOVE_DURATION_SECONDS = 0.5
 
+# True로 바꾸면 매칭 점수, 좌표 보정, 곡선 이동 같은 상세 로그를 다시 볼 수 있습니다.
+DETAILED_DEBUG_LOGS = False
+
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
@@ -659,11 +662,12 @@ def post_curved_click(
         client_height,
     )
 
-    log(
-        f"[곡선 시작] start={start_pos}, control={control_pos}, "
-        f"end={end_pos}, steps={steps}, duration={move_duration:.3f}s, "
-        f"step_delay={step_delay:.3f}s"
-    )
+    if DETAILED_DEBUG_LOGS:
+        log(
+            f"[곡선 시작] start={start_pos}, control={control_pos}, "
+            f"end={end_pos}, steps={steps}, duration={move_duration:.3f}s, "
+            f"step_delay={step_delay:.3f}s"
+        )
 
     for index in range(steps):
         t = index / (steps - 1)
@@ -672,7 +676,8 @@ def post_curved_click(
             client_width,
             client_height,
         )
-        log(f"[곡선 이동] {index + 1}/{steps} client=({move_x}, {move_y})")
+        if DETAILED_DEBUG_LOGS:
+            log(f"[곡선 이동] {index + 1}/{steps} client=({move_x}, {move_y})")
         post_mouse_move(
             hwnd,
             move_x,
@@ -687,7 +692,6 @@ def post_curved_click(
     if down_up_delay > 0:
         time.sleep(down_up_delay)
     post_mouse_up(hwnd, final_x, final_y, use_send_message=use_send_message)
-    log(f"[곡선 클릭 완료] client=({final_x}, {final_y})")
     return True
 
 
@@ -798,7 +802,8 @@ def wgc_to_client(
             client_screen_x, client_screen_y = win32gui.ClientToScreen(hwnd, (0, 0))
             capture_origin = _get_wgc_capture_origin(hwnd, frame_size)
             if capture_origin is None:
-                log("[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다.")
+                if DETAILED_DEBUG_LOGS:
+                    log("[좌표 안내] WGC 캡처 원점을 확인하지 못해 좌표를 클라이언트 기준으로 사용합니다.")
                 client_x, client_y = x, y
             else:
                 origin_x, origin_y = capture_origin
@@ -812,7 +817,7 @@ def wgc_to_client(
             )
             return None
 
-        if (client_x, client_y) != (x, y):
+        if DETAILED_DEBUG_LOGS and (client_x, client_y) != (x, y):
             log(f"[좌표 보정] WGC=({x}, {y}) -> client=({client_x}, {client_y})")
         return client_x, client_y
     except Exception as exc:
@@ -1292,7 +1297,8 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            self.log(f"[클릭 Down] HWND={self.hwnd}, client=({client_x}, {client_y})")
+            if DETAILED_DEBUG_LOGS:
+                self.log(f"[클릭 Down] HWND={self.hwnd}, client=({client_x}, {client_y})")
             return post_mouse_down(
                 self.hwnd,
                 client_x,
@@ -1321,7 +1327,8 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            self.log(f"[클릭 Up] HWND={self.hwnd}, client=({client_x}, {client_y})")
+            if DETAILED_DEBUG_LOGS:
+                self.log(f"[클릭 Up] HWND={self.hwnd}, client=({client_x}, {client_y})")
             return post_mouse_up(
                 self.hwnd,
                 client_x,
@@ -1366,18 +1373,21 @@ class InactiveManager:
                     max(0, int(right - left) // 2),
                     max(0, int(bottom - top) // 2),
                 )
-                self.log(f"[곡선 시작점] 이전 가상 위치가 없어 client 중심 {start_client}에서 시작합니다.")
+                if DETAILED_DEBUG_LOGS:
+                    self.log(f"[곡선 시작점] 이전 가상 위치가 없어 client 중심 {start_client}에서 시작합니다.")
             except Exception:
                 start_client = end_client
-                self.log("[곡선 시작점] 시작점 계산 실패로 목적지에서 시작합니다.")
+                if DETAILED_DEBUG_LOGS:
+                    self.log("[곡선 시작점] 시작점 계산 실패로 목적지에서 시작합니다.")
 
         try:
-            self.log(
-                f"[곡선 클릭 준비] HWND={self.hwnd}, "
-                f"start_wgc=({int(start_x)}, {int(start_y)}), "
-                f"end_wgc=({int(end_x)}, {int(end_y)}), "
-                f"start_client={start_client}, end_client={end_client}"
-            )
+            if DETAILED_DEBUG_LOGS:
+                self.log(
+                    f"[곡선 클릭 준비] HWND={self.hwnd}, "
+                    f"start_wgc=({int(start_x)}, {int(start_y)}), "
+                    f"end_wgc=({int(end_x)}, {int(end_y)}), "
+                    f"start_client={start_client}, end_client={end_client}"
+                )
             post_curved_click(
                 self.hwnd,
                 start_client[0],
@@ -1474,11 +1484,12 @@ class InactiveManager:
                 if target.message_lparam is None and control_hwnd is not None:
                     lparam = control_hwnd
 
-            self.log(
-                f"[메시지 전송] {target.name}, message={target.message}({message_id}), "
-                f"mode={mode_name}, targets={target_hwnds}, "
-                f"wParam={wparam}, lParam={lparam}"
-            )
+            if DETAILED_DEBUG_LOGS:
+                self.log(
+                    f"[메시지 전송] {target.name}, message={target.message}({message_id}), "
+                    f"mode={mode_name}, targets={target_hwnds}, "
+                    f"wParam={wparam}, lParam={lparam}"
+                )
 
             sent_count = 0
             for target_hwnd in target_hwnds:
@@ -1498,7 +1509,8 @@ class InactiveManager:
                 self.log("[메시지 오류] 메시지를 전송한 HWND가 없습니다.")
                 return False
 
-            self.log(f"[메시지 완료] {target.name}, count={sent_count}")
+            if DETAILED_DEBUG_LOGS:
+                self.log(f"[메시지 완료] {target.name}, count={sent_count}")
             return True
         except Exception as exc:
             self.log(f"[메시지 오류] Win32 메시지 액션 중 문제가 발생했습니다: {exc}")
@@ -1528,18 +1540,18 @@ class InactiveManager:
 
         client_x, client_y = client_point
         try:
-            self.log(
-                f"[클릭 전송] HWND={self.hwnd}, "
-                f"WGC=({int(x)}, {int(y)}), client=({client_x}, {client_y}), "
-                f"hover={MOUSE_HOVER_BEFORE_CLICK_SECONDS:.2f}s"
-            )
+            if DETAILED_DEBUG_LOGS:
+                self.log(
+                    f"[클릭 전송] HWND={self.hwnd}, "
+                    f"WGC=({int(x)}, {int(y)}), client=({client_x}, {client_y}), "
+                    f"hover={MOUSE_HOVER_BEFORE_CLICK_SECONDS:.2f}s"
+                )
             post_mouse_click(
                 self.hwnd,
                 client_x,
                 client_y,
                 use_send_message=use_send_message,
             )
-            self.log("[클릭 완료] WM_LBUTTONDOWN / WM_LBUTTONUP 메시지를 보냈습니다.")
             return True
         except Exception as exc:
             self.log(f"[오류] 클릭 메시지 전송 중 문제가 발생했습니다: {exc}")
@@ -2270,15 +2282,16 @@ class AutomationApp:
                     base_x, base_y = center
                     x, y = self.apply_click_jitter(target, base_x, base_y)
                     self.queue_status("이미지 감지 성공")
-                    self.queue_log(
-                        f"[감지] {target.name} "
-                        f"(점수: {score:.3f}, 위치: {base_x}, {base_y})"
-                    )
-                    if (x, y) != (base_x, base_y):
+                    if DETAILED_DEBUG_LOGS:
                         self.queue_log(
-                            f"[클릭 좌표] {target.name} "
-                            f"(기준: {base_x}, {base_y}, 보정: {x}, {y})"
+                            f"[감지] {target.name} "
+                            f"(점수: {score:.3f}, 위치: {base_x}, {base_y})"
                         )
+                        if (x, y) != (base_x, base_y):
+                            self.queue_log(
+                                f"[클릭 좌표] {target.name} "
+                                f"(기준: {base_x}, {base_y}, 보정: {x}, {y})"
+                            )
 
                     if target.action == "key":
                         action_ok = self.dispatch_key_press(manager, target)
@@ -2299,7 +2312,9 @@ class AutomationApp:
                             "key": "키 입력 완료",
                             "message": "메시지 완료",
                         }
-                        self.queue_status(status_by_action.get(target.action, "클릭 완료"))
+                        action_label = status_by_action.get(target.action, "클릭 완료")
+                        self.queue_status(action_label)
+                        self.queue_log(f"[동작 완료] {target.name}: {action_label}")
                         if target.wait_after_click > 0:
                             self.queue_log(f"[대기] {target.wait_after_click}초 동안 대기합니다.")
                             self.interruptible_sleep(target.wait_after_click)
@@ -2373,9 +2388,11 @@ class AutomationApp:
                 self.queue_log("[캡처 오류] 화면 영역 캡처 결과가 완전히 검은색입니다.")
                 return None
 
-            self.queue_log(f"[캡처 성공] 화면 영역 x={x}, y={y}, w={width}, h={height}")
+            if DETAILED_DEBUG_LOGS:
+                self.queue_log(f"[캡처 성공] 화면 영역 x={x}, y={y}, w={width}, h={height}")
             screen_gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-            cv2.imwrite(str(Path(__file__).resolve().parent / "debug_capture.png"), screen_gray)
+            if DETAILED_DEBUG_LOGS:
+                cv2.imwrite(str(Path(__file__).resolve().parent / "debug_capture.png"), screen_gray)
             return screen_gray
         except Exception as exc:
             self.queue_log(f"[캡처 오류] 화면 영역 캡처 중 문제가 발생했습니다: {exc}")
@@ -2405,13 +2422,13 @@ class AutomationApp:
             )
             return False
 
-        self.queue_log(
-            f"[키 요청] {target.name} 감지로 "
-            f"'{target.key.upper()}' 키를 vgamepad 버튼으로 보냅니다."
-        )
+        if DETAILED_DEBUG_LOGS:
+            self.queue_log(
+                f"[키 요청] {target.name} 감지로 "
+                f"'{target.key.upper()}' 키를 vgamepad 버튼으로 보냅니다."
+            )
         try:
             send_gamepad_button(button)
-            self.queue_log(f"[키 완료] vgamepad 버튼 입력: {target.key.upper()}")
             return True
         except Exception as exc:
             self.queue_log(f"[오류] vgamepad 버튼 입력 중 문제가 발생했습니다: {exc}")
@@ -2428,10 +2445,11 @@ class AutomationApp:
             self.queue_log("[오류] Win32 메시지 액션에는 대상 창 HWND가 필요합니다.")
             return False
 
-        self.queue_log(
-            f"[메시지 요청] {target.name} 감지로 "
-            f"{target.message} 메시지를 {target.message_mode}로 보냅니다."
-        )
+        if DETAILED_DEBUG_LOGS:
+            self.queue_log(
+                f"[메시지 요청] {target.name} 감지로 "
+                f"{target.message} 메시지를 {target.message_mode}로 보냅니다."
+            )
         return manager.send_win32_message_action(target)
 
     def dispatch_click(
@@ -2483,10 +2501,11 @@ class AutomationApp:
 
         try:
             original_x, original_y = pyautogui.position()
-            self.queue_log(
-                f"[클릭 전송] 화면 좌표=({screen_x}, {screen_y}), "
-                f"복귀 좌표=({original_x}, {original_y})"
-            )
+            if DETAILED_DEBUG_LOGS:
+                self.queue_log(
+                    f"[클릭 전송] 화면 좌표=({screen_x}, {screen_y}), "
+                    f"복귀 좌표=({original_x}, {original_y})"
+                )
 
             # 입력 렉과 포커스 흔들림을 줄이기 위해 순간이동 대신 짧은 고정 시간으로 이동합니다.
             pyautogui.moveTo(screen_x, screen_y, duration=0.15)
@@ -2497,7 +2516,6 @@ class AutomationApp:
 
             # 사용자의 원래 작업 위치를 최대한 보존합니다.
             pyautogui.moveTo(original_x, original_y, duration=0.15)
-            self.queue_log("[클릭 완료] 마우스 클릭 후 원래 위치로 복귀했습니다.")
             return True
         except pyautogui.FailSafeException:
             self.queue_log("[긴급 중단] PyAutoGUI FAILSAFE가 감지되었습니다.")
@@ -2838,7 +2856,8 @@ def find_template_center(
         )
         return None, 0.0
 
-    cv2.imwrite(str(Path(__file__).resolve().parent / "debug_screen.png"), screen_gray)
+    if DETAILED_DEBUG_LOGS:
+        cv2.imwrite(str(Path(__file__).resolve().parent / "debug_screen.png"), screen_gray)
 
     result = cv2.matchTemplate(
         screen_gray,
@@ -2847,19 +2866,16 @@ def find_template_center(
     )
     _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(result)
     score = float(max_value)
-    debug_message = f"[디버그] {target.name} 검사 중... 산출된 최고 유사도 점수: {score:.3f}"
-    print(debug_message)
-    if logger is not None:
-        log(debug_message)
 
     top_left_x, top_left_y = max_location
     center_x = top_left_x + target_width // 2
     center_y = top_left_y + target_height // 2
 
-    log(
-        f"[매칭] {target.name} "
-        f"(점수: {score:.3f}, 위치: {center_x}, {center_y}, 기준: {target.threshold:.2f})"
-    )
+    if DETAILED_DEBUG_LOGS:
+        log(
+            f"[매칭] {target.name} "
+            f"(점수: {score:.3f}, 위치: {center_x}, {center_y}, 기준: {target.threshold:.2f})"
+        )
 
     if score < target.threshold:
         return None, score
