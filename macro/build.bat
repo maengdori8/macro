@@ -2,7 +2,7 @@
 chcp 65001 >nul
 echo ===== 매크로 빌드 시작 =====
 
-pip install pyinstaller requests pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow >nul 2>&1
+pip install pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow >nul 2>&1
 
 pyinstaller --onefile --noconsole --name macro --icon=NONE main.py
 

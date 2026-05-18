@@ -34,10 +34,9 @@ import struct
 import subprocess
 import uuid
 
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None
+import json as _json
+import urllib.request
+import urllib.error
 
 import cv2
 import numpy as np
@@ -247,15 +246,16 @@ def get_hwid() -> str:
 
 def verify_license_server(key: str, hwid: str) -> dict:
     """서버에 라이센스 키와 HWID를 검증합니다. 서버 연결 실패 시 _offline=True 반환."""
-    if _requests is None:
-        return {"_offline": True}
     try:
-        resp = _requests.post(
+        data = _json.dumps({"key": key, "hwid": hwid}).encode("utf-8")
+        req = urllib.request.Request(
             VERIFY_SERVER_URL,
-            json={"key": key, "hwid": hwid},
-            timeout=10,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return resp.json()
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
     except Exception:
         return {"_offline": True}
 
@@ -268,11 +268,10 @@ def _parse_version(v: str) -> tuple:
 
 
 def check_for_update() -> Optional[dict]:
-    if _requests is None:
-        return None
     try:
-        resp = _requests.get(VERSION_CHECK_URL, timeout=5)
-        data = resp.json()
+        req = urllib.request.Request(VERSION_CHECK_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
         remote_ver = data.get("version", "")
         download_url = data.get("url", "")
         if not remote_ver or not download_url:
@@ -285,23 +284,26 @@ def check_for_update() -> Optional[dict]:
 
 
 def apply_update(download_url: str, progress_callback=None) -> bool:
-    if _requests is None or sys.platform != "win32":
+    if sys.platform != "win32":
         return False
     try:
         current_exe = sys.executable
         if not current_exe.endswith(".exe"):
             return False
         temp_path = current_exe + ".update"
-        resp = _requests.get(download_url, stream=True, timeout=60)
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        with open(temp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    progress_callback(downloaded / total)
+        req = urllib.request.Request(download_url, method="GET")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(temp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        progress_callback(downloaded / total)
 
         bat_path = current_exe + ".update.bat"
         with open(bat_path, "w", encoding="utf-8") as bat:
