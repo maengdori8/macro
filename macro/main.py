@@ -295,18 +295,21 @@ def check_for_update() -> Optional[dict]:
 
 
 def apply_update(download_url: str, progress_callback=None) -> bool:
+    import zipfile
+    import tempfile
     if sys.platform != "win32":
         return False
     try:
         current_exe = sys.executable
         if not current_exe.endswith(".exe"):
             return False
-        temp_path = current_exe + ".update"
+        app_dir = str(Path(current_exe).resolve().parent)
+        temp_zip = os.path.join(app_dir, "_update.zip")
         req = urllib.request.Request(download_url, method="GET")
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
-            with open(temp_path, "wb") as f:
+            with open(temp_zip, "wb") as f:
                 while True:
                     chunk = resp.read(65536)
                     if not chunk:
@@ -316,14 +319,24 @@ def apply_update(download_url: str, progress_callback=None) -> bool:
                     if progress_callback and total > 0:
                         progress_callback(downloaded / total)
 
-        bat_path = current_exe + ".update.bat"
+        temp_dir = os.path.join(app_dir, "_update_tmp")
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+
+        with zipfile.ZipFile(temp_zip, "r") as zf:
+            zf.extractall(temp_dir)
+
+        bat_path = os.path.join(app_dir, "_update.bat")
         with open(bat_path, "w", encoding="utf-8") as bat:
-            bat.write(f'@echo off\n')
-            bat.write(f'timeout /t 2 /nobreak >nul\n')
-            bat.write(f'del "{current_exe}"\n')
-            bat.write(f'move "{temp_path}" "{current_exe}"\n')
+            bat.write('@echo off\n')
+            bat.write('timeout /t 2 /nobreak >nul\n')
+            bat.write(f'xcopy /Y /E "{temp_dir}\\*" "{app_dir}\\" >nul\n')
+            bat.write(f'rmdir /s /q "{temp_dir}"\n')
+            bat.write(f'del "{temp_zip}"\n')
             bat.write(f'start "" "{current_exe}"\n')
-            bat.write(f'del "%~f0"\n')
+            bat.write('del "%~f0"\n')
         subprocess.Popen(["cmd", "/c", bat_path], creationflags=0x08000000)
         return True
     except Exception:
