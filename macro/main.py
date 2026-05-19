@@ -106,7 +106,7 @@ CLICK_JITTER_PIXELS = 3
 CLICK_MESSAGE_DELAY_SECONDS = 0.01
 
 # 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
-MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
+MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.8
 
 # PostMessage 가상 마우스 이동 단계와 전체 이동 시간입니다.
 CURVED_CLICK_MIN_STEPS = 15
