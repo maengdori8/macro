@@ -109,9 +109,9 @@ CLICK_MESSAGE_DELAY_SECONDS = 0.01
 MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
 
 # PostMessage 가상 마우스 이동 단계와 전체 이동 시간입니다.
-CURVED_CLICK_MIN_STEPS = 5
-CURVED_CLICK_MAX_STEPS = 10
-CURVED_CLICK_MOVE_DURATION_SECONDS = 0.05
+CURVED_CLICK_MIN_STEPS = 15
+CURVED_CLICK_MAX_STEPS = 25
+CURVED_CLICK_MOVE_DURATION_SECONDS = 0.2
 
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -132,9 +132,9 @@ LICENSE_VALID_DAYS = {1, 7, 30, 99999}
 TARGET_CONFIG_FILENAME = "targets.json"
 DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_A", "filename": "target_A.png", "action": "click"},
-    {"name": "target_B", "filename": "target_B.png", "action": "click"},
-    {"name": "target_C", "filename": "target_C.png", "action": "click"},
-    {"name": "target_D", "filename": "target_D.png", "action": "click"},
+    {"name": "target_B", "filename": "target_B.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
+    {"name": "target_C", "filename": "target_C.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
+    {"name": "target_D", "filename": "target_D.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
     {
         "name": "target_E",
         "filename": "target_E.png",
@@ -160,7 +160,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_target": "all",
     },
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
-    {"name": "target_I", "filename": "target_I.png", "action": "click"},
+    {"name": "target_I", "filename": "target_I.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
 ]
 
 def verify_license_key(key: str) -> dict:
