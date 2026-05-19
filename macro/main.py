@@ -159,6 +159,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_mode": "sendinput",
         "key_target": "all",
     },
+    {"name": "target_H", "filename": "target_H.png", "action": "click"},
 ]
 
 def verify_license_key(key: str) -> dict:
