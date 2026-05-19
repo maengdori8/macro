@@ -2714,11 +2714,12 @@ class AutomationApp:
         self.log_text.insert(tk.END, line)
 
         line_count = int(self.log_text.index("end-1c").split(".")[0])
-        if line_count > 1000:
-            self.log_text.delete("1.0", "100.0")
+        if line_count > 500:
+            self.log_text.delete("1.0", "200.0")
 
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+        self.log_text.update_idletasks()
 
     def queue_log(self, message: str) -> None:
         """작업 스레드에서 로그 메시지를 UI 큐에 넣습니다."""
@@ -2738,7 +2739,8 @@ class AutomationApp:
     def _poll_ui_queue(self) -> None:
         """root.after로 UI 큐를 주기적으로 확인하고 위젯을 갱신합니다."""
 
-        while True:
+        processed = 0
+        while processed < 20:
             try:
                 kind, message = self.ui_queue.get_nowait()
             except queue.Empty:
@@ -2750,9 +2752,10 @@ class AutomationApp:
                 self.set_status(message)
             elif kind == "finished":
                 self._set_button_state(running=False)
+            processed += 1
 
         if not self.closing:
-            self.root.after(33, self._poll_ui_queue)
+            self.root.after(50, self._poll_ui_queue)
 
     def _set_button_state(self, running: bool) -> None:
         """실행 상태에 따라 시작/종료 버튼 활성화를 조절합니다."""
