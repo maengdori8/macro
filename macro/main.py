@@ -132,9 +132,9 @@ LICENSE_VALID_DAYS = {1, 7, 30, 99999}
 TARGET_CONFIG_FILENAME = "targets.json"
 DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_A", "filename": "target_A.png", "action": "click"},
-    {"name": "target_B", "filename": "target_B.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
-    {"name": "target_C", "filename": "target_C.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
-    {"name": "target_D", "filename": "target_D.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
+    {"name": "target_B", "filename": "target_B.png", "action": "click"},
+    {"name": "target_C", "filename": "target_C.png", "action": "click"},
+    {"name": "target_D", "filename": "target_D.png", "action": "click"},
     {
         "name": "target_E",
         "filename": "target_E.png",
@@ -160,7 +160,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_target": "all",
     },
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
-    {"name": "target_I", "filename": "target_I.png", "action": "key", "key": "s", "key_mode": "sendinput", "key_target": "all"},
+    {"name": "target_I", "filename": "target_I.png", "action": "click"},
 ]
 
 def verify_license_key(key: str) -> dict:
