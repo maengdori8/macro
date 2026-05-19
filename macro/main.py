@@ -2666,10 +2666,9 @@ class AutomationApp:
             original_x, original_y = pyautogui.position()
             pyautogui.moveTo(screen_x, screen_y, duration=0.15)
 
-            if vibrate:
-                for dx in [3, -6, 6, -6, 3]:
-                    pyautogui.moveRel(dx, 0, duration=0.03)
-                pyautogui.moveTo(screen_x, screen_y, duration=0.02)
+            for dx in [3, -6, 6, -6, 3]:
+                pyautogui.moveRel(dx, 0, duration=0.03)
+            pyautogui.moveTo(screen_x, screen_y, duration=0.02)
 
             time.sleep(MOUSE_HOVER_BEFORE_CLICK_SECONDS)
             pyautogui.click()
