@@ -160,6 +160,7 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_target": "all",
     },
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
+    {"name": "target_I", "filename": "target_I.png", "action": "click"},
 ]
 
 def verify_license_key(key: str) -> dict:
