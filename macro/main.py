@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import platform
 import queue
 import random
@@ -3243,6 +3244,11 @@ class LicenseDialog:
 
 def main() -> None:
     """프로그램 진입점입니다."""
+
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
 
     root = tk.Tk()
     if getattr(sys, 'frozen', False):
