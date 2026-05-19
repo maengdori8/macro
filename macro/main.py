@@ -2566,38 +2566,49 @@ class AutomationApp:
         manager: Optional[InactiveManager],
         target: TargetImage,
     ) -> bool:
-        """타겟 감지 시 PostMessage로 대상 창에 키 입력을 전송합니다."""
+        """타겟 감지 시 vgamepad Xbox 컨트롤러 버튼 입력을 전송합니다.
+        대상 창이 비활성이면 잠깐 포커스 후 복귀합니다."""
 
         if not target.key:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
             return False
+        if vg is None:
+            self.queue_log("[오류] vgamepad를 불러올 수 없어 게임패드 입력을 보낼 수 없습니다.")
+            self.queue_log(f"       원본 오류: {VGAMEPAD_IMPORT_ERROR}")
+            return False
 
         normalized_key = target.key.strip().lower()
+        button = KEY_TO_GAMEPAD.get(normalized_key)
+        if button is None:
+            self.queue_log(
+                f"[키 경고] {target.name}의 key='{target.key}'는 "
+                "vgamepad 매핑에 없어 건너뜁니다."
+            )
+            return False
 
-        if manager is not None and manager.hwnd:
-            vk = KEY_TO_VK.get(normalized_key)
-            if vk is not None:
-                try:
-                    send_key_to_window(manager.hwnd, vk)
-                    self.queue_log(f"[키] {target.key.upper()} (PostMessage)")
-                    return True
-                except Exception as exc:
-                    self.queue_log(f"[오류] PostMessage 키 전송 실패: {exc}")
-                    return False
-
-        if vg is not None:
-            button = KEY_TO_GAMEPAD.get(normalized_key)
-            if button is not None:
-                try:
+        try:
+            restored = False
+            if manager is not None and manager.hwnd and win32gui is not None:
+                fg = win32gui.GetForegroundWindow()
+                if fg != manager.hwnd:
+                    win32gui.SetForegroundWindow(manager.hwnd)
+                    time.sleep(0.05)
                     send_gamepad_button(button)
-                    self.queue_log(f"[키] {target.key.upper()} (Gamepad)")
-                    return True
-                except Exception as exc:
-                    self.queue_log(f"[오류] vgamepad 버튼 입력 실패: {exc}")
-                    return False
+                    time.sleep(0.05)
+                    try:
+                        win32gui.SetForegroundWindow(fg)
+                    except Exception:
+                        pass
+                    restored = True
 
-        self.queue_log(f"[오류] {target.name}의 key='{target.key}' 전송 방법이 없습니다.")
-        return False
+            if not restored:
+                send_gamepad_button(button)
+
+            self.queue_log(f"[키] {target.key.upper()}")
+            return True
+        except Exception as exc:
+            self.queue_log(f"[오류] vgamepad 버튼 입력 중 문제가 발생했습니다: {exc}")
+            return False
 
     def dispatch_win32_message(
         self,
