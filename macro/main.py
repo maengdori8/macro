@@ -368,6 +368,40 @@ def send_gamepad_button(button: Any, press_delay: float = 0.05) -> bool:
     return True
 
 
+KEY_TO_VK: dict[str, int] = {
+    "esc": 0x1B, "escape": 0x1B,
+    "enter": 0x0D, "return": 0x0D,
+    "space": 0x20,
+    "tab": 0x09,
+    "s": 0x53, "a": 0x41, "b": 0x42, "c": 0x43, "d": 0x44,
+    "e": 0x45, "f": 0x46, "g": 0x47, "h": 0x48, "i": 0x49,
+    "j": 0x4A, "k": 0x4B, "l": 0x4C, "m": 0x4D, "n": 0x4E,
+    "o": 0x4F, "p": 0x50, "q": 0x51, "r": 0x52, "t": 0x54,
+    "u": 0x55, "v": 0x56, "w": 0x57, "x": 0x58, "y": 0x59, "z": 0x5A,
+    "0": 0x30, "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
+    "5": 0x35, "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
+    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73,
+    "f5": 0x74, "f6": 0x75, "f7": 0x76, "f8": 0x77,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+}
+
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+
+
+def send_key_to_window(hwnd: int, vk_code: int, press_delay: float = 0.05) -> bool:
+    """PostMessage로 대상 창에 WM_KEYDOWN/WM_KEYUP을 전송합니다."""
+    if win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+    lparam_down = (scan_code << 16) | 1
+    lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
+    win32gui.PostMessage(hwnd, WM_KEYDOWN, vk_code, lparam_down)
+    time.sleep(press_delay)
+    win32gui.PostMessage(hwnd, WM_KEYUP, vk_code, lparam_up)
+    return True
+
+
 def _make_mouse_lparam(x: int, y: int) -> int:
     """Windows 마우스 메시지 lParam을 클라이언트 좌표로 만듭니다."""
 
@@ -2532,32 +2566,38 @@ class AutomationApp:
         manager: Optional[InactiveManager],
         target: TargetImage,
     ) -> bool:
-        """타겟 감지 시 vgamepad Xbox 컨트롤러 버튼 입력을 전송합니다."""
+        """타겟 감지 시 PostMessage로 대상 창에 키 입력을 전송합니다."""
 
         if not target.key:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
             return False
-        if vg is None:
-            self.queue_log("[오류] vgamepad를 불러올 수 없어 게임패드 입력을 보낼 수 없습니다.")
-            self.queue_log(f"       원본 오류: {VGAMEPAD_IMPORT_ERROR}")
-            return False
 
         normalized_key = target.key.strip().lower()
-        button = KEY_TO_GAMEPAD.get(normalized_key)
-        if button is None:
-            self.queue_log(
-                f"[키 경고] {target.name}의 key='{target.key}'는 "
-                "vgamepad 매핑에 없어 건너뜁니다."
-            )
-            return False
 
-        try:
-            send_gamepad_button(button)
-            self.queue_log(f"[키] {target.key.upper()}")
-            return True
-        except Exception as exc:
-            self.queue_log(f"[오류] vgamepad 버튼 입력 중 문제가 발생했습니다: {exc}")
-            return False
+        if manager is not None and manager.hwnd:
+            vk = KEY_TO_VK.get(normalized_key)
+            if vk is not None:
+                try:
+                    send_key_to_window(manager.hwnd, vk)
+                    self.queue_log(f"[키] {target.key.upper()} (PostMessage)")
+                    return True
+                except Exception as exc:
+                    self.queue_log(f"[오류] PostMessage 키 전송 실패: {exc}")
+                    return False
+
+        if vg is not None:
+            button = KEY_TO_GAMEPAD.get(normalized_key)
+            if button is not None:
+                try:
+                    send_gamepad_button(button)
+                    self.queue_log(f"[키] {target.key.upper()} (Gamepad)")
+                    return True
+                except Exception as exc:
+                    self.queue_log(f"[오류] vgamepad 버튼 입력 실패: {exc}")
+                    return False
+
+        self.queue_log(f"[오류] {target.name}의 key='{target.key}' 전송 방법이 없습니다.")
+        return False
 
     def dispatch_win32_message(
         self,
