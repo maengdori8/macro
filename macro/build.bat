@@ -7,35 +7,49 @@ python -m pip install pyinstaller pywin32 windows-capture vgamepad opencv-python
 
 echo vgamepad DLL 경로 탐색 중...
 for /f "delims=" %%i in ('python -c "import vgamepad, os; print(os.path.dirname(vgamepad.__file__))"') do set VGAMEPAD_DIR=%%i
-echo vgamepad 경로: %VGAMEPAD_DIR%
 
-echo 빌드 중...
+echo.
+echo [1/3] macro.exe 빌드 중...
 python -m PyInstaller --onefile --noconsole --uac-admin --name macro --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" main.py
 
+echo.
+echo [2/3] launcher.exe 빌드 중...
+python -m PyInstaller --onefile --noconsole --uac-admin --name launcher launcher.py
+
 if not exist "dist\macro.exe" (
-    echo 빌드 실패!
+    echo macro.exe 빌드 실패!
+    pause
+    exit /b 1
+)
+if not exist "dist\launcher.exe" (
+    echo launcher.exe 빌드 실패!
     pause
     exit /b 1
 )
 
 echo.
-echo ===== 배포 패키지 생성 =====
-if exist "dist\release" rmdir /s /q "dist\release"
-mkdir "dist\release"
+echo [3/3] 설치 파일 생성 중...
+where iscc >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo [안내] Inno Setup이 설치되어 있지 않습니다.
+    echo        https://jrsoftware.org/isdl.php 에서 설치 후 다시 실행하세요.
+    echo.
+    echo        EXE 빌드는 완료되었습니다:
+    echo        - dist\macro.exe
+    echo        - dist\launcher.exe
+    pause
+    exit /b 0
+)
 
-copy "dist\macro.exe" "dist\release\" >nul
-copy "targets.json" "dist\release\" >nul
-for %%f in (target_*.png) do copy "%%f" "dist\release\" >nul
+iscc setup.iss
 
-echo 압축 중...
-if exist "dist\macro_release.zip" del "dist\macro_release.zip"
-powershell -Command "Compress-Archive -Path 'dist\release\*' -DestinationPath 'dist\macro_release.zip' -Force"
-
-echo.
-echo ===== 완료 =====
-echo EXE: dist\macro.exe
-echo ZIP: dist\macro_release.zip
-for %%A in ("dist\macro_release.zip") do echo 크기: %%~zA bytes
-echo.
-echo GitHub Releases에 macro_release.zip을 업로드하세요.
+if exist "dist\macro_setup.exe" (
+    echo.
+    echo ===== 빌드 완료 =====
+    echo 설치 파일: dist\macro_setup.exe
+    for %%A in ("dist\macro_setup.exe") do echo 크기: %%~zA bytes
+) else (
+    echo 설치 파일 생성 실패!
+)
 pause
