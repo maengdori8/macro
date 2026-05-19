@@ -2567,7 +2567,7 @@ class AutomationApp:
         target: TargetImage,
     ) -> bool:
         """타겟 감지 시 vgamepad Xbox 컨트롤러 버튼 입력을 전송합니다.
-        대상 창이 비활성이면 잠깐 포커스 후 복귀합니다."""
+        대상 창이 비활성이면 WM_ACTIVATE로 가짜 포커스를 보낸 뒤 입력합니다."""
 
         if not target.key:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
@@ -2587,23 +2587,13 @@ class AutomationApp:
             return False
 
         try:
-            restored = False
             if manager is not None and manager.hwnd and win32gui is not None:
-                fg = win32gui.GetForegroundWindow()
-                if fg != manager.hwnd:
-                    win32gui.SetForegroundWindow(manager.hwnd)
-                    time.sleep(0.05)
-                    send_gamepad_button(button)
-                    time.sleep(0.05)
-                    try:
-                        win32gui.SetForegroundWindow(fg)
-                    except Exception:
-                        pass
-                    restored = True
+                WM_ACTIVATE = 0x0006
+                WA_ACTIVE = 1
+                win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
+                time.sleep(0.02)
 
-            if not restored:
-                send_gamepad_button(button)
-
+            send_gamepad_button(button)
             self.queue_log(f"[키] {target.key.upper()}")
             return True
         except Exception as exc:
