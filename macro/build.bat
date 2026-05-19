@@ -29,8 +29,17 @@ if not exist "dist\launcher.exe" (
 
 echo.
 echo [3/3] 설치 파일 생성 중...
+set ISCC_PATH=
 where iscc >nul 2>&1
-if %errorlevel% neq 0 (
+if %errorlevel% equ 0 (
+    set ISCC_PATH=iscc
+) else if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
+    set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
+    set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
+)
+
+if "%ISCC_PATH%"=="" (
     echo.
     echo [안내] Inno Setup이 설치되어 있지 않습니다.
     echo        https://jrsoftware.org/isdl.php 에서 설치 후 다시 실행하세요.
@@ -42,7 +51,7 @@ if %errorlevel% neq 0 (
     exit /b 0
 )
 
-iscc setup.iss
+"%ISCC_PATH%" setup.iss
 
 if exist "dist\macro_setup.exe" (
     echo.
