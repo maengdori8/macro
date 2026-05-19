@@ -133,7 +133,7 @@ TARGET_CONFIG_FILENAME = "targets.json"
 DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_A", "filename": "target_A.png", "action": "click"},
     {"name": "target_B", "filename": "target_B.png", "action": "click"},
-    {"name": "target_C", "filename": "target_C.png", "action": "click"},
+    {"name": "target_C", "filename": "target_C.png", "action": "click", "vibrate_before_click": True},
     {"name": "target_D", "filename": "target_D.png", "action": "click"},
     {
         "name": "target_E",
@@ -1063,6 +1063,7 @@ class TargetImage:
     control_hwnd: Optional[int] = None
     control_class: Optional[str] = None
     control_text: Optional[str] = None
+    vibrate_before_click: bool = False
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -2479,6 +2480,7 @@ class AutomationApp:
                             region,
                             x,
                             y,
+                            target,
                         )
 
                     if action_ok:
@@ -2623,8 +2625,11 @@ class AutomationApp:
         region: tuple[int, int, int, int],
         x: int,
         y: int,
+        target: Optional[TargetImage] = None,
     ) -> bool:
         """선택된 클릭 모드에 따라 클릭을 전송합니다."""
+
+        vibrate = target is not None and target.vibrate_before_click
 
         if click_mode == "postmessage":
             if manager is None:
@@ -2636,7 +2641,7 @@ class AutomationApp:
         if capture_mode == "region":
             screen_x = region[0] + x
             screen_y = region[1] + y
-            return self.click_mouse_and_return(screen_x, screen_y)
+            return self.click_mouse_and_return(screen_x, screen_y, vibrate=vibrate)
 
         if manager is None:
             self.queue_log("[오류] 마우스 클릭 좌표 변환에 대상 창 정보가 없습니다.")
@@ -2647,15 +2652,10 @@ class AutomationApp:
             return False
 
         screen_x, screen_y = screen_point
-        return self.click_mouse_and_return(screen_x, screen_y)
+        return self.click_mouse_and_return(screen_x, screen_y, vibrate=vibrate)
 
-    def click_mouse_and_return(self, screen_x: int, screen_y: int) -> bool:
-        """
-        실제 마우스를 대상 위치로 부드럽게 이동해 클릭한 뒤 원래 위치로 되돌립니다.
-
-        허가된 UI 테스트 및 업무 자동화 환경에서 입력 장치 충돌을 줄이기 위한
-        안정 클릭 루틴입니다. 이 방식은 사용 중인 마우스를 잠깐 점유합니다.
-        """
+    def click_mouse_and_return(self, screen_x: int, screen_y: int, vibrate: bool = False) -> bool:
+        """실제 마우스를 대상 위치로 이동해 클릭한 뒤 원래 위치로 되돌립니다."""
 
         if pyautogui is None:
             self.queue_log("[오류] pyautogui를 불러올 수 없어 마우스 클릭을 사용할 수 없습니다.")
@@ -2665,6 +2665,12 @@ class AutomationApp:
         try:
             original_x, original_y = pyautogui.position()
             pyautogui.moveTo(screen_x, screen_y, duration=0.15)
+
+            if vibrate:
+                for dx in [3, -6, 6, -6, 3]:
+                    pyautogui.moveRel(dx, 0, duration=0.03)
+                pyautogui.moveTo(screen_x, screen_y, duration=0.02)
+
             time.sleep(MOUSE_HOVER_BEFORE_CLICK_SECONDS)
             pyautogui.click()
             time.sleep(0.05)
@@ -2858,6 +2864,7 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         control_hwnd=control_hwnd,
         control_class=control_class,
         control_text=control_text,
+        vibrate_before_click=bool(config.get("vibrate_before_click", False)),
     )
 
 
