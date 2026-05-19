@@ -90,7 +90,7 @@ else:
 WINDOW_TITLE = "대상 창 제목 일부를 입력하세요"
 
 # 아무것도 발견되지 않았을 때 CPU 과부하를 막기 위한 기본 대기 시간입니다.
-LOOP_SLEEP_SECONDS = 0.5
+LOOP_SLEEP_SECONDS = 0.03
 
 # 대상 창을 찾지 못했을 때 재검색하는 간격입니다.
 WINDOW_RETRY_SECONDS = 2.0
@@ -103,15 +103,15 @@ WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 CLICK_JITTER_PIXELS = 3
 
 # WM_LBUTTONDOWN과 WM_LBUTTONUP 사이의 짧은 지연입니다.
-CLICK_MESSAGE_DELAY_SECONDS = 0.05
+CLICK_MESSAGE_DELAY_SECONDS = 0.01
 
 # 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
 MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.5
 
 # PostMessage 가상 마우스 이동 단계와 전체 이동 시간입니다.
-CURVED_CLICK_MIN_STEPS = 30
-CURVED_CLICK_MAX_STEPS = 50
-CURVED_CLICK_MOVE_DURATION_SECONDS = 0.5
+CURVED_CLICK_MIN_STEPS = 5
+CURVED_CLICK_MAX_STEPS = 10
+CURVED_CLICK_MOVE_DURATION_SECONDS = 0.05
 
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -357,7 +357,7 @@ def _get_gamepad() -> Any:
     return gamepad
 
 
-def send_gamepad_button(button: Any, press_delay: float = 0.05) -> bool:
+def send_gamepad_button(button: Any, press_delay: float = 0.02) -> bool:
     """vgamepad Xbox 컨트롤러 버튼을 눌렀다 뗍니다."""
 
     pad = _get_gamepad()
@@ -1395,9 +1395,11 @@ class InactiveManager:
             return None
 
         try:
-            if frame_bgra.shape[2] >= 4:
-                return cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2GRAY)
-            return cv2.cvtColor(frame_bgra, cv2.COLOR_BGR2GRAY)
+            b = frame_bgra[:, :, 0].astype(np.uint16)
+            g = frame_bgra[:, :, 1].astype(np.uint16)
+            r = frame_bgra[:, :, 2].astype(np.uint16)
+            gray = ((r * 77 + g * 150 + b * 29) >> 8).astype(np.uint8)
+            return gray
         except Exception as exc:
             self.log(f"[캡처 오류] WGC 프레임을 GrayScale로 변환하지 못했습니다: {exc}")
             return None
@@ -2592,7 +2594,6 @@ class AutomationApp:
                 WM_ACTIVATE = 0x0006
                 WA_ACTIVE = 1
                 win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
-                time.sleep(0.02)
 
             send_gamepad_button(button)
             self.queue_log(f"[키] {target.key.upper()}")
@@ -2751,7 +2752,7 @@ class AutomationApp:
                 self._set_button_state(running=False)
 
         if not self.closing:
-            self.root.after(100, self._poll_ui_queue)
+            self.root.after(33, self._poll_ui_queue)
 
     def _set_button_state(self, running: bool) -> None:
         """실행 상태에 따라 시작/종료 버튼 활성화를 조절합니다."""
@@ -2980,17 +2981,16 @@ def load_targets(
     return targets
 
 
+DOWNSCALE_FACTOR = 2
+
+
 def find_template_center(
     screen_gray: np.ndarray,
     target: TargetImage,
     logger: Optional[LogCallback] = None,
 ) -> tuple[Optional[tuple[int, int]], float]:
     """
-    cv2.matchTemplate로 target 이미지를 찾고 중심 좌표와 매칭 점수를 반환합니다.
-
-    반환:
-    - center: threshold 이상이면 (x, y), 아니면 None
-    - score: 가장 높은 매칭 점수
+    2단계 템플릿 매칭: 축소 이미지로 빠른 사전 필터 → 원본에서 정밀 매칭.
     """
 
     log = logger or print
@@ -3003,24 +3003,58 @@ def find_template_center(
     screen_height, screen_width = screen_gray.shape[:2]
 
     if target_width > screen_width or target_height > screen_height:
-        log(
-            f"[주의] {target.filename}이 클라이언트 영역보다 큽니다. "
-            f"target={target_width}x{target_height}, screen={screen_width}x{screen_height}"
-        )
         return None, 0.0
 
-    result = cv2.matchTemplate(
-        screen_gray,
-        target.image_gray,
-        cv2.TM_CCOEFF_NORMED,
-    )
-    _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(result)
+    f = DOWNSCALE_FACTOR
+    small_tw = target_width // f
+    small_th = target_height // f
+
+    if small_tw < 4 or small_th < 4:
+        result = cv2.matchTemplate(screen_gray, target.image_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_value, _, max_location = cv2.minMaxLoc(result)
+        score = float(max_value)
+        if score < target.threshold:
+            return None, score
+        top_left_x, top_left_y = max_location
+        return (top_left_x + target_width // 2, top_left_y + target_height // 2), score
+
+    if not hasattr(target, '_small_gray') or target._small_gray is None:
+        target._small_gray = cv2.resize(target.image_gray, (small_tw, small_th), interpolation=cv2.INTER_AREA)
+
+    small_screen = screen_gray[::f, ::f]
+    small_result = cv2.matchTemplate(small_screen, target._small_gray, cv2.TM_CCOEFF_NORMED)
+    _, small_max, _, small_loc = cv2.minMaxLoc(small_result)
+
+    if small_max < target.threshold * 0.85:
+        return None, float(small_max)
+
+    rough_x = small_loc[0] * f
+    rough_y = small_loc[1] * f
+    margin = max(target_width, target_height) // 2
+    roi_x1 = max(0, rough_x - margin)
+    roi_y1 = max(0, rough_y - margin)
+    roi_x2 = min(screen_width, rough_x + target_width + margin)
+    roi_y2 = min(screen_height, rough_y + target_height + margin)
+
+    if roi_x2 - roi_x1 < target_width or roi_y2 - roi_y1 < target_height:
+        result = cv2.matchTemplate(screen_gray, target.image_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_value, _, max_location = cv2.minMaxLoc(result)
+        score = float(max_value)
+        if score < target.threshold:
+            return None, score
+        top_left_x, top_left_y = max_location
+        return (top_left_x + target_width // 2, top_left_y + target_height // 2), score
+
+    roi = screen_gray[roi_y1:roi_y2, roi_x1:roi_x2]
+    result = cv2.matchTemplate(roi, target.image_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_value, _, max_location = cv2.minMaxLoc(result)
     score = float(max_value)
 
     if score < target.threshold:
         return None, score
 
-    top_left_x, top_left_y = max_location
+    top_left_x = max_location[0] + roi_x1
+    top_left_y = max_location[1] + roi_y1
     center_x = top_left_x + target_width // 2
     center_y = top_left_y + target_height // 2
 
