@@ -58,11 +58,12 @@ def download_and_install(url):
                     f.write(chunk)
 
         print("설치 중...")
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [setup_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
             creationflags=0x08000000,
         )
-        time.sleep(2)
+        proc.wait(timeout=120)
+        time.sleep(1)
         return True
     except Exception as e:
         print(f"업데이트 실패: {e}")
@@ -81,8 +82,7 @@ def main():
     update = check_update()
     if update:
         print(f"새 버전 발견: {update['version']}")
-        if download_and_install(update["url"]):
-            time.sleep(3)
+        download_and_install(update["url"])
 
     if os.path.exists(macro_exe):
         subprocess.Popen([macro_exe])

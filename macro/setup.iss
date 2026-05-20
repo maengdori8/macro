@@ -12,6 +12,8 @@ UninstallDisplayIcon={app}\launcher.exe
 PrivilegesRequired=admin
 DisableProgramGroupPage=yes
 DisableDirPage=yes
+CloseApplications=force
+RestartApplications=no
 
 [Files]
 Source: "dist\macro.exe"; DestDir: "{app}"; Flags: ignoreversion
