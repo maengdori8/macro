@@ -1,3 +1,4 @@
+; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
 [Setup]
 AppName=Macro
 AppVersion=1.0.0
@@ -20,6 +21,7 @@ Source: "dist\macro.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "targets.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target_*.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Macro"; Filename: "{app}\launcher.exe"

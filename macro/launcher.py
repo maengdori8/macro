@@ -9,7 +9,6 @@ import time
 import urllib.request
 import urllib.error
 
-APP_VERSION = "1.0.0"
 VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
 
 
@@ -17,6 +16,18 @@ def get_app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def read_version():
+    try:
+        vpath = os.path.join(get_app_dir(), "version.txt")
+        with open(vpath, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "0.0.0"
+
+
+APP_VERSION = read_version()
 
 
 def parse_version(v):

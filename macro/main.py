@@ -28,10 +28,7 @@ from pathlib import Path
 from tkinter import scrolledtext
 from typing import Any, Callable, Optional
 
-import base64
 import hashlib
-import hmac
-import struct
 import subprocess
 import uuid
 
@@ -45,7 +42,7 @@ import numpy as np
 # 필요 패키지: pip install vgamepad
 try:
     import vgamepad as vg
-except (ImportError, OSError) as exc:
+except (ImportError, OSError, Exception) as exc:
     vg = None
     VGAMEPAD_IMPORT_ERROR = exc
 else:
@@ -122,12 +119,22 @@ DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
-APP_VERSION = "1.0.0"
-VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
+def _read_version() -> str:
+    """version.txt에서 버전을 읽습니다."""
+    try:
+        if getattr(sys, "frozen", False):
+            vpath = Path(sys.executable).parent / "version.txt"
+        else:
+            vpath = Path(__file__).parent / "version.txt"
+        return vpath.read_text(encoding="utf-8").strip()
+    except Exception:
+        return "0.0.0"
 
-LICENSE_SECRET_KEY = b"macro-automation-license-key-2026-xK9mP2vL"
+APP_VERSION = _read_version()
+VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
+VERIFY_SERVER_URL = "https://license-server-flame-eta.vercel.app/api/verify"
+
 LICENSE_FILE = "license.key"
-LICENSE_VALID_DAYS = {1, 7, 30, 99999}
 
 TARGET_CONFIG_FILENAME = "targets.json"
 DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
@@ -162,43 +169,6 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
     {"name": "target_I", "filename": "target_I.png", "action": "click"},
 ]
-
-def verify_license_key(key: str) -> dict:
-    """라이센스 키를 검증하고 정보를 반환합니다. 실패 시 ValueError를 발생시킵니다."""
-    clean = key.replace("-", "").replace(" ", "").upper()
-    padding = (8 - len(clean) % 8) % 8
-    clean += "=" * padding
-    try:
-        raw = base64.b32decode(clean)
-    except Exception:
-        raise ValueError("잘못된 키 형식입니다.")
-
-    if len(raw) != 16:
-        raise ValueError("잘못된 키 형식입니다.")
-
-    payload = raw[:8]
-    stored_sig = raw[8:]
-    expected_sig = hmac.new(LICENSE_SECRET_KEY, payload, hashlib.sha256).digest()[:8]
-
-    if not hmac.compare_digest(stored_sig, expected_sig):
-        raise ValueError("유효하지 않은 라이센스 키입니다.")
-
-    created, days = struct.unpack(">II", payload)
-    if days not in LICENSE_VALID_DAYS:
-        raise ValueError("유효하지 않은 라이센스 키입니다.")
-
-    expires = created + days * 86400
-    now = int(time.time())
-    remaining = expires - now
-    if remaining <= 0:
-        raise ValueError("만료된 라이센스 키입니다.")
-
-    return {
-        "created": created,
-        "days": days,
-        "expires": expires,
-        "remaining_seconds": remaining,
-    }
 
 
 def load_saved_license(base_dir: Path) -> Optional[str]:
@@ -1097,6 +1067,8 @@ class WGCCaptureEngine:
         self.closed_event = threading.Event()
         self.started = False
         self.logged_first_frame = False
+        self._frame_seq = 0
+        self._last_consumed_seq = -1
 
     def log(self, message: str) -> None:
         """콘솔 또는 GUI 로그 영역으로 메시지를 보냅니다."""
@@ -1114,6 +1086,7 @@ class WGCCaptureEngine:
             frame_copy = image_bgra.copy()
             with self.frame_lock:
                 self.latest_frame = frame_copy
+                self._frame_seq += 1
 
             self.first_frame_event.set()
             if not self.logged_first_frame:
@@ -1192,7 +1165,7 @@ class WGCCaptureEngine:
             return False
 
     def get_latest_frame(self, timeout: float = 0.0) -> Optional[np.ndarray]:
-        """최신 WGC 프레임을 BGRA NumPy 배열 복사본으로 반환합니다."""
+        """최신 WGC 프레임을 BGRA NumPy 배열로 반환합니다. 새 프레임이 없으면 None."""
 
         if timeout > 0 and not self.first_frame_event.wait(timeout):
             return None
@@ -1200,7 +1173,10 @@ class WGCCaptureEngine:
         with self.frame_lock:
             if self.latest_frame is None:
                 return None
-            return self.latest_frame.copy()
+            if self._frame_seq == self._last_consumed_seq:
+                return None  # 동일 프레임 재처리 방지
+            self._last_consumed_seq = self._frame_seq
+            return self.latest_frame
 
     def get_frame_size(self) -> Optional[tuple[int, int]]:
         """최신 WGC 프레임의 (width, height)를 반환합니다."""
@@ -1245,6 +1221,7 @@ class InactiveManager:
         self.last_capture_wait_log_time = 0.0
         self.virtual_mouse_wgc_pos: Optional[tuple[int, int]] = None
         self.virtual_mouse_client_pos: Optional[tuple[int, int]] = None
+        self._cached_gray: Optional[np.ndarray] = None
 
         if WIN32_IMPORT_ERROR is not None:
             self.log("[오류] pywin32 모듈을 불러올 수 없습니다.")
@@ -1396,6 +1373,9 @@ class InactiveManager:
             timeout=WGC_FIRST_FRAME_TIMEOUT_SECONDS,
         )
         if frame_bgra is None:
+            # 새 프레임 없음 — 캐시된 gray가 있으면 재사용 (재변환 없이)
+            if self._cached_gray is not None:
+                return self._cached_gray
             self._log_capture_wait("[대기] WGC 첫 프레임 또는 최신 프레임을 아직 받지 못했습니다.")
             return None
 
@@ -1409,10 +1389,9 @@ class InactiveManager:
             return None
 
         try:
-            b = frame_bgra[:, :, 0].astype(np.uint16)
-            g = frame_bgra[:, :, 1].astype(np.uint16)
-            r = frame_bgra[:, :, 2].astype(np.uint16)
-            gray = ((r * 77 + g * 150 + b * 29) >> 8).astype(np.uint8)
+            frame_bgr = frame_bgra[:, :, :3]
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            self._cached_gray = gray
             return gray
         except Exception as exc:
             self.log(f"[캡처 오류] WGC 프레임을 GrayScale로 변환하지 못했습니다: {exc}")
@@ -1426,6 +1405,7 @@ class InactiveManager:
 
         self.capture_engine.stop_capture()
         self.capture_engine = None
+        self._cached_gray = None
 
     def _log_capture_wait(self, message: str) -> None:
         """반복 루프에서 같은 캡처 메시지가 과도하게 쌓이지 않게 합니다."""
@@ -1758,11 +1738,6 @@ class AutomationApp:
         self.root = root
         self.license_key = license_key
         self.license_info: Optional[dict] = None
-        if license_key:
-            try:
-                self.license_info = verify_license_key(license_key)
-            except ValueError:
-                self.license_info = {"days": 0, "remaining_seconds": 0}
 
         self.root.title("비활성 창 이미지 자동화 테스트")
         self.root.geometry("980x760+80+80")
@@ -2273,13 +2248,10 @@ class AutomationApp:
             hwid = get_hwid()
             sr = verify_license_server(self.license_key, hwid)
             if sr.get("_offline"):
-                try:
-                    self.license_info = verify_license_key(self.license_key)
-                except ValueError as e:
-                    self.log(f"[라이센스] {e} 프로그램을 재시작하고 새 키를 입력하세요.")
-                    self.set_status("라이센스 만료")
-                    self._set_button_state(running=False)
-                    return
+                self.log("[라이센스] 서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
+                self.set_status("서버 연결 실패")
+                self._set_button_state(running=False)
+                return
             elif not sr.get("valid", False):
                 self.log(f"[라이센스] {sr.get('message', '인증 실패')} 프로그램을 재시작하고 새 키를 입력하세요.")
                 self.set_status("라이센스 만료")
@@ -3206,17 +3178,9 @@ class LicenseDialog:
         server_result = verify_license_server(key, hwid)
 
         if server_result.get("_offline"):
-            try:
-                info = verify_license_key(key)
-                remaining = format_remaining_time(info["remaining_seconds"])
-                self.message_var.set(f"저장된 라이센스가 유효합니다. ({info['days']}일권, {remaining}) [오프라인]")
-                self.message_label.configure(fg=self._success_color)
-                self.root.after(800, lambda: self._launch_app(key))
-            except ValueError:
-                self.message_var.set("저장된 라이센스가 만료되었거나 유효하지 않습니다. 새 키를 입력하세요.")
-                self.message_label.configure(fg=self._error_color)
-                self.key_var.set("")
-                self.key_entry.focus_set()
+            self.message_var.set("서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
+            self.message_label.configure(fg=self._error_color)
+            self.key_entry.focus_set()
             return
 
         if not server_result.get("valid", False):
@@ -3242,17 +3206,8 @@ class LicenseDialog:
         server_result = verify_license_server(key, hwid)
 
         if server_result.get("_offline"):
-            try:
-                info = verify_license_key(key)
-            except ValueError as e:
-                self.message_var.set(str(e))
-                self.message_label.configure(fg=self._error_color)
-                return
-            remaining = format_remaining_time(info["remaining_seconds"])
-            self.message_var.set(f"인증 성공! ({info['days']}일권, {remaining}) [오프라인]")
-            self.message_label.configure(fg=self._success_color)
-            save_license_key(self.base_dir, key)
-            self.root.after(600, lambda: self._launch_app(key))
+            self.message_var.set("서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
+            self.message_label.configure(fg=self._error_color)
             return
 
         if not server_result.get("valid", False):
