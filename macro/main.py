@@ -1782,6 +1782,20 @@ class AutomationApp:
         self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.closing = False
 
+        # 로그 파일 초기화
+        self._log_file = None
+        try:
+            log_dir = self.base_dir / "logs"
+            log_dir.mkdir(exist_ok=True)
+            log_path = log_dir / f"macro_{time.strftime('%Y-%m-%d')}.log"
+            self._log_file = open(log_path, "a", encoding="utf-8")
+            self._log_file.write(f"\n{'='*50}\n")
+            self._log_file.write(f"세션 시작: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self._log_file.write(f"버전: {APP_VERSION}\n")
+            self._log_file.write(f"{'='*50}\n")
+        except Exception:
+            pass
+
         self._build_ui()
         self._bind_shortcuts()
         self._set_button_state(running=False)
@@ -2351,14 +2365,24 @@ class AutomationApp:
         """창 닫기 버튼을 눌렀을 때도 자동화 스레드를 자연스럽게 멈춥니다."""
 
         self.closing = True
+        self._close_log_file()
         if self.worker_thread is not None and self.worker_thread.is_alive():
             self.stop_event.set()
-            self.log("[종료 요청] 창 닫기 전에 자동화 스레드를 중단합니다.")
             self.set_status("종료 요청됨")
             self.root.after(100, self._destroy_when_worker_stops)
             return
 
         self.root.destroy()
+
+    def _close_log_file(self) -> None:
+        """로그 파일을 안전하게 닫습니다."""
+        if self._log_file is not None:
+            try:
+                self._log_file.write(f"세션 종료: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def _destroy_when_worker_stops(self) -> None:
         """작업 스레드가 끝난 뒤 tkinter 창을 닫습니다."""
@@ -2395,6 +2419,14 @@ class AutomationApp:
                 self.queue_status("오류 발생")
                 self.queue_log("[종료] 타겟 이미지 준비에 실패하여 실행을 중단합니다.")
                 return
+
+            # ViGEm 드라이버 미설치 경고
+            has_key_targets = any(t.action == "key" for t in targets)
+            if has_key_targets and vg is None:
+                self.queue_log("[경고] vgamepad를 사용할 수 없어 키 입력 타겟이 작동하지 않습니다.")
+                self.queue_log(f"       원본 오류: {VGAMEPAD_IMPORT_ERROR}")
+                self.queue_log("       ViGEm Bus Driver를 설치하세요:")
+                self.queue_log("       https://github.com/nefarius/ViGEmBus/releases")
 
             requires_window = (
                 capture_mode == "wgc"
@@ -2690,6 +2722,14 @@ class AutomationApp:
 
         timestamp = time.strftime("%H:%M:%S")
         line = f"{timestamp} {message}\n"
+
+        # 로그 파일에 기록
+        if self._log_file is not None:
+            try:
+                self._log_file.write(line)
+                self._log_file.flush()
+            except Exception:
+                pass
 
         if hasattr(self, "preview_log_rows"):
             self.preview_log_messages.append(line.rstrip())

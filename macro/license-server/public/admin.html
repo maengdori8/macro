@@ -186,6 +186,18 @@ function renderTable(list) {
     else badge = '<span class="badge badge-active">활성</span>';
 
     const exp = new Date(l.expiresAt).toLocaleDateString('ko-KR');
+    const remainMs = l.expiresAt - Date.now();
+    let remainText = '';
+    if (l.days === 99999) {
+      remainText = '-';
+    } else if (remainMs <= 0) {
+      remainText = '<span style="color:#FF6B6B">만료됨</span>';
+    } else {
+      const remainDays = Math.floor(remainMs / 86400000);
+      const remainHours = Math.floor((remainMs % 86400000) / 3600000);
+      if (remainDays > 0) remainText = `<span style="color:#69DB7C">${remainDays}일 ${remainHours}시간</span>`;
+      else remainText = `<span style="color:#FFA94D">${remainHours}시간</span>`;
+    }
     const toggleLabel = l.disabled ? '활성화' : '비활성화';
     const toggleClass = l.disabled ? 'btn-primary' : 'btn-warning';
 
@@ -193,7 +205,7 @@ function renderTable(list) {
       <td class="key-text">${l.key}</td>
       <td>${l.days === 99999 ? '무제한' : l.days + '일'}</td>
       <td>${badge}</td>
-      <td>${l.days === 99999 ? '-' : exp}</td>
+      <td>${l.days === 99999 ? '-' : exp}<br><span style="font-size:11px">${remainText}</span></td>
       <td><span style="color:${l.hwids.length >= l.maxHwids ? '#FF6B6B' : '#69DB7C'}">${l.hwids.length}/${l.maxHwids}</span></td>
       <td class="memo-text">${l.memo || '-'}</td>
       <td class="btn-group">

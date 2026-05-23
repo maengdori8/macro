@@ -2,6 +2,19 @@
 chcp 65001 >nul
 echo ===== 매크로 빌드 시작 =====
 
+:: version.txt에서 버전 읽기
+set APP_VER=0.0.0
+if exist "version.txt" (
+    set /p APP_VER=<version.txt
+)
+echo 버전: %APP_VER%
+
+:: setup.iss의 AppVersion을 version.txt와 동기화
+if exist "setup.iss" (
+    python -c "import re,sys; t=open('setup.iss','r',encoding='utf-8').read(); t=re.sub(r'AppVersion=.*','AppVersion=%APP_VER%',t); open('setup.iss','w',encoding='utf-8').write(t)"
+    echo setup.iss 버전 동기화 완료
+)
+
 echo 패키지 설치 중...
 python -m pip install pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow >nul 2>&1
 
