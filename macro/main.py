@@ -82,9 +82,11 @@ else:
     WINDOWS_CAPTURE_IMPORT_ERROR = None
 
 
-# UI 입력칸의 기본값입니다. 사용자는 프로그램 실행 후 UI에서 수정할 수 있습니다.
-# 예: "메모장", "Notepad", "계산기", "Chrome"
-WINDOW_TITLE = "대상 창 제목 일부를 입력하세요"
+# FC Online 프로세스 이름 (확장자 제외 부분 매칭)
+FC_ONLINE_PROCESS_NAMES = ["fconline", "fcoffline", "fifa"]
+
+# UI 입력칸의 기본값입니다.
+WINDOW_TITLE = "FC Online"
 
 # 아무것도 발견되지 않았을 때 CPU 과부하를 막기 위한 기본 대기 시간입니다.
 LOOP_SLEEP_SECONDS = 0.03
@@ -1242,25 +1244,64 @@ class InactiveManager:
 
         self.logger(message)
 
+    @staticmethod
+    def _get_pid_process_name(pid: int) -> Optional[str]:
+        """PID로 프로세스 실행 파일 이름을 반환합니다."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                buf = ctypes.create_unicode_buffer(260)
+                size = wintypes.DWORD(260)
+                if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                    full_path = buf.value
+                    return os.path.basename(full_path).lower()
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+        return None
+
+    def _is_fc_online_process(self, hwnd: int) -> bool:
+        """HWND가 FC Online 프로세스의 창인지 확인합니다."""
+        try:
+            import ctypes
+            pid = ctypes.c_ulong(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+            if pid.value == 0:
+                return False
+            proc_name = self._get_pid_process_name(pid.value)
+            if proc_name is None:
+                return False
+            proc_name_lower = proc_name.replace(".exe", "")
+            for fc_name in FC_ONLINE_PROCESS_NAMES:
+                if fc_name in proc_name_lower:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def find_window(self) -> bool:
         """
-        WINDOW_TITLE 문자열이 제목에 포함된 창을 찾습니다.
+        FC Online 프로세스의 창을 찾습니다.
 
-        정확히 일치하지 않아도 되도록 부분 문자열로 검색합니다.
-        같은 제목의 창이 여러 개 있을 수 있으므로 모든 후보 HWND와 제목을 출력합니다.
+        프로세스 이름 기반으로 검색하여 다른 프로그램과 혼동하지 않습니다.
+        프로세스로 못 찾으면 창 제목 기반 검색으로 폴백합니다.
         """
 
         if not self._win32_ready():
             return False
 
-        keyword = self.window_title.strip().lower()
-        if not keyword:
-            self.log("[오류] 대상 창 제목이 비어 있습니다.")
-            self.log("       UI의 대상 창 제목 입력칸에 찾을 창 제목 일부를 입력하세요.")
-            return False
-
         matches: list[tuple[int, str]] = []
         minimized_matches: list[tuple[int, str]] = []
+        title_matches: list[tuple[int, str]] = []
+
+        keyword = self.window_title.strip().lower()
 
         def enum_handler(hwnd: int, _extra: object) -> None:
             if not win32gui.IsWindow(hwnd):
@@ -1271,14 +1312,19 @@ class InactiveManager:
             title = win32gui.GetWindowText(hwnd).strip()
             if not title:
                 return
-            if keyword not in title.lower():
-                return
 
-            if win32gui.IsIconic(hwnd):
-                minimized_matches.append((hwnd, title))
-                return
+            # 프로세스 이름으로 FC Online 확인
+            is_fc = self._is_fc_online_process(hwnd)
 
-            matches.append((hwnd, title))
+            if is_fc:
+                if win32gui.IsIconic(hwnd):
+                    minimized_matches.append((hwnd, title))
+                else:
+                    matches.append((hwnd, title))
+            elif keyword and keyword in title.lower():
+                # 프로세스 매칭 실패 시 제목 폴백용
+                if not win32gui.IsIconic(hwnd):
+                    title_matches.append((hwnd, title))
 
         try:
             win32gui.EnumWindows(enum_handler, None)
@@ -1286,16 +1332,21 @@ class InactiveManager:
             self.log(f"[오류] 창 검색 중 문제가 발생했습니다: {exc}")
             return False
 
-        self.log(f"[창 검색] 제목에 '{self.window_title}' 포함된 창을 검색했습니다.")
+        self.log(f"[창 검색] FC Online 프로세스를 검색했습니다.")
 
         if minimized_matches:
             self.log("[제외] 최소화된 창은 지원하지 않아 제외했습니다.")
             for hwnd, title in minimized_matches:
                 self.log(f"       HWND={hwnd}, 제목='{title}'")
 
+        # 프로세스 매칭 우선, 없으면 제목 폴백
+        if not matches and title_matches:
+            self.log("[안내] 프로세스로 찾지 못해 창 제목으로 검색합니다.")
+            matches = title_matches
+
         if not matches:
-            self.log("[안내] 사용 가능한 대상 창을 찾지 못했습니다.")
-            self.log("       창 제목을 확인하거나, 대상 창이 최소화되어 있지 않은지 확인하세요.")
+            self.log("[안내] FC Online 창을 찾지 못했습니다.")
+            self.log("       게임이 실행 중인지 확인하세요.")
             return False
 
         self.log("[발견] 사용 가능한 창 후보:")
