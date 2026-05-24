@@ -83,7 +83,7 @@ else:
 
 
 # FC Online 프로세스 이름 (확장자 제외 부분 매칭)
-FC_ONLINE_PROCESS_NAMES = ["fconline", "fcoffline", "fifa"]
+FC_ONLINE_PROCESS_NAMES = ["fczf"]
 
 # UI 입력칸의 기본값입니다.
 WINDOW_TITLE = "FC Online"
