@@ -1,0 +1,12 @@
+{
+  "name": "macro-discord-bot",
+  "version": "1.0.0",
+  "description": "매크로 상태 조회 디스코드 봇",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0"
+  }
+}

@@ -118,6 +118,7 @@
           <th>상태</th>
           <th>만료일</th>
           <th>HWID</th>
+          <th>디스코드</th>
           <th>메모</th>
           <th>관리</th>
         </tr>
@@ -207,6 +208,7 @@ function renderTable(list) {
       <td>${badge}</td>
       <td>${l.days === 99999 ? '-' : exp}<br><span style="font-size:11px">${remainText}</span></td>
       <td><span style="color:${l.hwids.length >= l.maxHwids ? '#FF6B6B' : '#69DB7C'}">${l.hwids.length}/${l.maxHwids}</span></td>
+      <td><span class="memo-text" style="cursor:pointer;text-decoration:underline dotted;" onclick="editDiscordId('${l.key}','${l.discordId || ''}')" title="클릭하여 수정">${l.discordId || '-'}</span></td>
       <td class="memo-text">${l.memo || '-'}</td>
       <td class="btn-group">
         <button class="btn ${toggleClass} btn-sm" onclick="toggleKey('${l.key}', ${!l.disabled})">${toggleLabel}</button>
@@ -279,6 +281,17 @@ async function resetHwids(key) {
     showToast(data.message, data.success ? 'success' : 'error');
     if (data.success) loadLicenses();
   } catch (e) { showToast('HWID 초기화 실패', 'error'); }
+}
+
+async function editDiscordId(key, current) {
+  const newId = prompt('디스코드 유저 ID를 입력하세요:', current);
+  if (newId === null) return;
+  try {
+    const res = await fetch(API, { method: 'PATCH', headers: headers(), body: JSON.stringify({ key, discordId: newId.trim() }) });
+    const data = await res.json();
+    showToast(data.message, data.success ? 'success' : 'error');
+    if (data.success) loadLicenses();
+  } catch (e) { showToast('디스코드 ID 수정 실패', 'error'); }
 }
 
 function generateRandomKey() {

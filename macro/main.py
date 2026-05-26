@@ -121,6 +121,30 @@ DEFAULT_REGION_Y = 0
 DEFAULT_REGION_WIDTH = 1280
 DEFAULT_REGION_HEIGHT = 720
 
+STATUS_API_URL = "https://license-server-flame-eta.vercel.app/api/status"
+STATUS_REPORT_INTERVAL_SECONDS = 30  # 서버에 상태 전송 간격
+
+
+def _send_status(license_key: str, rank: Optional[int] = None, running: bool = True, message: str = "") -> None:
+    """매크로 상태를 서버에 전송합니다."""
+    try:
+        data = _json.dumps({
+            "key": license_key,
+            "rank": rank,
+            "running": running,
+            "message": message,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            STATUS_API_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
 def _read_version() -> str:
     """version.txt에서 버전을 읽습니다."""
     try:
@@ -2488,7 +2512,24 @@ class AutomationApp:
             if requires_window:
                 manager = InactiveManager(window_title, logger=self.queue_log)
 
+            # 상태 전송 타이머
+            last_status_report = 0.0
+
+            # 시작 상태 전송
+            if self.license_key:
+                _send_status(self.license_key, running=True, message="매크로 시작")
+
             while not self.stop_event.is_set():
+                # 주기적 상태 전송
+                now_mono = time.monotonic()
+                if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
+                    last_status_report = now_mono
+                    threading.Thread(
+                        target=_send_status,
+                        args=(self.license_key,),
+                        kwargs={"running": True, "message": "실행 중"},
+                        daemon=True,
+                    ).start()
                 self.apply_current_thresholds(targets)
 
                 if requires_window and manager is not None and not manager.is_valid_window():
@@ -2579,6 +2620,14 @@ class AutomationApp:
             self.stop_event.set()
             self.queue_status("종료됨")
             self.queue_log("[종료] 자동화 루프가 종료되었습니다.")
+            # 종료 상태 전송
+            if self.license_key:
+                threading.Thread(
+                    target=_send_status,
+                    args=(self.license_key,),
+                    kwargs={"running": False, "message": "매크로 종료"},
+                    daemon=True,
+                ).start()
             self.ui_queue.put(("finished", ""))
 
     def apply_click_jitter(

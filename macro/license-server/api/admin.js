@@ -45,6 +45,7 @@ module.exports = async function handler(req, res) {
           memo: data.memo || "",
           hwids: data.hwids || [],
           maxHwids: data.maxHwids || 3,
+          discordId: data.discordId || "",
         });
       });
       return res.status(200).json({ success: true, licenses });
@@ -116,6 +117,12 @@ module.exports = async function handler(req, res) {
       if (resetHwids) {
         await col.doc(key).update({ hwids: [] });
         return res.status(200).json({ success: true, message: "HWID가 초기화되었습니다." });
+      }
+
+      const { discordId } = req.body;
+      if (discordId !== undefined) {
+        await col.doc(key).update({ discordId: discordId || "" });
+        return res.status(200).json({ success: true, message: "디스코드 ID가 업데이트되었습니다." });
       }
 
       await col.doc(key).update({ disabled: !!disabled });

@@ -20,6 +20,11 @@
       "src": "/api/version",
       "methods": ["GET", "POST"],
       "dest": "/api/version.js"
+    },
+    {
+      "src": "/api/status",
+      "methods": ["GET", "POST"],
+      "dest": "/api/status.js"
     }
   ]
 }
