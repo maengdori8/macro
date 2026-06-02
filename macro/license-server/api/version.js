@@ -1,4 +1,5 @@
 const admin = require("firebase-admin");
+const sec = require("../lib/security");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -11,9 +12,17 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const ADMIN_KEY = process.env.ADMIN_KEY;
+
+const ALLOWED_ORIGINS = [
+  "https://license-server-flame-eta.vercel.app",
+  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : []),
+];
 
 module.exports = async function handler(req, res) {
+  sec.setSecurityHeaders(res);
+  const corsOk = sec.applyCors(req, res, ALLOWED_ORIGINS);
+  if (req.method === "OPTIONS") return res.status(204).end();
+
   if (req.method === "GET") {
     try {
       const doc = await db.collection("config").doc("version").get();
@@ -33,14 +42,27 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const authKey = req.headers["x-admin-key"];
-    if (!ADMIN_KEY || authKey !== ADMIN_KEY) {
+    if (!corsOk) {
+      return res.status(403).json({ success: false, message: "허용되지 않은 출처입니다." });
+    }
+    const ip = sec.getClientIp(req);
+    const rl = await sec.rateLimit(db, { bucket: "version", ip, max: 10, windowMs: 60000, failClosed: true });
+    if (!rl.allowed) {
+      return res.status(429).json({ success: false, message: "요청이 너무 많습니다." });
+    }
+    if (!sec.verifyAdminKey(req)) {
       return res.status(401).json({ success: false, message: "인증 실패" });
     }
 
     const { version, url, changelog } = req.body || {};
-    if (!version || typeof version !== "string") {
-      return res.status(400).json({ success: false, message: "version이 필요합니다." });
+    if (!sec.isValidVersion(version)) {
+      return res.status(400).json({ success: false, message: "버전 형식이 올바르지 않습니다. (예: 1.0.1)" });
+    }
+    if (!sec.isValidHttpsUrl(url)) {
+      return res.status(400).json({ success: false, message: "다운로드 URL은 https여야 합니다." });
+    }
+    if (changelog !== undefined && (typeof changelog !== "string" || changelog.length > 1000)) {
+      return res.status(400).json({ success: false, message: "변경사항은 1000자 이하여야 합니다." });
     }
 
     try {

@@ -130,6 +130,7 @@ def _send_status(license_key: str, rank: Optional[int] = None, running: bool = T
     try:
         data = _json.dumps({
             "key": license_key,
+            "hwid": get_hwid(),
             "rank": rank,
             "running": running,
             "message": message,

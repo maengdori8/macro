@@ -3,6 +3,7 @@ const { Client, GatewayIntentBits } = require("discord.js");
 // ─── 설정 ───
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const STATUS_API = process.env.STATUS_API || "https://license-server-flame-eta.vercel.app/api/status";
+const BOT_API_KEY = process.env.BOT_API_KEY; // 서버 status GET 인증용
 const PREFIX = "!";
 
 // ─── 봇 초기화 ───
@@ -16,8 +17,10 @@ const client = new Client({
 
 // ─── API 호출 ───
 async function fetchStatus(discordId) {
-  const url = `${STATUS_API}?discordId=${discordId}`;
-  const res = await fetch(url);
+  const url = `${STATUS_API}?discordId=${encodeURIComponent(discordId)}`;
+  const res = await fetch(url, {
+    headers: { "X-Bot-Key": BOT_API_KEY || "" },
+  });
   return res.json();
 }
 
@@ -80,6 +83,10 @@ client.once("ready", () => {
 
 if (!DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN 환경변수가 설정되지 않았습니다.");
+  process.exit(1);
+}
+if (!BOT_API_KEY) {
+  console.error("❌ BOT_API_KEY 환경변수가 설정되지 않았습니다.");
   process.exit(1);
 }
 

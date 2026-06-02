@@ -1,4 +1,5 @@
 const admin = require("firebase-admin");
+const sec = require("../lib/security");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -11,15 +12,39 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const ADMIN_KEY = process.env.ADMIN_KEY;
+
+// 허용된 관리자 패널 출처 (환경변수로 추가 가능)
+const ALLOWED_ORIGINS = [
+  "https://license-server-flame-eta.vercel.app",
+  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : []),
+];
 
 function unauthorized(res) {
   return res.status(401).json({ success: false, message: "인증 실패" });
 }
 
 module.exports = async function handler(req, res) {
-  const authKey = req.headers["x-admin-key"];
-  if (!ADMIN_KEY || authKey !== ADMIN_KEY) {
+  sec.setSecurityHeaders(res);
+  const corsOk = sec.applyCors(req, res, ALLOWED_ORIGINS);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (!corsOk) {
+    return res.status(403).json({ success: false, message: "허용되지 않은 출처입니다." });
+  }
+
+  // 관리자 키 브루트포스 방지: IP당 분당 10회
+  const ip = sec.getClientIp(req);
+  const rl = await sec.rateLimit(db, {
+    bucket: "admin",
+    ip,
+    max: 10,
+    windowMs: 60000,
+    failClosed: true,
+  });
+  if (!rl.allowed) {
+    return res.status(429).json({ success: false, message: "요청이 너무 많습니다." });
+  }
+
+  if (!sec.verifyAdminKey(req)) {
     return unauthorized(res);
   }
 
@@ -57,11 +82,14 @@ module.exports = async function handler(req, res) {
 
   if (req.method === "POST") {
     const { key, days, memo } = req.body || {};
-    if (!key || typeof key !== "string") {
-      return res.status(400).json({ success: false, message: "key가 필요합니다." });
+    if (!sec.isValidKeyFormat(key)) {
+      return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
     if (![1, 7, 30, 99999].includes(days)) {
       return res.status(400).json({ success: false, message: "days는 1, 7, 30, 99999 중 하나여야 합니다." });
+    }
+    if (memo !== undefined && (typeof memo !== "string" || memo.length > 200)) {
+      return res.status(400).json({ success: false, message: "메모는 200자 이하 문자열이어야 합니다." });
     }
 
     try {
@@ -85,8 +113,8 @@ module.exports = async function handler(req, res) {
 
   if (req.method === "DELETE") {
     const { key } = req.body || {};
-    if (!key || typeof key !== "string") {
-      return res.status(400).json({ success: false, message: "key가 필요합니다." });
+    if (!sec.isValidKeyFormat(key)) {
+      return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
 
     try {
@@ -95,6 +123,7 @@ module.exports = async function handler(req, res) {
         return res.status(404).json({ success: false, message: "존재하지 않는 키입니다." });
       }
       await col.doc(key).delete();
+      await db.collection("status").doc(key).delete().catch(() => {});
       return res.status(200).json({ success: true, message: "라이센스가 삭제되었습니다." });
     } catch (err) {
       console.error("Admin delete error:", err);
@@ -104,8 +133,8 @@ module.exports = async function handler(req, res) {
 
   if (req.method === "PATCH") {
     const { key, disabled, resetHwids } = req.body || {};
-    if (!key || typeof key !== "string") {
-      return res.status(400).json({ success: false, message: "key가 필요합니다." });
+    if (!sec.isValidKeyFormat(key)) {
+      return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
 
     try {
@@ -121,6 +150,9 @@ module.exports = async function handler(req, res) {
 
       const { discordId } = req.body;
       if (discordId !== undefined) {
+        if (!sec.isValidDiscordId(discordId)) {
+          return res.status(400).json({ success: false, message: "디스코드 ID 형식이 올바르지 않습니다. (숫자 17~20자)" });
+        }
         await col.doc(key).update({ discordId: discordId || "" });
         return res.status(200).json({ success: true, message: "디스코드 ID가 업데이트되었습니다." });
       }
