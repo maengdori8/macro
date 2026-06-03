@@ -1920,6 +1920,14 @@ class AutomationApp:
         self._bring_window_to_front()
         self._poll_ui_queue()
 
+        # 가상 게임패드를 미리 생성해 게임이 컨트롤러를 일찍 인식하게 합니다.
+        if vg is not None and not self.ui_preview_only:
+            try:
+                _get_gamepad()
+                self.log("[게임패드] 가상 Xbox 컨트롤러를 연결했습니다.")
+            except Exception as exc:
+                self.log(f"[게임패드] 가상 컨트롤러 생성 실패: {exc}")
+
         self.log("프로그램을 시작했습니다.")
         if self.license_info:
             remaining = format_remaining_time(self.license_info["remaining_seconds"])
