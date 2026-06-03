@@ -346,10 +346,29 @@ gamepad: Optional[Any] = None
 
 KEY_TO_GAMEPAD: dict[str, Any] = {}
 if vg is not None:
+    B = vg.XUSB_BUTTON
     KEY_TO_GAMEPAD = {
-        "esc": vg.XUSB_BUTTON.XUSB_GAMEPAD_START,
-        "escape": vg.XUSB_BUTTON.XUSB_GAMEPAD_START,
-        "s": vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
+        # 별칭 (기존 호환)
+        "esc": B.XUSB_GAMEPAD_START,
+        "escape": B.XUSB_GAMEPAD_START,
+        "s": B.XUSB_GAMEPAD_A,
+        # Xbox 버튼 직접 지정용 (targets.json의 key에 아래 이름 사용)
+        "a": B.XUSB_GAMEPAD_A,
+        "b": B.XUSB_GAMEPAD_B,
+        "x": B.XUSB_GAMEPAD_X,
+        "y": B.XUSB_GAMEPAD_Y,
+        "lb": B.XUSB_GAMEPAD_LEFT_SHOULDER,
+        "rb": B.XUSB_GAMEPAD_RIGHT_SHOULDER,
+        "back": B.XUSB_GAMEPAD_BACK,
+        "select": B.XUSB_GAMEPAD_BACK,
+        "start": B.XUSB_GAMEPAD_START,
+        "guide": B.XUSB_GAMEPAD_GUIDE,
+        "lstick": B.XUSB_GAMEPAD_LEFT_THUMB,
+        "rstick": B.XUSB_GAMEPAD_RIGHT_THUMB,
+        "up": B.XUSB_GAMEPAD_DPAD_UP,
+        "down": B.XUSB_GAMEPAD_DPAD_DOWN,
+        "left": B.XUSB_GAMEPAD_DPAD_LEFT,
+        "right": B.XUSB_GAMEPAD_DPAD_RIGHT,
     }
 
 
@@ -367,7 +386,7 @@ def _get_gamepad() -> Any:
     return gamepad
 
 
-def send_gamepad_button(button: Any, press_delay: float = 0.02) -> bool:
+def send_gamepad_button(button: Any, press_delay: float = 0.08) -> bool:
     """vgamepad Xbox 컨트롤러 버튼을 눌렀다 뗍니다."""
 
     pad = _get_gamepad()
@@ -377,6 +396,29 @@ def send_gamepad_button(button: Any, press_delay: float = 0.02) -> bool:
     pad.release_button(button=button)
     pad.update()
     return True
+
+
+def send_gamepad_trigger(side: str, press_delay: float = 0.08) -> bool:
+    """vgamepad LT/RT 트리거를 당겼다 놓습니다."""
+
+    pad = _get_gamepad()
+    if side == "lt":
+        pad.left_trigger(value=255)
+        pad.update()
+        time.sleep(press_delay)
+        pad.left_trigger(value=0)
+        pad.update()
+    else:
+        pad.right_trigger(value=255)
+        pad.update()
+        time.sleep(press_delay)
+        pad.right_trigger(value=0)
+        pad.update()
+    return True
+
+
+# 트리거 키 이름 (버튼이 아닌 아날로그 입력)
+TRIGGER_KEYS = {"lt", "rt"}
 
 
 KEY_TO_VK: dict[str, int] = {
@@ -2701,8 +2743,9 @@ class AutomationApp:
             return False
 
         normalized_key = target.key.strip().lower()
-        button = KEY_TO_GAMEPAD.get(normalized_key)
-        if button is None:
+        is_trigger = normalized_key in TRIGGER_KEYS
+        button = None if is_trigger else KEY_TO_GAMEPAD.get(normalized_key)
+        if not is_trigger and button is None:
             self.queue_log(
                 f"[키 경고] {target.name}의 key='{target.key}'는 "
                 "vgamepad 매핑에 없어 건너뜁니다."
@@ -2715,7 +2758,10 @@ class AutomationApp:
                 WA_ACTIVE = 1
                 win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
 
-            send_gamepad_button(button)
+            if is_trigger:
+                send_gamepad_trigger(normalized_key)
+            else:
+                send_gamepad_button(button)
             self.queue_log(f"[키] {target.key.upper()}")
             return True
         except Exception as exc:

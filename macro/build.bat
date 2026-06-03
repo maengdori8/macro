@@ -29,6 +29,10 @@ echo.
 echo [2/3] launcher.exe 빌드 중...
 python -m PyInstaller --onefile --noconsole --uac-admin --name launcher launcher.py
 
+echo.
+echo [추가] gamepad_test.exe 빌드 중 (버튼 테스트용, 콘솔 표시)...
+python -m PyInstaller --onefile --uac-admin --name gamepad_test --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" gamepad_test.py
+
 if not exist "dist\macro.exe" (
     echo macro.exe 빌드 실패!
     pause
