@@ -19,6 +19,7 @@ RestartApplications=no
 [Files]
 Source: "dist\macro.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "targets.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target_*.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion

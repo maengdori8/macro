@@ -1,0 +1,25 @@
+# 빌드 산출물
+dist/
+build/
+*.build/
+*.onefile-build/
+*.dist/
+*.spec
+
+# 런타임 생성물
+logs/
+license.key
+_update.zip
+_update_tmp/
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Claude worktrees/agent state
+.claude/

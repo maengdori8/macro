@@ -13,7 +13,8 @@ VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
 
 
 def get_app_dir():
-    if getattr(sys, "frozen", False):
+    # PyInstaller(sys.frozen)와 Nuitka(__compiled__) 모두 대응
+    if getattr(sys, "frozen", False) or ("__compiled__" in globals()):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 

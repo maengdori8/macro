@@ -5,3 +5,8 @@ opencv-python
 numpy
 pyautogui
 pillow
+
+# 빌드 전용 (디컴파일 방어). Windows에서만 필요.
+nuitka; platform_system == "Windows"
+ordered-set; platform_system == "Windows"
+zstandard; platform_system == "Windows"
