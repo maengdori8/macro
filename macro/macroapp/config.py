@@ -82,6 +82,8 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     {"name": "target_I", "filename": "target_I.png", "action": "click"},
 ]
 
+# 1차 사전필터 축소 배율. 클수록 CPU↓ (최종 클릭 정확도는 ROI 정밀매칭이라 무관).
+# 2=가장 안전(권장, 8/8 탐지). 3=CPU 2.4배↓이나 얇은(16px) 템플릿 누락 위험.
 DOWNSCALE_FACTOR = 2
 
 

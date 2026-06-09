@@ -31,7 +31,7 @@ from macroapp.license_client import (
     STATUS_REPORT_INTERVAL_SECONDS, _send_status, get_hwid, verify_license_server,
     format_remaining_time, load_saved_license, save_license_key,
 )
-from macroapp.matching import find_template_center
+from macroapp.matching import find_template_center, downscale_screen
 from macroapp.window import InactiveManager
 
 class AutomationApp:
@@ -823,12 +823,17 @@ class AutomationApp:
 
                 found_any = False
 
+                # 프레임당 1회만 축소해 모든 타겟이 공유합니다(중복 축소 제거).
+                small_screen = downscale_screen(screen_gray)
+
                 # targets.json에 적힌 순서대로 탐지합니다.
                 for target in targets:
                     if self.stop_event.is_set():
                         break
 
-                    center, score = find_template_center(screen_gray, target, self.queue_log)
+                    center, score = find_template_center(
+                        screen_gray, target, self.queue_log, small_screen=small_screen
+                    )
                     if center is None:
                         continue
 

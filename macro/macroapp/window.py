@@ -379,10 +379,11 @@ class InactiveManager:
             timeout=WGC_FIRST_FRAME_TIMEOUT_SECONDS,
         )
         if frame_bgra is None:
-            # 새 프레임 없음 — 캐시된 gray가 있으면 재사용 (재변환 없이)
-            if self._cached_gray is not None:
-                return self._cached_gray
-            self._log_capture_wait("[대기] WGC 첫 프레임 또는 최신 프레임을 아직 받지 못했습니다.")
+            # 새 프레임이 없으면(화면 정지) None을 반환해 재매칭을 건너뜁니다.
+            # 같은 픽셀은 매칭 결과도 같으므로 재매칭은 순수 낭비이며,
+            # 새 프레임이 도착하면 그때 다시 매칭합니다. → 정지 화면 CPU ~0.
+            if self._cached_gray is None:
+                self._log_capture_wait("[대기] WGC 첫 프레임을 아직 받지 못했습니다.")
             return None
 
         if frame_bgra.ndim != 3 or frame_bgra.shape[2] < 3:

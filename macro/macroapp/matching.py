@@ -9,13 +9,30 @@ from macroapp.config import TargetImage, DOWNSCALE_FACTOR
 
 _INTER_AREA = getattr(cv2, "INTER_AREA", getattr(cv2, "INTER_LINEAR", 1))
 
+
+def downscale_screen(screen_gray: np.ndarray) -> np.ndarray:
+    """프레임당 1회만 화면을 축소해 모든 타겟이 공유하도록 합니다(중복 복사 제거).
+
+    템플릿과 '동일한' INTER_AREA로 축소해야 1차 상관도가 정확합니다.
+    (기존엔 화면=스트라이드 슬라이싱, 템플릿=INTER_AREA로 방식이 달라
+     얇은 템플릿이 1차에서 누락되던 버그가 있었음.)
+    """
+    f = DOWNSCALE_FACTOR
+    h, w = screen_gray.shape[:2]
+    return cv2.resize(screen_gray, (w // f, h // f), interpolation=_INTER_AREA)
+
+
 def find_template_center(
     screen_gray: np.ndarray,
     target: TargetImage,
     logger: Optional[LogCallback] = None,
+    small_screen: Optional[np.ndarray] = None,
 ) -> tuple[Optional[tuple[int, int]], float]:
     """
     2단계 템플릿 매칭: 축소 이미지로 빠른 사전 필터 → 원본에서 정밀 매칭.
+
+    small_screen을 미리 만들어 넘기면 프레임 내 모든 타겟이 같은 축소본을
+    재사용하여 타겟마다 축소·복사하던 낭비를 제거합니다.
     """
 
     log = logger or print
@@ -46,12 +63,19 @@ def find_template_center(
     if not hasattr(target, '_small_gray') or target._small_gray is None:
         target._small_gray = cv2.resize(target.image_gray, (small_tw, small_th), interpolation=_INTER_AREA)
 
-    # 캡처 스레드가 버퍼를 덮어써도 안전하도록 다운샘플은 독립 복사본으로 만듭니다.
-    small_screen = screen_gray[::f, ::f].copy()
+    # 미리 만든 축소본이 있으면 재사용(프레임당 1회), 없으면 직접 만듭니다.
+    # 템플릿과 동일한 INTER_AREA로 축소해야 1차 상관도가 정확합니다.
+    if small_screen is None or small_screen.shape != (screen_height // f, screen_width // f):
+        small_screen = cv2.resize(
+            screen_gray, (screen_width // f, screen_height // f), interpolation=_INTER_AREA
+        )
     small_result = cv2.matchTemplate(small_screen, target._small_gray, cv2.TM_CCOEFF_NORMED)
     _, small_max, _, small_loc = cv2.minMaxLoc(small_result)
 
-    if small_max < target.threshold * 0.85:
+    # 1차 게이트: 축소 배율이 클수록 상관도가 떨어지므로 게이트를 약간 낮춰
+    # 진짜 타겟을 놓치지 않게 합니다(정밀도는 ROI 재매칭이 보장).
+    gate_mult = 0.85 if f <= 2 else (0.80 if f == 3 else 0.75)
+    if small_max < target.threshold * gate_mult:
         return None, float(small_max)
 
     rough_x = small_loc[0] * f
