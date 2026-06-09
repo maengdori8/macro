@@ -22,7 +22,7 @@ def get_app_dir():
 def read_version():
     try:
         vpath = os.path.join(get_app_dir(), "version.txt")
-        with open(vpath, "r", encoding="utf-8") as f:
+        with open(vpath, "r", encoding="utf-8-sig") as f:
             return f.read().strip()
     except Exception:
         return "0.0.0"

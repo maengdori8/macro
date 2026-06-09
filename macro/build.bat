@@ -24,11 +24,18 @@ echo 패키지 설치 중...
 python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow ordered-set zstandard
 
 echo vgamepad DLL 경로 탐색 중...
-for /f "delims=" %%i in ('python -c "import vgamepad, os; print(os.path.dirname(vgamepad.__file__))"') do set VGAMEPAD_DIR=%%i
+:: find_spec로 위치만 찾습니다(import 시 ViGEm 드라이버가 없으면 죽으므로 실행하지 않음).
+for /f "delims=" %%i in ('python -c "import importlib.util,os; s=importlib.util.find_spec('vgamepad'); print(os.path.dirname(s.origin) if s and s.origin else '')"') do set "VGAMEPAD_DIR=%%i"
+if not defined VGAMEPAD_DIR (
+    echo [오류] vgamepad 패키지를 찾을 수 없습니다. 'pip install vgamepad' 후 다시 실행하세요.
+    pause
+    exit /b 1
+)
 
-:: 문법 게이트 (느린 컴파일 전에 1초 안에 오류 잡기)
+:: 문법 게이트 (느린 컴파일 전에 오류 잡기). cmd는 와일드카드를 확장하지 않으므로
+:: py_compile 대신 디렉터리를 재귀 처리하는 compileall을 사용합니다.
 echo 문법 검사 중...
-python -m py_compile macroapp\*.py macro_main.py launcher.py gamepad_test.py
+python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py
 if %errorlevel% neq 0 (
     echo [오류] 문법 검사 실패. 빌드를 중단합니다.
     pause
@@ -96,17 +103,14 @@ if not exist "dist\launcher.exe" (
 
 echo.
 echo [3/3] 설치 파일 생성 중...
-set ISCC_PATH=
-where iscc >nul 2>&1
-if %errorlevel% equ 0 (
-    set ISCC_PATH=iscc
-) else if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
-    set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
-    set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
-)
+:: 경로에 (x86) 같은 괄호가 있으면 if-블록 안에서 cmd가 오파싱하므로
+:: 괄호 블록을 쓰지 않고 한 줄 if로 처리합니다.
+set "ISCC_PATH="
+where iscc >nul 2>&1 && set "ISCC_PATH=iscc"
+if not defined ISCC_PATH if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if not defined ISCC_PATH if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
 
-if "%ISCC_PATH%"=="" (
+if not defined ISCC_PATH (
     echo.
     echo [안내] Inno Setup이 설치되어 있지 않습니다.
     echo        https://jrsoftware.org/isdl.php 에서 설치 후 다시 실행하세요.

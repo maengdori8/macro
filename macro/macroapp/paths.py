@@ -28,7 +28,8 @@ def app_dir() -> Path:
 def read_version() -> str:
     """version.txt에서 버전 문자열을 읽습니다. 실패 시 0.0.0."""
     try:
-        return (app_dir() / "version.txt").read_text(encoding="utf-8").strip()
+        # utf-8-sig: Notepad 등이 추가한 BOM도 안전하게 처리.
+        return (app_dir() / "version.txt").read_text(encoding="utf-8-sig").strip()
     except Exception:
         return "0.0.0"
 
