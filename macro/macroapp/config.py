@@ -233,6 +233,10 @@ def load_target_definitions(
             with config_path.open("r", encoding="utf-8") as config_file:
                 raw_config = json.load(config_file)
             raw_targets = raw_config.get("targets", raw_config) if isinstance(raw_config, dict) else raw_config
+        except json.JSONDecodeError as exc:
+            log(f"[설정 오류] {config_path} JSON 형식 오류 (줄 {exc.lineno}, 칸 {exc.colno}): {exc.msg}")
+            log("[설정 안내] 기본 타겟 설정을 대신 사용합니다.")
+            raw_targets = DEFAULT_TARGET_CONFIGS
         except Exception as exc:
             log(f"[설정 오류] {config_path} 파일을 읽지 못했습니다: {exc}")
             log("[설정 안내] 기본 타겟 설정을 대신 사용합니다.")
@@ -316,8 +320,8 @@ def load_targets(
 
         try:
             # cv2.imread는 한글/특수문자 경로에서 실패하는 경우가 있어,
-            # np.fromfile + cv2.imdecode 방식으로 읽습니다.
-            file_bytes = np.fromfile(str(image_path), dtype=np.uint8)
+            # read_bytes + np.frombuffer + cv2.imdecode (유니코드 경로 안전, str 변환 불필요).
+            file_bytes = np.frombuffer(image_path.read_bytes(), dtype=np.uint8)
             image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         except Exception as exc:
             log(f"[오류] 이미지 파일을 읽는 중 문제가 발생했습니다: {image_path}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ctypes
+from ctypes import wintypes
 from typing import Any, Optional
 
 from macroapp import winapi
@@ -9,6 +10,37 @@ from macroapp.config import (
     _parse_optional_int,
 )
 import time
+
+
+# GUITHREADINFO 구조체는 함수 호출마다 재정의하지 않고 모듈 1회 정의합니다.
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+_USER32_SIG_READY = False
+
+
+def _setup_user32_sigs() -> None:
+    """user32 함수 시그니처를 1회만 설정합니다(호출마다 반복 방지)."""
+    global _USER32_SIG_READY
+    if _USER32_SIG_READY or not hasattr(ctypes, "windll"):
+        return
+    u = ctypes.windll.user32
+    u.MapVirtualKeyW.restype = ctypes.c_uint
+    u.MapVirtualKeyW.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    u.GetWindowThreadProcessId.restype = wintypes.DWORD
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+    _USER32_SIG_READY = True
 
 KEY_TO_VK: dict[str, int] = {
     "esc": 0x1B, "escape": 0x1B,
@@ -34,6 +66,7 @@ def send_key_to_window(hwnd: int, vk_code: int, press_delay: float = 0.05) -> bo
     """PostMessage로 대상 창에 WM_KEYDOWN/WM_KEYUP을 전송합니다."""
     if winapi.win32gui is None:
         raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    _setup_user32_sigs()
     scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
     lparam_down = (scan_code << 16) | 1
     lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
@@ -95,30 +128,13 @@ def _get_thread_focus_hwnd(hwnd: int) -> Optional[int]:
         return None
 
     try:
-        from ctypes import wintypes
-
-        class GUITHREADINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("hwndActive", wintypes.HWND),
-                ("hwndFocus", wintypes.HWND),
-                ("hwndCapture", wintypes.HWND),
-                ("hwndMenuOwner", wintypes.HWND),
-                ("hwndMoveSize", wintypes.HWND),
-                ("hwndCaret", wintypes.HWND),
-                ("rcCaret", wintypes.RECT),
-            ]
-
-        _gwtpi = ctypes.windll.user32.GetWindowThreadProcessId
-        _gwtpi.restype = wintypes.DWORD
-        _gwtpi.argtypes = [wintypes.HWND, wintypes.LPDWORD]
-        thread_id = _gwtpi(wintypes.HWND(int(hwnd)), None)
+        _setup_user32_sigs()
+        thread_id = ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
         if not thread_id:
             return None
 
-        info = GUITHREADINFO()
-        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
         if not ctypes.windll.user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
             return None
 

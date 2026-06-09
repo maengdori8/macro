@@ -25,6 +25,11 @@ from macroapp.input_message import (
 )
 from macroapp.input_mouse import post_curved_click
 
+# ctypes 함수 시그니처를 1회만 설정하기 위한 플래그 (창마다 반복 설정 방지).
+_KERNEL32_SIG_READY = False
+_USER32_GWTPI_READY = False
+
+
 def _same_size(
     first: tuple[int, int],
     second: tuple[int, int],
@@ -193,14 +198,18 @@ class InactiveManager:
             from ctypes import wintypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             kernel32 = ctypes.windll.kernel32
-            # 64비트에서 기본 restype(c_int)은 HANDLE을 잘라먹으므로 명시 지정.
-            kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-            kernel32.QueryFullProcessImageNameW.argtypes = [
-                wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
-            ]
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            # ctypes 시그니처는 창마다 반복 설정하지 않고 1회만 지정합니다.
+            # (64비트에서 기본 restype(c_int)은 HANDLE을 잘라먹으므로 명시 필요.)
+            global _KERNEL32_SIG_READY
+            if not _KERNEL32_SIG_READY:
+                kernel32.OpenProcess.restype = wintypes.HANDLE
+                kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+                kernel32.QueryFullProcessImageNameW.argtypes = [
+                    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+                ]
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                _KERNEL32_SIG_READY = True
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
             if not handle:
                 return None
@@ -222,8 +231,11 @@ class InactiveManager:
         try:
             from ctypes import wintypes
             user32 = ctypes.windll.user32
-            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            global _USER32_GWTPI_READY
+            if not _USER32_GWTPI_READY:
+                user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+                user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+                _USER32_GWTPI_READY = True
             pid = wintypes.DWORD(0)
             user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
             if pid.value == 0:

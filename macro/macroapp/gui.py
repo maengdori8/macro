@@ -83,6 +83,8 @@ class AutomationApp:
         self.closing = False
         # 상태 전송 전용 단일 워커 풀 (스레드 누적 방지)
         self._status_executor = ThreadPoolExecutor(max_workers=1)
+        self._log_dirty = False
+        self._close_deadline = 0.0
 
         # 로그 파일 초기화
         self._log_file = None
@@ -103,6 +105,7 @@ class AutomationApp:
         self._set_button_state(running=False)
         self._bring_window_to_front()
         self._poll_ui_queue()
+        self._flush_log_periodic()
 
         # 가상 게임패드를 미리 생성해 게임이 컨트롤러를 일찍 인식하게 합니다.
         if winapi.vg is not None and not self.ui_preview_only:
@@ -707,13 +710,13 @@ class AutomationApp:
 
         self.closing = True
         self._close_log_file()
-        try:
-            self._status_executor.shutdown(wait=False)
-        except Exception:
-            pass
+        # 상태 풀은 여기서 닫지 않습니다: 워커의 finally가 '종료' 상태를 제출한 뒤
+        # 인터프리터 종료 시 atexit가 풀을 join하여 마지막 전송이 완료됩니다.
+        # (여기서 shutdown하면 워커의 마지막 제출이 거부될 수 있음.)
         if self.worker_thread is not None and self.worker_thread.is_alive():
             self.stop_event.set()
             self.set_status("종료 요청됨")
+            self._close_deadline = time.monotonic() + 5.0
             self.root.after(100, self._destroy_when_worker_stops)
             return
 
@@ -733,6 +736,12 @@ class AutomationApp:
         """작업 스레드가 끝난 뒤 tkinter 창을 닫습니다."""
 
         if self.worker_thread is not None and self.worker_thread.is_alive():
+            # 워커가 5초 안에 안 멈추면(블로킹 호출에 걸림) 강제로 닫습니다.
+            # daemon 스레드라 프로세스 종료 시 함께 정리됩니다.
+            if time.monotonic() > self._close_deadline:
+                self._log_to_file_only("[종료] 워커가 응답하지 않아 강제 종료합니다.")
+                self.root.destroy()
+                return
             self.root.after(100, self._destroy_when_worker_stops)
             return
         self.root.destroy()
@@ -1121,11 +1130,11 @@ class AutomationApp:
         timestamp = time.strftime("%H:%M:%S")
         line = f"{timestamp} {message}\n"
 
-        # 로그 파일에 기록
+        # 로그 파일에 기록 (flush는 _flush_log_periodic이 1초마다 묶어서 처리)
         if self._log_file is not None:
             try:
                 self._log_file.write(line)
-                self._log_file.flush()
+                self._log_dirty = True
             except Exception:
                 pass
 
@@ -1168,7 +1177,8 @@ class AutomationApp:
         """root.after로 UI 큐를 주기적으로 확인하고 위젯을 갱신합니다."""
 
         processed = 0
-        while processed < 20:
+        # 상한을 두되(이벤트 루프 기아 방지) 로그 폭주 시 따라잡도록 200으로.
+        while processed < 200:
             try:
                 kind, message = self.ui_queue.get_nowait()
             except queue.Empty:
@@ -1184,6 +1194,17 @@ class AutomationApp:
 
         if not self.closing:
             self.root.after(50, self._poll_ui_queue)
+
+    def _flush_log_periodic(self) -> None:
+        """로그 파일을 1초마다 한 번씩 묶어서 flush합니다(매 줄 flush 제거)."""
+        if self._log_file is not None and self._log_dirty:
+            try:
+                self._log_file.flush()
+                self._log_dirty = False
+            except Exception:
+                pass
+        if not self.closing:
+            self.root.after(1000, self._flush_log_periodic)
 
     def _set_button_state(self, running: bool) -> None:
         """실행 상태에 따라 시작/종료 버튼 활성화를 조절합니다."""

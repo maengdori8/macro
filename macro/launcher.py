@@ -75,6 +75,10 @@ def download_and_install(url):
             creationflags=0x08000000,
         )
         proc.wait(timeout=120)
+        # Inno Setup 종료 코드: 0=성공, 그 외=실패. 실패면 기존 버전으로 실행.
+        if proc.returncode not in (0, None):
+            print(f"설치 실패 (코드 {proc.returncode}). 기존 버전으로 실행합니다.")
+            return False
         time.sleep(1)
         return True
     except Exception as e:

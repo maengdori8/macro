@@ -12,11 +12,16 @@ echo 버전: %APP_VER%
 :: setup.iss의 AppVersion을 version.txt와 동기화
 if exist "setup.iss" (
     python -c "import re,sys; t=open('setup.iss','r',encoding='utf-8').read(); t=re.sub(r'AppVersion=.*','AppVersion=%APP_VER%',t); open('setup.iss','w',encoding='utf-8').write(t)"
+    if errorlevel 1 (
+        echo [오류] setup.iss 버전 동기화 실패. 빌드를 중단합니다.
+        pause
+        exit /b 1
+    )
     echo setup.iss 버전 동기화 완료
 )
 
 echo 패키지 설치 중...
-python -m pip install nuitka pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow ordered-set zstandard >nul 2>&1
+python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow ordered-set zstandard
 
 echo vgamepad DLL 경로 탐색 중...
 for /f "delims=" %%i in ('python -c "import vgamepad, os; print(os.path.dirname(vgamepad.__file__))"') do set VGAMEPAD_DIR=%%i
@@ -33,6 +38,7 @@ if %errorlevel% neq 0 (
 echo.
 echo [1/3] macro.exe 빌드 중... (첫 빌드는 5~10분 걸릴 수 있습니다)
 python -m nuitka --onefile --assume-yes-for-downloads ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
   --output-dir=dist --output-filename=macro.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   --enable-plugin=tk-inter ^
@@ -47,6 +53,7 @@ if not exist "dist\macro.exe" (
 echo.
 echo [2/3] launcher.exe 빌드 중...
 python -m nuitka --onefile --assume-yes-for-downloads ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
   --output-dir=dist --output-filename=launcher.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   launcher.py
@@ -58,6 +65,7 @@ if not exist "dist\launcher.exe" (
 echo.
 echo [추가] gamepad_test.exe 빌드 중 (버튼 테스트용, 콘솔 표시)...
 python -m nuitka --onefile --assume-yes-for-downloads ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
   --output-dir=dist --output-filename=gamepad_test.exe ^
   --windows-uac-admin ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
@@ -65,6 +73,7 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
 if not exist "dist\gamepad_test.exe" (
     python -m PyInstaller --onefile --uac-admin --name gamepad_test --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" gamepad_test.py
 )
+if not exist "dist\gamepad_test.exe" echo [경고] gamepad_test.exe 빌드 실패 (버튼 테스트 도구 — 설치엔 선택사항).
 
 :: Nuitka 빌드 부산물 정리
 if exist "macro_main.build" rmdir /s /q "macro_main.build"
