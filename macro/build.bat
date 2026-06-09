@@ -32,6 +32,20 @@ if not defined VGAMEPAD_DIR (
     exit /b 1
 )
 
+:: 자산 임베드 (판매본 보호): targets.json/target_*.png를 exe 안에 컴파일해 넣습니다.
+echo 자산 임베드 중...
+python gen_assets.py
+if %errorlevel% neq 0 (
+    echo [오류] 자산 임베드 실패. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+if not exist "macroapp\_assets.py" (
+    echo [오류] macroapp\_assets.py가 생성되지 않았습니다. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+
 :: 문법 게이트 (느린 컴파일 전에 오류 잡기). cmd는 와일드카드를 확장하지 않으므로
 :: py_compile 대신 디렉터리를 재귀 처리하는 compileall을 사용합니다.
 echo 문법 검사 중...
@@ -45,7 +59,7 @@ if %errorlevel% neq 0 (
 echo.
 echo [1/3] macro.exe 빌드 중... (첫 빌드는 5~10분 걸릴 수 있습니다)
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=macro.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   --enable-plugin=tk-inter ^
@@ -60,7 +74,7 @@ if not exist "dist\macro.exe" (
 echo.
 echo [2/3] launcher.exe 빌드 중...
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=launcher.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   launcher.py
@@ -72,7 +86,7 @@ if not exist "dist\launcher.exe" (
 echo.
 echo [추가] gamepad_test.exe 빌드 중 (버튼 테스트용, 콘솔 표시)...
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output ^
+  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=gamepad_test.exe ^
   --windows-uac-admin ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^

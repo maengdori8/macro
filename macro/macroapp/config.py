@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,46 @@ from macroapp.logging_util import LogCallback
 from macroapp.paths import app_dir
 
 FC_ONLINE_PROCESS_NAMES = ["fczf"]
+
+
+# ─── 내장 자산(판매본 보호) ───
+# 빌드 시 gen_assets.py가 targets.json/target_*.png를 macroapp/_assets.py에 박아
+# Nuitka가 컴파일합니다. 그러면 설치 폴더엔 느슨한 로직/이미지 파일이 없어
+# 구매자가 내부 구성을 열람·복사할 수 없습니다.
+# 개발/소유자는 exe 옆에 느슨한 파일을 두면 그게 우선합니다(오버라이드).
+def _embedded():
+    try:
+        from macroapp import _assets  # 빌드 시 생성됨(개발 중엔 없을 수 있음)
+        return _assets
+    except Exception:
+        return None
+
+
+def _read_asset_bytes(filename: str, base_dir: Path) -> Optional[bytes]:
+    """이미지 바이트를 느슨한 파일 → 내장 자산 순으로 읽습니다."""
+    loose = base_dir / filename
+    if loose.exists():
+        try:
+            return loose.read_bytes()
+        except Exception:
+            pass
+    a = _embedded()
+    if a is not None:
+        b64 = getattr(a, "ASSETS", {}).get(filename)
+        if b64:
+            try:
+                return base64.b64decode(b64)
+            except Exception:
+                pass
+    return None
+
+
+def _read_embedded_targets_json() -> Optional[str]:
+    """내장된 targets.json 문자열(있으면)을 반환합니다."""
+    a = _embedded()
+    if a is not None:
+        return getattr(a, "TARGETS_JSON", None)
+    return None
 
 # UI 입력칸의 기본값입니다.
 WINDOW_TITLE = "FC Online"
@@ -242,7 +283,16 @@ def load_target_definitions(
             log("[설정 안내] 기본 타겟 설정을 대신 사용합니다.")
             raw_targets = DEFAULT_TARGET_CONFIGS
     else:
-        log(f"[설정 안내] {TARGET_CONFIG_FILENAME}이 없어 기본 타겟 설정을 사용합니다.")
+        # 느슨한 targets.json이 없으면 바이너리에 내장된 설정을 사용합니다(판매본).
+        embedded = _read_embedded_targets_json()
+        if embedded:
+            try:
+                raw_config = json.loads(embedded)
+                raw_targets = raw_config.get("targets", raw_config) if isinstance(raw_config, dict) else raw_config
+            except Exception:
+                raw_targets = DEFAULT_TARGET_CONFIGS
+        else:
+            log(f"[설정 안내] {TARGET_CONFIG_FILENAME}이 없어 기본 타겟 설정을 사용합니다.")
 
     if not isinstance(raw_targets, list):
         log("[설정 오류] 타겟 설정은 리스트이거나 {'targets': [...]} 형태여야 합니다.")
@@ -311,25 +361,22 @@ def load_targets(
     targets = [clone_target_definition(target) for target in target_definitions]
 
     for target in targets:
-        image_path = base_dir / target.filename
-
-        if not image_path.exists():
-            log(f"[오류] 이미지 파일을 찾을 수 없습니다: {image_path}")
-            log(f"       targets.json의 filename을 확인하거나 파일을 같은 폴더에 넣어주세요.")
+        raw = _read_asset_bytes(target.filename, base_dir)
+        if raw is None:
+            log(f"[오류] 이미지 자산을 찾을 수 없습니다: {target.filename}")
+            log("       (느슨한 파일도 없고 바이너리 내장 자산도 없습니다)")
             return None
 
         try:
-            # cv2.imread는 한글/특수문자 경로에서 실패하는 경우가 있어,
-            # read_bytes + np.frombuffer + cv2.imdecode (유니코드 경로 안전, str 변환 불필요).
-            file_bytes = np.frombuffer(image_path.read_bytes(), dtype=np.uint8)
+            file_bytes = np.frombuffer(raw, dtype=np.uint8)
             image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         except Exception as exc:
-            log(f"[오류] 이미지 파일을 읽는 중 문제가 발생했습니다: {image_path}")
+            log(f"[오류] 이미지를 디코드하는 중 문제가 발생했습니다: {target.filename}")
             log(f"       원본 오류: {exc}")
             return None
 
         if image_bgr is None:
-            log(f"[오류] 이미지 로드에 실패했습니다: {image_path}")
+            log(f"[오류] 이미지 로드에 실패했습니다: {target.filename}")
             log("       파일이 손상되었거나 OpenCV가 읽을 수 없는 형식일 수 있습니다.")
             return None
 

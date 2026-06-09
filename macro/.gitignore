@@ -23,3 +23,6 @@ venv/
 
 # Claude worktrees/agent state
 .claude/
+
+# 생성된 임베드 자산 (빌드 시 gen_assets.py가 생성)
+macroapp/_assets.py

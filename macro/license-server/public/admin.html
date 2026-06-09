@@ -106,6 +106,10 @@
           <label>다운로드 URL</label>
           <input type="text" id="newUrl" placeholder="https://github.com/.../releases/download/..." />
         </div>
+        <div style="flex:2;">
+          <label>SHA256 (무결성 검증, 권장)</label>
+          <input type="text" id="newSha" placeholder="certutil -hashfile macro_setup.exe SHA256" />
+        </div>
         <button class="btn btn-primary" onclick="updateVersion()" style="margin-bottom:14px;">업데이트</button>
       </div>
     </div>
@@ -263,13 +267,16 @@ async function loadVersion() {
 async function updateVersion() {
   const version = document.getElementById('newVersion').value.trim();
   const url = document.getElementById('newUrl').value.trim();
+  const sha256 = document.getElementById('newSha').value.trim().toLowerCase();
   if (!version) return showToast('버전을 입력하세요.', 'error');
   if (!url) return showToast('다운로드 URL을 입력하세요.', 'error');
+  if (sha256 && !/^[a-f0-9]{64}$/.test(sha256)) return showToast('SHA256은 64자리 hex여야 합니다.', 'error');
+  if (!sha256 && !confirm('SHA256 없이 등록하면 무결성 검증 없이 업데이트됩니다. 계속할까요?')) return;
   try {
-    const res = await fetch('/api/version', { method: 'POST', headers: headers(), body: JSON.stringify({ version, url }) });
+    const res = await fetch('/api/version', { method: 'POST', headers: headers(), body: JSON.stringify({ version, url, sha256 }) });
     const data = await res.json();
     showToast(data.message, data.success ? 'success' : 'error');
-    if (data.success) { document.getElementById('curVersion').value = version; document.getElementById('newVersion').value = ''; document.getElementById('newUrl').value = ''; }
+    if (data.success) { document.getElementById('curVersion').value = version; document.getElementById('newVersion').value = ''; document.getElementById('newUrl').value = ''; document.getElementById('newSha').value = ''; }
   } catch (e) { showToast('버전 업데이트 실패', 'error'); }
 }
 

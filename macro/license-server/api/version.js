@@ -34,6 +34,7 @@ module.exports = async function handler(req, res) {
         version: data.version || "1.0.0",
         url: data.url || "",
         changelog: data.changelog || "",
+        sha256: data.sha256 || "",
       });
     } catch (err) {
       console.error("Version check error:", err);
@@ -54,7 +55,7 @@ module.exports = async function handler(req, res) {
       return res.status(401).json({ success: false, message: "인증 실패" });
     }
 
-    const { version, url, changelog } = req.body || {};
+    const { version, url, changelog, sha256 } = req.body || {};
     if (!sec.isValidVersion(version)) {
       return res.status(400).json({ success: false, message: "버전 형식이 올바르지 않습니다. (예: 1.0.1)" });
     }
@@ -64,12 +65,18 @@ module.exports = async function handler(req, res) {
     if (changelog !== undefined && (typeof changelog !== "string" || changelog.length > 1000)) {
       return res.status(400).json({ success: false, message: "변경사항은 1000자 이하여야 합니다." });
     }
+    // SHA256: 빈 값 허용(미설정), 값이 있으면 64자리 hex여야 함.
+    const cleanSha = typeof sha256 === "string" ? sha256.trim().toLowerCase() : "";
+    if (cleanSha && !/^[a-f0-9]{64}$/.test(cleanSha)) {
+      return res.status(400).json({ success: false, message: "SHA256은 64자리 hex여야 합니다." });
+    }
 
     try {
       await db.collection("config").doc("version").set({
         version,
         url: url || "",
         changelog: changelog || "",
+        sha256: cleanSha,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.status(200).json({ success: true, message: `버전 ${version}으로 업데이트되었습니다.` });
