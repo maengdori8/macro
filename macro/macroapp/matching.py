@@ -45,6 +45,15 @@ def find_template_center(
     screen_height, screen_width = screen_gray.shape[:2]
 
     if target_width > screen_width or target_height > screen_height:
+        # 캡처 UI로 만든 큰 템플릿이 조용히 영원히 매칭 실패하는 일을 막기 위해
+        # 실행당 1회 경고합니다(타겟 객체는 시작 시마다 새로 만들어져 자동 리셋).
+        if not getattr(target, "_oversize_warned", False):
+            target._oversize_warned = True
+            log(
+                f"[경고] {target.name} 템플릿({target_width}x{target_height})이 "
+                f"캡처 프레임({screen_width}x{screen_height})보다 커서 매칭할 수 없습니다. "
+                "더 작은 영역으로 다시 캡처하거나 '기본값'으로 되돌리세요."
+            )
         return None, 0.0
 
     f = DOWNSCALE_FACTOR

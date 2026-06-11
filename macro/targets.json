@@ -1,6 +1,13 @@
 {
   "targets": [
     {
+      "name": "target_H",
+      "filename": "target_H.png",
+      "action": "click",
+      "threshold": 0.8,
+      "wait_after_action": 0.0
+    },
+    {
       "name": "target_A",
       "filename": "target_A.png",
       "action": "click",
@@ -57,13 +64,7 @@
       "threshold": 0.8,
       "wait_after_action": 0.0
     },
-    {
-      "name": "target_H",
-      "filename": "target_H.png",
-      "action": "click",
-      "threshold": 0.8,
-      "wait_after_action": 0.0
-    },
+    
     {
       "name": "bm_click_example_disabled",
       "filename": "button_image.png",

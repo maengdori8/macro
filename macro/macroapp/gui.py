@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import os
 import platform
 import queue
@@ -16,6 +17,12 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
+try:
+    from PIL import Image as PILImage, ImageTk as PILImageTk
+except Exception:  # noqa: BLE001 - 썸네일 표시는 선택 기능이라 없으면 건너뜁니다.
+    PILImage = None
+    PILImageTk = None
+
 from macroapp import winapi
 from macroapp import input_gamepad
 from macroapp.input_gamepad import _get_gamepad, send_gamepad_button, send_gamepad_trigger
@@ -25,8 +32,12 @@ from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
+    CUSTOM_TARGETS_DIR_NAME,
     load_targets, load_target_definitions,
+    read_target_image_bytes, has_custom_target_image,
+    save_custom_target_image, delete_custom_target_image,
 )
+from macroapp.region_select import RegionSelector
 from macroapp.license_client import (
     STATUS_REPORT_INTERVAL_SECONDS, _send_status, get_hwid, verify_license_server,
     format_remaining_time, load_saved_license, save_license_key,
@@ -37,14 +48,35 @@ from macroapp.window import InactiveManager
 class AutomationApp:
     """tkinter UI와 자동화 스레드를 관리합니다."""
 
+    # 다크 + 레드 테마 팔레트 (UI 전반에서 공유)
+    COLORS = {
+        "bg": "#101010",
+        "panel": "#1A1A1A",
+        "border": "#2B2B2B",
+        "input": "#262626",
+        "text": "#F3F3F3",
+        "muted": "#9C9C9C",
+        "accent": "#D93A2B",
+        "accent_active": "#B72D20",
+        "accent_soft": "#FF6A55",
+        "disabled": "#3A3A3A",
+        "ok": "#69DB7C",
+    }
+
     def __init__(self, root: tk.Tk, license_key: Optional[str] = None):
         self.root = root
         self.license_key = license_key
         self.license_info: Optional[dict] = None
 
         self.root.title("비활성 창 이미지 자동화 테스트")
-        self.root.geometry("980x760+80+80")
-        self.root.minsize(900, 640)
+        # LicenseDialog가 고정 크기로 만든 root를 재사용하므로 리사이즈를 다시 허용합니다.
+        self.root.resizable(True, True)
+        # 1366x768 같은 작은 화면에서도 하단 시작/정지 버튼이 잘리지 않게 높이를 화면에 맞춥니다.
+        screen_height = self.root.winfo_screenheight()
+        window_height = min(780, max(560, screen_height - 110))
+        offset_y = max(0, min(60, screen_height - window_height - 90))
+        self.root.geometry(f"1180x{window_height}+80+{offset_y}")
+        self.root.minsize(1080, 560)
         self.ui_preview_only = platform.system() != "Windows"
         if self.ui_preview_only:
             self.root.title("비활성 창 이미지 자동화 테스트 - UI 미리보기")
@@ -77,6 +109,16 @@ class AutomationApp:
             "height": tk.IntVar(value=DEFAULT_REGION_HEIGHT),
         }
 
+        # 타겟별 템플릿 캡처 UI 상태 (썸네일 PhotoImage는 GC 방지를 위해 보관)
+        self.clock_var = tk.StringVar(value="--:--:--")
+        self._thumb_refs: dict[str, Any] = {}
+        self._thumb_labels: dict[str, tk.Label] = {}
+        self._target_source_vars: dict[str, tk.StringVar] = {}
+        self._target_source_labels: dict[str, tk.Label] = {}
+        self._capture_buttons: dict[str, tk.Button] = {}
+        self._reset_buttons: dict[str, tk.Button] = {}
+        self._capturing_template = False
+
         self.stop_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
         self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -106,6 +148,7 @@ class AutomationApp:
         self._bring_window_to_front()
         self._poll_ui_queue()
         self._flush_log_periodic()
+        self._tick_clock()
 
         # 가상 게임패드를 미리 생성해 게임이 컨트롤러를 일찍 인식하게 합니다.
         if winapi.vg is not None and not self.ui_preview_only:
@@ -137,235 +180,117 @@ class AutomationApp:
         self.root.attributes("-topmost", True)
         self.root.after(1200, lambda: self.root.attributes("-topmost", False))
 
+    def _font(self, size: int, bold: bool = False) -> tuple:
+        """플랫폼에 맞는 한글 UI 폰트를 반환합니다."""
+
+        family = "Malgun Gothic" if platform.system() == "Windows" else "Arial"
+        return (family, size, "bold") if bold else (family, size)
+
+    def _panel(self, parent: tk.Misc, title: Optional[str] = None) -> tk.Frame:
+        """테두리가 있는 어두운 패널 프레임을 만듭니다."""
+
+        c = self.COLORS
+        frame = tk.Frame(
+            parent,
+            bg=c["panel"],
+            padx=12,
+            pady=10,
+            highlightbackground=c["border"],
+            highlightthickness=1,
+        )
+        if title:
+            tk.Label(
+                frame,
+                text=title,
+                bg=c["panel"],
+                fg=c["text"],
+                font=self._font(11, bold=True),
+            ).pack(pady=(0, 8))
+        return frame
+
+    def _accent_button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        small: bool = False,
+    ) -> tk.Button:
+        """스크린샷 느낌의 빨간 강조 버튼을 만듭니다."""
+
+        c = self.COLORS
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=c["accent"],
+            fg="#FFFFFF",
+            activebackground=c["accent_active"],
+            activeforeground="#FFFFFF",
+            disabledforeground="#8A8A8A",
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            font=self._font(9 if small else 11, bold=not small),
+            padx=10 if small else 18,
+            pady=1 if small else 8,
+        )
+
     def _build_ui(self) -> None:
-        """간단한 테스트 도구 형태의 UI를 만듭니다."""
+        """다크 + 레드 테마의 2단 레이아웃 UI를 만듭니다."""
 
         if self.ui_preview_only:
             self._build_preview_ui()
             return
 
-        # macOS의 기본 Tcl/Tk는 다크 모드에서 배경색을 강하게 바꾸는 경우가 있어,
-        # 미리보기에서도 확실히 읽히도록 어두운 배경 + 밝은 글자로 고정합니다.
-        bg = "#1E1E1E"
-        panel_bg = "#252526"
-        input_bg = "#111827"
-        text_color = "#F9FAFB"
-        accent = "#7AB7FF"
+        c = self.COLORS
+        self.root.configure(bg=c["bg"])
 
-        self.root.configure(bg=bg)
-
-        main_frame = tk.Frame(self.root, bg=bg, padx=12, pady=12)
+        main_frame = tk.Frame(self.root, bg=c["bg"], padx=14, pady=14)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        title_frame = tk.Frame(
-            main_frame,
-            bg=panel_bg,
-            padx=8,
-            pady=8,
-            relief=tk.SOLID,
-            bd=1,
-        )
-        title_frame.pack(fill=tk.X)
+        left_column = tk.Frame(main_frame, bg=c["bg"])
+        left_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            title_frame,
-            text="대상 창",
-            bg=panel_bg,
-            fg=accent,
-            font=("Arial", 12, "bold"),
-        ).pack(anchor=tk.W)
+        right_column = tk.Frame(main_frame, bg=c["bg"], width=400)
+        right_column.pack(side=tk.LEFT, fill=tk.Y, padx=(14, 0))
+        right_column.pack_propagate(False)
 
-        tk.Label(
-            title_frame,
-            text="창 제목 일부",
-            bg=panel_bg,
-            fg=text_color,
-        ).pack(anchor=tk.W, pady=(8, 4))
-        self.title_entry = tk.Entry(
-            title_frame,
-            textvariable=self.window_title_var,
-            bg=input_bg,
-            fg=text_color,
-            insertbackground=text_color,
-            relief=tk.SOLID,
-            bd=1,
-        )
-        self.title_entry.pack(fill=tk.X)
+        # ── 왼쪽 아래: 기본 설정 ──
+        # 먼저 pack해 두면 창 높이가 부족할 때 타겟 목록 쪽이 먼저 줄어듭니다.
+        settings_panel = self._panel(left_column, "기본 설정")
+        settings_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
 
-        button_frame = tk.Frame(main_frame, bg=bg)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
-
-        self.start_button = tk.Button(
-            button_frame,
-            text="시작 (F8)",
-            command=self.start_automation,
-            width=14,
-        )
-        self.start_button.pack(side=tk.LEFT)
-
-        self.stop_button = tk.Button(
-            button_frame,
-            text="종료 (F9/ESC)",
-            command=self.stop_automation,
-            width=14,
-        )
-        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
-
-        status_frame = tk.Frame(main_frame, bg=bg)
-        status_frame.pack(fill=tk.X, pady=(10, 0))
-        tk.Label(status_frame, text="상태", bg=bg, fg=text_color).pack(side=tk.LEFT)
-        self.status_label = tk.Label(
-            status_frame,
-            textvariable=self.status_var,
-            bg=bg,
-            fg=accent,
-        )
-        self.status_label.pack(side=tk.LEFT, padx=(8, 0))
-
-        mode_frame = tk.Frame(
-            main_frame,
-            bg=panel_bg,
-            padx=8,
-            pady=8,
-            relief=tk.SOLID,
-            bd=1,
-        )
-        mode_frame.pack(fill=tk.X, pady=(10, 0))
-
-        tk.Label(
-            mode_frame,
-            text="캡처/클릭 모드",
-            bg=panel_bg,
-            fg=accent,
-            font=("Arial", 12, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 6))
-
-        capture_row = tk.Frame(mode_frame, bg=panel_bg)
-        capture_row.pack(fill=tk.X, pady=2)
-        tk.Label(
-            capture_row,
-            text="캡처",
-            bg=panel_bg,
-            fg=text_color,
-            width=10,
-            anchor=tk.W,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            capture_row,
-            text="비활성 WGC",
-            variable=self.capture_mode_var,
-            value="wgc",
-            command=self.on_capture_mode_changed,
-            bg=panel_bg,
-            fg=text_color,
-            selectcolor=input_bg,
-            activebackground=panel_bg,
-            activeforeground=text_color,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            capture_row,
-            text="화면 영역 캡처",
-            variable=self.capture_mode_var,
-            value="region",
-            command=self.on_capture_mode_changed,
-            bg=panel_bg,
-            fg=text_color,
-            selectcolor=input_bg,
-            activebackground=panel_bg,
-            activeforeground=text_color,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-
-        click_row = tk.Frame(mode_frame, bg=panel_bg)
-        click_row.pack(fill=tk.X, pady=2)
-        tk.Label(
-            click_row,
-            text="클릭",
-            bg=panel_bg,
-            fg=text_color,
-            width=10,
-            anchor=tk.W,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            click_row,
-            text="PostMessage",
-            variable=self.click_mode_var,
-            value="postmessage",
-            bg=panel_bg,
-            fg=text_color,
-            selectcolor=input_bg,
-            activebackground=panel_bg,
-            activeforeground=text_color,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            click_row,
-            text="마우스 이동 후 복귀",
-            variable=self.click_mode_var,
-            value="mouse",
-            bg=panel_bg,
-            fg=text_color,
-            selectcolor=input_bg,
-            activebackground=panel_bg,
-            activeforeground=text_color,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-
-        region_row = tk.Frame(mode_frame, bg=panel_bg)
-        region_row.pack(fill=tk.X, pady=(6, 0))
-        tk.Label(
-            region_row,
-            text="영역",
-            bg=panel_bg,
-            fg=text_color,
-            width=10,
-            anchor=tk.W,
-        ).pack(side=tk.LEFT)
-        for key, label in (
-            ("x", "X"),
-            ("y", "Y"),
-            ("width", "W"),
-            ("height", "H"),
-        ):
-            tk.Label(region_row, text=label, bg=panel_bg, fg=text_color).pack(side=tk.LEFT)
-            tk.Entry(
-                region_row,
-                textvariable=self.region_vars[key],
-                width=7,
-                bg=input_bg,
-                fg=text_color,
-                insertbackground=text_color,
-                relief=tk.SOLID,
-                bd=1,
-            ).pack(side=tk.LEFT, padx=(4, 10))
-
-        threshold_frame = tk.Frame(
-            main_frame,
-            bg=panel_bg,
-            padx=8,
-            pady=8,
-            relief=tk.SOLID,
-            bd=1,
-        )
-        threshold_frame.pack(fill=tk.X, pady=(10, 0))
-
-        tk.Label(
-            threshold_frame,
-            text="타겟별 임계값",
-            bg=panel_bg,
-            fg=accent,
-            font=("Arial", 12, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 6))
+        # ── 왼쪽: 타겟 설정 (target_A~H, 템플릿 캡처/임계값) ──
+        targets_panel = self._panel(left_column, "타겟 설정")
+        targets_panel.pack(fill=tk.BOTH, expand=True)
 
         for name in self.target_names:
-            row = tk.Frame(threshold_frame, bg=panel_bg)
-            row.pack(fill=tk.X, pady=2)
+            row = tk.Frame(targets_panel, bg=c["panel"])
+            row.pack(fill=tk.X, pady=3)
 
             tk.Label(
                 row,
                 text=name,
-                bg=panel_bg,
-                fg=text_color,
-                width=10,
+                bg=c["panel"],
+                fg=c["text"],
+                width=9,
                 anchor=tk.W,
+                font=self._font(10, bold=True),
             ).pack(side=tk.LEFT)
+
+            thumb_holder = tk.Frame(
+                row,
+                bg=c["input"],
+                width=66,
+                height=28,
+                highlightbackground=c["border"],
+                highlightthickness=1,
+            )
+            thumb_holder.pack_propagate(False)
+            thumb_holder.pack(side=tk.LEFT, padx=(0, 10))
+            thumb_label = tk.Label(thumb_holder, bg=c["input"], fg=c["muted"], font=self._font(8))
+            thumb_label.pack(fill=tk.BOTH, expand=True)
+            self._thumb_labels[name] = thumb_label
 
             tk.Scale(
                 row,
@@ -378,52 +303,440 @@ class AutomationApp:
                     target_name,
                     value,
                 ),
-                bg=panel_bg,
-                fg=text_color,
-                troughcolor=input_bg,
+                bg=c["panel"],
+                fg=c["text"],
+                troughcolor=c["input"],
+                activebackground=c["accent_soft"],
                 highlightthickness=0,
-                length=360,
+                bd=0,
+                showvalue=False,
+                length=140,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             tk.Label(
                 row,
                 textvariable=self.threshold_label_vars[name],
-                bg=panel_bg,
-                fg=accent,
+                bg=c["panel"],
+                fg=c["accent_soft"],
                 width=5,
-            ).pack(side=tk.LEFT, padx=(8, 0))
+                font=self._font(10, bold=True),
+            ).pack(side=tk.LEFT, padx=(6, 6))
 
-        log_frame = tk.Frame(
-            main_frame,
-            bg=panel_bg,
-            padx=8,
-            pady=8,
-            relief=tk.SOLID,
-            bd=1,
-        )
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+            source_var = tk.StringVar(value="기본")
+            source_label = tk.Label(
+                row,
+                textvariable=source_var,
+                bg=c["panel"],
+                fg=c["muted"],
+                width=5,
+                font=self._font(9),
+            )
+            source_label.pack(side=tk.LEFT)
+            self._target_source_vars[name] = source_var
+            self._target_source_labels[name] = source_label
+
+            capture_button = self._accent_button(
+                row,
+                "캡처",
+                lambda target_name=name: self.capture_target_template(target_name),
+                small=True,
+            )
+            capture_button.pack(side=tk.LEFT, padx=(8, 4))
+            self._capture_buttons[name] = capture_button
+
+            reset_button = tk.Button(
+                row,
+                text="기본값",
+                command=lambda target_name=name: self.reset_target_template(target_name),
+                bg=c["input"],
+                fg=c["text"],
+                activebackground=c["border"],
+                activeforeground=c["text"],
+                disabledforeground="#6A6A6A",
+                relief=tk.FLAT,
+                bd=0,
+                cursor="hand2",
+                font=self._font(9),
+                padx=8,
+                pady=1,
+            )
+            reset_button.pack(side=tk.LEFT)
+            self._reset_buttons[name] = reset_button
 
         tk.Label(
-            log_frame,
-            text="로그",
-            bg=panel_bg,
-            fg=accent,
-            font=("Arial", 12, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 6))
+            targets_panel,
+            text="캡처: 화면에서 드래그한 영역으로 템플릿 교체 · 기본값: 빌드 내장 이미지로 복원",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8),
+        ).pack(pady=(8, 0))
 
+        title_row = tk.Frame(settings_panel, bg=c["panel"])
+        title_row.pack(fill=tk.X, pady=2)
+        tk.Label(
+            title_row,
+            text="대상 창",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        self.title_entry = tk.Entry(
+            title_row,
+            textvariable=self.window_title_var,
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            disabledbackground=c["bg"],
+            disabledforeground=c["muted"],
+            relief=tk.FLAT,
+            highlightbackground=c["border"],
+            highlightcolor=c["accent"],
+            highlightthickness=1,
+        )
+        self.title_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+
+        capture_row = tk.Frame(settings_panel, bg=c["panel"])
+        capture_row.pack(fill=tk.X, pady=2)
+        tk.Label(
+            capture_row,
+            text="캡처",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        for text, value in (("비활성 WGC", "wgc"), ("화면 영역 캡처", "region")):
+            tk.Radiobutton(
+                capture_row,
+                text=text,
+                variable=self.capture_mode_var,
+                value=value,
+                command=self.on_capture_mode_changed,
+                bg=c["panel"],
+                fg=c["text"],
+                selectcolor=c["input"],
+                activebackground=c["panel"],
+                activeforeground=c["text"],
+                font=self._font(9),
+            ).pack(side=tk.LEFT, padx=(0, 12))
+
+        click_row = tk.Frame(settings_panel, bg=c["panel"])
+        click_row.pack(fill=tk.X, pady=2)
+        tk.Label(
+            click_row,
+            text="클릭",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        for text, value in (("PostMessage", "postmessage"), ("마우스 이동 후 복귀", "mouse")):
+            tk.Radiobutton(
+                click_row,
+                text=text,
+                variable=self.click_mode_var,
+                value=value,
+                bg=c["panel"],
+                fg=c["text"],
+                selectcolor=c["input"],
+                activebackground=c["panel"],
+                activeforeground=c["text"],
+                font=self._font(9),
+            ).pack(side=tk.LEFT, padx=(0, 12))
+
+        region_row = tk.Frame(settings_panel, bg=c["panel"])
+        region_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(
+            region_row,
+            text="영역",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        for key, label in (
+            ("x", "X"),
+            ("y", "Y"),
+            ("width", "W"),
+            ("height", "H"),
+        ):
+            tk.Label(
+                region_row,
+                text=label,
+                bg=c["panel"],
+                fg=c["muted"],
+                font=self._font(9),
+            ).pack(side=tk.LEFT)
+            tk.Entry(
+                region_row,
+                textvariable=self.region_vars[key],
+                width=7,
+                bg=c["input"],
+                fg=c["text"],
+                insertbackground=c["text"],
+                relief=tk.FLAT,
+                highlightbackground=c["border"],
+                highlightcolor=c["accent"],
+                highlightthickness=1,
+            ).pack(side=tk.LEFT, padx=(4, 10), ipady=2)
+
+        # ── 오른쪽: 버전 / 시계 / 상태 / 로그 / 시작·정지 ──
+        version_panel = self._panel(right_column)
+        version_panel.pack(fill=tk.X)
+        version_text = f"Version : {APP_VERSION}"
+        if self.license_key:
+            version_text = f"Version : {APP_VERSION}  👑"
+        tk.Label(
+            version_panel,
+            text=version_text,
+            bg=c["panel"],
+            fg=c["accent_soft"],
+            font=self._font(12, bold=True),
+        ).pack()
+
+        clock_panel = self._panel(right_column)
+        clock_panel.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(
+            clock_panel,
+            textvariable=self.clock_var,
+            bg=c["panel"],
+            fg=c["text"],
+            font=("Consolas", 26, "bold"),
+        ).pack()
+
+        status_panel = self._panel(right_column)
+        status_panel.pack(fill=tk.X, pady=(12, 0))
+        status_row = tk.Frame(status_panel, bg=c["panel"])
+        status_row.pack()
+        tk.Label(
+            status_row,
+            text="상태 : ",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(11),
+        ).pack(side=tk.LEFT)
+        self.status_label = tk.Label(
+            status_row,
+            textvariable=self.status_var,
+            bg=c["panel"],
+            fg=c["accent_soft"],
+            font=self._font(11, bold=True),
+        )
+        self.status_label.pack(side=tk.LEFT)
+
+        # 시작/정지 패널을 로그보다 먼저 pack해, 높이가 부족하면 로그가 먼저 줄어듭니다.
+        control_panel = self._panel(right_column, "시작/정지 & ETC")
+        control_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
+        button_row = tk.Frame(control_panel, bg=c["panel"])
+        button_row.pack(fill=tk.X)
+        self.start_button = self._accent_button(button_row, "시작 (F8)", self.start_automation)
+        self.start_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.stop_button = self._accent_button(button_row, "정지 (F9/ESC)", self.stop_automation)
+        self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        log_panel = self._panel(right_column, "로그")
+        log_panel.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=22,
+            log_panel,
+            height=10,
             wrap=tk.WORD,
             state=tk.DISABLED,
-            bg=input_bg,
-            fg=text_color,
-            insertbackground=text_color,
-            relief=tk.SOLID,
-            bd=1,
-            font=("Consolas", 10),
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief=tk.FLAT,
+            bd=0,
+            font=("Consolas", 9),
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        self._refresh_all_target_rows()
+
+    def _tick_clock(self) -> None:
+        """오른쪽 패널의 시계를 0.5초마다 갱신합니다."""
+
+        self.clock_var.set(time.strftime("%H:%M:%S"))
+        if not self.closing:
+            self.root.after(500, self._tick_clock)
+
+    # ── 타겟 템플릿 캡처 ──
+
+    def _find_target_definition(self, name: str) -> Optional[TargetImage]:
+        for target in self.target_definitions:
+            if target.name == name:
+                return target
+        return None
+
+    def capture_target_template(self, name: str) -> None:
+        """화면 드래그 캡처로 타겟 템플릿을 교체합니다."""
+
+        if self.ui_preview_only:
+            self.log("[UI 미리보기] 템플릿 캡처는 Windows에서만 사용할 수 있습니다.")
+            return
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.log("[캡처] 자동화 실행 중에는 템플릿을 변경할 수 없습니다. 정지 후 다시 시도하세요.")
+            return
+        if self._capturing_template:
+            return
+        target = self._find_target_definition(name)
+        if target is None:
+            self.log(f"[캡처 오류] {name} 타겟 정보를 찾을 수 없습니다.")
+            return
+
+        self._capturing_template = True
+        self.log(f"[캡처] {name}: 화면에서 영역을 드래그하세요. (ESC: 취소, 주 모니터만 지원)")
+        self.root.withdraw()
+        # 창이 화면에서 완전히 사라진 뒤 스크린샷을 찍도록 잠시 기다립니다.
+        self.root.after(300, lambda: self._run_template_capture(target))
+
+    def _run_template_capture(self, target: TargetImage) -> None:
+        """창을 숨긴 상태에서 영역 선택 오버레이를 띄우고 결과를 저장합니다."""
+
+        image = None
+        try:
+            selector = RegionSelector(self.root, logger=self.log)
+            image = selector.select()
+        except Exception as exc:
+            # 콘솔 없는 빌드에서는 예외가 조용히 사라지므로 UI 로그로 남깁니다.
+            if not self.closing:
+                self.log(f"[캡처 오류] 영역 선택 중 문제가 발생했습니다: {exc}")
+        finally:
+            self._capturing_template = False
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+            except tk.TclError:
+                pass  # 캡처 도중 창이 닫힌 경우 복원할 UI가 없습니다.
+
+        if self.closing:
+            return
+
+        if image is None:
+            self.log(f"[캡처] {target.name} 캡처를 취소했습니다.")
+            return
+
+        if image.width < 12 or image.height < 12:
+            self.log(
+                f"[캡처 오류] 선택 영역({image.width}x{image.height})이 너무 작습니다. "
+                "가로/세로 12px 이상으로 선택하세요."
+            )
+            return
+
+        try:
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            path = save_custom_target_image(self.base_dir, target.filename, buffer.getvalue())
+        except Exception as exc:
+            self.log(f"[캡처 오류] 템플릿 저장에 실패했습니다: {exc}")
+            return
+
+        self.log(
+            f"[캡처] {target.name} 템플릿을 교체했습니다 "
+            f"({image.width}x{image.height}) → {CUSTOM_TARGETS_DIR_NAME}/{path.name}"
+        )
+        self.log("       다음 '시작'부터 새 템플릿이 적용됩니다.")
+
+        # 캡처 프레임보다 큰 템플릿은 절대 매칭되지 않으므로 미리 경고합니다.
+        if self.capture_mode_var.get() == "region":
+            region = self.get_region_from_ui()
+            if region is not None and (image.width > region[2] or image.height > region[3]):
+                self.log(
+                    f"[경고] 선택 영역({image.width}x{image.height})이 "
+                    f"현재 캡처 영역({region[2]}x{region[3]})보다 큽니다."
+                )
+                self.log("       이대로는 매칭되지 않으니 더 작게 캡처하거나 영역을 키우세요.")
+
+        self._refresh_target_row(target.name)
+
+    def reset_target_template(self, name: str) -> None:
+        """커스텀 캡처를 삭제하고 빌드에 포함된 기본 템플릿으로 되돌립니다."""
+
+        if self.ui_preview_only:
+            self.log("[UI 미리보기] 템플릿 복원은 Windows에서만 사용할 수 있습니다.")
+            return
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.log("[캡처] 자동화 실행 중에는 템플릿을 변경할 수 없습니다. 정지 후 다시 시도하세요.")
+            return
+        target = self._find_target_definition(name)
+        if target is None:
+            return
+
+        try:
+            removed = delete_custom_target_image(self.base_dir, target.filename)
+        except Exception as exc:
+            self.log(f"[캡처 오류] 커스텀 템플릿 삭제에 실패했습니다: {exc}")
+            return
+
+        if removed:
+            self.log(f"[캡처] {name} 템플릿을 기본 이미지로 되돌렸습니다.")
+        else:
+            self.log(f"[캡처] {name}은(는) 이미 기본 이미지를 사용하고 있습니다.")
+        self._refresh_target_row(name)
+
+    def _refresh_all_target_rows(self) -> None:
+        for name in self.target_names:
+            self._refresh_target_row(name)
+
+    def _refresh_target_row(self, name: str) -> None:
+        """타겟 행의 템플릿 출처(기본/커스텀) 표시와 썸네일을 갱신합니다."""
+
+        if self.ui_preview_only:
+            return
+        target = self._find_target_definition(name)
+        if target is None:
+            return
+
+        c = self.COLORS
+        is_custom = has_custom_target_image(self.base_dir, target.filename)
+        source_var = self._target_source_vars.get(name)
+        source_label = self._target_source_labels.get(name)
+        if source_var is not None and source_label is not None:
+            source_var.set("커스텀" if is_custom else "기본")
+            source_label.configure(fg=c["ok"] if is_custom else c["muted"])
+        self._update_thumbnail(name, target.filename)
+
+    def _update_thumbnail(self, name: str, filename: str) -> None:
+        """타겟 행의 작은 템플릿 미리보기를 갱신합니다.
+
+        판매본 보호(자산 임베드)의 취지를 지키기 위해 내장 기본 템플릿의
+        픽셀은 화면에 노출하지 않고 크기 정보만 표시합니다.
+        사용자가 직접 캡처한 커스텀 템플릿만 실제 이미지로 보여줍니다.
+        """
+
+        label = self._thumb_labels.get(name)
+        if label is None:
+            return
+        if PILImage is None or PILImageTk is None:
+            label.configure(text="-", image="")
+            return
+
+        raw = read_target_image_bytes(self.base_dir, filename)
+        if not raw:
+            self._thumb_refs.pop(name, None)
+            label.configure(text="없음", image="")
+            return
+
+        try:
+            image = PILImage.open(io.BytesIO(raw))
+            if not has_custom_target_image(self.base_dir, filename):
+                self._thumb_refs.pop(name, None)
+                label.configure(text=f"{image.width}x{image.height}", image="")
+                return
+            image.thumbnail((62, 24))
+            photo = PILImageTk.PhotoImage(image, master=self.root)
+        except Exception:
+            self._thumb_refs.pop(name, None)
+            label.configure(text="오류", image="")
+            return
+
+        self._thumb_refs[name] = photo
+        label.configure(image=photo, text="")
 
     def _build_preview_ui(self) -> None:
         """
@@ -538,10 +851,17 @@ class AutomationApp:
         self.root.bind("<Escape>", lambda _event: self.stop_automation())
 
         # 기존 콘솔 예제의 q 종료 습관을 보조로 유지합니다.
-        self.root.bind("<KeyPress-q>", lambda _event: self.stop_automation())
-        self.root.bind("<KeyPress-Q>", lambda _event: self.stop_automation())
+        self.root.bind("<KeyPress-q>", self._on_stop_hotkey)
+        self.root.bind("<KeyPress-Q>", self._on_stop_hotkey)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _on_stop_hotkey(self, event: tk.Event) -> None:
+        """q/Q 정지 단축키. Entry 입력 중에는 무시해 텍스트 입력과 충돌하지 않게 합니다."""
+
+        if isinstance(getattr(event, "widget", None), tk.Entry):
+            return
+        self.stop_automation()
 
     def on_capture_mode_changed(self) -> None:
         """화면 영역 캡처 모드에서는 기본 클릭 방식을 마우스 이동/복귀로 맞춥니다."""
@@ -1206,8 +1526,17 @@ class AutomationApp:
         if not self.closing:
             self.root.after(1000, self._flush_log_periodic)
 
+    def _set_accent_button_state(self, button: tk.Button, enabled: bool) -> None:
+        """빨간 강조 버튼의 활성/비활성 상태와 색을 함께 바꿉니다."""
+
+        c = self.COLORS
+        button.configure(
+            state=tk.NORMAL if enabled else tk.DISABLED,
+            bg=c["accent"] if enabled else c["disabled"],
+        )
+
     def _set_button_state(self, running: bool) -> None:
-        """실행 상태에 따라 시작/종료 버튼 활성화를 조절합니다."""
+        """실행 상태에 따라 시작/종료/캡처 버튼 활성화를 조절합니다."""
 
         if self.ui_preview_only:
             self.start_button.configure(state=tk.NORMAL)
@@ -1215,14 +1544,15 @@ class AutomationApp:
             self.title_entry.configure(state=tk.NORMAL)
             return
 
-        if running:
-            self.start_button.configure(state=tk.DISABLED)
-            self.stop_button.configure(state=tk.NORMAL)
-            self.title_entry.configure(state=tk.DISABLED)
-        else:
-            self.start_button.configure(state=tk.NORMAL)
-            self.stop_button.configure(state=tk.DISABLED)
-            self.title_entry.configure(state=tk.NORMAL)
+        self._set_accent_button_state(self.start_button, enabled=not running)
+        self._set_accent_button_state(self.stop_button, enabled=running)
+        self.title_entry.configure(state=tk.DISABLED if running else tk.NORMAL)
+
+        # 실행 중 템플릿 교체는 다음 시작까지 반영되지 않으므로 혼동을 막기 위해 잠급니다.
+        for button in self._capture_buttons.values():
+            self._set_accent_button_state(button, enabled=not running)
+        for button in self._reset_buttons.values():
+            button.configure(state=tk.DISABLED if running else tk.NORMAL)
 
 
 class LicenseDialog:
@@ -1237,11 +1567,11 @@ class LicenseDialog:
         self.root.geometry("480x340+200+200")
         self.root.resizable(False, False)
 
-        bg = "#1E1E1E"
-        panel_bg = "#252526"
-        input_bg = "#111827"
-        text_color = "#F9FAFB"
-        accent = "#7AB7FF"
+        bg = "#101010"
+        panel_bg = "#1A1A1A"
+        input_bg = "#262626"
+        text_color = "#F3F3F3"
+        accent = "#D93A2B"
         error_color = "#FF6B6B"
         success_color = "#69DB7C"
 
@@ -1301,7 +1631,9 @@ class LicenseDialog:
             text="인증하기",
             command=self._activate,
             bg=accent,
-            fg="#000000",
+            fg="#FFFFFF",
+            activebackground="#B72D20",
+            activeforeground="#FFFFFF",
             font=("Arial", 11, "bold"),
             relief=tk.FLAT,
             padx=20,

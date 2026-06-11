@@ -1,6 +1,7 @@
 from __future__ import annotations
 import base64
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -27,8 +28,25 @@ def _embedded():
         return None
 
 
-def _read_asset_bytes(filename: str, base_dir: Path) -> Optional[bytes]:
-    """이미지 바이트를 느슨한 파일 → 내장 자산 순으로 읽습니다."""
+# UI에서 캡처한 사용자 템플릿이 저장되는 폴더입니다.
+# 기본 이미지(빌드 내장/느슨한 파일)는 건드리지 않으므로 언제든 되돌릴 수 있습니다.
+CUSTOM_TARGETS_DIR_NAME = "custom_targets"
+
+
+def custom_targets_dir(base_dir: Path) -> Path:
+    """사용자 캡처 템플릿 폴더 경로를 반환합니다."""
+    return base_dir / CUSTOM_TARGETS_DIR_NAME
+
+
+def _read_asset_bytes(filename: str, base_dir: Path, include_custom: bool = True) -> Optional[bytes]:
+    """이미지 바이트를 사용자 캡처 → 느슨한 파일 → 내장 자산 순으로 읽습니다."""
+    if include_custom:
+        custom = custom_targets_dir(base_dir) / filename
+        if custom.exists():
+            try:
+                return custom.read_bytes()
+            except Exception:
+                pass
     loose = base_dir / filename
     if loose.exists():
         try:
@@ -44,6 +62,46 @@ def _read_asset_bytes(filename: str, base_dir: Path) -> Optional[bytes]:
             except Exception:
                 pass
     return None
+
+
+def read_target_image_bytes(base_dir: Path, filename: str) -> Optional[bytes]:
+    """현재 적용 중인 타겟 이미지 바이트를 반환합니다(썸네일 등 UI 표시용)."""
+    return _read_asset_bytes(filename, base_dir)
+
+
+def has_custom_target_image(base_dir: Path, filename: str) -> bool:
+    """해당 타겟이 UI에서 캡처한 커스텀 템플릿을 쓰는지 확인합니다."""
+    return (custom_targets_dir(base_dir) / filename).exists()
+
+
+def save_custom_target_image(base_dir: Path, filename: str, png_bytes: bytes) -> Path:
+    """캡처한 PNG 바이트를 커스텀 템플릿으로 원자적으로 저장하고 경로를 반환합니다.
+
+    디스크 부족 등으로 쓰기가 중단돼도 잘린 PNG가 최우선 경로에 남아
+    다음 시작을 막는 일이 없도록 임시 파일에 쓴 뒤 교체합니다.
+    """
+    path = custom_targets_dir(base_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_bytes(png_bytes)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def delete_custom_target_image(base_dir: Path, filename: str) -> bool:
+    """커스텀 템플릿을 삭제해 기본 이미지로 되돌립니다. 삭제했으면 True."""
+    path = custom_targets_dir(base_dir) / filename
+    if path.exists():
+        path.unlink()
+        return True
+    return False
 
 
 def _read_embedded_targets_json() -> Optional[str]:
@@ -347,6 +405,7 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         control_hwnd=target.control_hwnd,
         control_class=target.control_class,
         control_text=target.control_text,
+        vibrate_before_click=target.vibrate_before_click,
     )
 
 def load_targets(
@@ -360,20 +419,30 @@ def load_targets(
     target_definitions = definitions or load_target_definitions(base_dir, logger=log)
     targets = [clone_target_definition(target) for target in target_definitions]
 
+    def _decode(raw_bytes: bytes) -> Optional[np.ndarray]:
+        try:
+            file_bytes = np.frombuffer(raw_bytes, dtype=np.uint8)
+            return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+
     for target in targets:
+        is_custom = has_custom_target_image(base_dir, target.filename)
         raw = _read_asset_bytes(target.filename, base_dir)
         if raw is None:
             log(f"[오류] 이미지 자산을 찾을 수 없습니다: {target.filename}")
             log("       (느슨한 파일도 없고 바이너리 내장 자산도 없습니다)")
             return None
 
-        try:
-            file_bytes = np.frombuffer(raw, dtype=np.uint8)
-            image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        except Exception as exc:
-            log(f"[오류] 이미지를 디코드하는 중 문제가 발생했습니다: {target.filename}")
-            log(f"       원본 오류: {exc}")
-            return None
+        image_bgr = _decode(raw)
+
+        if image_bgr is None and is_custom:
+            # 손상된 커스텀 캡처가 시작 자체를 막지 않도록 기본 이미지로 자가 복구합니다.
+            log(f"[경고] 커스텀 캡처가 손상되어 기본 이미지를 대신 사용합니다: {target.filename}")
+            log("       해당 타겟을 다시 캡처하거나 '기본값' 버튼으로 정리하세요.")
+            is_custom = False
+            raw = _read_asset_bytes(target.filename, base_dir, include_custom=False)
+            image_bgr = _decode(raw) if raw is not None else None
 
         if image_bgr is None:
             log(f"[오류] 이미지 로드에 실패했습니다: {target.filename}")
@@ -381,8 +450,9 @@ def load_targets(
             return None
 
         target.image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        source = "커스텀 캡처" if is_custom else "기본"
         log(
-            f"[이미지 로드] {target.filename}, "
+            f"[이미지 로드] {target.filename} ({source}), "
             f"크기={target.image_gray.shape[1]}x{target.image_gray.shape[0]}, "
             f"임계값={target.threshold:.2f}, action={target.action}"
         )

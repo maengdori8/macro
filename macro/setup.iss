@@ -1,7 +1,7 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
 [Setup]
 AppName=Macro
-AppVersion=1.0.0
+AppVersion=1.0.8
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
@@ -23,6 +23,14 @@ Source: "dist\macro.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+; 런타임 생성물 정리: 캡처 템플릿이 재설치 후에도 몰래 살아남지 않게 합니다.
+; license.key는 재설치 시 재인증을 피하기 위해 남겨둡니다.
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\custom_targets"
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\_update_tmp"
+Type: files; Name: "{app}\_update.zip"
 
 [Icons]
 Name: "{group}\Macro"; Filename: "{app}\launcher.exe"

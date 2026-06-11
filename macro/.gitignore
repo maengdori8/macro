@@ -11,6 +11,7 @@ logs/
 license.key
 _update.zip
 _update_tmp/
+custom_targets/
 
 # 파이썬
 __pycache__/

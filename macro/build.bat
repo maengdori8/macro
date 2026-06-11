@@ -46,8 +46,9 @@ if not exist "macroapp\_assets.py" (
     exit /b 1
 )
 
-:: 문법 게이트 (느린 컴파일 전에 오류 잡기). cmd는 와일드카드를 확장하지 않으므로
-:: py_compile 대신 디렉터리를 재귀 처리하는 compileall을 사용합니다.
+rem Syntax gate before the slow compile. cmd does not expand wildcards,
+rem so use compileall (handles directories) instead of py_compile.
+rem (NOTE: keep this comment ASCII - cmd misparses some UTF-8 Korean in :: comments)
 echo 문법 검사 중...
 python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py
 if %errorlevel% neq 0 (
@@ -58,8 +59,12 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [1/3] macro.exe 빌드 중... (첫 빌드는 5~10분 걸릴 수 있습니다)
+rem --lto=no is REQUIRED here: without MSVC, Nuitka on Python 3.13 uses the
+rem downloaded zig 0.16 compiler, and zig + LTO fails at link time
+rem (undefined symbols frexpf/wmemchr/isnan in zigc.lib). Do not re-enable
+rem LTO unless MSVC Build Tools are installed.
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=macro.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   --enable-plugin=tk-inter ^
@@ -74,7 +79,7 @@ if not exist "dist\macro.exe" (
 echo.
 echo [2/3] launcher.exe 빌드 중...
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=launcher.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
   launcher.py
@@ -86,7 +91,7 @@ if not exist "dist\launcher.exe" (
 echo.
 echo [추가] gamepad_test.exe 빌드 중 (버튼 테스트용, 콘솔 표시)...
 python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=yes --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=gamepad_test.exe ^
   --windows-uac-admin ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
