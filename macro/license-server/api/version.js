@@ -35,6 +35,7 @@ module.exports = async function handler(req, res) {
         url: data.url || "",
         changelog: data.changelog || "",
         sha256: data.sha256 || "",
+        sig: data.sig || "",
       });
     } catch (err) {
       console.error("Version check error:", err);
@@ -55,7 +56,7 @@ module.exports = async function handler(req, res) {
       return res.status(401).json({ success: false, message: "인증 실패" });
     }
 
-    const { version, url, changelog, sha256 } = req.body || {};
+    const { version, url, changelog, sha256, sig } = req.body || {};
     if (!sec.isValidVersion(version)) {
       return res.status(400).json({ success: false, message: "버전 형식이 올바르지 않습니다. (예: 1.0.1)" });
     }
@@ -70,6 +71,11 @@ module.exports = async function handler(req, res) {
     if (cleanSha && !/^[a-f0-9]{64}$/.test(cleanSha)) {
       return res.status(400).json({ success: false, message: "SHA256은 64자리 hex여야 합니다." });
     }
+    // Ed25519 서명(hex 128자): 런처가 이 값으로 매니페스트를 검증하며, 없으면 업데이트를 무시함.
+    const cleanSig = typeof sig === "string" ? sig.trim().toLowerCase() : "";
+    if (cleanSig && !/^[a-f0-9]{128}$/.test(cleanSig)) {
+      return res.status(400).json({ success: false, message: "서명(sig)은 128자리 hex여야 합니다." });
+    }
 
     try {
       await db.collection("config").doc("version").set({
@@ -77,6 +83,7 @@ module.exports = async function handler(req, res) {
         url: url || "",
         changelog: changelog || "",
         sha256: cleanSha,
+        sig: cleanSig,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.status(200).json({ success: true, message: `버전 ${version}으로 업데이트되었습니다.` });

@@ -107,8 +107,12 @@
           <input type="text" id="newUrl" placeholder="https://github.com/.../releases/download/..." />
         </div>
         <div style="flex:2;">
-          <label>SHA256 (무결성 검증, 권장)</label>
-          <input type="text" id="newSha" placeholder="certutil -hashfile macro_setup.exe SHA256" />
+          <label>SHA256 (필수 — 없으면 런처가 업데이트 무시)</label>
+          <input type="text" id="newSha" placeholder="python sign_release.py <URL> 출력의 sha256" />
+        </div>
+        <div style="flex:2;">
+          <label>서명 (필수 — sign_release.py 출력의 sig)</label>
+          <input type="text" id="newSig" placeholder="python sign_release.py <URL> 출력의 sig" />
         </div>
         <button class="btn btn-primary" onclick="updateVersion()" style="margin-bottom:14px;">업데이트</button>
       </div>
@@ -268,15 +272,17 @@ async function updateVersion() {
   const version = document.getElementById('newVersion').value.trim();
   const url = document.getElementById('newUrl').value.trim();
   const sha256 = document.getElementById('newSha').value.trim().toLowerCase();
+  const sig = document.getElementById('newSig').value.trim().toLowerCase();
   if (!version) return showToast('버전을 입력하세요.', 'error');
   if (!url) return showToast('다운로드 URL을 입력하세요.', 'error');
   if (sha256 && !/^[a-f0-9]{64}$/.test(sha256)) return showToast('SHA256은 64자리 hex여야 합니다.', 'error');
-  if (!sha256 && !confirm('SHA256 없이 등록하면 무결성 검증 없이 업데이트됩니다. 계속할까요?')) return;
+  if (sig && !/^[a-f0-9]{128}$/.test(sig)) return showToast('서명(sig)은 128자리 hex여야 합니다.', 'error');
+  if ((!sha256 || !sig) && !confirm('SHA256/서명 없이 등록하면 1.0.9+ 런처는 이 업데이트를 무시합니다. 계속할까요?')) return;
   try {
-    const res = await fetch('/api/version', { method: 'POST', headers: headers(), body: JSON.stringify({ version, url, sha256 }) });
+    const res = await fetch('/api/version', { method: 'POST', headers: headers(), body: JSON.stringify({ version, url, sha256, sig }) });
     const data = await res.json();
     showToast(data.message, data.success ? 'success' : 'error');
-    if (data.success) { document.getElementById('curVersion').value = version; document.getElementById('newVersion').value = ''; document.getElementById('newUrl').value = ''; document.getElementById('newSha').value = ''; }
+    if (data.success) { document.getElementById('curVersion').value = version; document.getElementById('newVersion').value = ''; document.getElementById('newUrl').value = ''; document.getElementById('newSha').value = ''; document.getElementById('newSig').value = ''; }
   } catch (e) { showToast('버전 업데이트 실패', 'error'); }
 }
 

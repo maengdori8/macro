@@ -1,9 +1,23 @@
-"""매크로 런처 — 업데이트 확인 후 macro.exe를 실행합니다."""
+"""매크로 런처 — 업데이트 확인 후 macro.exe를 실행합니다.
 
+업데이트 보안 모델 (판매본 보호):
+  1. https + 신뢰 호스트(GitHub releases)만 허용
+  2. SHA256 필수 — 해시가 없거나 불일치하면 설치하지 않음
+  3. Ed25519 서명 필수 — "버전|URL|해시" 매니페스트를 개발자 개인키로 서명한 값을
+     서버가 내려주고, 여기 내장된 공개키로 검증. 서버(Vercel/Firestore)가 통째로
+     탈취돼도 개인키 없이는 위조 업데이트를 배포할 수 없습니다.
+
+설치 흐름: 검증 통과 → 설치 파일을 분리 실행하고 런처는 즉시 종료 →
+설치가 끝나면 setup.iss [Run]이 새 launcher.exe를 /postupdate로 재실행 →
+업데이트 확인을 건너뛰고 macro.exe를 띄웁니다(재설치 루프 원천 차단).
+"""
+
+import ctypes
 import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,10 +26,17 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
+import ed25519_tiny
+
 VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
 
+# 업데이트 매니페스트 서명 검증용 공개키. 개인키는 release_signing_key.txt(미배포)로
+# 보관하며 sign_release.py가 서명을 만듭니다. 키를 바꾸면 기존 배포본은 업데이트를
+# 거부하므로 재배포 전에는 절대 바꾸지 마세요.
+UPDATE_PUBKEY_HEX = "a32926b5e2cea4631bb294c7882d416505206c037cd017f86bef024b954cc1d5"
+UPDATE_MANIFEST_PREFIX = "macro-update-v1"
+
 # 업데이트 설치 파일을 받을 수 있는 신뢰 호스트(화이트리스트).
-# 서버가 탈취당해 임의 URL을 내려도 여기 없는 호스트면 실행하지 않습니다.
 ALLOWED_UPDATE_HOSTS = {
     "github.com",
     "objects.githubusercontent.com",
@@ -23,10 +44,39 @@ ALLOWED_UPDATE_HOSTS = {
     "github-releases.githubusercontent.com",
 }
 
+# 같은 버전 설치를 이 시간(초) 안에 재시도하지 않습니다.
+# 서버 버전과 설치본 version.txt가 어긋나는 사고가 나도 재설치 폭주를 막는 안전핀.
+UPDATE_RETRY_COOLDOWN_SECONDS = 600
+UPDATE_MARKER = os.path.join(tempfile.gettempdir(), "macro_update_attempt.json")
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def show_error(text: str, title: str = "Macro 실행 오류") -> None:
+    """콘솔이 없는 빌드에서도 사용자가 볼 수 있게 메시지 박스를 띄웁니다."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)  # MB_ICONERROR
+    except Exception:
+        pass
+
 
 def get_app_dir():
-    # PyInstaller(sys.frozen)와 Nuitka(__compiled__) 모두 대응
+    """런처 exe가 실제로 위치한 폴더(= 설치 폴더)를 반환합니다.
+
+    Nuitka onefile에서 sys.executable은 임시 압축해제 폴더를 가리키므로 쓰면 안
+    됩니다(과거 '항상 0.0.0으로 읽혀 매번 재설치'를 일으킨 원인). 원본 경로를
+    보존하는 sys.argv[0]을 쓰고, 그래도 못 찾으면 GetModuleFileNameW로 보강합니다.
+    """
     if getattr(sys, "frozen", False) or ("__compiled__" in globals()):
+        argv0 = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if argv0 and os.path.isfile(argv0):
+            return os.path.dirname(argv0)
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            if ctypes.windll.kernel32.GetModuleFileNameW(None, buf, 32768):
+                return os.path.dirname(buf.value)
+        except Exception:
+            pass
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -50,22 +100,6 @@ def parse_version(v):
         return (0,)
 
 
-def check_update():
-    try:
-        req = urllib.request.Request(VERSION_CHECK_URL, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        remote_ver = data.get("version", "")
-        url = data.get("url", "")
-        if not remote_ver or not url:
-            return None
-        if parse_version(remote_ver) > parse_version(APP_VERSION):
-            return {"version": remote_ver, "url": url, "sha256": (data.get("sha256") or "").strip().lower()}
-    except Exception:
-        pass
-    return None
-
-
 def _host_allowed(url):
     try:
         host = urllib.parse.urlparse(url).hostname or ""
@@ -75,17 +109,73 @@ def _host_allowed(url):
     return host in ALLOWED_UPDATE_HOSTS or host.endswith(".githubusercontent.com")
 
 
-def download_and_install(url, expected_sha256=""):
+def _verify_manifest_signature(version: str, url: str, sha256_hex: str, sig_hex: str) -> bool:
+    """서버가 내려준 업데이트 매니페스트의 Ed25519 서명을 검증합니다."""
     try:
-        # 1) https + 신뢰 호스트만 허용 (서버 탈취 시 임의 URL 실행 차단).
+        message = f"{UPDATE_MANIFEST_PREFIX}|{version}|{url}|{sha256_hex}".encode("utf-8")
+        return ed25519_tiny.verify(
+            message, bytes.fromhex(sig_hex), bytes.fromhex(UPDATE_PUBKEY_HEX)
+        )
+    except Exception:
+        return False
+
+
+def check_update():
+    """검증을 모두 통과한 업데이트 정보만 반환합니다. 아니면 None."""
+    try:
+        req = urllib.request.Request(VERSION_CHECK_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        remote_ver = (data.get("version") or "").strip()
+        url = (data.get("url") or "").strip()
+        sha256_hex = (data.get("sha256") or "").strip().lower()
+        sig_hex = (data.get("sig") or "").strip().lower()
+
+        if not remote_ver or not url:
+            return None
+        if not re.fullmatch(r"\d{1,4}(\.\d{1,4}){0,3}", remote_ver):
+            return None
+        if parse_version(remote_ver) <= parse_version(APP_VERSION):
+            return None
+        # 보안 게이트: https + 신뢰 호스트 + SHA256 + 서명. 하나라도 빠지면 업데이트 포기.
         if not url.lower().startswith("https://") or not _host_allowed(url):
-            print("업데이트 거부: 허용되지 않은 다운로드 출처입니다.")
-            return False
+            return None
+        if not re.fullmatch(r"[a-f0-9]{64}", sha256_hex):
+            return None
+        if not _verify_manifest_signature(remote_ver, url, sha256_hex, sig_hex):
+            return None
+        return {"version": remote_ver, "url": url, "sha256": sha256_hex}
+    except Exception:
+        pass
+    return None
 
-        temp_dir = tempfile.gettempdir()
-        setup_path = os.path.join(temp_dir, "macro_setup.exe")
 
-        print(f"업데이트 다운로드 중...")
+def _recently_attempted(version: str) -> bool:
+    """같은 버전 설치를 최근에 이미 시도했으면 True (재설치 루프 방지)."""
+    try:
+        with open(UPDATE_MARKER, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        return (
+            marker.get("version") == version
+            and time.time() - float(marker.get("ts", 0)) < UPDATE_RETRY_COOLDOWN_SECONDS
+        )
+    except Exception:
+        return False
+
+
+def _record_attempt(version: str) -> None:
+    try:
+        with open(UPDATE_MARKER, "w", encoding="utf-8") as f:
+            json.dump({"version": version, "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def download_and_install(url, expected_sha256):
+    """설치 파일을 받아 해시 검증 후 분리 실행합니다. 성공 시 True(런처는 종료해야 함)."""
+    try:
+        setup_path = os.path.join(tempfile.gettempdir(), "macro_setup_update.exe")
+
         sha = hashlib.sha256()
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -97,34 +187,39 @@ def download_and_install(url, expected_sha256=""):
                     f.write(chunk)
                     sha.update(chunk)
 
-        # 2) 서버가 해시를 제공하면 일치할 때만 실행 (변조/스왑된 설치 파일 차단).
-        digest = sha.hexdigest()
-        if expected_sha256:
-            if not hmac.compare_digest(digest, expected_sha256):
-                print("업데이트 거부: 설치 파일 해시 불일치 (변조 의심).")
-                try:
-                    os.remove(setup_path)
-                except Exception:
-                    pass
-                return False
-        else:
-            print("경고: 서버가 SHA256을 제공하지 않아 무결성 검증 없이 진행합니다.")
-
-        print("설치 중...")
-        proc = subprocess.Popen(
-            [setup_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-            creationflags=0x08000000,
-        )
-        proc.wait(timeout=120)
-        # Inno Setup 종료 코드: 0=성공, 그 외=실패. 실패면 기존 버전으로 실행.
-        if proc.returncode not in (0, None):
-            print(f"설치 실패 (코드 {proc.returncode}). 기존 버전으로 실행합니다.")
+        if not hmac.compare_digest(sha.hexdigest(), expected_sha256):
+            try:
+                os.remove(setup_path)
+            except Exception:
+                pass
             return False
-        time.sleep(1)
+
+        # 분리 실행 후 즉시 종료: 설치기가 launcher.exe를 교체할 때 파일 잠금이 없고,
+        # 설치 완료 시 [Run]이 새 런처를 /postupdate로 다시 띄워줍니다.
+        subprocess.Popen(
+            [setup_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+            creationflags=CREATE_NO_WINDOW,
+            close_fds=True,
+        )
         return True
-    except Exception as e:
-        print(f"업데이트 실패: {e}")
+    except Exception:
         return False
+
+
+def launch_macro(app_dir):
+    macro_exe = os.path.join(app_dir, "macro.exe")
+    if not os.path.exists(macro_exe):
+        show_error(
+            "macro.exe를 찾을 수 없습니다.\n\n"
+            "백신(Windows Defender 등)이 파일을 격리했을 수 있습니다.\n"
+            "백신 예외 등록 후 프로그램을 다시 설치해 주세요.\n\n"
+            f"확인한 경로: {macro_exe}"
+        )
+        return
+    try:
+        subprocess.Popen([macro_exe], close_fds=True)
+    except Exception as exc:
+        show_error(f"macro.exe 실행에 실패했습니다.\n\n{exc}")
 
 
 def main():
@@ -134,18 +229,18 @@ def main():
         sys.stderr = open(os.devnull, "w")
 
     app_dir = get_app_dir()
-    macro_exe = os.path.join(app_dir, "macro.exe")
 
-    update = check_update()
-    if update:
-        print(f"새 버전 발견: {update['version']}")
-        download_and_install(update["url"], update.get("sha256", ""))
+    # 설치 직후 재실행(/postupdate)이면 업데이트 확인을 건너뜁니다.
+    skip_update = any(arg.lower() in ("/postupdate", "--postupdate") for arg in sys.argv[1:])
 
-    if os.path.exists(macro_exe):
-        subprocess.Popen([macro_exe])
-    else:
-        print("macro.exe를 찾을 수 없습니다.")
-        time.sleep(3)
+    if not skip_update:
+        update = check_update()
+        if update and not _recently_attempted(update["version"]):
+            _record_attempt(update["version"])
+            if download_and_install(update["url"], update["sha256"]):
+                return  # 설치기에게 넘기고 종료. 새 런처가 macro를 실행합니다.
+
+    launch_macro(app_dir)
 
 
 if __name__ == "__main__":

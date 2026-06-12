@@ -50,12 +50,18 @@ rem Syntax gate before the slow compile. cmd does not expand wildcards,
 rem so use compileall (handles directories) instead of py_compile.
 rem (NOTE: keep this comment ASCII - cmd misparses some UTF-8 Korean in :: comments)
 echo 문법 검사 중...
-python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py
+python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py
 if %errorlevel% neq 0 (
     echo [오류] 문법 검사 실패. 빌드를 중단합니다.
     pause
     exit /b 1
 )
+
+rem Stale-output guard: delete old exes so a failed compile cannot silently
+rem ship the previous build (old exe passing the "if exist" checks below).
+if exist "dist\macro.exe" del /f /q "dist\macro.exe"
+if exist "dist\launcher.exe" del /f /q "dist\launcher.exe"
+if exist "dist\macro_setup.exe" del /f /q "dist\macro_setup.exe"
 
 echo.
 echo [1/3] macro.exe 빌드 중... (첫 빌드는 5~10분 걸릴 수 있습니다)
@@ -82,10 +88,11 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
   --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=launcher.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
+  --include-module=ed25519_tiny ^
   launcher.py
 if not exist "dist\launcher.exe" (
     echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
-    python -m PyInstaller --onefile --noconsole --uac-admin --name launcher launcher.py
+    python -m PyInstaller --onefile --noconsole --uac-admin --name launcher --hidden-import ed25519_tiny launcher.py
 )
 
 echo.
@@ -148,6 +155,11 @@ if exist "dist\macro_setup.exe" (
     echo ===== 빌드 완료 =====
     echo 설치 파일: dist\macro_setup.exe
     for %%A in ("dist\macro_setup.exe") do echo 크기: %%~zA bytes
+    echo.
+    echo [배포 절차] GitHub Release에 dist\macro_setup.exe 업로드 후:
+    echo    python sign_release.py "<업로드된 다운로드 URL>"
+    echo 출력된 version/url/sha256/sig 네 값을 admin 패널에 등록하세요.
+    echo ^(ADMIN_KEY 환경변수 설정 시 --post 옵션으로 자동 등록 가능^)
 ) else (
     echo 설치 파일 생성 실패!
 )

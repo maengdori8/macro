@@ -13,6 +13,9 @@ _update.zip
 _update_tmp/
 custom_targets/
 
+# 릴리스 서명 개인키 — 절대 커밋 금지 (유출 시 위조 업데이트 서명 가능)
+release_signing_key.txt
+
 # 파이썬
 __pycache__/
 *.pyc
