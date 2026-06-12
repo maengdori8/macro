@@ -117,7 +117,7 @@ function timingSafeEqual(a, b) {
 // 관리자 키 검증
 function verifyAdminKey(req) {
   const ADMIN_KEY = process.env.ADMIN_KEY;
-  if (!ADMIN_KEY || ADMIN_KEY.length < 16) return false; // 약한 키 거부
+  if (!ADMIN_KEY) return false;
   const provided = req.headers["x-admin-key"];
   return timingSafeEqual(String(provided || ""), ADMIN_KEY);
 }
