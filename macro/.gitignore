@@ -30,3 +30,6 @@ venv/
 
 # 생성된 임베드 자산 (빌드 시 gen_assets.py가 생성)
 macroapp/_assets.py
+
+# 시작 오류 진단 로그(런타임 생성)
+startup_error.log

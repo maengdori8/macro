@@ -21,7 +21,33 @@ if exist "setup.iss" (
 )
 
 echo 패키지 설치 중...
-python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad opencv-python numpy pyautogui pillow ordered-set zstandard
+rem CRITICAL: opencv-python(일반)은 cv2.pyd가 Media Foundation(MF.dll/MFPlat.dll/
+rem MFReadWrite.dll)을 정적 임포트한다. Windows N/KN 에디션 등 미디어 기능이 없는 PC에선
+rem 'import cv2'가 DLL 로드 단계에서 실패하고, --windows-console-mode=disable 때문에
+rem 아무 메시지 없이 종료된다(= 다른 PC에서 '더블클릭해도 무반응'의 원인).
+rem opencv-python-headless는 videoio/highgui를 빼서 MF 의존성이 없다. 이 앱은 cv2를
+rem 계산용(matchTemplate/imdecode 등)으로만 쓰므로 headless로 충분하다.
+rem
+rem 함정: windows-capture가 'opencv-python'(일반판)을 의존성으로 끌어온다. 그래서 headless를
+rem 먼저 깔아도 windows-capture 설치 단계에서 일반 opencv-python이 다시 들어와 cv2.pyd를
+rem MF 버전으로 덮어쓴다. 따라서 순서가 중요하다:
+rem  (1) 일반 패키지 먼저 설치 (windows-capture가 opencv-python을 끌어옴)
+rem  (2) 그 뒤에 opencv-python을 제거하고 headless를 강제 재설치 → cv2.pyd의 '마지막 기록자'가
+rem      headless가 되게 한다. headless도 동일한 cv2 모듈을 제공하므로 windows-capture는 정상 동작.
+python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad numpy pyautogui pillow ordered-set zstandard
+python -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >nul 2>&1
+python -m pip install --quiet --disable-pip-version-check --no-warn-script-location --force-reinstall --no-deps opencv-python-headless
+
+rem 검증 게이트: 설치된 cv2.pyd가 Media Foundation을 임포트하면 빌드를 중단한다.
+rem (과거 pip 상태 꼬임으로 MF 버전이 조용히 번들돼 N에디션에서 무반응이 재발한 적 있음)
+echo cv2 Media Foundation 의존성 검사 중...
+python check_cv2_headless.py
+if %errorlevel% neq 0 (
+    echo [오류] cv2.pyd가 Media Foundation을 임포트합니다. opencv-python-headless 설치 실패.
+    echo        pip uninstall opencv-python opencv-python-headless 후 다시 실행하세요.
+    pause
+    exit /b 1
+)
 
 echo vgamepad DLL 경로 탐색 중...
 :: find_spec로 위치만 찾습니다(import 시 ViGEm 드라이버가 없으면 죽으므로 실행하지 않음).
@@ -50,16 +76,28 @@ rem Syntax gate before the slow compile. cmd does not expand wildcards,
 rem so use compileall (handles directories) instead of py_compile.
 rem (NOTE: keep this comment ASCII - cmd misparses some UTF-8 Korean in :: comments)
 echo 문법 검사 중...
-python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py
+python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py check_cv2_headless.py
 if %errorlevel% neq 0 (
     echo [오류] 문법 검사 실패. 빌드를 중단합니다.
     pause
     exit /b 1
 )
 
-rem Stale-output guard: delete old exes so a failed compile cannot silently
-rem ship the previous build (old exe passing the "if exist" checks below).
+rem Stale-output guard: delete old exes so a locked/failed build cannot silently
+rem ship the PREVIOUS build. macro.exe runs as admin(uac-admin); if a copy is still
+rem running it LOCKS the file, del fails, Nuitka cannot overwrite, and the old exe
+rem passes the "if exist" checks below -> stale (e.g. pre-headless cv2) gets shipped.
+rem So: try to kill it, then ABORT LOUDLY if it still cannot be removed.
+taskkill /f /im macro.exe >nul 2>&1
+taskkill /f /im launcher.exe >nul 2>&1
+taskkill /f /im gamepad_test.exe >nul 2>&1
 if exist "dist\macro.exe" del /f /q "dist\macro.exe"
+if exist "dist\macro.exe" (
+    echo [오류] dist\macro.exe 삭제 불가 - 실행 중이거나 잠겨 있습니다. 빌드를 중단합니다.
+    echo        실행 중인 macro.exe 를 관리자 권한으로 종료한 뒤 다시 빌드하세요.
+    pause
+    exit /b 1
+)
 if exist "dist\launcher.exe" del /f /q "dist\launcher.exe"
 if exist "dist\macro_setup.exe" del /f /q "dist\macro_setup.exe"
 
@@ -76,7 +114,15 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
   --enable-plugin=tk-inter ^
   --include-package=macroapp ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" ^
   macro_main.py
+rem NOTE: the two ViGEmClient.dll lines above are REQUIRED and must not be removed.
+rem --include-data-dir silently SKIPS .dll files (treats them as code), so the
+rem vigem CLIENT dlls vgamepad loads via ctypes.CDLL at runtime get dropped while
+rem the install\*.msi files come through. Without these, the onefile runs but
+rem "import vgamepad" fails with "Could not find module ViGEmClient.dll" and all
+rem key/gamepad targets silently stop working. Must be explicit --include-data-files.
 if not exist "dist\macro.exe" (
     echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
     python -m PyInstaller --onefile --noconsole --uac-admin --name macro --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" macro_main.py
@@ -102,6 +148,8 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
   --output-dir=dist --output-filename=gamepad_test.exe ^
   --windows-uac-admin ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" ^
   gamepad_test.py
 if not exist "dist\gamepad_test.exe" (
     python -m PyInstaller --onefile --uac-admin --name gamepad_test --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" gamepad_test.py
