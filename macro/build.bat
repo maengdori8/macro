@@ -91,9 +91,12 @@ rem So: try to kill it, then ABORT LOUDLY if it still cannot be removed.
 taskkill /f /im macro.exe >nul 2>&1
 taskkill /f /im launcher.exe >nul 2>&1
 taskkill /f /im gamepad_test.exe >nul 2>&1
+if exist "dist\macro_app" rmdir /s /q "dist\macro_app"
+if exist "dist\macro_main.dist" rmdir /s /q "dist\macro_main.dist"
+if exist "dist\macro" rmdir /s /q "dist\macro"
 if exist "dist\macro.exe" del /f /q "dist\macro.exe"
-if exist "dist\macro.exe" (
-    echo [오류] dist\macro.exe 삭제 불가 - 실행 중이거나 잠겨 있습니다. 빌드를 중단합니다.
+if exist "dist\macro_app\macro.exe" (
+    echo [오류] 이전 macro 빌드 폴더 삭제 불가 - 실행 중이거나 잠겨 있습니다. 빌드를 중단합니다.
     echo        실행 중인 macro.exe 를 관리자 권한으로 종료한 뒤 다시 빌드하세요.
     pause
     exit /b 1
@@ -102,12 +105,17 @@ if exist "dist\launcher.exe" del /f /q "dist\launcher.exe"
 if exist "dist\macro_setup.exe" del /f /q "dist\macro_setup.exe"
 
 echo.
-echo [1/3] macro.exe 빌드 중... (첫 빌드는 5~10분 걸릴 수 있습니다)
+echo [1/3] macro 빌드 중 (폴더형/standalone)... (첫 빌드는 5~10분 걸릴 수 있습니다)
+rem --standalone(폴더형): onefile과 달리 실행 시 임시폴더에 압축 해제하지 않는다. 큰
+rem 압축 덩어리를 통째로 페이징하지도 않으므로, 일부 PC에서 발생하던
+rem "파일에 액세스할 수 없습니다 / STATUS_IN_PAGE_ERROR로 macro.exe 종료" 와
+rem 백신의 임시추출 차단 문제를 근본적으로 없앤다. macro.exe + 부품 DLL이 설치폴더에
+rem 그대로 놓인다.
 rem --lto=no is REQUIRED here: without MSVC, Nuitka on Python 3.13 uses the
 rem downloaded zig 0.16 compiler, and zig + LTO fails at link time
 rem (undefined symbols frexpf/wmemchr/isnan in zigc.lib). Do not re-enable
 rem LTO unless MSVC Build Tools are installed.
-python -m nuitka --onefile --assume-yes-for-downloads ^
+python -m nuitka --standalone --assume-yes-for-downloads ^
   --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=macro.exe ^
   --windows-console-mode=disable --windows-uac-admin ^
@@ -120,13 +128,16 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
 rem NOTE: the two ViGEmClient.dll lines above are REQUIRED and must not be removed.
 rem --include-data-dir silently SKIPS .dll files (treats them as code), so the
 rem vigem CLIENT dlls vgamepad loads via ctypes.CDLL at runtime get dropped while
-rem the install\*.msi files come through. Without these, the onefile runs but
-rem "import vgamepad" fails with "Could not find module ViGEmClient.dll" and all
-rem key/gamepad targets silently stop working. Must be explicit --include-data-files.
-if not exist "dist\macro.exe" (
-    echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
-    python -m PyInstaller --onefile --noconsole --uac-admin --name macro --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" macro_main.py
+rem the install\*.msi files come through. Without these, "import vgamepad" fails
+rem with "Could not find module ViGEmClient.dll". Must be explicit --include-data-files.
+rem Nuitka standalone 출력은 dist\macro_main.dist\ ; 실패 시 PyInstaller --onedir 폴백(dist\macro\).
+if not exist "dist\macro_main.dist\macro.exe" (
+    echo [경고] Nuitka 빌드 실패 - PyInstaller 폴더형으로 폴백합니다.
+    python -m PyInstaller --onedir --noconsole --uac-admin --name macro --distpath dist --add-data "%VGAMEPAD_DIR%\win;vgamepad\win" macro_main.py
 )
+rem 어느 도구가 만들었든 출력 폴더 이름을 dist\macro_app 으로 통일한다.
+if exist "dist\macro_main.dist\macro.exe" ren "dist\macro_main.dist" "macro_app"
+if not exist "dist\macro_app\macro.exe" if exist "dist\macro\macro.exe" ren "dist\macro" "macro_app"
 
 echo.
 echo [2/3] launcher.exe 빌드 중...
@@ -164,8 +175,8 @@ if exist "launcher.onefile-build" rmdir /s /q "launcher.onefile-build"
 if exist "gamepad_test.build" rmdir /s /q "gamepad_test.build"
 if exist "gamepad_test.onefile-build" rmdir /s /q "gamepad_test.onefile-build"
 
-if not exist "dist\macro.exe" (
-    echo macro.exe 빌드 실패!
+if not exist "dist\macro_app\macro.exe" (
+    echo macro 빌드 실패!
     pause
     exit /b 1
 )

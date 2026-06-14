@@ -1,7 +1,7 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
 [Setup]
 AppName=Macro
-AppVersion=1.0.10
+AppVersion=1.0.11
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
@@ -25,7 +25,10 @@ ArchitecturesAllowed=x64compatible
 ; 보안: targets.json / target_*.png 는 배포하지 않습니다.
 ; 이 자산은 gen_assets.py가 exe 안에 컴파일해 넣으므로 설치 폴더엔 노출되지 않습니다.
 [Files]
-Source: "dist\macro.exe"; DestDir: "{app}"; Flags: ignoreversion
+; macro는 폴더형(standalone) 빌드 — macro.exe + 부품 DLL 전체를 설치폴더에 그대로 푼다.
+; (onefile의 실시간 임시추출이 일부 PC에서 'STATUS_IN_PAGE_ERROR / 파일 액세스 불가'를
+;  일으켜, 폴더형으로 전환함. dist\macro_app\ 안의 모든 파일을 재귀로 담는다.)
+Source: "dist\macro_app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
