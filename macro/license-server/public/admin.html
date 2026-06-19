@@ -73,14 +73,15 @@
           <label>라이센스 키</label>
           <input type="text" id="newKey" placeholder="키 입력 또는 자동 생성" />
         </div>
-        <div style="min-width:100px; flex:0.5;">
-          <label>기간</label>
-          <select id="newDays">
-            <option value="1">1일</option>
-            <option value="7">7일</option>
-            <option value="30" selected>30일</option>
-            <option value="99999">무제한</option>
-          </select>
+        <div style="min-width:150px; flex:0.7;">
+          <label>기간 (일 직접 입력)</label>
+          <input type="number" id="newDays" value="30" min="1" max="36500" style="margin-bottom:6px;" />
+          <div style="display:flex; gap:4px;">
+            <button type="button" class="btn btn-sm" style="background:#2a2a2a;color:#ccc;flex:1;" onclick="setDays(7)">7</button>
+            <button type="button" class="btn btn-sm" style="background:#2a2a2a;color:#ccc;flex:1;" onclick="setDays(30)">30</button>
+            <button type="button" class="btn btn-sm" style="background:#2a2a2a;color:#ccc;flex:1;" onclick="setDays(90)">90</button>
+            <button type="button" class="btn btn-sm" style="background:#2a2a2a;color:#ccc;flex:1.4;" onclick="setDays(99999)">무제한</button>
+          </div>
         </div>
         <div>
           <label>메모</label>
@@ -218,7 +219,8 @@ function renderTable(list) {
       <td><span style="color:${l.hwids.length >= l.maxHwids ? '#FF6B6B' : '#69DB7C'}">${l.hwids.length}/${l.maxHwids}</span></td>
       <td><span class="memo-text" style="cursor:pointer;text-decoration:underline dotted;" onclick="editDiscordId('${l.key}','${l.discordId || ''}')" title="클릭하여 수정">${l.discordId || '-'}</span></td>
       <td class="memo-text">${l.memo || '-'}</td>
-      <td class="btn-group">
+      <td class="btn-group" style="flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" onclick="extendKey('${l.key}', ${l.days})">연장</button>
         <button class="btn ${toggleClass} btn-sm" onclick="toggleKey('${l.key}', ${!l.disabled})">${toggleLabel}</button>
         <button class="btn btn-danger btn-sm" onclick="deleteKey('${l.key}')">삭제</button>
         <button class="btn btn-sm" style="background:${l.hwids.length === 0 ? '#333' : '#555'};color:${l.hwids.length === 0 ? '#666' : '#fff'};${l.hwids.length === 0 ? 'cursor:default;' : ''}" onclick="resetHwids('${l.key}')" ${l.hwids.length === 0 ? 'disabled' : ''}>HWID초기화</button>
@@ -227,11 +229,18 @@ function renderTable(list) {
   }).join('');
 }
 
+function setDays(n) {
+  document.getElementById('newDays').value = n;
+}
+
 async function issueKey() {
   const key = document.getElementById('newKey').value.trim();
-  const days = parseInt(document.getElementById('newDays').value);
+  const days = parseInt(document.getElementById('newDays').value, 10);
   const memo = document.getElementById('newMemo').value.trim();
   if (!key) return showToast('라이센스 키를 입력하세요.', 'error');
+  if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) {
+    return showToast('기간은 1~36500 사이 정수 또는 무제한(99999)이어야 합니다.', 'error');
+  }
 
   try {
     const res = await fetch(API, { method: 'POST', headers: headers(), body: JSON.stringify({ key, days, memo }) });
@@ -239,6 +248,30 @@ async function issueKey() {
     showToast(data.message, data.success ? 'success' : 'error');
     if (data.success) { document.getElementById('newKey').value = ''; document.getElementById('newMemo').value = ''; loadLicenses(); }
   } catch (e) { showToast('발급 실패', 'error'); }
+}
+
+async function extendKey(key, curDays) {
+  if (curDays === 99999) return showToast('이미 무제한 라이센스입니다.', 'error');
+  const input = prompt(`"${key}" 를 며칠 연장할까요? (현재 만료일 기준으로 추가)\n무제한으로 바꾸려면 "무제한" 입력`, '30');
+  if (input === null) return;
+  const trimmed = input.trim();
+  try {
+    let body;
+    if (trimmed === '무제한' || trimmed === '99999') {
+      if (!confirm(`"${key}" 를 무제한으로 전환할까요?`)) return;
+      body = { key, makeUnlimited: true };
+    } else {
+      const extendDays = parseInt(trimmed, 10);
+      if (!Number.isInteger(extendDays) || extendDays < 1 || extendDays > 36500) {
+        return showToast('연장 일수는 1~36500 사이 정수여야 합니다.', 'error');
+      }
+      body = { key, extendDays };
+    }
+    const res = await fetch(API, { method: 'PATCH', headers: headers(), body: JSON.stringify(body) });
+    const data = await res.json();
+    showToast(data.message, data.success ? 'success' : 'error');
+    if (data.success) loadLicenses();
+  } catch (e) { showToast('연장 실패', 'error'); }
 }
 
 async function deleteKey(key) {

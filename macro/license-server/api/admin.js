@@ -85,8 +85,9 @@ module.exports = async function handler(req, res) {
     if (!sec.isValidKeyFormat(key)) {
       return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
-    if (![1, 7, 30, 99999].includes(days)) {
-      return res.status(400).json({ success: false, message: "days는 1, 7, 30, 99999 중 하나여야 합니다." });
+    // 기간(일): 1~36500 사이 정수 또는 무제한(99999).
+    if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) {
+      return res.status(400).json({ success: false, message: "기간(일)은 1~36500 사이 정수 또는 무제한(99999)이어야 합니다." });
     }
     if (memo !== undefined && (typeof memo !== "string" || memo.length > 200)) {
       return res.status(400).json({ success: false, message: "메모는 200자 이하 문자열이어야 합니다." });
@@ -146,6 +147,35 @@ module.exports = async function handler(req, res) {
       if (resetHwids) {
         await col.doc(key).update({ hwids: [] });
         return res.status(200).json({ success: true, message: "HWID가 초기화되었습니다." });
+      }
+
+      // 기간 연장: 현재 만료(또는 지금) 기준으로 N일 추가.
+      const { extendDays } = req.body;
+      if (extendDays !== undefined) {
+        if (!Number.isInteger(extendDays) || extendDays < 1 || extendDays > 36500) {
+          return res.status(400).json({ success: false, message: "연장 일수는 1~36500 사이 정수여야 합니다." });
+        }
+        const data = doc.data();
+        const curDays = data.days || 0;
+        if (curDays === 99999) {
+          return res.status(400).json({ success: false, message: "이미 무제한 라이센스입니다." });
+        }
+        const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
+        const currentExpiry = createdAt + curDays * 86400000;
+        // 아직 유효하면 만료일에서, 이미 만료됐으면 지금부터 연장.
+        const base = Math.max(Date.now(), currentExpiry);
+        const newExpiry = base + extendDays * 86400000;
+        const newDays = Math.max(1, Math.round((newExpiry - createdAt) / 86400000));
+        await col.doc(key).update({ days: newDays });
+        const remainDays = Math.ceil((newExpiry - Date.now()) / 86400000);
+        return res.status(200).json({ success: true, message: `${extendDays}일 연장되었습니다. (남은 약 ${remainDays}일)` });
+      }
+
+      // 무제한으로 전환.
+      const { makeUnlimited } = req.body;
+      if (makeUnlimited) {
+        await col.doc(key).update({ days: 99999 });
+        return res.status(200).json({ success: true, message: "무제한으로 전환되었습니다." });
       }
 
       const { discordId } = req.body;
