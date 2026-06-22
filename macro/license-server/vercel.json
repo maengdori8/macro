@@ -25,6 +25,11 @@
       "src": "/api/status",
       "methods": ["GET", "POST"],
       "dest": "/api/status.js"
+    },
+    {
+      "src": "/api/discord-link",
+      "methods": ["POST"],
+      "dest": "/api/discord-link.js"
     }
   ]
 }
