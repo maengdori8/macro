@@ -26,6 +26,9 @@ _RANK_RE = re.compile(r"(\d{1,8})\s*위")
 # 챔피언스/슈퍼 챔피언스 감독 티어 판별 토큰(OCR 오인식 대비 느슨하게).
 _CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
 
+# SKIP 자동 넘기기 토큰 (대소문자 무관, 공백 제거 후 부분일치). "skip"이 SKIP/Skip/skip 모두 커버.
+_SKIP_TOKENS = ("skip", "스킵")
+
 
 def ocr_available() -> bool:
     return winocr is not None
@@ -114,3 +117,20 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
         result["has_panel"] = True
     result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
     return result
+
+
+def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
+    """이미지(또는 일부 영역)에 SKIP/스킵 글자가 보이면 True. OCR 불가/실패 시 False.
+
+    대소문자 무관: 인식 텍스트를 소문자화하고 공백을 제거한 뒤 'skip'/'스킵' 부분일치.
+    """
+    if winocr is None:
+        return False
+    try:
+        text = _recognize_text(image_bgr_or_gray)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger(f"[SKIP OCR] 인식 중 오류: {exc}")
+        return False
+    cleaned = (text or "").lower().replace(" ", "")
+    return any(tok in cleaned for tok in _SKIP_TOKENS)

@@ -131,6 +131,19 @@ RANK_OCR_LEFT_FRACTION = 0.45     # 프레임 가로의 왼쪽 비율만 OCR (�
 RANK_OCR_TOP_FRACTION = 0.0       # 위쪽 잘라낼 비율(0=전체 높이)
 RANK_OCR_BOTTOM_FRACTION = 1.0    # 아래쪽 경계 비율(1.0=끝까지)
 
+# ─── SKIP 자동 넘기기 ───
+# 화면에 'SKIP'(대소문자 무관) 또는 '스킵' 글자가 보이면, 사라질 때까지
+# A(=s)와 Start를 번갈아 눌러 넘긴다.
+SKIP_ENABLED = True
+SKIP_OCR_INTERVAL_SECONDS = 0.3   # 이 간격마다 SKIP 텍스트 확인(작을수록 빨리 반응·무거움)
+SKIP_PRESS_DELAY_SECONDS = 0.05   # A·Start 누름 사이 지연
+SKIP_OCR_MAX_WIDTH = 1280         # OCR 전 이 폭으로 축소(0=축소 안 함). 속도용.
+# SKIP을 찾을 영역(프레임 비율). 기본=전체. 특정 위치만 보려면 좁히세요.
+SKIP_OCR_LEFT_FRACTION = 0.0
+SKIP_OCR_RIGHT_FRACTION = 1.0
+SKIP_OCR_TOP_FRACTION = 0.0
+SKIP_OCR_BOTTOM_FRACTION = 1.0
+
 # 매칭 영역 중심 주변에서 클릭 좌표를 약간 조정합니다.
 # 허가된 UI 테스트에서 고정 좌표 취약성을 줄이기 위한 안정화 값입니다.
 CLICK_JITTER_PIXELS = 3

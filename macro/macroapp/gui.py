@@ -35,6 +35,9 @@ from macroapp.config import (
     CUSTOM_TARGETS_DIR_NAME,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_LEFT_FRACTION,
     RANK_OCR_TOP_FRACTION, RANK_OCR_BOTTOM_FRACTION,
+    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
+    SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
+    SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
@@ -133,6 +136,7 @@ class AutomationApp:
         self._current_rank = None       # OCR로 읽은 내 등수
         self._last_rank_ocr = 0.0       # 마지막 등수 OCR 시각
         self._rank_message = "실행 중"   # 상태 메시지(챔스/슈챔 아님 등)
+        self._last_skip_ocr = 0.0       # 마지막 SKIP OCR 시각
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1166,6 +1170,14 @@ class AutomationApp:
                     self._last_rank_ocr = now_mono
                     self._try_read_rank(screen_gray)
 
+                # SKIP 자동 넘기기: 화면에 SKIP/스킵이 보이면 A·Start를 눌러 넘긴다.
+                # 일반 타겟 매칭보다 우선 처리하고, 눌렀으면 다음 프레임에서 사라졌는지
+                # 다시 확인 → 사라질 때까지 s→start→s→start 릴레이가 된다.
+                if SKIP_ENABLED and now_mono - self._last_skip_ocr >= SKIP_OCR_INTERVAL_SECONDS:
+                    self._last_skip_ocr = now_mono
+                    if self._try_skip(screen_gray, manager):
+                        continue
+
                 found_any = False
 
                 # 프레임당 1회만 축소해 모든 타겟이 공유합니다(중복 축소 제거).
@@ -1286,6 +1298,52 @@ class AutomationApp:
             self.queue_log("[등수] 챔스/슈챔이 아닙니다.")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True, message=new_msg)
+
+    def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
+        """화면에 SKIP/스킵이 보이면 A(=s)·Start를 눌러 넘기고 True를 반환합니다.
+
+        반환 True면 호출부가 이번 프레임 일반 타겟 매칭을 건너뛰고 곧장 다음 프레임을
+        다시 확인 → 사라질 때까지 s→start→s→start 릴레이가 됩니다. 실패/미감지 시 False.
+        """
+        if winapi.vg is None or not rank_ocr.ocr_available():
+            return False
+        try:
+            h, w = screen_gray.shape[:2]
+            x1 = max(0, int(w * SKIP_OCR_LEFT_FRACTION))
+            x2 = min(w, int(w * SKIP_OCR_RIGHT_FRACTION))
+            y1 = max(0, int(h * SKIP_OCR_TOP_FRACTION))
+            y2 = min(h, int(h * SKIP_OCR_BOTTOM_FRACTION))
+            crop = screen_gray[y1:y2, x1:x2]
+            # 속도: 큰 프레임은 OCR 전에 폭 기준으로 축소(SKIP 글자는 크므로 인식 유지).
+            if SKIP_OCR_MAX_WIDTH and crop.shape[1] > SKIP_OCR_MAX_WIDTH:
+                scale = SKIP_OCR_MAX_WIDTH / crop.shape[1]
+                crop = cv2.resize(
+                    crop, (SKIP_OCR_MAX_WIDTH, max(1, int(crop.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            if not rank_ocr.contains_skip(crop, logger=None):
+                return False
+        except Exception:
+            return False
+
+        # SKIP 감지됨 → A, Start 입력 (대상 창이 비활성이면 가짜 포커스 먼저).
+        try:
+            if manager is not None and manager.hwnd and winapi.win32gui is not None:
+                WM_ACTIVATE = 0x0006
+                WA_ACTIVE = 1
+                winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
+            a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
+            start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
+            if a_btn is not None:
+                send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
+            if start_btn is not None:
+                send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
+            self.queue_status("SKIP 넘기는 중")
+            self.queue_log("[SKIP] 감지 → A·Start 입력")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.queue_log(f"[SKIP] 입력 중 오류: {exc}")
+            return False
 
     def _log_to_file_only(self, text: str) -> None:
         """UI를 거치지 않고 로그 파일에만 기록합니다(트레이스백 등)."""
