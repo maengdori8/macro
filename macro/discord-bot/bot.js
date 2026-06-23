@@ -92,32 +92,70 @@ async function resolveMe(guild) {
   return me;
 }
 
-// ─── 서버 구축 청사진 ───
-const BUYER_ONLY = "BUYER_ONLY";
-const READONLY = "READONLY";
+// ─── 서버 구축 청사진 (채널별 보기/채팅 권한 명시) ───
+// OPEN        : @everyone 보기+채팅
+// READONLY    : @everyone 보기 O, 채팅 X (공지/규칙/FAQ)
+// BUYER_WRITE : @everyone 보기 O, 채팅은 구매자만 (후기)
+// BUYER_ONLY  : 구매자만 보기+채팅 (비구매자에겐 채널 자체가 안 보임)
+// BUYER_READ  : 구매자만 보기, 채팅 X (다운로드/사용법 — 관리자만 게시)
+const P = { OPEN: "OPEN", READONLY: "READONLY", BUYER_WRITE: "BUYER_WRITE", BUYER_ONLY: "BUYER_ONLY", BUYER_READ: "BUYER_READ" };
+
 const BLUEPRINT = [
   {
     category: "📢 환영",
+    catPerm: P.OPEN,
     channels: [
-      { name: "공지", flag: READONLY },
-      { name: "규칙", flag: READONLY },
-      { name: "인증" },
+      { name: "공지", perm: P.READONLY },
+      { name: "규칙", perm: P.READONLY },
+      { name: "인증", perm: P.OPEN },
     ],
   },
   {
     category: "💎 구매-체험",
-    channels: [{ name: "무료체험-신청" }, { name: "구매방법" }, { name: "후기" }],
+    catPerm: P.OPEN,
+    channels: [
+      { name: "무료체험-신청", perm: P.OPEN },
+      { name: "구매방법", perm: P.READONLY },
+      { name: "후기", perm: P.BUYER_WRITE },
+    ],
   },
   {
     category: "🔒 구매자전용",
-    flag: BUYER_ONLY,
-    channels: [{ name: "다운로드" }, { name: "사용법" }, { name: "내등수" }, { name: "문의" }],
+    catPerm: P.BUYER_ONLY,
+    channels: [
+      { name: "다운로드", perm: P.BUYER_READ },
+      { name: "사용법", perm: P.BUYER_READ },
+      { name: "내등수", perm: P.BUYER_ONLY },
+      { name: "문의", perm: P.BUYER_ONLY },
+    ],
   },
   {
     category: "🛠 지원",
-    channels: [{ name: "자주묻는질문", flag: READONLY }],
+    catPerm: P.OPEN,
+    channels: [{ name: "자주묻는질문", perm: P.READONLY }],
   },
 ];
+
+const V = PermissionFlagsBits.ViewChannel;
+const S = PermissionFlagsBits.SendMessages;
+
+// 권한 타입 → permissionOverwrites 배열. 봇은 항상 보기+채팅 허용(모든 동작 보장).
+function permsFor(type, everyoneId, buyerId, botId) {
+  const botAllow = { id: botId, allow: [V, S] };
+  switch (type) {
+    case P.READONLY:
+      return [{ id: everyoneId, allow: [V], deny: [S] }, botAllow];
+    case P.BUYER_WRITE:
+      return [{ id: everyoneId, allow: [V], deny: [S] }, { id: buyerId, allow: [S] }, botAllow];
+    case P.BUYER_ONLY:
+      return [{ id: everyoneId, deny: [V] }, { id: buyerId, allow: [V, S] }, botAllow];
+    case P.BUYER_READ:
+      return [{ id: everyoneId, deny: [V] }, { id: buyerId, allow: [V], deny: [S] }, botAllow];
+    case P.OPEN:
+    default:
+      return [{ id: everyoneId, allow: [V, S] }, botAllow];
+  }
+}
 
 async function ensureRole(guild, name) {
   const existing = guild.roles.cache.find((r) => r.name === name);
@@ -125,53 +163,48 @@ async function ensureRole(guild, name) {
   return guild.roles.create({ name, mentionable: false, reason: "매크로 판매 서버 구축" });
 }
 
-async function buildServer(guild) {
-  const everyone = guild.roles.everyone;
+async function buildServer(guild, botId) {
+  const everyoneId = guild.roles.everyone.id;
   const buyerRole = await ensureRole(guild, BUYER_ROLE);
-  let created = 0;
+  let processed = 0;
 
   for (const group of BLUEPRINT) {
+    const catPerms = permsFor(group.catPerm, everyoneId, buyerRole.id, botId);
     let cat = guild.channels.cache.find(
       (c) => c.type === ChannelType.GuildCategory && c.name === group.category
     );
     if (!cat) {
-      const overwrites = [];
-      if (group.flag === BUYER_ONLY) {
-        overwrites.push({ id: everyone.id, deny: [PermissionFlagsBits.ViewChannel] });
-        overwrites.push({ id: buyerRole.id, allow: [PermissionFlagsBits.ViewChannel] });
-      }
       cat = await guild.channels.create({
         name: group.category,
         type: ChannelType.GuildCategory,
-        permissionOverwrites: overwrites,
+        permissionOverwrites: catPerms,
       });
-      created++;
+    } else {
+      // 기존 카테고리도 권한 강제 동기화
+      await cat.permissionOverwrites.set(catPerms);
     }
+    processed++;
 
     for (const ch of group.channels) {
+      const chPerms = permsFor(ch.perm, everyoneId, buyerRole.id, botId);
       const exists = guild.channels.cache.find(
         (c) => c.type === ChannelType.GuildText && c.name === ch.name && c.parentId === cat.id
       );
-      if (exists) continue;
-
-      const overwrites = [];
-      if (group.flag === BUYER_ONLY) {
-        overwrites.push({ id: everyone.id, deny: [PermissionFlagsBits.ViewChannel] });
-        overwrites.push({ id: buyerRole.id, allow: [PermissionFlagsBits.ViewChannel] });
+      if (!exists) {
+        await guild.channels.create({
+          name: ch.name,
+          type: ChannelType.GuildText,
+          parent: cat.id,
+          permissionOverwrites: chPerms,
+        });
+      } else {
+        // 기존 채널 권한도 강제 동기화(보기/채팅 싹 다 재설정)
+        await exists.permissionOverwrites.set(chPerms);
       }
-      if (ch.flag === READONLY) {
-        overwrites.push({ id: everyone.id, deny: [PermissionFlagsBits.SendMessages] });
-      }
-      await guild.channels.create({
-        name: ch.name,
-        type: ChannelType.GuildText,
-        parent: cat.id,
-        permissionOverwrites: overwrites,
-      });
-      created++;
+      processed++;
     }
   }
-  return { created, buyerRole };
+  return { created: processed, buyerRole };
 }
 
 // ─── 메시지 처리 ───
@@ -243,10 +276,10 @@ client.on("messageCreate", async (msg) => {
     if (!me.permissions.has(PermissionFlagsBits.ManageChannels) || !me.permissions.has(PermissionFlagsBits.ManageRoles)) {
       return safeReply(msg, "❌ 봇에 '채널 관리'와 '역할 관리' 권한이 필요합니다.");
     }
-    await safeReply(msg, "🛠 서버를 구축하는 중...");
+    await safeReply(msg, "🛠 서버 구축 + 권한 설정 중...");
     try {
-      const { created } = await buildServer(msg.guild);
-      return safeReply(msg, `✅ 서버 구축 완료! (${created}개 생성/스킵 완료)\n이제 #인증 채널에서 \`!인증 <키>\`로 구매자 역할을 받을 수 있습니다.`);
+      const { created } = await buildServer(msg.guild, me.id);
+      return safeReply(msg, `✅ 서버 구축 + 권한 설정 완료! (${created}개 처리)\n채널별 보기/채팅 권한까지 모두 적용했습니다.\n이제 #인증 채널에서 \`!인증 <키>\`로 구매자 역할을 받을 수 있습니다.`);
     } catch (e) {
       console.error("서버구축 오류:", e?.message || e);
       return safeReply(msg, `❌ 서버 구축 실패: ${e?.message || e}\n(봇 역할이 충분히 높은지 확인하세요)`);
