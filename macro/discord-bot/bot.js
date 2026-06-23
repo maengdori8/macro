@@ -3,6 +3,7 @@ const {
   GatewayIntentBits,
   PermissionFlagsBits,
   ChannelType,
+  SlashCommandBuilder,
 } = require("discord.js");
 
 // ─── 설정 ───
@@ -13,7 +14,6 @@ const LINK_API = process.env.LINK_API || `${API_BASE}/discord-link`;
 const BOT_API_KEY = process.env.BOT_API_KEY;
 const PREFIX = "!";
 const BUYER_ROLE = "구매자";
-const AUTH_CHANNEL = "인증"; // 이 채널에서만 !인증 허용
 
 // ─── 봇 초기화 ───
 const client = new Client({
@@ -208,6 +208,101 @@ async function buildServer(guild, botId) {
   return { created: processed, buyerRole };
 }
 
+// ─── 인증/등수 공용 로직 (프리픽스·슬래시 공용, 결과 문자열 반환) ───
+async function doAuth(guild, member, userId, key) {
+  if (!guild || !member) return "❌ 서버 안에서 사용하세요.";
+  if (!key) return "❌ 라이센스 키를 입력하세요.";
+  try {
+    const data = await apiPost(LINK_API, { key, discordId: userId });
+    if (!data.success) return `❌ ${data.message || "인증 실패"}`;
+    const role = guild.roles.cache.find((r) => r.name === BUYER_ROLE);
+    if (!role) return "✅ 라이센스는 유효하지만 `구매자` 역할이 없습니다. 관리자가 `!서버구축`을 먼저 실행해야 합니다.";
+    try {
+      await member.roles.add(role);
+    } catch (e) {
+      console.error("역할 부여 실패:", e?.message || e);
+      return "✅ 인증됐지만 역할 부여에 실패했습니다. (봇 권한/역할 순서 확인)";
+    }
+    const left = data.unlimited ? "무제한" : `${data.remainingDays}일 남음`;
+    return `✅ 인증 완료! \`구매자\` 역할이 부여되었습니다. (${left})`;
+  } catch (e) {
+    console.error("인증 오류:", e?.message || e);
+    return e?.name === "TimeoutError"
+      ? "❌ 서버 응답 시간 초과. 잠시 후 다시 시도하세요."
+      : "❌ 서버 연결 실패. 잠시 후 다시 시도하세요.";
+  }
+}
+
+async function rankText(userId) {
+  try {
+    const data = await fetchStatus(userId);
+    if (!data.success) return `❌ ${data.message}`;
+    const status = data.running ? "🟢 실행 중" : "🔴 중지됨";
+    const rank = data.rank !== null && data.rank !== undefined ? `**${data.rank}등**` : "측정 중...";
+    return (
+      `📊 **매크로 상태**\n상태: ${status}\n등수: ${rank}\n` +
+      `${data.message ? `메시지: ${data.message}\n` : ""}마지막 업데이트: ${timeAgo(data.updatedAt)}`
+    );
+  } catch (e) {
+    console.error("fetchStatus 오류:", e?.message || e);
+    return e?.name === "TimeoutError"
+      ? "❌ 서버 응답 시간 초과. 잠시 후 다시 시도하세요."
+      : "❌ 서버 연결 실패. 잠시 후 다시 시도하세요.";
+  }
+}
+
+const HELP_TEXT =
+  `📋 **명령어 목록**\n` +
+  `\`/인증 키:<키>\` - 라이센스 인증 후 구매자 역할 받기 (🔒 본인만 보임)\n` +
+  `\`/등수\` - 현재 매크로 등수 (본인만 보임)\n` +
+  `\`/도움\` - 명령어 목록\n` +
+  `\`!서버구축\` - (관리자) 채널/역할/권한 자동 설정`;
+
+// ─── 슬래시 명령 정의/등록 ───
+const SLASH_COMMANDS = [
+  new SlashCommandBuilder()
+    .setName("인증")
+    .setDescription("라이센스 키로 구매자 역할 받기 (본인만 보임)")
+    .addStringOption((o) => o.setName("키").setDescription("라이센스 키").setRequired(true)),
+  new SlashCommandBuilder().setName("등수").setDescription("현재 매크로 등수 조회 (본인만 보임)"),
+  new SlashCommandBuilder().setName("도움").setDescription("명령어 목록"),
+].map((c) => c.toJSON());
+
+async function registerGuildCommands(guild) {
+  try {
+    await guild.commands.set(SLASH_COMMANDS);
+    console.log(`슬래시 명령 등록 완료: ${guild.name}`);
+  } catch (e) {
+    console.error(`슬래시 등록 실패(${guild?.id}). 봇을 applications.commands 스코프로 재초대했는지 확인:`, e?.message || e);
+  }
+}
+
+// ─── 슬래시 명령 처리 ───
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const name = interaction.commandName;
+  try {
+    if (name === "인증") {
+      const key = (interaction.options.getString("키") || "").trim();
+      await interaction.deferReply({ ephemeral: true });
+      return interaction.editReply(await doAuth(interaction.guild, interaction.member, interaction.user.id, key));
+    }
+    if (name === "등수") {
+      await interaction.deferReply({ ephemeral: true });
+      return interaction.editReply(await rankText(interaction.user.id));
+    }
+    if (name === "도움") {
+      return interaction.reply({ content: HELP_TEXT, ephemeral: true });
+    }
+  } catch (e) {
+    console.error("interaction 오류:", e?.message || e);
+    try {
+      if (interaction.deferred || interaction.replied) await interaction.editReply("❌ 처리 중 오류가 발생했습니다.");
+      else await interaction.reply({ content: "❌ 처리 중 오류가 발생했습니다.", ephemeral: true });
+    } catch {}
+  }
+});
+
 // ─── 메시지 처리 ───
 client.on("messageCreate", async (msg) => {
   if (msg.author.bot) return;
@@ -216,60 +311,19 @@ client.on("messageCreate", async (msg) => {
   const args = msg.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd = args[0].toLowerCase();
 
-  // !인증 <키> — 라이센스 검증 후 구매자 역할 자동 부여
+  // !인증 (구버전) → 슬래시 명령으로 유도. 키가 노출됐으면 즉시 삭제.
   if (cmd === "인증" || cmd === "auth") {
-    if (!msg.guild) return safeReply(msg, "❌ 서버의 #인증 채널에서 사용하세요.");
-    if (!msg.member) return safeReply(msg, "❌ 사용자 정보를 조회할 수 없습니다. 잠시 후 다시 시도하세요.");
-    const key = (args[1] || "").trim();
-    const me = await resolveMe(msg.guild);
-    const canDelete = !!(me && me.permissions.has(PermissionFlagsBits.ManageMessages));
-
-    // 인증은 #인증 채널에서만. 다른 채널이면 키가 노출됐을 수 있으니 즉시 삭제 시도.
-    if (msg.channel.name !== AUTH_CHANNEL) {
-      if (canDelete) await msg.delete().catch(() => {});
-      const warn = canDelete ? "" : " (키가 노출됐으니 방금 메시지를 직접 삭제하세요)";
-      return notify(msg, `❌ 인증은 #${AUTH_CHANNEL} 채널에서만 가능합니다.${warn}`);
-    }
-
-    if (!key) return safeReply(msg, "❌ 사용법: `!인증 <라이센스키>`");
-
-    // 키가 채팅에 남지 않도록 삭제. 삭제 권한이 없으면 처리하지 않고 거부(키 노출 방지).
-    if (!canDelete) {
-      return safeReply(
-        msg,
-        "❌ 봇에 '메시지 관리' 권한이 없어 키가 노출될 수 있습니다. 방금 보낸 키를 직접 삭제하고, 관리자에게 권한 부여를 요청하세요."
-      );
-    }
-    try {
-      await msg.delete();
-    } catch (e) {
-      console.error("메시지 삭제 실패:", e?.message || e);
-      return notify(msg, "❌ 보안을 위해 메시지를 삭제하지 못했습니다. 키를 직접 삭제하고 다시 시도하세요.");
-    }
-
-    // 이 시점부터 원본 메시지는 삭제됨 → reply 대신 notify(채널 멘션) 사용.
-    try {
-      const data = await apiPost(LINK_API, { key, discordId: msg.author.id });
-      if (!data.success) {
-        return notify(msg, `❌ ${data.message || "인증 실패"}`);
+    if (msg.guild) {
+      const me = await resolveMe(msg.guild);
+      if (me && me.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        await msg.delete().catch(() => {});
       }
-      const role = msg.guild.roles.cache.find((r) => r.name === BUYER_ROLE);
-      if (!role) {
-        return notify(msg, "✅ 라이센스는 유효하지만 `구매자` 역할이 없습니다. 관리자가 `!서버구축`을 먼저 실행해야 합니다.");
-      }
-      try {
-        await msg.member.roles.add(role);
-      } catch (e) {
-        console.error("역할 부여 실패:", e?.message || e);
-        return notify(msg, "✅ 인증됐지만 역할 부여에 실패했습니다. (봇 권한/역할 순서 확인)");
-      }
-      const left = data.unlimited ? "무제한" : `${data.remainingDays}일 남음`;
-      return notify(msg, `✅ 인증 완료! \`구매자\` 역할이 부여되었습니다. (${left})`);
-    } catch (e) {
-      console.error("인증 오류:", e?.message || e);
-      const reason = e?.name === "TimeoutError" ? "서버 응답 시간 초과" : "서버 연결 실패";
-      return notify(msg, `❌ ${reason}. 잠시 후 다시 시도하세요.`);
     }
+    return notify(
+      msg,
+      "🔒 보안을 위해 **`/인증`** 슬래시 명령어를 사용하세요. 키가 채팅에 노출되지 않고, 결과도 본인에게만 보입니다.\n" +
+        "(입력창에 `/인증` 입력 → `키` 칸에 라이센스 키 붙여넣기)"
+    );
   }
 
   // !서버구축 — 관리자 전용: 채널/역할/권한 자동 생성
@@ -298,33 +352,12 @@ client.on("messageCreate", async (msg) => {
 
   // !등수 — 현재 등수 조회
   if (cmd === "등수" || cmd === "rank") {
-    try {
-      const data = await fetchStatus(msg.author.id);
-      if (!data.success) return safeReply(msg, `❌ ${data.message}`);
-      const status = data.running ? "🟢 실행 중" : "🔴 중지됨";
-      const rank = data.rank !== null && data.rank !== undefined ? `**${data.rank}등**` : "측정 중...";
-      return safeReply(
-        msg,
-        `📊 **매크로 상태**\n상태: ${status}\n등수: ${rank}\n` +
-          `${data.message ? `메시지: ${data.message}\n` : ""}마지막 업데이트: ${timeAgo(data.updatedAt)}`
-      );
-    } catch (e) {
-      console.error("fetchStatus 오류:", e?.message || e);
-      const reason = e?.name === "TimeoutError" ? "서버 응답 시간 초과" : "서버 연결 실패";
-      return safeReply(msg, `❌ ${reason}. 잠시 후 다시 시도하세요.`);
-    }
+    return safeReply(msg, await rankText(msg.author.id));
   }
 
   // !도움
   if (cmd === "도움" || cmd === "help") {
-    return safeReply(
-      msg,
-      `📋 **명령어 목록**\n` +
-        `\`!인증 <키>\` - 라이센스 인증 후 구매자 역할 받기\n` +
-        `\`!등수\` - 현재 매크로 등수 조회\n` +
-        `\`!도움\` - 명령어 목록\n` +
-        `\`!서버구축\` - (관리자) 채널/역할 자동 생성`
-    );
+    return safeReply(msg, HELP_TEXT);
   }
 });
 
@@ -332,9 +365,15 @@ process.on("unhandledRejection", (e) => {
   console.error("unhandledRejection:", e?.message || e);
 });
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`✅ 봇 로그인: ${client.user.tag}`);
+  // 각 서버에 슬래시 명령 등록(길드 명령은 즉시 반영).
+  for (const [, guild] of client.guilds.cache) {
+    await registerGuildCommands(guild);
+  }
 });
+// 새 서버에 초대되면 슬래시 명령 자동 등록.
+client.on("guildCreate", registerGuildCommands);
 
 if (!DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN 환경변수가 설정되지 않았습니다.");
