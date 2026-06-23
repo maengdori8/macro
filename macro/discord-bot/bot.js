@@ -13,6 +13,7 @@ const LINK_API = process.env.LINK_API || `${API_BASE}/discord-link`;
 const BOT_API_KEY = process.env.BOT_API_KEY;
 const PREFIX = "!";
 const BUYER_ROLE = "구매자";
+const AUTH_CHANNEL = "인증"; // 이 채널에서만 !인증 허용
 
 // ─── 봇 초기화 ───
 const client = new Client({
@@ -220,11 +221,20 @@ client.on("messageCreate", async (msg) => {
     if (!msg.guild) return safeReply(msg, "❌ 서버의 #인증 채널에서 사용하세요.");
     if (!msg.member) return safeReply(msg, "❌ 사용자 정보를 조회할 수 없습니다. 잠시 후 다시 시도하세요.");
     const key = (args[1] || "").trim();
+    const me = await resolveMe(msg.guild);
+    const canDelete = !!(me && me.permissions.has(PermissionFlagsBits.ManageMessages));
+
+    // 인증은 #인증 채널에서만. 다른 채널이면 키가 노출됐을 수 있으니 즉시 삭제 시도.
+    if (msg.channel.name !== AUTH_CHANNEL) {
+      if (canDelete) await msg.delete().catch(() => {});
+      const warn = canDelete ? "" : " (키가 노출됐으니 방금 메시지를 직접 삭제하세요)";
+      return notify(msg, `❌ 인증은 #${AUTH_CHANNEL} 채널에서만 가능합니다.${warn}`);
+    }
+
     if (!key) return safeReply(msg, "❌ 사용법: `!인증 <라이센스키>`");
 
     // 키가 채팅에 남지 않도록 삭제. 삭제 권한이 없으면 처리하지 않고 거부(키 노출 방지).
-    const me = await resolveMe(msg.guild);
-    if (!me || !me.permissions.has(PermissionFlagsBits.ManageMessages)) {
+    if (!canDelete) {
       return safeReply(
         msg,
         "❌ 봇에 '메시지 관리' 권한이 없어 키가 노출될 수 있습니다. 방금 보낸 키를 직접 삭제하고, 관리자에게 권한 부여를 요청하세요."
