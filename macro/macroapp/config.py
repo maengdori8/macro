@@ -123,6 +123,14 @@ WINDOW_RETRY_SECONDS = 2.0
 # WGC 세션 시작 뒤 첫 프레임을 기다리는 최대 시간입니다.
 WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 
+# ─── 등수 OCR (큐 매칭 화면에서 내 등수 읽기) ───
+# 내 정보는 왼쪽, 상대는 오른쪽 → 왼쪽 일부만 OCR하면 상대 등수는 안 읽힘.
+RANK_OCR_ENABLED = True
+RANK_OCR_INTERVAL_SECONDS = 1.0   # 이 간격마다 1회 OCR (2~3초 떠있으면 충분히 잡음)
+RANK_OCR_LEFT_FRACTION = 0.45     # 프레임 가로의 왼쪽 비율만 OCR (상대=오른쪽 제외)
+RANK_OCR_TOP_FRACTION = 0.0       # 위쪽 잘라낼 비율(0=전체 높이)
+RANK_OCR_BOTTOM_FRACTION = 1.0    # 아래쪽 경계 비율(1.0=끝까지)
+
 # 매칭 영역 중심 주변에서 클릭 좌표를 약간 조정합니다.
 # 허가된 UI 테스트에서 고정 좌표 취약성을 줄이기 위한 안정화 값입니다.
 CLICK_JITTER_PIXELS = 3

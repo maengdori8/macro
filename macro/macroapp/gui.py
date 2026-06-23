@@ -33,10 +33,13 @@ from macroapp.config import (
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
     CUSTOM_TARGETS_DIR_NAME,
+    RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_LEFT_FRACTION,
+    RANK_OCR_TOP_FRACTION, RANK_OCR_BOTTOM_FRACTION,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
 )
+from macroapp import ocr as rank_ocr
 from macroapp.region_select import RegionSelector
 from macroapp.license_client import (
     STATUS_REPORT_INTERVAL_SECONDS, _send_status, get_hwid, verify_license_server,
@@ -127,6 +130,8 @@ class AutomationApp:
         self._status_executor = ThreadPoolExecutor(max_workers=1)
         self._log_dirty = False
         self._close_deadline = 0.0
+        self._current_rank = None       # OCR로 읽은 내 등수
+        self._last_rank_ocr = 0.0       # 마지막 등수 OCR 시각
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1102,6 +1107,11 @@ class AutomationApp:
                 self.queue_log("       ViGEm Bus Driver를 설치하세요:")
                 self.queue_log("       https://github.com/nefarius/ViGEmBus/releases")
 
+            if RANK_OCR_ENABLED and not rank_ocr.ocr_available():
+                self.queue_log("[경고] 등수 OCR(winocr)을 사용할 수 없어 등수가 표시되지 않습니다.")
+                self.queue_log(f"       원본 오류: {rank_ocr.WINOCR_IMPORT_ERROR}")
+                self.queue_log("       'pip install winocr' + Windows 한국어 OCR 언어팩 확인.")
+
             requires_window = (
                 capture_mode == "wgc"
                 or click_mode == "postmessage"
@@ -1149,6 +1159,11 @@ class AutomationApp:
                 if screen_gray is None:
                     self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
+
+                # 등수 OCR: 왼쪽 일부만 주기적으로 읽어 내 등수 추출(상대=오른쪽 제외).
+                if RANK_OCR_ENABLED and now_mono - self._last_rank_ocr >= RANK_OCR_INTERVAL_SECONDS:
+                    self._last_rank_ocr = now_mono
+                    self._try_read_rank(screen_gray)
 
                 found_any = False
 
@@ -1230,10 +1245,28 @@ class AutomationApp:
             return
         try:
             self._status_executor.submit(
-                _send_status, self.license_key, None, running, message
+                _send_status, self.license_key, self._current_rank, running, message
             )
         except Exception:
             pass
+
+    def _try_read_rank(self, screen_gray) -> None:
+        """프레임 왼쪽 일부를 OCR해 내 등수(\\d+위)를 읽습니다. 실패해도 무시."""
+        try:
+            h, w = screen_gray.shape[:2]
+            x1 = 0
+            x2 = max(1, int(w * RANK_OCR_LEFT_FRACTION))
+            y1 = max(0, int(h * RANK_OCR_TOP_FRACTION))
+            y2 = min(h, int(h * RANK_OCR_BOTTOM_FRACTION))
+            crop = screen_gray[y1:y2, x1:x2]
+            rank = rank_ocr.extract_rank(crop, logger=None)
+        except Exception:
+            return
+        if rank is not None and rank != self._current_rank:
+            self._current_rank = rank
+            self.queue_log(f"[등수] 현재 등수: {rank}위")
+            # 등수가 바뀌면 즉시 서버로 전송(다음 30초 주기 안 기다림).
+            self._report_status(running=True, message="실행 중")
 
     def _log_to_file_only(self, text: str) -> None:
         """UI를 거치지 않고 로그 파일에만 기록합니다(트레이스백 등)."""

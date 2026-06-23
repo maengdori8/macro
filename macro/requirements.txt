@@ -5,6 +5,7 @@ opencv-python-headless
 numpy
 pyautogui
 pillow
+winocr; platform_system == "Windows"
 
 # 빌드 전용 (디컴파일 방어). Windows에서만 필요.
 nuitka; platform_system == "Windows"
