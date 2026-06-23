@@ -4,6 +4,13 @@ const {
   PermissionFlagsBits,
   ChannelType,
   SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 
 // ─── 설정 ───
@@ -256,7 +263,46 @@ const HELP_TEXT =
   `\`/인증 키:<키>\` - 라이센스 인증 후 구매자 역할 받기 (🔒 본인만 보임)\n` +
   `\`/등수\` - 현재 매크로 등수 (본인만 보임)\n` +
   `\`/도움\` - 명령어 목록\n` +
-  `\`!서버구축\` - (관리자) 채널/역할/권한 자동 설정`;
+  `\`!서버구축\` - (관리자) 채널/역할/권한 자동 설정\n` +
+  `\`!패널\` - (관리자) 인증/등수 버튼 패널 게시`;
+
+// ─── 패널(임베드 + 버튼) ───
+const PANEL_IMAGE = process.env.PANEL_IMAGE || ""; // 배너 이미지 URL(선택)
+
+function buildPanel() {
+  const embed = new EmbedBuilder()
+    .setColor(0x7ab7ff)
+    .setTitle("🎮 FC ONLINE 감독모드 자동매크로")
+    .setDescription("아래 버튼으로 **인증 / 등수 확인**을 진행하세요.\n키는 버튼 클릭 시 뜨는 비공개 입력창에 넣으면 됩니다 (채팅 노출 X).")
+    .addFields(
+      { name: "🔑 인증", value: "라이센스 키 → 구매자 역할 자동", inline: true },
+      { name: "📊 내 등수", value: "내 매크로 실시간 현황", inline: true },
+      { name: "🔄 업데이트", value: "패치돼도 자동 적용", inline: true }
+    )
+    .setFooter({ text: "문제가 있나요? #문의 채널로 알려주세요." });
+  if (PANEL_IMAGE) embed.setImage(PANEL_IMAGE);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_auth").setLabel("인증").setEmoji("🔑").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("panel_rank").setLabel("내 등수").setEmoji("📊").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("panel_help").setLabel("도움말").setEmoji("❓").setStyle(ButtonStyle.Secondary)
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+function buildAuthModal() {
+  const input = new TextInputBuilder()
+    .setCustomId("key")
+    .setLabel("라이센스 키")
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder("XXXXX-XXXXX-XXXXX-XXXXX-XXXXX")
+    .setRequired(true)
+    .setMaxLength(64);
+  return new ModalBuilder()
+    .setCustomId("auth_modal")
+    .setTitle("라이센스 인증")
+    .addComponents(new ActionRowBuilder().addComponents(input));
+}
 
 // ─── 슬래시 명령 정의/등록 ───
 const SLASH_COMMANDS = [
@@ -277,11 +323,37 @@ async function registerGuildCommands(guild) {
   }
 }
 
-// ─── 슬래시 명령 처리 ───
+// ─── 인터랙션 처리 (슬래시 / 버튼 / 모달) ───
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  const name = interaction.commandName;
   try {
+    // 패널 버튼
+    if (interaction.isButton()) {
+      if (interaction.customId === "panel_auth") {
+        return interaction.showModal(buildAuthModal());
+      }
+      if (interaction.customId === "panel_rank") {
+        await interaction.deferReply({ ephemeral: true });
+        return interaction.editReply(await rankText(interaction.user.id));
+      }
+      if (interaction.customId === "panel_help") {
+        return interaction.reply({ content: HELP_TEXT, ephemeral: true });
+      }
+      return;
+    }
+
+    // 인증 모달 제출
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === "auth_modal") {
+        const key = (interaction.fields.getTextInputValue("key") || "").trim();
+        await interaction.deferReply({ ephemeral: true });
+        return interaction.editReply(await doAuth(interaction.guild, interaction.member, interaction.user.id, key));
+      }
+      return;
+    }
+
+    // 슬래시 명령
+    if (!interaction.isChatInputCommand()) return;
+    const name = interaction.commandName;
     if (name === "인증") {
       const key = (interaction.options.getString("키") || "").trim();
       await interaction.deferReply({ ephemeral: true });
@@ -298,7 +370,7 @@ client.on("interactionCreate", async (interaction) => {
     console.error("interaction 오류:", e?.message || e);
     try {
       if (interaction.deferred || interaction.replied) await interaction.editReply("❌ 처리 중 오류가 발생했습니다.");
-      else await interaction.reply({ content: "❌ 처리 중 오류가 발생했습니다.", ephemeral: true });
+      else if (interaction.isRepliable()) await interaction.reply({ content: "❌ 처리 중 오류가 발생했습니다.", ephemeral: true });
     } catch {}
   }
 });
@@ -348,6 +420,22 @@ client.on("messageCreate", async (msg) => {
       console.error("서버구축 오류:", e?.message || e);
       return safeReply(msg, `❌ 서버 구축 실패: ${e?.message || e}\n(봇 역할이 충분히 높은지 확인하세요)`);
     }
+  }
+
+  // !패널 — 관리자: 현재 채널에 인증/등수 버튼 패널 게시
+  if (cmd === "패널" || cmd === "panel") {
+    if (!msg.guild || !msg.member) return;
+    if (!msg.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return safeReply(msg, "❌ 관리자만 사용할 수 있습니다.");
+    }
+    try {
+      await msg.channel.send(buildPanel());
+      await msg.delete().catch(() => {});
+    } catch (e) {
+      console.error("패널 게시 실패:", e?.message || e);
+      return safeReply(msg, "❌ 패널 게시 실패. 봇에 '메시지 보내기'/'임베드 링크' 권한이 있는지 확인하세요.");
+    }
+    return;
   }
 
   // !등수 — 현재 등수 조회
