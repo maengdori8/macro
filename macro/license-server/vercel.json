@@ -30,6 +30,16 @@
       "src": "/api/discord-link",
       "methods": ["POST"],
       "dest": "/api/discord-link.js"
+    },
+    {
+      "src": "/api/my-license",
+      "methods": ["GET"],
+      "dest": "/api/my-license.js"
+    },
+    {
+      "src": "/api/expiring",
+      "methods": ["GET"],
+      "dest": "/api/expiring.js"
     }
   ]
 }

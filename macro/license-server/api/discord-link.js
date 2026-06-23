@@ -71,17 +71,20 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (existing !== discordId) {
+    const alreadyLinked = existing === discordId;
+    if (!alreadyLinked) {
       await ref.update({ discordId });
     }
 
     const remainingDays = days === 99999 ? null : Math.max(0, Math.ceil((expiresAt - now) / 86400000));
     return res.status(200).json({
       success: true,
-      message: "인증 성공",
+      message: alreadyLinked ? "이미 등록됨" : "인증 성공",
+      alreadyLinked,
       days,
       unlimited: days === 99999,
       remainingDays,
+      expiresAt: days === 99999 ? null : expiresAt,
     });
   } catch (err) {
     console.error("discord-link error:", err);

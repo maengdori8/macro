@@ -18,9 +18,12 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const API_BASE = process.env.API_BASE || "https://license-server-flame-eta.vercel.app/api";
 const STATUS_API = process.env.STATUS_API || `${API_BASE}/status`;
 const LINK_API = process.env.LINK_API || `${API_BASE}/discord-link`;
+const MYLICENSE_API = process.env.MYLICENSE_API || `${API_BASE}/my-license`;
+const EXPIRING_API = process.env.EXPIRING_API || `${API_BASE}/expiring`;
 const BOT_API_KEY = process.env.BOT_API_KEY;
 const PREFIX = "!";
 const BUYER_ROLE = "구매자";
+const EXPIRY_ALERT_DAYS = 3; // 만료 D-N 이내면 DM 알림
 
 // ─── 봇 초기화 ───
 const client = new Client({
@@ -47,8 +50,8 @@ async function apiPost(url, body) {
   }
 }
 
-async function fetchStatus(discordId) {
-  const res = await fetch(`${STATUS_API}?discordId=${encodeURIComponent(discordId)}`, {
+async function apiGet(url) {
+  const res = await fetch(url, {
     headers: { "X-Bot-Key": BOT_API_KEY },
     signal: AbortSignal.timeout(8000),
   });
@@ -57,6 +60,10 @@ async function fetchStatus(discordId) {
   } catch {
     throw new Error(`서버 응답 파싱 실패 (HTTP ${res.status})`);
   }
+}
+
+async function fetchStatus(discordId) {
+  return apiGet(`${STATUS_API}?discordId=${encodeURIComponent(discordId)}`);
 }
 
 function timeAgo(ms) {
@@ -224,6 +231,7 @@ async function doAuth(guild, member, userId, key) {
     if (!data.success) return `❌ ${data.message || "인증 실패"}`;
     const role = guild.roles.cache.find((r) => r.name === BUYER_ROLE);
     if (!role) return "✅ 라이센스는 유효하지만 `구매자` 역할이 없습니다. 관리자가 `!서버구축`을 먼저 실행해야 합니다.";
+    const hadRole = member.roles.cache.has(role.id);
     try {
       await member.roles.add(role);
     } catch (e) {
@@ -231,6 +239,13 @@ async function doAuth(guild, member, userId, key) {
       return "✅ 인증됐지만 역할 부여에 실패했습니다. (봇 권한/역할 순서 확인)";
     }
     const left = data.unlimited ? "무제한" : `${data.remainingDays}일 남음`;
+    // 중복 등록: 이미 본인 키로 등록 + 이미 역할 보유 → 안내만
+    if (data.alreadyLinked && hadRole) {
+      return `ℹ️ 이미 인증되어 있습니다. (${left})`;
+    }
+    if (data.alreadyLinked) {
+      return `✅ 이미 등록된 키입니다. \`구매자\` 역할을 확인했습니다. (${left})`;
+    }
     return `✅ 인증 완료! \`구매자\` 역할이 부여되었습니다. (${left})`;
   } catch (e) {
     console.error("인증 오류:", e?.message || e);
@@ -258,12 +273,46 @@ async function rankText(userId) {
   }
 }
 
+function fmtDate(ms) {
+  if (!ms) return "-";
+  const d = new Date(ms);
+  const kst = new Date(d.getTime() + 9 * 3600000); // KST
+  return `${kst.getUTCFullYear()}-${String(kst.getUTCMonth() + 1).padStart(2, "0")}-${String(kst.getUTCDate()).padStart(2, "0")}`;
+}
+
+async function licenseInfoText(userId) {
+  try {
+    const d = await apiGet(`${MYLICENSE_API}?discordId=${encodeURIComponent(userId)}`);
+    if (!d.success) return `❌ ${d.message || "조회 실패"}`;
+    if (!d.registered) return "❌ 등록된 라이센스가 없습니다. 먼저 `[🔑 인증]` 으로 인증하세요.";
+    if (d.disabled) return "⛔ 비활성화된 라이센스입니다. 관리자에게 문의하세요.";
+    if (d.expired) return "⏰ 만료된 라이센스입니다. `#구매방법` 에서 연장하세요.";
+    const period = d.unlimited
+      ? "♾️ 무제한"
+      : `**${d.remainingDays}일 남음** (만료: ${fmtDate(d.expiresAt)})`;
+    return (
+      `📋 **내 라이센스**\n` +
+      `상태: 🟢 정상\n` +
+      `기간: ${period}\n` +
+      `등록 기기: ${d.hwidCount}/${d.maxHwids}대`
+    );
+  } catch (e) {
+    console.error("licenseInfo 오류:", e?.message || e);
+    return e?.name === "TimeoutError"
+      ? "❌ 서버 응답 시간 초과. 잠시 후 다시 시도하세요."
+      : "❌ 서버 연결 실패. 잠시 후 다시 시도하세요.";
+  }
+}
+
 const HELP_TEXT =
   `📋 **사용 방법**\n\n` +
   `🔑 **인증** — \`[🔑 인증]\` 버튼 또는 \`/인증\`\n` +
   `　라이센스 키를 입력하면 **구매자 역할**이 자동으로 부여됩니다.\n\n` +
+  `📋 **내 라이센스** — \`[📋 내 라이센스]\` 버튼 또는 \`/내정보\`\n` +
+  `　만료일 · 남은 기간 · 등록 기기 수를 확인합니다.\n\n` +
   `📊 **내 등수** — \`[📊 내 등수]\` 버튼 또는 \`/등수\`\n` +
   `　매크로 실시간 등수/상태를 확인합니다.\n\n` +
+  `⏰ 만료 3일 전 DM으로 자동 알려드립니다.\n` +
   `❓ 문제가 있으면 **#문의** 채널로 알려주세요.`;
 
 // ─── 패널(임베드 + 버튼) ───
@@ -284,6 +333,7 @@ function buildPanel() {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("panel_auth").setLabel("인증").setEmoji("🔑").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("panel_license").setLabel("내 라이센스").setEmoji("📋").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("panel_rank").setLabel("내 등수").setEmoji("📊").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("panel_help").setLabel("도움말").setEmoji("❓").setStyle(ButtonStyle.Secondary)
   );
@@ -311,6 +361,7 @@ const SLASH_COMMANDS = [
     .setDescription("라이센스 키로 구매자 역할 받기 (본인만 보임)")
     .addStringOption((o) => o.setName("키").setDescription("라이센스 키").setRequired(true)),
   new SlashCommandBuilder().setName("등수").setDescription("현재 매크로 등수 조회 (본인만 보임)"),
+  new SlashCommandBuilder().setName("내정보").setDescription("내 라이센스 만료일/남은기간 확인 (본인만 보임)"),
   new SlashCommandBuilder().setName("도움").setDescription("명령어 목록"),
 ].map((c) => c.toJSON());
 
@@ -330,6 +381,10 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       if (interaction.customId === "panel_auth") {
         return interaction.showModal(buildAuthModal());
+      }
+      if (interaction.customId === "panel_license") {
+        await interaction.deferReply({ ephemeral: true });
+        return interaction.editReply(await licenseInfoText(interaction.user.id));
       }
       if (interaction.customId === "panel_rank") {
         await interaction.deferReply({ ephemeral: true });
@@ -362,6 +417,10 @@ client.on("interactionCreate", async (interaction) => {
     if (name === "등수") {
       await interaction.deferReply({ ephemeral: true });
       return interaction.editReply(await rankText(interaction.user.id));
+    }
+    if (name === "내정보") {
+      await interaction.deferReply({ ephemeral: true });
+      return interaction.editReply(await licenseInfoText(interaction.user.id));
     }
     if (name === "도움") {
       return interaction.reply({ content: HELP_TEXT, ephemeral: true });
@@ -453,12 +512,40 @@ process.on("unhandledRejection", (e) => {
   console.error("unhandledRejection:", e?.message || e);
 });
 
+// ─── 만료 임박 DM 알림 ───
+async function runExpiryAlerts() {
+  try {
+    const data = await apiGet(`${EXPIRING_API}?days=${EXPIRY_ALERT_DAYS}`);
+    if (!data.success || !Array.isArray(data.list)) return;
+    let sent = 0;
+    for (const item of data.list) {
+      try {
+        const user = await client.users.fetch(item.discordId);
+        await user.send(
+          `⏰ **라이센스 만료 임박 안내**\n` +
+            `회원님의 라이센스가 **${item.remainingDays}일 후 만료**됩니다.\n` +
+            `계속 사용하시려면 \`#구매방법\` 채널에서 연장해 주세요. 🙏`
+        );
+        sent++;
+      } catch (e) {
+        // DM 차단/탈퇴 등은 무시
+      }
+    }
+    if (sent) console.log(`만료 임박 DM 발송: ${sent}건`);
+  } catch (e) {
+    console.error("만료 알림 오류:", e?.message || e);
+  }
+}
+
 client.once("ready", async () => {
   console.log(`✅ 봇 로그인: ${client.user.tag}`);
   // 각 서버에 슬래시 명령 등록(길드 명령은 즉시 반영).
   for (const [, guild] of client.guilds.cache) {
     await registerGuildCommands(guild);
   }
+  // 만료 임박 알림: 시작 1분 뒤 1회 + 매일.
+  setTimeout(runExpiryAlerts, 60000);
+  setInterval(runExpiryAlerts, 24 * 3600 * 1000);
 });
 // 새 서버에 초대되면 슬래시 명령 자동 등록.
 client.on("guildCreate", registerGuildCommands);
