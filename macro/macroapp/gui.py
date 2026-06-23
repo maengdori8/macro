@@ -132,6 +132,7 @@ class AutomationApp:
         self._close_deadline = 0.0
         self._current_rank = None       # OCR로 읽은 내 등수
         self._last_rank_ocr = 0.0       # 마지막 등수 OCR 시각
+        self._rank_message = "실행 중"   # 상태 메시지(챔스/슈챔 아님 등)
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1132,7 +1133,7 @@ class AutomationApp:
                 now_mono = time.monotonic()
                 if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
                     last_status_report = now_mono
-                    self._report_status(running=True, message="실행 중")
+                    self._report_status(running=True, message=self._rank_message)
                 self.apply_current_thresholds(targets)
 
                 if requires_window and manager is not None and not manager.is_valid_window():
@@ -1251,22 +1252,40 @@ class AutomationApp:
             pass
 
     def _try_read_rank(self, screen_gray) -> None:
-        """프레임 왼쪽 일부를 OCR해 내 등수(\\d+위)를 읽습니다. 실패해도 무시."""
+        """프레임 왼쪽 일부를 OCR해 내 등수를 읽습니다.
+
+        티어가 '챔피언스/슈퍼 챔피언스 감독'일 때만 등수를 띄우고,
+        아니면 '챔스/슈챔이 아닙니다'로 표시합니다. 실패해도 무시.
+        """
         try:
             h, w = screen_gray.shape[:2]
-            x1 = 0
             x2 = max(1, int(w * RANK_OCR_LEFT_FRACTION))
             y1 = max(0, int(h * RANK_OCR_TOP_FRACTION))
             y2 = min(h, int(h * RANK_OCR_BOTTOM_FRACTION))
-            crop = screen_gray[y1:y2, x1:x2]
-            rank = rank_ocr.extract_rank(crop, logger=None)
+            crop = screen_gray[y1:y2, 0:x2]
+            info = rank_ocr.read_rank_panel(crop, logger=None)
         except Exception:
             return
-        if rank is not None and rank != self._current_rank:
-            self._current_rank = rank
-            self.queue_log(f"[등수] 현재 등수: {rank}위")
-            # 등수가 바뀌면 즉시 서버로 전송(다음 30초 주기 안 기다림).
-            self._report_status(running=True, message="실행 중")
+
+        if not info["has_panel"]:
+            return  # 등수 패널이 안 떠 있음 → 상태 변화 없음
+
+        if info["is_champion"]:
+            new_rank, new_msg = info["rank"], "실행 중"
+        else:
+            new_rank, new_msg = None, "챔스/슈챔이 아닙니다"
+
+        if new_rank == self._current_rank and new_msg == self._rank_message:
+            return  # 변화 없음
+
+        self._current_rank = new_rank
+        self._rank_message = new_msg
+        if new_rank is not None:
+            self.queue_log(f"[등수] 현재 등수: {new_rank}위")
+        else:
+            self.queue_log("[등수] 챔스/슈챔이 아닙니다.")
+        # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
+        self._report_status(running=True, message=new_msg)
 
     def _log_to_file_only(self, text: str) -> None:
         """UI를 거치지 않고 로그 파일에만 기록합니다(트레이스백 등)."""

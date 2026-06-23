@@ -23,6 +23,9 @@ else:
 # "1,681 위" / "1681위" 등에서 등수 숫자만 추출 (쉼표 제거 후).
 _RANK_RE = re.compile(r"(\d{1,8})\s*위")
 
+# 챔피언스/슈퍼 챔피언스 감독 티어 판별 토큰(OCR 오인식 대비 느슨하게).
+_CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
+
 
 def ocr_available() -> bool:
     return winocr is not None
@@ -80,17 +83,31 @@ def _result_text(res) -> Optional[str]:
 
 def extract_rank(image_bgr_or_gray: np.ndarray, logger=None) -> Optional[int]:
     """이미지에서 '숫자+위' 패턴의 첫 등수를 반환합니다. 없으면 None."""
+    info = read_rank_panel(image_bgr_or_gray, logger=logger)
+    return info["rank"]
+
+
+def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
+    """OCR 1회로 등수 패널 정보를 반환합니다.
+
+    반환:
+    - rank: 등수 숫자(없으면 None)
+    - is_champion: '챔피언스/슈퍼 챔피언스 감독' 티어 여부
+    - has_panel: 등수(\\d+위)가 보여 패널이 떠 있는지
+    """
+    result = {"rank": None, "is_champion": False, "has_panel": False}
     if winocr is None:
-        return None
+        return result
     try:
         text = _recognize_text(image_bgr_or_gray)
-        if not text:
-            return None
-        cleaned = text.replace(",", "").replace(" ", "")
-        m = _RANK_RE.search(cleaned)
-        if m:
-            return int(m.group(1))
     except Exception as exc:
         if logger:
-            logger(f"[OCR] 등수 인식 중 오류: {exc}")
-    return None
+            logger(f"[OCR] 인식 중 오류: {exc}")
+        return result
+    cleaned = (text or "").replace(",", "").replace(" ", "")
+    m = _RANK_RE.search(cleaned)
+    if m:
+        result["rank"] = int(m.group(1))
+        result["has_panel"] = True
+    result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
+    return result
