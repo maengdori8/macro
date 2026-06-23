@@ -34,7 +34,7 @@ rem MF 버전으로 덮어쓴다. 따라서 순서가 중요하다:
 rem  (1) 일반 패키지 먼저 설치 (windows-capture가 opencv-python을 끌어옴)
 rem  (2) 그 뒤에 opencv-python을 제거하고 headless를 강제 재설치 → cv2.pyd의 '마지막 기록자'가
 rem      headless가 되게 한다. headless도 동일한 cv2 모듈을 제공하므로 windows-capture는 정상 동작.
-python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad numpy pyautogui pillow ordered-set zstandard
+python -m pip install --quiet --disable-pip-version-check --no-warn-script-location nuitka pyinstaller pywin32 windows-capture vgamepad numpy pyautogui pillow ordered-set zstandard winocr
 python -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >nul 2>&1
 python -m pip install --quiet --disable-pip-version-check --no-warn-script-location --force-reinstall --no-deps opencv-python-headless
 
@@ -121,10 +121,15 @@ python -m nuitka --standalone --assume-yes-for-downloads ^
   --windows-console-mode=disable --windows-uac-admin ^
   --enable-plugin=tk-inter ^
   --include-package=macroapp ^
+  --include-module=winocr ^
+  --include-package=winrt ^
   --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
   --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll" ^
   --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" ^
   macro_main.py
+rem 등수 OCR(winocr)은 winrt.windows.* 네임스페이스 패키지(native .pyd)들을 동적 import한다.
+rem Nuitka가 놓치지 않도록 winocr 모듈과 winrt 패키지를 명시 포함한다. 빠지면 빌드는 되지만
+rem 'import winocr'가 frozen exe에서 실패해 등수 OCR이 조용히 비활성된다.
 rem NOTE: the two ViGEmClient.dll lines above are REQUIRED and must not be removed.
 rem --include-data-dir silently SKIPS .dll files (treats them as code), so the
 rem vigem CLIENT dlls vgamepad loads via ctypes.CDLL at runtime get dropped while

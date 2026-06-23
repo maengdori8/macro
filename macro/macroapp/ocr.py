@@ -75,10 +75,13 @@ def _result_text(res) -> Optional[str]:
         return None
     if isinstance(res, str):
         return res
+    # winocr 0.0.15: recognize_*_sync는 dict를 반환 → {'text': ..., 'lines': [...]}
+    if isinstance(res, dict):
+        text = res.get("text")
+        return text if isinstance(text, str) else None
+    # 구버전 winocr: .text 속성을 가진 결과 객체
     text = getattr(res, "text", None)
-    if isinstance(text, str):
-        return text
-    return None
+    return text if isinstance(text, str) else None
 
 
 def extract_rank(image_bgr_or_gray: np.ndarray, logger=None) -> Optional[int]:
