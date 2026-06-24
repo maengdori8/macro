@@ -134,9 +134,11 @@ class AutomationApp:
         self._log_dirty = False
         self._close_deadline = 0.0
         self._current_rank = None       # OCR로 읽은 내 등수
-        self._last_rank_ocr = 0.0       # 마지막 등수 OCR 시각
         self._rank_message = "실행 중"   # 상태 메시지(챔스/슈챔 아님 등)
-        self._last_skip_ocr = 0.0       # 마지막 SKIP OCR 시각
+        self._latest_gray = None        # 매칭 루프 → OCR 워커로 공개하는 최신 프레임
+        self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
+        self._ocr_thread = None         # OCR 전용 스레드
+        self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1126,6 +1128,15 @@ class AutomationApp:
             if requires_window:
                 manager = InactiveManager(window_title, logger=self.queue_log)
 
+            # OCR(등수·SKIP)을 매칭 루프와 분리된 별도 스레드에서 처리합니다.
+            # → 무거운 OCR이 이미지 인식(템플릿 매칭) 루프를 멈추지 않아 인식 속도 최대화.
+            self._ocr_manager = manager
+            self._latest_gray = None
+            self._skip_active_until = 0.0
+            if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
+                self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
+                self._ocr_thread.start()
+
             # 상태 전송 타이머
             last_status_report = 0.0
 
@@ -1165,18 +1176,13 @@ class AutomationApp:
                     self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
-                # 등수 OCR: 왼쪽 일부만 주기적으로 읽어 내 등수 추출(상대=오른쪽 제외).
-                if RANK_OCR_ENABLED and now_mono - self._last_rank_ocr >= RANK_OCR_INTERVAL_SECONDS:
-                    self._last_rank_ocr = now_mono
-                    self._try_read_rank(screen_gray)
+                # 최신 프레임을 OCR 워커 스레드에 공개(참조 대입은 원자적).
+                self._latest_gray = screen_gray
 
-                # SKIP 자동 넘기기: 화면에 SKIP/스킵이 보이면 A·Start를 눌러 넘긴다.
-                # 일반 타겟 매칭보다 우선 처리하고, 눌렀으면 다음 프레임에서 사라졌는지
-                # 다시 확인 → 사라질 때까지 s→start→s→start 릴레이가 된다.
-                if SKIP_ENABLED and now_mono - self._last_skip_ocr >= SKIP_OCR_INTERVAL_SECONDS:
-                    self._last_skip_ocr = now_mono
-                    if self._try_skip(screen_gray, manager):
-                        continue
+                # SKIP 처리 중에는 잠깐 매칭을 멈춰 입력 충돌을 막는다(가벼운 플래그 체크).
+                if now_mono < self._skip_active_until:
+                    self.interruptible_sleep(LOOP_SLEEP_SECONDS)
+                    continue
 
                 found_any = False
 
@@ -1243,9 +1249,15 @@ class AutomationApp:
             self._log_to_file_only(traceback.format_exc())
 
         finally:
+            self.stop_event.set()
+            # OCR 워커 스레드 정리(최대 2초 대기).
+            if self._ocr_thread is not None:
+                self._ocr_thread.join(timeout=2.0)
+                self._ocr_thread = None
+            self._latest_gray = None
+            self._ocr_manager = None
             if manager is not None:
                 manager.stop_capture()
-            self.stop_event.set()
             self.queue_status("종료됨")
             self.queue_log("[종료] 자동화 루프가 종료되었습니다.")
             # 종료 상태 전송 (단일 워커 풀)
@@ -1262,6 +1274,33 @@ class AutomationApp:
             )
         except Exception:
             pass
+
+    def _ocr_worker_loop(self) -> None:
+        """별도 스레드: 매칭 루프를 막지 않고 SKIP/등수 OCR을 처리합니다.
+
+        매칭 루프가 self._latest_gray에 올려둔 최신 프레임을 가져와 OCR합니다.
+        OCR이 아무리 무거워도 이미지 인식 루프(다른 스레드)는 영향받지 않습니다.
+        """
+        last_rank = 0.0
+        last_skip = 0.0
+        while not self.stop_event.is_set():
+            gray = self._latest_gray
+            if gray is None:
+                if self.stop_event.wait(0.05):
+                    break
+                continue
+            now = time.monotonic()
+            try:
+                if SKIP_ENABLED and now - last_skip >= SKIP_OCR_INTERVAL_SECONDS:
+                    last_skip = now
+                    self._try_skip(gray, self._ocr_manager)
+                if RANK_OCR_ENABLED and now - last_rank >= RANK_OCR_INTERVAL_SECONDS:
+                    last_rank = now
+                    self._try_read_rank(gray)
+            except Exception as exc:
+                self._log_to_file_only(f"[OCR thread] {exc}")
+            if self.stop_event.wait(0.02):
+                break
 
     def _try_read_rank(self, screen_gray) -> None:
         """프레임 왼쪽 일부를 OCR해 내 등수를 읽습니다.
@@ -1338,6 +1377,8 @@ class AutomationApp:
                 send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             if start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
+            # 매칭 루프가 잠깐 멈춰 입력 충돌을 피하도록 짧은 윈도우 설정.
+            self._skip_active_until = time.monotonic() + 0.5
             self.queue_status("SKIP 넘기는 중")
             self.queue_log("[SKIP] 감지 → A·Start 입력")
             return True

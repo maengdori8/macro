@@ -9,6 +9,12 @@ from macroapp.config import TargetImage, DOWNSCALE_FACTOR
 
 _INTER_AREA = getattr(cv2, "INTER_AREA", getattr(cv2, "INTER_LINEAR", 1))
 
+# SIMD/멀티스레드 최적화를 명시적으로 켭니다(빌드에 따라 꺼져 있을 수 있음).
+try:
+    cv2.setUseOptimized(True)
+except Exception:
+    pass
+
 
 def downscale_screen(screen_gray: np.ndarray) -> np.ndarray:
     """프레임당 1회만 화면을 축소해 모든 타겟이 공유하도록 합니다(중복 복사 제거).
