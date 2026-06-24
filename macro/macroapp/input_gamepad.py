@@ -9,7 +9,13 @@ from typing import Any, Optional
 from macroapp import winapi
 
 gamepad: Optional[Any] = None
-_gamepad_lock = threading.Lock()
+# RLock(재진입 락): 입력 시퀀스 전체를 잠근 채 그 안에서 _get_gamepad()를 다시
+# 호출해도 같은 스레드면 데드락 없이 통과합니다.
+_gamepad_lock = threading.RLock()
+
+# 연속 입력 시 게임의 폴링이 '뗌→누름' 상승엣지를 반드시 한 프레임 이상 보도록,
+# release 직후 중립 상태를 잠깐 유지합니다(엣지 병합으로 인한 입력 누락 방지).
+_POST_RELEASE_SETTLE_SECONDS = 0.02
 
 # 트리거 키 이름 (버튼이 아닌 아날로그 입력)
 TRIGGER_KEYS = {"lt", "rt"}
@@ -62,33 +68,49 @@ def _get_gamepad() -> Any:
             KEY_TO_GAMEPAD = build_key_to_gamepad()
         if gamepad is None:
             gamepad = winapi.vg.VX360Gamepad()
+            # 생성 직후 중립 리포트를 명시적으로 한 번 보내, 이전 세션의 잔류 비트가
+            # 없는 깨끗한 상태에서 첫 입력이 나가도록 합니다.
+            try:
+                gamepad.reset()
+                gamepad.update()
+            except Exception:
+                pass
         return gamepad
 
 
 def send_gamepad_button(button: Any, press_delay: float = 0.08) -> bool:
-    """vgamepad Xbox 컨트롤러 버튼을 눌렀다 뗍니다."""
-    pad = _get_gamepad()
-    pad.press_button(button=button)
-    pad.update()
-    time.sleep(press_delay)
-    pad.release_button(button=button)
-    pad.update()
+    """vgamepad Xbox 컨트롤러 버튼을 눌렀다 뗍니다.
+
+    누름→업데이트→뗌→업데이트 전체를 락으로 묶어, 메인 매칭 루프와 SKIP 워커
+    스레드가 같은 가상패드 리포트를 동시에 건드려 비트가 섞이는(입력 병합/누락)
+    문제를 막습니다. 공유 리포트의 일관성이 곧 입력 정확도입니다.
+    """
+    with _gamepad_lock:
+        pad = _get_gamepad()
+        pad.press_button(button=button)
+        pad.update()
+        time.sleep(press_delay)
+        pad.release_button(button=button)
+        pad.update()
+        time.sleep(_POST_RELEASE_SETTLE_SECONDS)
     return True
 
 
 def send_gamepad_trigger(side: str, press_delay: float = 0.08) -> bool:
-    """vgamepad LT/RT 트리거를 당겼다 놓습니다."""
-    pad = _get_gamepad()
-    if side == "lt":
-        pad.left_trigger(value=255)
-        pad.update()
-        time.sleep(press_delay)
-        pad.left_trigger(value=0)
-        pad.update()
-    else:
-        pad.right_trigger(value=255)
-        pad.update()
-        time.sleep(press_delay)
-        pad.right_trigger(value=0)
-        pad.update()
+    """vgamepad LT/RT 트리거를 당겼다 놓습니다(시퀀스 전체를 락으로 원자화)."""
+    with _gamepad_lock:
+        pad = _get_gamepad()
+        if side == "lt":
+            pad.left_trigger(value=255)
+            pad.update()
+            time.sleep(press_delay)
+            pad.left_trigger(value=0)
+            pad.update()
+        else:
+            pad.right_trigger(value=255)
+            pad.update()
+            time.sleep(press_delay)
+            pad.right_trigger(value=0)
+            pad.update()
+        time.sleep(_POST_RELEASE_SETTLE_SECONDS)
     return True
