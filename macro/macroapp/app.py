@@ -7,6 +7,7 @@ import sys
 import tkinter as tk
 
 from macroapp.paths import app_dir
+from macroapp.config import migrate_custom_targets
 from macroapp.gui import LicenseDialog
 
 
@@ -18,6 +19,8 @@ def main() -> None:
 
     root = tk.Tk()
     base_dir = app_dir()
+    # 예전 설치 폴더에 있던 커스텀 캡처를 업데이트에도 안 지워지는 AppData로 1회 이전.
+    migrate_custom_targets(base_dir)
     LicenseDialog(root, base_dir)
     root.mainloop()
 

@@ -33,9 +33,47 @@ def _embedded():
 CUSTOM_TARGETS_DIR_NAME = "custom_targets"
 
 
+def _persistent_data_dir() -> Path:
+    """설치 폴더와 무관하게 유지되는 사용자 데이터 폴더(%LOCALAPPDATA%\\Macro).
+
+    캡처를 설치 폴더(Program Files) 안에 두면 언인스톨/재설치 시 함께 지워진다.
+    여기(사용자 AppData)에 두면 업데이트·재설치·언인스톨 무엇을 해도 보존된다.
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    root = Path(base) if base else (Path.home() / ".macro")
+    return root / "Macro"
+
+
 def custom_targets_dir(base_dir: Path) -> Path:
-    """사용자 캡처 템플릿 폴더 경로를 반환합니다."""
-    return base_dir / CUSTOM_TARGETS_DIR_NAME
+    """사용자 캡처 템플릿 폴더 경로를 반환합니다.
+
+    설치 폴더가 아니라 %LOCALAPPDATA%\\Macro 아래에 두어 업데이트/재설치/언인스톨에도
+    캡처가 보존되게 합니다. base_dir 인자는 호환을 위해 받지만 위치 결정엔 쓰지 않습니다.
+    """
+    return _persistent_data_dir() / CUSTOM_TARGETS_DIR_NAME
+
+
+def migrate_custom_targets(install_dir: Path) -> None:
+    """예전 위치(설치 폴더/custom_targets)의 캡처를 새 위치(AppData)로 1회 이전합니다.
+
+    이미 새 위치에 있으면 덮어쓰지 않습니다. 실패해도 매크로 본체엔 영향이 없도록
+    전부 가드합니다. (옛 파일은 지우지 않아 안전; 언인스톨 시 설치 폴더와 함께 정리됨.)
+    """
+    try:
+        old = install_dir / CUSTOM_TARGETS_DIR_NAME
+        new = custom_targets_dir(install_dir)
+        if not old.is_dir() or old.resolve() == new.resolve():
+            return
+        new.mkdir(parents=True, exist_ok=True)
+        for f in old.glob("*.png"):
+            dest = new / f.name
+            if not dest.exists():
+                try:
+                    dest.write_bytes(f.read_bytes())
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _read_asset_bytes(filename: str, base_dir: Path, include_custom: bool = True) -> Optional[bytes]:
