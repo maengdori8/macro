@@ -260,10 +260,17 @@ async function rankText(userId) {
     const data = await fetchStatus(userId);
     if (!data.success) return `❌ ${data.message}`;
     const status = data.running ? "🟢 실행 중" : "🔴 중지됨";
-    const rank = data.rank !== null && data.rank !== undefined ? `**${data.rank}등**` : "측정 중...";
+    const hasRank = data.rank !== null && data.rank !== undefined;
+    // 등수가 없고 메시지가 티어('OO 감독')면 등수 자리에 티어를 띄운다.
+    const isTier = !hasRank && typeof data.message === "string" && data.message.includes("감독");
+    const line = hasRank
+      ? `등수: **${data.rank}등**`
+      : (isTier ? `티어: **${data.message}**` : "등수: 측정 중...");
+    // 티어를 이미 위에서 보여줬으면 메시지 줄에서 중복 표시하지 않는다.
+    const showMsg = data.message && !isTier;
     return (
-      `📊 **매크로 상태**\n상태: ${status}\n등수: ${rank}\n` +
-      `${data.message ? `메시지: ${data.message}\n` : ""}마지막 업데이트: ${timeAgo(data.updatedAt)}`
+      `📊 **매크로 상태**\n상태: ${status}\n${line}\n` +
+      `${showMsg ? `메시지: ${data.message}\n` : ""}마지막 업데이트: ${timeAgo(data.updatedAt)}`
     );
   } catch (e) {
     console.error("fetchStatus 오류:", e?.message || e);

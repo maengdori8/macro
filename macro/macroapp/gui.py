@@ -1309,10 +1309,10 @@ class AutomationApp:
                 break
 
     def _try_read_rank(self, screen_gray) -> None:
-        """프레임 왼쪽 일부를 OCR해 내 등수를 읽습니다.
+        """프레임 왼쪽 일부를 OCR해 등수/티어를 읽습니다.
 
-        티어가 '챔피언스/슈퍼 챔피언스 감독'일 때만 등수를 띄우고,
-        아니면 '챔스/슈챔이 아닙니다'로 표시합니다. 실패해도 무시.
+        등수(N위)가 보이면 등수를, 등수가 없으면 티어('OO 감독')를 띄웁니다.
+        디스코드에는 (등수, 메시지=티어) 형태로 전송됩니다. 실패해도 무시.
         """
         try:
             h, w = screen_gray.shape[:2]
@@ -1325,22 +1325,26 @@ class AutomationApp:
             return
 
         if not info["has_panel"]:
-            return  # 등수 패널이 안 떠 있음 → 상태 변화 없음
+            return  # 등수도 티어도 안 보임 → 상태 변화 없음
 
-        if info["is_champion"]:
-            new_state = (info["rank"], "실행 중")
+        rank = info.get("rank")
+        tier = info.get("tier")
+        if rank is not None:
+            new_state = (rank, "실행 중")        # 등수 있음 → 등수 표시
+        elif tier:
+            new_state = (None, tier)            # 등수 없음 → 티어 표시
         else:
-            new_state = (None, "챔스/슈챔이 아닙니다")
+            return  # 둘 다 못 읽음
 
         if new_state == self._rank_state:
             return  # 변화 없음
 
         # (등수, 메시지)를 한 번에 원자적으로 교체 → 다른 스레드가 짝이 안 맞는 값을 못 봄.
         self._rank_state = new_state
-        if new_state[0] is not None:
-            self.queue_log(f"[등수] 현재 등수: {new_state[0]}위")
+        if rank is not None:
+            self.queue_log(f"[등수] 현재 등수: {rank}위")
         else:
-            self.queue_log("[등수] 챔스/슈챔이 아닙니다.")
+            self.queue_log(f"[티어] {tier}")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 

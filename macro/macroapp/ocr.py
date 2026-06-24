@@ -26,6 +26,17 @@ _RANK_RE = re.compile(r"(\d{1,8})\s*위")
 # 챔피언스/슈퍼 챔피언스 감독 티어 판별 토큰(OCR 오인식 대비 느슨하게).
 _CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
 
+# 티어 추출: "월드클래스 1부 감독"처럼 'OO 감독'으로 끝나는 문구.
+# FC Online 감독 모드 티어명을 앵커로 써서 앞 노이즈("내 정보 ..." 등)를 안 먹게 한다.
+# (긴 이름 먼저 — '슈퍼챔피언스'가 '챔피언스'보다 먼저 와야 부분일치 방지.)
+_TIER_NAMES = (
+    "슈퍼챔피언스", "슈퍼 챔피언스", "챔피언스",
+    "월드클래스", "세미프로", "프로", "아마추어", "비기너", "유스", "레전드",
+)
+_TIER_RE = re.compile(r"((?:" + "|".join(_TIER_NAMES) + r")\s*\d*\s*부?\s*감독)")
+# 폴백: 알려진 티어명이 아니어도 'OO 감독'(한 단어 + 선택적 N부)은 잡되 앞 노이즈는 제외.
+_TIER_FALLBACK_RE = re.compile(r"([가-힣]+(?:\s*\d+\s*부)?\s*감독)")
+
 # SKIP 자동 넘기기 토큰 (대소문자 무관, 공백 제거 후 부분일치). "skip"이 SKIP/Skip/skip 모두 커버.
 _SKIP_TOKENS = ("skip", "스킵")
 
@@ -99,9 +110,10 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
     반환:
     - rank: 등수 숫자(없으면 None)
     - is_champion: '챔피언스/슈퍼 챔피언스 감독' 티어 여부
-    - has_panel: 등수(\\d+위)가 보여 패널이 떠 있는지
+    - tier: 'OO 감독' 티어 텍스트(예: '월드클래스 1부 감독'). 없으면 None.
+    - has_panel: 등수(\\d+위)나 티어('OO 감독')가 보여 패널이 떠 있는지
     """
-    result = {"rank": None, "is_champion": False, "has_panel": False}
+    result = {"rank": None, "is_champion": False, "tier": None, "has_panel": False}
     if winocr is None:
         return result
     try:
@@ -110,12 +122,18 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
         if logger:
             logger(f"[OCR] 인식 중 오류: {exc}")
         return result
-    cleaned = (text or "").replace(",", "").replace(" ", "")
+    raw = text or ""
+    cleaned = raw.replace(",", "").replace(" ", "")
     m = _RANK_RE.search(cleaned)
     if m:
         result["rank"] = int(m.group(1))
         result["has_panel"] = True
     result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
+    # 티어("OO 감독") 추출 — 등수가 없을 때 표시용. 공백 보존 위해 원본에서 찾는다.
+    tm = _TIER_RE.search(raw) or _TIER_FALLBACK_RE.search(raw)
+    if tm:
+        result["tier"] = re.sub(r"\s+", " ", tm.group(1)).strip()
+        result["has_panel"] = True
     return result
 
 
