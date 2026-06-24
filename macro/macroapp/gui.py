@@ -133,8 +133,8 @@ class AutomationApp:
         self._status_executor = ThreadPoolExecutor(max_workers=1)
         self._log_dirty = False
         self._close_deadline = 0.0
-        self._current_rank = None       # OCR로 읽은 내 등수
-        self._rank_message = "실행 중"   # 상태 메시지(챔스/슈챔 아님 등)
+        # (등수, 상태메시지)를 한 튜플로 묶어 스레드 간 원자적으로 교체/읽기.
+        self._rank_state = (None, "실행 중")
         self._latest_gray = None        # 매칭 루프 → OCR 워커로 공개하는 최신 프레임
         self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
         self._ocr_thread = None         # OCR 전용 스레드
@@ -1148,7 +1148,7 @@ class AutomationApp:
                 now_mono = time.monotonic()
                 if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
                     last_status_report = now_mono
-                    self._report_status(running=True, message=self._rank_message)
+                    self._report_status(running=True)
                 self.apply_current_thresholds(targets)
 
                 if requires_window and manager is not None and not manager.is_valid_window():
@@ -1264,13 +1264,19 @@ class AutomationApp:
             self._report_status(running=False, message="매크로 종료")
             self.ui_queue.put(("finished", ""))
 
-    def _report_status(self, running: bool, message: str = "") -> None:
-        """라이센스가 있으면 상태를 단일 워커 풀로 전송합니다(스레드 누적 방지)."""
+    def _report_status(self, running: bool, message: Optional[str] = None) -> None:
+        """라이센스가 있으면 상태를 단일 워커 풀로 전송합니다(스레드 누적 방지).
+
+        message가 None이면 OCR 상태(_rank_state)의 메시지를 사용합니다.
+        등수·메시지를 한 번의 원자적 읽기로 가져와 짝이 항상 일치합니다.
+        """
         if not self.license_key:
             return
+        rank, rank_msg = self._rank_state
+        msg = message if message is not None else rank_msg
         try:
             self._status_executor.submit(
-                _send_status, self.license_key, self._current_rank, running, message
+                _send_status, self.license_key, rank, running, msg
             )
         except Exception:
             pass
@@ -1322,21 +1328,21 @@ class AutomationApp:
             return  # 등수 패널이 안 떠 있음 → 상태 변화 없음
 
         if info["is_champion"]:
-            new_rank, new_msg = info["rank"], "실행 중"
+            new_state = (info["rank"], "실행 중")
         else:
-            new_rank, new_msg = None, "챔스/슈챔이 아닙니다"
+            new_state = (None, "챔스/슈챔이 아닙니다")
 
-        if new_rank == self._current_rank and new_msg == self._rank_message:
+        if new_state == self._rank_state:
             return  # 변화 없음
 
-        self._current_rank = new_rank
-        self._rank_message = new_msg
-        if new_rank is not None:
-            self.queue_log(f"[등수] 현재 등수: {new_rank}위")
+        # (등수, 메시지)를 한 번에 원자적으로 교체 → 다른 스레드가 짝이 안 맞는 값을 못 봄.
+        self._rank_state = new_state
+        if new_state[0] is not None:
+            self.queue_log(f"[등수] 현재 등수: {new_state[0]}위")
         else:
             self.queue_log("[등수] 챔스/슈챔이 아닙니다.")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
-        self._report_status(running=True, message=new_msg)
+        self._report_status(running=True)
 
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
         """화면에 SKIP/스킵이 보이면 A(=s)·Start를 눌러 넘기고 True를 반환합니다.
@@ -1345,6 +1351,10 @@ class AutomationApp:
         다시 확인 → 사라질 때까지 s→start→s→start 릴레이가 됩니다. 실패/미감지 시 False.
         """
         if winapi.vg is None or not rank_ocr.ocr_available():
+            return False
+        # SKIP은 대상 창(매니저)이 있어야 가짜 포커스로 입력을 보낼 수 있습니다.
+        # 화면영역 캡처 모드(매니저 None)에선 버튼을 헛누르지 않도록 건너뜁니다.
+        if manager is None:
             return False
         try:
             h, w = screen_gray.shape[:2]
