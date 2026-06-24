@@ -1325,16 +1325,23 @@ class AutomationApp:
             return
 
         if not info["has_panel"]:
-            return  # 등수도 티어도 안 보임 → 상태 변화 없음
+            return  # 등수도 티어도 점수도 안 보임 → 상태 변화 없음
 
         rank = info.get("rank")
         tier = info.get("tier")
+        score = info.get("score")
         if rank is not None:
             new_state = (rank, "실행 중")        # 등수 있음 → 등수 표시
-        elif tier:
-            new_state = (None, tier)            # 등수 없음 → 티어 표시
         else:
-            return  # 둘 다 못 읽음
+            # 등수 없음 → 티어 + 점수를 한 메시지로(예: '챌린저 3부 감독 · 2229점').
+            parts = []
+            if tier:
+                parts.append(tier)
+            if score is not None:
+                parts.append(f"{score}점")
+            if not parts:
+                return  # 표시할 게 없음
+            new_state = (None, " · ".join(parts))
 
         if new_state == self._rank_state:
             return  # 변화 없음
@@ -1344,7 +1351,7 @@ class AutomationApp:
         if rank is not None:
             self.queue_log(f"[등수] 현재 등수: {rank}위")
         else:
-            self.queue_log(f"[티어] {tier}")
+            self.queue_log(f"[티어/점수] {new_state[1]}")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 

@@ -23,6 +23,9 @@ else:
 # "1,681 위" / "1681위" 등에서 등수 숫자만 추출 (쉼표 제거 후).
 _RANK_RE = re.compile(r"(\d{1,8})\s*위")
 
+# "2229점" 등에서 점수만 추출 (쉼표 제거 후). 3자리 이상이라 '3부'의 3 등은 안 걸림.
+_SCORE_RE = re.compile(r"(\d{3,7})점")
+
 # 챔피언스/슈퍼 챔피언스 감독 티어 판별 토큰(OCR 오인식 대비 느슨하게).
 _CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
 
@@ -31,7 +34,7 @@ _CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
 # (긴 이름 먼저 — '슈퍼챔피언스'가 '챔피언스'보다 먼저 와야 부분일치 방지.)
 _TIER_NAMES = (
     "슈퍼챔피언스", "슈퍼 챔피언스", "챔피언스",
-    "월드클래스", "세미프로", "프로", "아마추어", "비기너", "유스", "레전드",
+    "월드클래스", "챌린저", "세미프로", "프로", "아마추어", "비기너", "유스", "레전드",
 )
 _TIER_RE = re.compile(r"((?:" + "|".join(_TIER_NAMES) + r")\s*\d*\s*부?\s*감독)")
 # 폴백: 알려진 티어명이 아니어도 'OO 감독'(한 단어 + 선택적 N부)은 잡되 앞 노이즈는 제외.
@@ -110,10 +113,12 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
     반환:
     - rank: 등수 숫자(없으면 None)
     - is_champion: '챔피언스/슈퍼 챔피언스 감독' 티어 여부
-    - tier: 'OO 감독' 티어 텍스트(예: '월드클래스 1부 감독'). 없으면 None.
-    - has_panel: 등수(\\d+위)나 티어('OO 감독')가 보여 패널이 떠 있는지
+    - tier: 'OO 감독' 티어 텍스트(예: '챌린저 3부 감독'). 없으면 None.
+    - score: 점수 숫자(예: 2229). 없으면 None.
+    - has_panel: 등수/티어/점수 중 하나라도 보여 패널이 떠 있는지
     """
-    result = {"rank": None, "is_champion": False, "tier": None, "has_panel": False}
+    result = {"rank": None, "is_champion": False, "tier": None,
+              "score": None, "has_panel": False}
     if winocr is None:
         return result
     try:
@@ -129,7 +134,12 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
         result["rank"] = int(m.group(1))
         result["has_panel"] = True
     result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
-    # 티어("OO 감독") 추출 — 등수가 없을 때 표시용. 공백 보존 위해 원본에서 찾는다.
+    # 점수("2229점") 추출.
+    sm = _SCORE_RE.search(cleaned)
+    if sm:
+        result["score"] = int(sm.group(1))
+        result["has_panel"] = True
+    # 티어("OO 감독") 추출 — 공백 보존 위해 원본에서 찾는다.
     tm = _TIER_RE.search(raw) or _TIER_FALLBACK_RE.search(raw)
     if tm:
         result["tier"] = re.sub(r"\s+", " ", tm.group(1)).strip()

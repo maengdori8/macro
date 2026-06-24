@@ -161,13 +161,15 @@ WINDOW_RETRY_SECONDS = 2.0
 # WGC 세션 시작 뒤 첫 프레임을 기다리는 최대 시간입니다.
 WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 
-# ─── 등수 OCR (큐 매칭 화면에서 내 등수 읽기) ───
-# 내 정보는 왼쪽, 상대는 오른쪽 → 왼쪽 일부만 OCR하면 상대 등수는 안 읽힘.
+# ─── 등수/티어/점수 OCR (공식경기 감독모드 화면에서 내 정보 읽기) ───
+# 내 팀=왼쪽, 상대=오른쪽. 내 점수/티어는 왼쪽 팀 아래에 뜬다(예: '2229점', '챌린저 3부 감독').
+# 전체 높이를 읽으면 상단 중앙의 '공식경기 감독모드' 제목까지 잡혀 '경기 감독'으로 오인식됨.
+# → 가로는 왼쪽 절반(상대 제외), 세로는 화면 중하단 띠(상단 제목 제외)만 본다.
 RANK_OCR_ENABLED = True
 RANK_OCR_INTERVAL_SECONDS = 1.0   # 이 간격마다 1회 OCR (2~3초 떠있으면 충분히 잡음)
-RANK_OCR_LEFT_FRACTION = 0.45     # 프레임 가로의 왼쪽 비율만 OCR (상대=오른쪽 제외)
-RANK_OCR_TOP_FRACTION = 0.0       # 위쪽 잘라낼 비율(0=전체 높이)
-RANK_OCR_BOTTOM_FRACTION = 1.0    # 아래쪽 경계 비율(1.0=끝까지)
+RANK_OCR_LEFT_FRACTION = 0.50     # 가로: 0~이 비율(상대=오른쪽 제외)
+RANK_OCR_TOP_FRACTION = 0.45      # 세로 시작 비율(상단 제목/로고 제외)
+RANK_OCR_BOTTOM_FRACTION = 0.66   # 세로 끝 비율(하단 미리보기 이미지 제외)
 
 # ─── SKIP 자동 넘기기 ───
 # 화면에 'SKIP'(대소문자 무관) 또는 '스킵' 글자가 보이면, 사라질 때까지
