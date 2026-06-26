@@ -166,10 +166,23 @@ WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 # 전체 높이를 읽으면 상단 중앙의 '공식경기 감독모드' 제목까지 잡혀 '경기 감독'으로 오인식됨.
 # → 가로는 왼쪽 절반(상대 제외), 세로는 화면 중하단 띠(상단 제목 제외)만 본다.
 RANK_OCR_ENABLED = True
-RANK_OCR_INTERVAL_SECONDS = 1.0   # 이 간격마다 1회 OCR (2~3초 떠있으면 충분히 잡음)
+# 패널이 ~0.7초만 떠서, 시간 간격으로 폴링하면 윈도우를 통째로 놓칠 수 있다.
+# → 워커는 '새 프레임이 올라올 때마다'(프레임 신선도) OCR하고, 이 값은 단지 하한(0=제한 없음).
+RANK_OCR_INTERVAL_SECONDS = 0.0   # 0=새 프레임마다 즉시 OCR(같은 프레임 재OCR은 안 함)
 RANK_OCR_LEFT_FRACTION = 0.50     # 가로: 0~이 비율(상대=오른쪽 제외)
 RANK_OCR_TOP_FRACTION = 0.45      # 세로 시작 비율(상단 제목/로고 제외)
 RANK_OCR_BOTTOM_FRACTION = 0.66   # 세로 끝 비율(하단 미리보기 이미지 제외)
+
+# ── 등수 OCR 정확도(전처리·컨센서스) ──
+# 전처리: crop을 목표 높이로 정수배 업스케일(작은 글자 인식률↑) + 대비 스트레칭.
+RANK_OCR_TARGET_HEIGHT = 320      # crop 높이를 이 픽셀에 맞춰 스케일(해상도 무관 글자 크기 일정화)
+RANK_OCR_MAX_UPSCALE = 3.0        # 업스케일 상한(과확대 방지)
+RANK_OCR_MAX_WIDTH = 1100         # OCR 입력 폭 상한(>이면 축소). OCR 1회 비용을 눌러 0.7초 내 표본↑
+RANK_OCR_INVERT_FALLBACK = True   # 1차 인식 실패 시에만 흑백 반전 후 1회 재시도(light-on-dark 보강)
+# 컨센서스: 0.7초 동안 얻은 여러 읽기를 필드별 최빈값으로 확정(단발 오인식 폐기).
+RANK_OCR_VOTE_MIN = 2             # 같은 값 이 표 이상이면 즉시 확정
+RANK_OCR_PANEL_GAP_SECONDS = 0.9  # 이 시간 이상 패널 미검출이면 새 패널로 보고 투표 초기화
+RANK_OCR_COMMIT_AFTER_GONE = 0.35 # 패널이 사라진 뒤 이 시간 지나면 1표라도 확정(놓치지 않기)
 
 # ─── SKIP 자동 넘기기 ───
 # 화면에 'SKIP'(대소문자 무관) 또는 '스킵' 글자가 보이면, 사라질 때까지

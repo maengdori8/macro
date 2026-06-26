@@ -135,7 +135,11 @@ class AutomationApp:
         self._close_deadline = 0.0
         # (등수, 상태메시지)를 한 튜플로 묶어 스레드 간 원자적으로 교체/읽기.
         self._rank_state = (None, "실행 중")
-        self._latest_gray = None        # 매칭 루프 → OCR 워커로 공개하는 최신 프레임
+        # 매칭 루프 → OCR 워커로 공개하는 최신 프레임. (시퀀스번호, gray) 튜플을 원자적으로 교체.
+        # 시퀀스번호로 '아직 OCR 안 한 새 프레임'만 골라 같은 프레임 중복 OCR을 막는다(신선도 게이팅).
+        self._latest_frame = None
+        self._frame_seq = 0
+        self._rank_consensus = rank_ocr.RankConsensus()  # 다중 프레임 투표(단발 오인식 폐기)
         self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
         self._ocr_thread = None         # OCR 전용 스레드
         self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
@@ -1131,7 +1135,11 @@ class AutomationApp:
             # OCR(등수·SKIP)을 매칭 루프와 분리된 별도 스레드에서 처리합니다.
             # → 무거운 OCR이 이미지 인식(템플릿 매칭) 루프를 멈추지 않아 인식 속도 최대화.
             self._ocr_manager = manager
-            self._latest_gray = None
+            self._latest_frame = None
+            self._frame_seq = 0
+            # 새 객체로 교체(reset 아님): 혹시 직전 run의 워커가 join 타임아웃으로 살아있어도
+            # 옛 객체를 만지게 분리해, 새 워커의 투표 상태와 절대 안 섞이게 한다.
+            self._rank_consensus = rank_ocr.RankConsensus()
             self._skip_active_until = 0.0
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
                 self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
@@ -1176,8 +1184,10 @@ class AutomationApp:
                     self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
-                # 최신 프레임을 OCR 워커 스레드에 공개(참조 대입은 원자적).
-                self._latest_gray = screen_gray
+                # 최신 프레임을 OCR 워커 스레드에 공개. (seq, gray) 튜플 대입은 원자적이라
+                # 워커가 짝이 안 맞는 값을 볼 수 없다. seq로 새 프레임만 OCR(신선도 게이팅).
+                self._frame_seq += 1
+                self._latest_frame = (self._frame_seq, screen_gray)
 
                 # SKIP 처리 중에는 잠깐 매칭을 멈춰 입력 충돌을 막는다(가벼운 플래그 체크).
                 if now_mono < self._skip_active_until:
@@ -1254,7 +1264,7 @@ class AutomationApp:
             if self._ocr_thread is not None:
                 self._ocr_thread.join(timeout=2.0)
                 self._ocr_thread = None
-            self._latest_gray = None
+            self._latest_frame = None
             self._ocr_manager = None
             if manager is not None:
                 manager.stop_capture()
@@ -1284,35 +1294,51 @@ class AutomationApp:
     def _ocr_worker_loop(self) -> None:
         """별도 스레드: 매칭 루프를 막지 않고 SKIP/등수 OCR을 처리합니다.
 
-        매칭 루프가 self._latest_gray에 올려둔 최신 프레임을 가져와 OCR합니다.
+        매칭 루프가 self._latest_frame에 올려둔 (seq, gray)를 가져와 OCR합니다.
         OCR이 아무리 무거워도 이미지 인식 루프(다른 스레드)는 영향받지 않습니다.
+
+        등수 OCR은 '새 프레임이 올라올 때마다'(seq 변화) 실행해 0.7초 패널을 놓치지
+        않고, 그 사이 SKIP은 0.3초 데드라인으로 끼어듭니다. 한 루프에서 둘을 무조건
+        직렬로 돌리지 않아(가장 필요한 것만) 서로를 굶기지 않습니다.
         """
-        last_rank = 0.0
+        last_rank_seq = -1
+        last_rank_time = 0.0
         last_skip = 0.0
         while not self.stop_event.is_set():
-            gray = self._latest_gray
-            if gray is None:
-                if self.stop_event.wait(0.05):
-                    break
-                continue
+            frame = self._latest_frame
             now = time.monotonic()
+            did_ocr = False
             try:
-                if SKIP_ENABLED and now - last_skip >= SKIP_OCR_INTERVAL_SECONDS:
-                    last_skip = now
-                    self._try_skip(gray, self._ocr_manager)
-                if RANK_OCR_ENABLED and now - last_rank >= RANK_OCR_INTERVAL_SECONDS:
-                    last_rank = now
-                    self._try_read_rank(gray)
+                if frame is not None:
+                    seq, gray = frame
+                    # SKIP: 0.3초 데드라인으로 정확히 끼어듦(입력 직결이라 우선).
+                    if SKIP_ENABLED and now - last_skip >= SKIP_OCR_INTERVAL_SECONDS:
+                        last_skip = now
+                        self._try_skip(gray, self._ocr_manager)
+                        did_ocr = True
+                    # 등수: 새 프레임(seq 변화)마다 OCR+투표. 같은 프레임은 재OCR 안 함.
+                    # RANK_OCR_INTERVAL_SECONDS(기본 0)는 하한일 뿐 — 보통은 seq 변화가 트리거.
+                    if (RANK_OCR_ENABLED and seq != last_rank_seq
+                            and now - last_rank_time >= RANK_OCR_INTERVAL_SECONDS):
+                        last_rank_seq = seq
+                        last_rank_time = now
+                        self._observe_rank(gray, now)
+                        did_ocr = True
+                # 확정은 '벽시계'로 매 사이클 폴링 — WGC가 정적 화면에서 프레임 공급을 멈춰
+                # seq가 동결돼도 패널 소멸-후-커밋(graceful)·패널 경계 리셋이 진행되게 한다.
+                if RANK_OCR_ENABLED:
+                    self._commit_rank(now)
             except Exception as exc:
                 self._log_to_file_only(f"[OCR thread] {exc}")
-            if self.stop_event.wait(0.02):
+            # OCR을 돌렸으면 다음 새 프레임이 거의 대기 중 → 짧게, 아니면 살짝 길게(idle 절약).
+            if self.stop_event.wait(0.005 if did_ocr else 0.02):
                 break
 
-    def _try_read_rank(self, screen_gray) -> None:
-        """프레임 왼쪽 일부를 OCR해 등수/티어를 읽습니다.
+    def _observe_rank(self, screen_gray, now: float) -> None:
+        """프레임 왼쪽 일부를 OCR해 등수/티어/점수를 읽고 '투표에만' 반영합니다.
 
-        등수(N위)가 보이면 등수를, 등수가 없으면 티어('OO 감독')를 띄웁니다.
-        디스코드에는 (등수, 메시지=티어) 형태로 전송됩니다. 실패해도 무시.
+        새 프레임마다 호출. 실제 확정/보고는 _commit_rank가 벽시계로 따로 담당하므로,
+        OCR이 멈춰도(WGC 정적 화면) 확정 로직이 프레임에 묶이지 않습니다. 실패해도 무시.
         """
         try:
             h, w = screen_gray.shape[:2]
@@ -1323,13 +1349,21 @@ class AutomationApp:
             info = rank_ocr.read_rank_panel(crop, logger=None)
         except Exception:
             return
+        # 이번 읽기(빈 결과 포함)를 투표에 반영 → 패널 소멸/경계 추적에 필요.
+        self._rank_consensus.observe(info, now)
 
-        if not info["has_panel"]:
-            return  # 등수도 티어도 점수도 안 보임 → 상태 변화 없음
+    def _commit_rank(self, now: float) -> None:
+        """컨센서스가 확정한 (등수/티어/점수)를 _rank_state로 반영합니다(OCR 불필요).
 
-        rank = info.get("rank")
-        tier = info.get("tier")
-        score = info.get("score")
+        매 워커 사이클 벽시계로 호출 → 프레임이 멈춰도 '패널 소멸 후 graceful 확정'과
+        '패널 경계 리셋'이 진행됩니다. 확정 직후엔 투표를 비워 같은 패널 재커밋과
+        다음 패널과의 표 오염을 막습니다. 단발 오인식은 다수결로 이미 걸러진 값만 옵니다.
+        """
+        committed = self._rank_consensus.commit(now)
+        if committed is None:
+            return  # 아직 확정 못 함(표 부족) 또는 보고할 게 없음
+
+        rank, tier, score = committed
         if rank is not None:
             new_state = (rank, "실행 중")        # 등수 있음 → 등수 표시
         else:
@@ -1340,11 +1374,15 @@ class AutomationApp:
             if score is not None:
                 parts.append(f"{score}점")
             if not parts:
-                return  # 표시할 게 없음
+                self._rank_consensus.reset()  # 확정했으나 표시할 게 없음 → 투표 정리
+                return
             new_state = (None, " · ".join(parts))
 
+        # 확정 처리 완료 → 투표를 비워 같은 패널을 재커밋하지 않고 다음 패널과 분리.
+        self._rank_consensus.reset()
+
         if new_state == self._rank_state:
-            return  # 변화 없음
+            return  # 변화 없음(이미 같은 값을 보고함)
 
         # (등수, 메시지)를 한 번에 원자적으로 교체 → 다른 스레드가 짝이 안 맞는 값을 못 봄.
         self._rank_state = new_state

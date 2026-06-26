@@ -13,12 +13,31 @@ from typing import Optional
 import numpy as np
 
 try:
+    import cv2  # 전처리용(매칭에서 이미 의존). 없으면 전처리만 건너뛰고 원본으로 OCR.
+except Exception:  # noqa: BLE001
+    cv2 = None
+
+try:
     import winocr  # Windows 전용
 except Exception as exc:  # noqa: BLE001
     winocr = None
     WINOCR_IMPORT_ERROR = exc
 else:
     WINOCR_IMPORT_ERROR = None
+
+from macroapp.config import (
+    RANK_OCR_TARGET_HEIGHT,
+    RANK_OCR_MAX_UPSCALE,
+    RANK_OCR_MAX_WIDTH,
+    RANK_OCR_INVERT_FALLBACK,
+    RANK_OCR_VOTE_MIN,
+    RANK_OCR_PANEL_GAP_SECONDS,
+    RANK_OCR_COMMIT_AFTER_GONE,
+)
+
+# 등수 현실 범위(거짓 양성·자릿수 폭주 차단). 0/음수/비현실값은 버린다.
+_RANK_MIN = 1
+_RANK_MAX = 2_000_000
 
 # "1,681 위" / "1681위" 등에서 등수 숫자만 추출 (쉼표 제거 후).
 _RANK_RE = re.compile(r"(\d{1,8})\s*위")
@@ -39,6 +58,14 @@ _TIER_NAMES = (
 _TIER_RE = re.compile(r"((?:" + "|".join(_TIER_NAMES) + r")\s*\d*\s*부?\s*감독)")
 # 폴백: 알려진 티어명이 아니어도 'OO 감독'(한 단어 + 선택적 N부)은 잡되 앞 노이즈는 제외.
 _TIER_FALLBACK_RE = re.compile(r"([가-힣]+(?:\s*\d+\s*부)?\s*감독)")
+
+# 티어 정규화용 표준명(공백 제거형). 긴 이름 먼저 → '슈퍼챔피언스'가 '챔피언스'에 안 묻힘.
+_TIER_CANON = (
+    "슈퍼챔피언스", "챔피언스", "월드클래스", "챌린저",
+    "세미프로", "아마추어", "비기너", "레전드", "프로", "유스",
+)
+# 표준키(공백 제거형) → 표시형(공백 복원). 디스코드 표기를 보기 좋게 유지.
+_TIER_DISPLAY = {"슈퍼챔피언스": "슈퍼 챔피언스"}
 
 # SKIP 자동 넘기기 토큰 (대소문자 무관, 공백 제거 후 부분일치). "skip"이 SKIP/Skip/skip 모두 커버.
 _SKIP_TOKENS = ("skip", "스킵")
@@ -107,8 +134,103 @@ def extract_rank(image_bgr_or_gray: np.ndarray, logger=None) -> Optional[int]:
     return info["rank"]
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """짧은 문자열용 편집거리(티어명 스냅 판정에만 사용)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _canon_tier(tier_text: str) -> Optional[str]:
+    """OCR로 읽은 티어 문구를 표준 티어명으로 보수적으로 스냅합니다.
+
+    편집거리가 충분히 가까울 때만 표준명으로 교체하고(자모 1~2글자 오인식 보정),
+    너무 멀면 None을 반환해 버립니다 — 모든 실제 티어는 _TIER_CANON에 있으므로,
+    못 좁히는 'OO 감독'은 상단 제목 등 노이즈('공식경기 감독'→'경기 감독')로 보고 폐기.
+    'N부'는 살려 두고, 표시형은 공백을 복원합니다('슈퍼챔피언스'→'슈퍼 챔피언스').
+    """
+    floor = re.search(r"([1-9])\s*부", tier_text)
+    name_part = re.sub(r"[0-9]|부|감독|\s", "", tier_text)
+    if not name_part:
+        return None
+    best = min(_TIER_CANON, key=lambda c: _levenshtein(name_part, c))
+    if _levenshtein(name_part, best) <= max(1, len(best) // 4):
+        disp = _TIER_DISPLAY.get(best, best)
+        return f"{disp} {floor.group(1)}부 감독" if floor else f"{disp} 감독"
+    return None   # 알려진 티어로 못 좁힘 → 노이즈로 보고 버림(거짓 티어 차단)
+
+
+def _parse_rank_text(raw: str) -> dict:
+    """OCR 텍스트(원문)에서 등수/티어/점수를 추출하는 순수 함수.
+
+    winocr 없이도(Mac에서) 단위 테스트할 수 있도록 OCR 호출과 분리되어 있습니다.
+    """
+    result = {"rank": None, "is_champion": False, "tier": None,
+              "score": None, "has_panel": False}
+    raw = raw or ""
+    cleaned = raw.replace(",", "").replace(" ", "")
+    m = _RANK_RE.search(cleaned)
+    if m:
+        rank = int(m.group(1))
+        if _RANK_MIN <= rank <= _RANK_MAX:   # 0/비현실값 폐기
+            result["rank"] = rank
+            result["has_panel"] = True
+    result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
+    sm = _SCORE_RE.search(cleaned)
+    if sm:
+        result["score"] = int(sm.group(1))
+        result["has_panel"] = True
+    # 티어("OO 감독") 추출 — 공백 보존 위해 원본에서 찾고, 표준명으로 스냅.
+    # 못 좁히면(노이즈) 버린다 → 거짓 티어가 패널로 오인되지 않게.
+    tm = _TIER_RE.search(raw) or _TIER_FALLBACK_RE.search(raw)
+    if tm:
+        canon = _canon_tier(tm.group(1))
+        if canon:
+            result["tier"] = canon
+            result["has_panel"] = True
+    return result
+
+
+def _preprocess_rank(gray: np.ndarray) -> np.ndarray:
+    """등수 crop을 OCR하기 좋게 만든다: 목표 높이로 업스케일 + 대비 스트레칭.
+
+    - 해상도 무관하게 글자 크기를 일정화(작은 글자에서 winocr 인식률↑).
+    - 폭 상한으로 OCR 1회 비용을 눌러 0.7초 윈도우 내 표본 수를 확보.
+    - 이진화/디노이즈는 한글 획을 망쳐서 일부러 안 함(grayscale 그대로가 winocr에 유리).
+    """
+    if cv2 is None or gray is None or gray.size == 0:
+        return gray
+    h, w = gray.shape[:2]
+    if h <= 0 or w <= 0:
+        return gray
+    # 목표 높이·폭 상한·업스케일 상한을 한 번에 반영한 단일 스케일(업→다운 이중 리샘플 제거).
+    # 폭 제약이 있으면 그만큼만 키우고(또는 줄이고) OCR 1회 비용을 상한 안에 유지.
+    scale = min(RANK_OCR_TARGET_HEIGHT / float(h), RANK_OCR_MAX_UPSCALE)
+    if RANK_OCR_MAX_WIDTH:
+        scale = min(scale, RANK_OCR_MAX_WIDTH / float(w))
+    if scale > 1.001:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    elif scale < 0.999:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    # 2/98 퍼센타일 대비 스트레칭(반짝이 픽셀에 안 휘둘리게 클리핑).
+    lo, hi = np.percentile(gray, (2, 98))
+    if hi > lo:
+        gray = np.clip((gray.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+    return gray
+
+
 def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
-    """OCR 1회로 등수 패널 정보를 반환합니다.
+    """OCR로 등수 패널 정보를 읽습니다(전처리 + 실패 시 반전 폴백).
 
     반환:
     - rank: 등수 숫자(없으면 None)
@@ -117,34 +239,111 @@ def read_rank_panel(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
     - score: 점수 숫자(예: 2229). 없으면 None.
     - has_panel: 등수/티어/점수 중 하나라도 보여 패널이 떠 있는지
     """
-    result = {"rank": None, "is_champion": False, "tier": None,
-              "score": None, "has_panel": False}
+    empty = {"rank": None, "is_champion": False, "tier": None,
+             "score": None, "has_panel": False}
     if winocr is None:
-        return result
+        return empty
     try:
-        text = _recognize_text(image_bgr_or_gray)
+        prepped = _preprocess_rank(image_bgr_or_gray)
+    except Exception:
+        prepped = image_bgr_or_gray
+    try:
+        text = _recognize_text(prepped)
     except Exception as exc:
         if logger:
             logger(f"[OCR] 인식 중 오류: {exc}")
-        return result
-    raw = text or ""
-    cleaned = raw.replace(",", "").replace(" ", "")
-    m = _RANK_RE.search(cleaned)
-    if m:
-        result["rank"] = int(m.group(1))
-        result["has_panel"] = True
-    result["is_champion"] = any(tok in cleaned for tok in _CHAMP_TOKENS)
-    # 점수("2229점") 추출.
-    sm = _SCORE_RE.search(cleaned)
-    if sm:
-        result["score"] = int(sm.group(1))
-        result["has_panel"] = True
-    # 티어("OO 감독") 추출 — 공백 보존 위해 원본에서 찾는다.
-    tm = _TIER_RE.search(raw) or _TIER_FALLBACK_RE.search(raw)
-    if tm:
-        result["tier"] = re.sub(r"\s+", " ", tm.group(1)).strip()
-        result["has_panel"] = True
-    return result
+        return empty
+    info = _parse_rank_text(text)
+    # 1차에서 아무것도 못 읽었고 cv2가 있으면, 흑백 반전 후 1회만 재시도(light-on-dark 보강).
+    if not info["has_panel"] and RANK_OCR_INVERT_FALLBACK and cv2 is not None:
+        try:
+            inv = cv2.bitwise_not(prepped)
+            text2 = _recognize_text(inv)
+            info2 = _parse_rank_text(text2)
+            if info2["has_panel"]:
+                info = info2
+        except Exception:
+            pass
+    return info
+
+
+class RankConsensus:
+    """0.7초 동안 얻은 여러 OCR 읽기를 필드별 최빈값으로 합쳐 최종값을 확정합니다.
+
+    - 단발 오인식(예: 1681→1631)을 다수결로 폐기.
+    - 등수 단독 1표 + 동반 근거(티어/점수) 없음 → 거짓 양성 의심으로 보류.
+    - 패널이 사라지면(소멸 후 일정 시간) 1표라도 graceful 확정(놓치지 않기).
+    이 클래스는 winocr와 무관한 순수 로직이라 Mac에서 단위 테스트할 수 있습니다.
+    """
+
+    def __init__(self, vote_min: int = RANK_OCR_VOTE_MIN,
+                 gap: float = RANK_OCR_PANEL_GAP_SECONDS,
+                 commit_after_gone: float = RANK_OCR_COMMIT_AFTER_GONE):
+        self.vote_min = vote_min
+        self.gap = gap
+        self.commit_after_gone = commit_after_gone
+        self.reset()
+
+    def reset(self) -> None:
+        self._t0: Optional[float] = None
+        self._last_seen = -1.0
+        self._rank: dict = {}
+        self._tier: dict = {}
+        self._score: dict = {}
+
+    @staticmethod
+    def _bump(table: dict, value, now: float) -> None:
+        if value is None:
+            return
+        if value in table:
+            table[value][0] += 1
+            table[value][1] = now
+        else:
+            table[value] = [1, now]
+
+    @staticmethod
+    def _mode(table: dict):
+        """(값, 표수) 반환. 동률은 가장 최근 본 값 우선."""
+        if not table:
+            return None, 0
+        value, (count, _ts) = max(table.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+        return value, count
+
+    def observe(self, info: dict, now: float) -> None:
+        """OCR 1회 결과를 투표에 반영. 패널 경계(긴 공백)는 자동 초기화."""
+        if self._t0 is not None and (now - self._last_seen) > self.gap:
+            self.reset()   # 새 패널 등장 → 옛 표와 안 섞이게
+        if not info.get("has_panel"):
+            return
+        if self._t0 is None:
+            self._t0 = now
+        self._last_seen = now
+        self._bump(self._rank, info.get("rank"), now)
+        self._bump(self._tier, info.get("tier"), now)
+        self._bump(self._score, info.get("score"), now)
+
+    def commit(self, now: float):
+        """확정할 (rank, tier, score)를 반환하거나, 아직이면 None.
+
+        확정 트리거: 최빈값 표 ≥ vote_min(패널 떠있는 중 즉시) 또는
+        패널 소멸(now-last_seen ≥ commit_after_gone) 후 1표라도 있으면.
+        """
+        if self._t0 is None:
+            return None
+        rank, rc = self._mode(self._rank)
+        tier, tc = self._mode(self._tier)
+        score, sc = self._mode(self._score)
+        strength = (rank is not None) + (tier is not None) + (score is not None)
+        if strength == 0:
+            return None
+        gone = (now - self._last_seen) >= self.commit_after_gone
+        # 거짓 양성 차단: 등수 단독 1표 + 동반 근거 없음 → 아직 떠 있으면 보류.
+        if rank is not None and rc < self.vote_min and tier is None and score is None and not gone:
+            return None
+        ready = (rc >= self.vote_min or tc >= self.vote_min or sc >= self.vote_min) or (gone and strength >= 1)
+        if not ready:
+            return None
+        return (rank, tier, score)
 
 
 def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
