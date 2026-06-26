@@ -33,8 +33,7 @@ from macroapp.config import (
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
     CUSTOM_TARGETS_DIR_NAME,
-    RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_LEFT_FRACTION,
-    RANK_OCR_TOP_FRACTION, RANK_OCR_BOTTOM_FRACTION,
+    RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
@@ -111,6 +110,14 @@ class AutomationApp:
         # 목표 도달 시 자동 정지: "off"=안 멈춤 / "rank"=등수 / "score"=점수 (둘 중 하나)
         self.stop_mode_var = tk.StringVar(value="off")
         self.stop_value_var = tk.StringVar(value="")
+        # 등수/점수/티어 OCR 박스(프레임 비율 %). 클러스터만 정확히 가둬 노이즈 제거.
+        # 기본값 = 기존 동작(좌0~우50%, 상45~하66%). 매칭 화면에서 셋이 다 들어오게 조절.
+        self.ocr_box_vars = {
+            "left": tk.StringVar(value="0"),
+            "top": tk.StringVar(value="45"),
+            "right": tk.StringVar(value="50"),
+            "bottom": tk.StringVar(value="66"),
+        }
         self.region_vars = {
             "x": tk.IntVar(value=DEFAULT_REGION_X),
             "y": tk.IntVar(value=DEFAULT_REGION_Y),
@@ -150,6 +157,13 @@ class AutomationApp:
         self._stop_mode = "off"         # off | rank | score
         self._stop_value = 0            # 목표 등수/점수
         self._stop_triggered = False    # 중복 트리거/로그 방지
+        # 마지막 값 유지: 등수 없는 프레임(로비)이 매칭 때 읽은 등수를 덮어쓰지 않게 한다.
+        # 챔/슈챔이면 등수가 무조건 있으므로, 한 번 읽은 등수는 다음 매칭 전까지 유지·표시.
+        self._last_rank = None
+        self._last_tier = None
+        self._last_score = None
+        # OCR 박스(프레임 비율 l,t,r,b) — 시작 시 UI에서 스냅샷(스레드 안전)
+        self._ocr_box = (0.0, 0.45, 0.50, 0.66)
 
         # 로그 파일 초기화
         self._log_file = None
@@ -552,6 +566,39 @@ class AutomationApp:
             highlightcolor=c["accent"],
             highlightthickness=1,
         ).pack(side=tk.LEFT, padx=(0, 4), ipady=2)
+
+        # ── 등수/점수/티어 OCR 박스(프레임 비율 %) — 그 영역만 정확히 읽어 노이즈 제거 ──
+        ocr_row = tk.Frame(settings_panel, bg=c["panel"])
+        ocr_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(
+            ocr_row,
+            text="등수영역%",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        for key, label in (("left", "좌"), ("top", "상"), ("right", "우"), ("bottom", "하")):
+            tk.Label(
+                ocr_row,
+                text=label,
+                bg=c["panel"],
+                fg=c["muted"],
+                font=self._font(9),
+            ).pack(side=tk.LEFT)
+            tk.Entry(
+                ocr_row,
+                textvariable=self.ocr_box_vars[key],
+                width=5,
+                bg=c["input"],
+                fg=c["text"],
+                insertbackground=c["text"],
+                relief=tk.FLAT,
+                highlightbackground=c["border"],
+                highlightcolor=c["accent"],
+                highlightthickness=1,
+            ).pack(side=tk.LEFT, padx=(2, 8), ipady=2)
 
         # ── 오른쪽: 버전 / 시계 / 상태 / 로그 / 시작·정지 ──
         version_panel = self._panel(right_column)
@@ -1038,8 +1085,9 @@ class AutomationApp:
             self._set_button_state(running=False)
             return
 
-        # 목표 도달 자동 정지 조건을 시작 시점에 스냅샷(메인 스레드에서 tk 변수 읽기 → 안전).
+        # 목표 도달 자동 정지 조건 + 등수 OCR 박스를 시작 시점에 스냅샷(메인 스레드 → 안전).
         self._snapshot_stop_condition()
+        self._snapshot_ocr_box()
 
         self.stop_event.clear()
         self._set_button_state(running=True)
@@ -1125,6 +1173,34 @@ class AutomationApp:
             self.log(f"[자동 정지] 현재 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
         else:
             self.log(f"[자동 정지] 현재 점수가 {value}점 이상이 되면 자동으로 정지합니다.")
+
+    def _snapshot_ocr_box(self) -> None:
+        """시작 시 UI의 등수 OCR 박스(%)를 평문 비율로 고정합니다(메인 스레드 전용).
+
+        좌<우, 상<하가 아니거나 값이 잘못되면 기본 박스로 폴백하고 안내합니다.
+        OCR 워커가 tkinter 변수를 직접 읽지 않도록 평문 튜플(_ocr_box)로 스냅샷합니다.
+        """
+        default = (0.0, 0.45, 0.50, 0.66)
+        try:
+            l = float(self.ocr_box_vars["left"].get()) / 100.0
+            t = float(self.ocr_box_vars["top"].get()) / 100.0
+            r = float(self.ocr_box_vars["right"].get()) / 100.0
+            b = float(self.ocr_box_vars["bottom"].get()) / 100.0
+        except (ValueError, TypeError):
+            self._ocr_box = default
+            self.log("[등수영역] 값이 올바르지 않아 기본 영역으로 실행합니다(0~100 숫자).")
+            return
+        # 범위/순서 검증: 0~1로 클램프하고 좌<우, 상<하를 보장.
+        l = min(max(l, 0.0), 1.0); r = min(max(r, 0.0), 1.0)
+        t = min(max(t, 0.0), 1.0); b = min(max(b, 0.0), 1.0)
+        if r - l < 0.02 or b - t < 0.02:
+            self._ocr_box = default
+            self.log("[등수영역] 폭/높이가 너무 작아 기본 영역으로 실행합니다(좌<우, 상<하).")
+            return
+        self._ocr_box = (l, t, r, b)
+        self.log(
+            f"[등수영역] OCR 박스: 좌{l*100:.0f}~우{r*100:.0f}%, 상{t*100:.0f}~하{b*100:.0f}%"
+        )
 
     def _maybe_stop_on_target(self, rank: Optional[int], score: Optional[int]) -> None:
         """컨센서스로 확정된 등수/점수가 목표에 도달하면 자동 정지합니다(OCR 워커 스레드).
@@ -1245,6 +1321,9 @@ class AutomationApp:
             # 새 객체로 교체(reset 아님): 혹시 직전 run의 워커가 join 타임아웃으로 살아있어도
             # 옛 객체를 만지게 분리해, 새 워커의 투표 상태와 절대 안 섞이게 한다.
             self._rank_consensus = rank_ocr.RankConsensus()
+            self._last_rank = None       # 마지막 값 유지 초기화(이전 run 잔류 방지)
+            self._last_tier = None
+            self._last_score = None
             self._skip_active_until = 0.0
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
                 self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
@@ -1447,10 +1526,14 @@ class AutomationApp:
         """
         try:
             h, w = screen_gray.shape[:2]
-            x2 = max(1, int(w * RANK_OCR_LEFT_FRACTION))
-            y1 = max(0, int(h * RANK_OCR_TOP_FRACTION))
-            y2 = min(h, int(h * RANK_OCR_BOTTOM_FRACTION))
-            crop = screen_gray[y1:y2, 0:x2]
+            l, t, r, b = self._ocr_box
+            x1 = max(0, int(w * l))
+            x2 = min(w, int(w * r))
+            y1 = max(0, int(h * t))
+            y2 = min(h, int(h * b))
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                return
+            crop = screen_gray[y1:y2, x1:x2]
             info = rank_ocr.read_rank_panel(crop, logger=None)
         except Exception:
             return
@@ -1468,25 +1551,31 @@ class AutomationApp:
         if committed is None:
             return  # 아직 확정 못 함(표 부족) 또는 보고할 게 없음
 
-        rank, tier, score = committed
-        # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식으로 잘못 멈추지 않음.
-        self._maybe_stop_on_target(rank, score)
-        if rank is not None:
-            new_state = (rank, "실행 중")        # 등수 있음 → 등수 표시
-        else:
-            # 등수 없음 → 티어 + 점수를 한 메시지로(예: '챌린저 3부 감독 · 2229점').
-            parts = []
-            if tier:
-                parts.append(tier)
-            if score is not None:
-                parts.append(f"{score}점")
-            if not parts:
-                self._rank_consensus.reset()  # 확정했으나 표시할 게 없음 → 투표 정리
-                return
-            new_state = (None, " · ".join(parts))
-
         # 확정 처리 완료 → 투표를 비워 같은 패널을 재커밋하지 않고 다음 패널과 분리.
         self._rank_consensus.reset()
+
+        rank, tier, score = committed
+        # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
+        self._maybe_stop_on_target(rank, score)
+
+        # 마지막 값 유지: 이번에 '읽힌' 필드만 갱신하고, 없는 필드는 직전 값을 보존한다.
+        # → 로비(등수 없음)에서 읽어도 매칭 때 잡은 등수가 안 지워지고 계속 표시된다.
+        if rank is not None:
+            self._last_rank = rank
+        if tier is not None:
+            self._last_tier = tier
+        if score is not None:
+            self._last_score = score
+
+        # 표시: 유지된 등수 + (티어·점수)를 함께 보여준다(봇 임베드에 등수/메시지 동시 표시).
+        parts = []
+        if self._last_tier:
+            parts.append(self._last_tier)
+        if self._last_score is not None:
+            parts.append(f"{self._last_score}점")
+        # 티어·점수가 없으면 빈 메시지("") → 봇이 중복 '메시지' 줄을 안 띄움.
+        message = " · ".join(parts)
+        new_state = (self._last_rank, message)
 
         if new_state == self._rank_state:
             return  # 변화 없음(이미 같은 값을 보고함)
@@ -1495,8 +1584,8 @@ class AutomationApp:
         self._rank_state = new_state
         if rank is not None:
             self.queue_log(f"[등수] 현재 등수: {rank}위")
-        else:
-            self.queue_log(f"[티어/점수] {new_state[1]}")
+        elif tier is not None or score is not None:
+            self.queue_log(f"[티어/점수] {message}")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 

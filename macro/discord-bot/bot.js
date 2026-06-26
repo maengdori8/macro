@@ -261,16 +261,17 @@ async function rankText(userId) {
     if (!data.success) return `❌ ${data.message}`;
     const status = data.running ? "🟢 실행 중" : "🔴 중지됨";
     const hasRank = data.rank !== null && data.rank !== undefined;
-    // 등수가 없고 메시지가 티어('OO 감독')면 등수 자리에 티어를 띄운다.
-    const isTier = !hasRank && typeof data.message === "string" && data.message.includes("감독");
-    const line = hasRank
-      ? `등수: **${data.rank}등**`
-      : (isTier ? `티어: **${data.message}**` : "등수: 측정 중...");
-    // 티어를 이미 위에서 보여줬으면 메시지 줄에서 중복 표시하지 않는다.
-    const showMsg = data.message && !isTier;
+    const msg = typeof data.message === "string" ? data.message : "";
+    // 메시지가 티어·점수('OO 감독 · NNNN점')면 '티어:' 줄로, 그 외 일반 메시지는 '메시지:' 줄로.
+    const isTier = msg.includes("감독");
+    const lines = [`상태: ${status}`];
+    if (hasRank) lines.push(`등수: **${data.rank}등**`);          // 등수 + 티어 동시 표시
+    if (isTier) lines.push(`티어: **${msg}**`);
+    else if (!hasRank) lines.push("등수: 측정 중...");
+    else if (msg && msg !== "실행 중") lines.push(`메시지: ${msg}`);  // 중복 '실행 중'은 숨김
     return (
-      `📊 **매크로 상태**\n상태: ${status}\n${line}\n` +
-      `${showMsg ? `메시지: ${data.message}\n` : ""}마지막 업데이트: ${timeAgo(data.updatedAt)}`
+      `📊 **매크로 상태**\n${lines.join("\n")}\n` +
+      `마지막 업데이트: ${timeAgo(data.updatedAt)}`
     );
   } catch (e) {
     console.error("fetchStatus 오류:", e?.message || e);
