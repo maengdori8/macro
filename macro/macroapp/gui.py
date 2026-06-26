@@ -111,12 +111,13 @@ class AutomationApp:
         self.stop_mode_var = tk.StringVar(value="off")
         self.stop_value_var = tk.StringVar(value="")
         # 등수/점수/티어 OCR 박스(프레임 비율 %). 클러스터만 정확히 가둬 노이즈 제거.
-        # 기본값 = 기존 동작(좌0~우50%, 상45~하66%). 매칭 화면에서 셋이 다 들어오게 조절.
+        # 기본값 = 실제 매칭 화면 기준으로 등수·점수·티어 기둥만(좌33~우50, 상47~하64).
+        # 왼쪽 3D 선수 모델·배경·상대(우측)를 제외 → 인식 정확도↑. 필요하면 UI에서 조절.
         self.ocr_box_vars = {
-            "left": tk.StringVar(value="0"),
-            "top": tk.StringVar(value="45"),
+            "left": tk.StringVar(value="33"),
+            "top": tk.StringVar(value="47"),
             "right": tk.StringVar(value="50"),
-            "bottom": tk.StringVar(value="66"),
+            "bottom": tk.StringVar(value="64"),
         }
         self.region_vars = {
             "x": tk.IntVar(value=DEFAULT_REGION_X),
@@ -163,7 +164,7 @@ class AutomationApp:
         self._last_tier = None
         self._last_score = None
         # OCR 박스(프레임 비율 l,t,r,b) — 시작 시 UI에서 스냅샷(스레드 안전)
-        self._ocr_box = (0.0, 0.45, 0.50, 0.66)
+        self._ocr_box = (0.33, 0.47, 0.50, 0.64)
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1180,7 +1181,7 @@ class AutomationApp:
         좌<우, 상<하가 아니거나 값이 잘못되면 기본 박스로 폴백하고 안내합니다.
         OCR 워커가 tkinter 변수를 직접 읽지 않도록 평문 튜플(_ocr_box)로 스냅샷합니다.
         """
-        default = (0.0, 0.45, 0.50, 0.66)
+        default = (0.33, 0.47, 0.50, 0.64)
         try:
             l = float(self.ocr_box_vars["left"].get()) / 100.0
             t = float(self.ocr_box_vars["top"].get()) / 100.0
