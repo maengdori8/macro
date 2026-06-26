@@ -71,6 +71,25 @@ _TIER_DISPLAY = {"슈퍼챔피언스": "슈퍼 챔피언스"}
 _SKIP_TOKENS = ("skip", "스킵")
 
 
+def on_match_screen(image_bgr_or_gray: np.ndarray, tokens=("팀정보", "유니폼"), logger=None) -> bool:
+    """탭 바 영역에 '팀 정보/유니폼' 글자가 보이면 True(=공식경기 감독모드 화면).
+
+    이 화면에서만 등수/점수를 읽게 해서 구단 관리 등 다른 화면의 오인식을 막는다.
+    OCR을 못 쓰면(winocr 없음) 게이트를 무력화(True)해 기존 동작을 유지한다.
+    인식 실패/미검출이면 False(보수적으로 등수 OCR 건너뜀).
+    """
+    if winocr is None:
+        return True
+    try:
+        text = _recognize_text(image_bgr_or_gray)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger(f"[게이트 OCR] 인식 중 오류: {exc}")
+        return False
+    cleaned = (text or "").replace(" ", "")
+    return any(tok in cleaned for tok in tokens)
+
+
 def ocr_available() -> bool:
     return winocr is not None
 

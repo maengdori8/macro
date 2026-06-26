@@ -34,6 +34,8 @@ from macroapp.config import (
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
     CUSTOM_TARGETS_DIR_NAME,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
+    MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
+    MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
@@ -1536,6 +1538,19 @@ class AutomationApp:
         """
         try:
             h, w = screen_gray.shape[:2]
+            # 매치 화면 게이트: '팀 정보/유니폼 선택' 탭이 안 보이면(구단 관리 등 다른 화면)
+            # 등수 OCR을 건너뛰고 '패널 없음'으로 투표 → 오인식 차단 + 패널 소멸 추적.
+            if MATCH_GATE_ENABLED:
+                gx1 = max(0, int(w * MATCH_GATE_LEFT_FRACTION))
+                gx2 = min(w, int(w * MATCH_GATE_RIGHT_FRACTION))
+                gy1 = max(0, int(h * MATCH_GATE_TOP_FRACTION))
+                gy2 = min(h, int(h * MATCH_GATE_BOTTOM_FRACTION))
+                gate_crop = screen_gray[gy1:gy2, gx1:gx2]
+                if gate_crop.size == 0 or not rank_ocr.on_match_screen(gate_crop, MATCH_GATE_TOKENS):
+                    self._rank_consensus.observe(
+                        {"rank": None, "is_champion": False, "tier": None,
+                         "score": None, "has_panel": False}, now)
+                    return
             l, t, r, b = self._ocr_box
             x1 = max(0, int(w * l))
             x2 = min(w, int(w * r))

@@ -173,6 +173,17 @@ RANK_OCR_LEFT_FRACTION = 0.50     # 가로: 0~이 비율(상대=오른쪽 제외
 RANK_OCR_TOP_FRACTION = 0.45      # 세로 시작 비율(상단 제목/로고 제외)
 RANK_OCR_BOTTOM_FRACTION = 0.66   # 세로 끝 비율(하단 미리보기 이미지 제외)
 
+# ─── 매치 화면 게이트 ───
+# 등수/점수는 '공식경기 감독모드'(팀 정보/유니폼 선택 탭이 보이는 화면)에서만 읽는다.
+# 이 영역(상단 중앙 탭 바)에서 '팀 정보'/'유니폼'이 보일 때만 등수 OCR을 진행 →
+# 구단 관리 등 다른 화면의 숫자를 등수/점수로 오인식하는 일을 원천 차단.
+MATCH_GATE_ENABLED = True
+MATCH_GATE_LEFT_FRACTION = 0.37   # 탭 바 가로 좌
+MATCH_GATE_RIGHT_FRACTION = 0.64  # 탭 바 가로 우
+MATCH_GATE_TOP_FRACTION = 0.17    # 탭 바 세로 상
+MATCH_GATE_BOTTOM_FRACTION = 0.26 # 탭 바 세로 하
+MATCH_GATE_TOKENS = ("팀정보", "유니폼")  # 공백 제거 후 부분일치(둘 중 하나면 매치 화면)
+
 # ── 등수 OCR 정확도(전처리·컨센서스) ──
 # 전처리: crop을 목표 높이로 정수배 업스케일(작은 글자 인식률↑) + 대비 스트레칭.
 RANK_OCR_TARGET_HEIGHT = 320      # crop 높이를 이 픽셀에 맞춰 스케일(해상도 무관 글자 크기 일정화)
