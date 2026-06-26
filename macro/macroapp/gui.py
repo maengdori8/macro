@@ -535,7 +535,7 @@ class AutomationApp:
             anchor=tk.W,
             font=self._font(10),
         ).pack(side=tk.LEFT)
-        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score")):
+        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score"), ("슈퍼챔스 등수", "super_rank")):
             tk.Radiobutton(
                 stop_row,
                 text=text,
@@ -1154,7 +1154,7 @@ class AutomationApp:
         """
         self._stop_triggered = False
         mode = self.stop_mode_var.get()
-        if mode not in ("rank", "score"):
+        if mode not in ("rank", "score", "super_rank"):
             self._stop_mode = "off"
             self._stop_value = 0
             return
@@ -1172,8 +1172,10 @@ class AutomationApp:
         self._stop_value = value
         if mode == "rank":
             self.log(f"[자동 정지] 현재 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
-        else:
+        elif mode == "score":
             self.log(f"[자동 정지] 현재 점수가 {value}점 이상이 되면 자동으로 정지합니다.")
+        else:  # super_rank
+            self.log(f"[자동 정지] 슈퍼 챔피언스이고 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
 
     def _snapshot_ocr_box(self) -> None:
         """시작 시 UI의 등수 OCR 박스(%)를 평문 비율로 고정합니다(메인 스레드 전용).
@@ -1203,19 +1205,26 @@ class AutomationApp:
             f"[등수영역] OCR 박스: 좌{l*100:.0f}~우{r*100:.0f}%, 상{t*100:.0f}~하{b*100:.0f}%"
         )
 
-    def _maybe_stop_on_target(self, rank: Optional[int], score: Optional[int]) -> None:
-        """컨센서스로 확정된 등수/점수가 목표에 도달하면 자동 정지합니다(OCR 워커 스레드).
+    def _maybe_stop_on_target(
+        self, rank: Optional[int], score: Optional[int], tier: Optional[str] = None
+    ) -> None:
+        """컨센서스로 확정된 등수/점수/티어가 목표에 도달하면 자동 정지합니다(OCR 워커 스레드).
 
         tkinter를 직접 만지지 않고 stop_event + 큐 메시지만 사용 → 스레드 안전.
         매칭 루프가 stop_event를 보고 안전하게 종료하며 UI도 정상 복귀합니다.
         """
         if self._stop_triggered or self._stop_mode == "off":
             return
+        # 슈퍼 챔피언스 여부: 정규화된 티어가 '슈퍼 챔피언스 감독'이면 '슈퍼'+'챔피언스'를 모두 포함.
+        # (일반 '챔피언스 감독'은 '슈퍼'가 없어 제외됨.)
+        is_super = bool(tier and "슈퍼" in tier and "챔피언스" in tier)
         hit_msg = None
         if self._stop_mode == "rank" and rank is not None and rank <= self._stop_value:
             hit_msg = f"목표 등수 도달: 현재 {rank}위 ≤ 목표 {self._stop_value}위"
         elif self._stop_mode == "score" and score is not None and score >= self._stop_value:
             hit_msg = f"목표 점수 도달: 현재 {score}점 ≥ 목표 {self._stop_value}점"
+        elif self._stop_mode == "super_rank" and is_super and rank is not None and rank <= self._stop_value:
+            hit_msg = f"슈퍼챔스 목표 도달: {tier} {rank}위 ≤ 목표 {self._stop_value}위"
         if hit_msg is None:
             return
         self._stop_triggered = True
@@ -1557,7 +1566,8 @@ class AutomationApp:
 
         rank, tier, score = committed
         # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
-        self._maybe_stop_on_target(rank, score)
+        # 티어는 이번에 안 읽혔으면 직전 확정 티어로 보강(슈퍼챔스+등수 조건 판정용).
+        self._maybe_stop_on_target(rank, score, tier if tier is not None else self._last_tier)
 
         # 마지막 값 유지: 이번에 '읽힌' 필드만 갱신하고, 없는 필드는 직전 값을 보존한다.
         # → 로비(등수 없음)에서 읽어도 매칭 때 잡은 등수가 안 지워지고 계속 표시된다.
