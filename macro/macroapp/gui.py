@@ -108,6 +108,9 @@ class AutomationApp:
         }
         self.capture_mode_var = tk.StringVar(value="wgc")
         self.click_mode_var = tk.StringVar(value="postmessage")
+        # 목표 도달 시 자동 정지: "off"=안 멈춤 / "rank"=등수 / "score"=점수 (둘 중 하나)
+        self.stop_mode_var = tk.StringVar(value="off")
+        self.stop_value_var = tk.StringVar(value="")
         self.region_vars = {
             "x": tk.IntVar(value=DEFAULT_REGION_X),
             "y": tk.IntVar(value=DEFAULT_REGION_Y),
@@ -143,6 +146,10 @@ class AutomationApp:
         self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
         self._ocr_thread = None         # OCR 전용 스레드
         self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
+        # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
+        self._stop_mode = "off"         # off | rank | score
+        self._stop_value = 0            # 목표 등수/점수
+        self._stop_triggered = False    # 중복 트리거/로그 방지
 
         # 로그 파일 초기화
         self._log_file = None
@@ -500,6 +507,51 @@ class AutomationApp:
                 highlightcolor=c["accent"],
                 highlightthickness=1,
             ).pack(side=tk.LEFT, padx=(4, 10), ipady=2)
+
+        # ── 자동 정지: 목표 등수/점수 도달 시 멈춤(둘 중 하나) 또는 안 멈춤 ──
+        stop_row = tk.Frame(settings_panel, bg=c["panel"])
+        stop_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(
+            stop_row,
+            text="자동 정지",
+            bg=c["panel"],
+            fg=c["text"],
+            width=10,
+            anchor=tk.W,
+            font=self._font(10),
+        ).pack(side=tk.LEFT)
+        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score")):
+            tk.Radiobutton(
+                stop_row,
+                text=text,
+                variable=self.stop_mode_var,
+                value=value,
+                bg=c["panel"],
+                fg=c["text"],
+                selectcolor=c["input"],
+                activebackground=c["panel"],
+                activeforeground=c["text"],
+                font=self._font(9),
+            ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(
+            stop_row,
+            text="목표",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(9),
+        ).pack(side=tk.LEFT, padx=(4, 2))
+        tk.Entry(
+            stop_row,
+            textvariable=self.stop_value_var,
+            width=8,
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief=tk.FLAT,
+            highlightbackground=c["border"],
+            highlightcolor=c["accent"],
+            highlightthickness=1,
+        ).pack(side=tk.LEFT, padx=(0, 4), ipady=2)
 
         # ── 오른쪽: 버전 / 시계 / 상태 / 로그 / 시작·정지 ──
         version_panel = self._panel(right_column)
@@ -986,6 +1038,9 @@ class AutomationApp:
             self._set_button_state(running=False)
             return
 
+        # 목표 도달 자동 정지 조건을 시작 시점에 스냅샷(메인 스레드에서 tk 변수 읽기 → 안전).
+        self._snapshot_stop_condition()
+
         self.stop_event.clear()
         self._set_button_state(running=True)
         self.set_status("실행 중")
@@ -1040,6 +1095,56 @@ class AutomationApp:
         self.set_status("종료 요청됨")
         self.log("[중지 요청] 자동화 루프를 안전하게 중단합니다.")
         self.stop_button.configure(state=tk.DISABLED)
+
+    def _snapshot_stop_condition(self) -> None:
+        """시작 시 UI의 자동 정지 조건을 평문 속성으로 고정합니다(메인 스레드 전용).
+
+        OCR 워커 스레드가 tkinter 변수를 직접 읽는 것을 피하려고, 시작 순간의 값을
+        평문(_stop_mode/_stop_value)으로 스냅샷합니다. 실행 중 바꾸려면 재시작하세요.
+        값이 비었거나 잘못되면 '안 함'으로 처리하고 사용자에게 안내합니다.
+        """
+        self._stop_triggered = False
+        mode = self.stop_mode_var.get()
+        if mode not in ("rank", "score"):
+            self._stop_mode = "off"
+            self._stop_value = 0
+            return
+        raw = (self.stop_value_var.get() or "").strip().replace(",", "")
+        try:
+            value = int(raw)
+            if value <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            self._stop_mode = "off"
+            self._stop_value = 0
+            self.log("[자동 정지] 목표 값이 올바르지 않아 '안 함'으로 실행합니다(숫자를 입력하세요).")
+            return
+        self._stop_mode = mode
+        self._stop_value = value
+        if mode == "rank":
+            self.log(f"[자동 정지] 현재 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
+        else:
+            self.log(f"[자동 정지] 현재 점수가 {value}점 이상이 되면 자동으로 정지합니다.")
+
+    def _maybe_stop_on_target(self, rank: Optional[int], score: Optional[int]) -> None:
+        """컨센서스로 확정된 등수/점수가 목표에 도달하면 자동 정지합니다(OCR 워커 스레드).
+
+        tkinter를 직접 만지지 않고 stop_event + 큐 메시지만 사용 → 스레드 안전.
+        매칭 루프가 stop_event를 보고 안전하게 종료하며 UI도 정상 복귀합니다.
+        """
+        if self._stop_triggered or self._stop_mode == "off":
+            return
+        hit_msg = None
+        if self._stop_mode == "rank" and rank is not None and rank <= self._stop_value:
+            hit_msg = f"목표 등수 도달: 현재 {rank}위 ≤ 목표 {self._stop_value}위"
+        elif self._stop_mode == "score" and score is not None and score >= self._stop_value:
+            hit_msg = f"목표 점수 도달: 현재 {score}점 ≥ 목표 {self._stop_value}점"
+        if hit_msg is None:
+            return
+        self._stop_triggered = True
+        self.queue_log(f"[자동 정지] {hit_msg} → 매크로를 멈춥니다.")
+        self.queue_status("목표 도달 — 정지")
+        self.stop_event.set()
 
     def on_close(self) -> None:
         """창 닫기 버튼을 눌렀을 때도 자동화 스레드를 자연스럽게 멈춥니다."""
@@ -1364,6 +1469,8 @@ class AutomationApp:
             return  # 아직 확정 못 함(표 부족) 또는 보고할 게 없음
 
         rank, tier, score = committed
+        # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식으로 잘못 멈추지 않음.
+        self._maybe_stop_on_target(rank, score)
         if rank is not None:
             new_state = (rank, "실행 중")        # 등수 있음 → 등수 표시
         else:
