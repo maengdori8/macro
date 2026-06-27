@@ -168,7 +168,8 @@ WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 RANK_OCR_ENABLED = True
 # 패널이 ~0.7초만 떠서, 시간 간격으로 폴링하면 윈도우를 통째로 놓칠 수 있다.
 # → 워커는 '새 프레임이 올라올 때마다'(프레임 신선도) OCR하고, 이 값은 단지 하한(0=제한 없음).
-RANK_OCR_INTERVAL_SECONDS = 0.0   # 0=새 프레임마다 즉시 OCR(같은 프레임 재OCR은 안 함)
+RANK_OCR_INTERVAL_SECONDS = 0.1   # 등수 OCR 최소 간격(초). 0=매 프레임(CPU 폭증). 0.1=최대 10회/초로
+                                  # 제한 → CPU 대폭↓. 패널이 수 초간 떠 있어 0.1초×3표=0.3초면 확정(인식 충분히 빠름).
 RANK_OCR_LEFT_FRACTION = 0.50     # 가로: 0~이 비율(상대=오른쪽 제외)
 RANK_OCR_TOP_FRACTION = 0.45      # 세로 시작 비율(상단 제목/로고 제외)
 RANK_OCR_BOTTOM_FRACTION = 0.66   # 세로 끝 비율(하단 미리보기 이미지 제외)
@@ -191,7 +192,7 @@ RANK_OCR_MAX_UPSCALE = 3.0        # 업스케일 상한(과확대 방지)
 RANK_OCR_MAX_WIDTH = 1100         # OCR 입력 폭 상한(>이면 축소). OCR 1회 비용을 눌러 0.7초 내 표본↑
 RANK_OCR_INVERT_FALLBACK = True   # 1차 인식 실패 시에만 흑백 반전 후 1회 재시도(light-on-dark 보강)
 # 컨센서스: 0.7초 동안 얻은 여러 읽기를 필드별 최빈값으로 확정(단발 오인식 폐기).
-RANK_OCR_VOTE_MIN = 2             # 같은 값 이 표 이상이면 즉시 확정
+RANK_OCR_VOTE_MIN = 3             # 같은 값 이 표 이상이면 즉시 확정(단발·2프레임 오독 차단 위해 3)
 RANK_OCR_PANEL_GAP_SECONDS = 0.9  # 이 시간 이상 패널 미검출이면 새 패널로 보고 투표 초기화
 RANK_OCR_COMMIT_AFTER_GONE = 0.35 # 패널이 사라진 뒤 이 시간 지나면 1표라도 확정(놓치지 않기)
 
@@ -202,11 +203,26 @@ SKIP_ENABLED = True
 SKIP_OCR_INTERVAL_SECONDS = 0.3   # 이 간격마다 SKIP 텍스트 확인(작을수록 빨리 반응·무거움)
 SKIP_PRESS_DELAY_SECONDS = 0.05   # A·Start 누름 사이 지연
 SKIP_OCR_MAX_WIDTH = 1280         # OCR 전 이 폭으로 축소(0=축소 안 함). 속도용.
-# SKIP을 찾을 영역(프레임 비율). 기본=전체. 특정 위치만 보려면 좁히세요.
+# SKIP을 찾을 영역(프레임 비율). FC온라인 스킵 안내(일반·(A)형)는 항상 화면 하단에 뜨므로
+# 하단 22%만 본다 → skip-A matchTemplate + OCR 비용을 ~5배 줄이고 노이즈도 차단(CPU 대폭↓).
 SKIP_OCR_LEFT_FRACTION = 0.0
 SKIP_OCR_RIGHT_FRACTION = 1.0
-SKIP_OCR_TOP_FRACTION = 0.0
+SKIP_OCR_TOP_FRACTION = 0.78
 SKIP_OCR_BOTTOM_FRACTION = 1.0
+
+# ─── SKIP 버튼 분기(A형 vs Start형) ───
+# '(A) SKIP'처럼 초록 A 버튼이 붙은 스킵은 A만, 그 외 일반 스킵은 Start만 누른다.
+# A형은 target_skip_a.png 템플릿(grayscale 매칭)으로 먼저 잡고, 매칭되면 그 프레임은
+# OCR 'skip' 텍스트를 읽지 않는다(= A형일 때 Start 경로로 안 샌다).
+# 템플릿 파일이 없으면 match는 항상 False → 기존처럼 OCR 텍스트→Start로 안전 폴백.
+SKIP_A_MATCH_THRESHOLD = 0.82     # (A) SKIP 템플릿 상관도 이 값 이상이면 A형으로 판정
+SKIP_TEXT_CONSENSUS = 2           # 일반 스킵(OCR 'skip')은 이만큼 연속 감지돼야 Start(단발 노이즈 차단)
+SKIP_FALLBACK_BOTH_SECONDS = 0.6  # 한 스킵이 이 시간 넘게 안 사라지면 A·Start 둘 다(템플릿 빗나가도 안 갇힘)
+
+# ─── 자동 정지 단발 오독 가드 ───
+# 합의로 확정된 값이라도, 같은 정지조건이 연속 이 횟수만큼 확정될 때만 실제로 멈춘다.
+# (한 번의 오독이 작업 전체를 멈추는 사고를 막는다. 1=즉시 정지=기존 동작.)
+STOP_CONFIRM_COUNT = 2
 
 # 매칭 영역 중심 주변에서 클릭 좌표를 약간 조정합니다.
 # 허가된 UI 테스트에서 고정 좌표 취약성을 줄이기 위한 안정화 값입니다.

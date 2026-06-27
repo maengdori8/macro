@@ -39,6 +39,7 @@ from macroapp.config import (
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
+    SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
@@ -156,17 +157,22 @@ class AutomationApp:
         self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
         self._ocr_thread = None         # OCR 전용 스레드
         self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
+        self._skip_seen_since = None    # 현재 스킵이 처음 감지된 시각(안전망 타이머용)
+        self._skip_text_streak = 0      # 일반 스킵(OCR) 연속 감지 횟수(단발 노이즈 차단)
+        self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start" (A형은 sticky)
+        self._gate_fail_log_at = 0.0    # 게이트 미검출 로그 스로틀(과다 로그 방지)
         # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
         self._stop_mode = "off"         # off | rank | score
         self._stop_value = 0            # 목표 등수/점수
         self._stop_triggered = False    # 중복 트리거/로그 방지
+        self._stop_confirm_count = 0    # 정지조건 연속 확정 횟수(STOP_CONFIRM_COUNT 도달 시 정지)
         # 마지막 값 유지: 등수 없는 프레임(로비)이 매칭 때 읽은 등수를 덮어쓰지 않게 한다.
         # 챔/슈챔이면 등수가 무조건 있으므로, 한 번 읽은 등수는 다음 매칭 전까지 유지·표시.
         self._last_rank = None
         self._last_tier = None
         self._last_score = None
         # OCR 박스(프레임 비율 l,t,r,b) — 시작 시 UI에서 스냅샷(스레드 안전)
-        self._ocr_box = (0.33, 0.47, 0.50, 0.64)
+        self._ocr_box = (0.35, 0.50, 0.48, 0.64)
 
         # 로그 파일 초기화
         self._log_file = None
@@ -1185,7 +1191,7 @@ class AutomationApp:
         좌<우, 상<하가 아니거나 값이 잘못되면 기본 박스로 폴백하고 안내합니다.
         OCR 워커가 tkinter 변수를 직접 읽지 않도록 평문 튜플(_ocr_box)로 스냅샷합니다.
         """
-        default = (0.33, 0.47, 0.50, 0.64)
+        default = (0.35, 0.50, 0.48, 0.64)
         try:
             l = float(self.ocr_box_vars["left"].get()) / 100.0
             t = float(self.ocr_box_vars["top"].get()) / 100.0
@@ -1218,7 +1224,8 @@ class AutomationApp:
         if self._stop_triggered or self._stop_mode == "off":
             return
         # 슈퍼 챔피언스 여부: 정규화된 티어가 '슈퍼 챔피언스 감독'이면 '슈퍼'+'챔피언스'를 모두 포함.
-        # (일반 '챔피언스 감독'은 '슈퍼'가 없어 제외됨.)
+        # (일반 '챔피언스 감독'은 '슈퍼'가 없어 제외됨.) tier는 '이번 패널에서 실제로 읽힌' 값만
+        # 받는다 — 직전 매치의 스테일 티어로는 절대 슈퍼 판정을 하지 않아 거짓 정지를 막는다(#5).
         is_super = bool(tier and "슈퍼" in tier and "챔피언스" in tier)
         hit_msg = None
         if self._stop_mode == "rank" and rank is not None and rank <= self._stop_value:
@@ -1228,6 +1235,17 @@ class AutomationApp:
         elif self._stop_mode == "super_rank" and is_super and rank is not None and rank <= self._stop_value:
             hit_msg = f"슈퍼챔스 목표 도달: {tier} {rank}위 ≤ 목표 {self._stop_value}위"
         if hit_msg is None:
+            # 조건 미충족 → 연속 확정 카운트 리셋(스트릭이 끊기면 처음부터 다시).
+            self._stop_confirm_count = 0
+            return
+        # 단발 오독 가드(#3): 합의로 확정된 값이라도 같은 조건이 STOP_CONFIRM_COUNT회
+        # '연속' 확정될 때만 실제로 멈춘다 → 한 번의 오독이 작업 전체를 멈추는 사고를 막음.
+        self._stop_confirm_count += 1
+        if self._stop_confirm_count < STOP_CONFIRM_COUNT:
+            self.queue_log(
+                f"[자동 정지] 조건 충족({self._stop_confirm_count}/{STOP_CONFIRM_COUNT}) "
+                f"— 재확인 대기: {hit_msg}"
+            )
             return
         self._stop_triggered = True
         self.queue_log(f"[자동 정지] {hit_msg} → 매크로를 멈춥니다.")
@@ -1337,6 +1355,11 @@ class AutomationApp:
             self._last_tier = None
             self._last_score = None
             self._skip_active_until = 0.0
+            self._skip_seen_since = None
+            self._skip_text_streak = 0
+            self._skip_kind = None
+            self._stop_confirm_count = 0
+            rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
                 self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
                 self._ocr_thread.start()
@@ -1550,6 +1573,14 @@ class AutomationApp:
                     self._rank_consensus.observe(
                         {"rank": None, "is_champion": False, "tier": None,
                          "score": None, "has_panel": False}, now)
+                    # 추적성(#10): 매치 화면이 맞는데도 탭바를 못 읽으면(해상도/DPI 어긋남)
+                    # 등수가 영영 안 잡힌다. 일반 화면에선 정상이라 파일 로그로 5초마다만 남긴다.
+                    if now - self._gate_fail_log_at >= 5.0:
+                        self._gate_fail_log_at = now
+                        self._log_to_file_only(
+                            "[게이트] 탭바('팀정보/유니폼') 미검출 → 등수 OCR 건너뜀"
+                            "(매치 화면인데 반복되면 해상도/게이트 영역 확인)"
+                        )
                     return
             l, t, r, b = self._ocr_box
             x1 = max(0, int(w * l))
@@ -1581,8 +1612,9 @@ class AutomationApp:
 
         rank, tier, score = committed
         # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
-        # 티어는 이번에 안 읽혔으면 직전 확정 티어로 보강(슈퍼챔스+등수 조건 판정용).
-        self._maybe_stop_on_target(rank, score, tier if tier is not None else self._last_tier)
+        # 정지 판정엔 '이번 패널에서 실제로 읽힌' 티어만 넘긴다(없으면 None) → 직전 매치의
+        # 슈퍼챔스 티어가 다음 매치로 새서 거짓 정지하는 일을 막는다(#5). 표시용 보강은 아래에서.
+        self._maybe_stop_on_target(rank, score, tier)
 
         # 마지막 값 유지: 이번에 '읽힌' 필드만 갱신하고, 없는 필드는 직전 값을 보존한다.
         # → 로비(등수 없음)에서 읽어도 매칭 때 잡은 등수가 안 지워지고 계속 표시된다.
@@ -1616,16 +1648,19 @@ class AutomationApp:
         self._report_status(running=True)
 
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
-        """화면에 SKIP/스킵이 보이면 A(=s)·Start를 눌러 넘기고 True를 반환합니다.
+        """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
 
-        반환 True면 호출부가 이번 프레임 일반 타겟 매칭을 건너뛰고 곧장 다음 프레임을
-        다시 확인 → 사라질 때까지 s→start→s→start 릴레이가 됩니다. 실패/미감지 시 False.
+        - '(A) SKIP'(초록 A 버튼 = target_skip_a.png 템플릿) → A만 누른다.
+        - 그 외 일반 스킵(OCR 'skip'/'스킵', SKIP_TEXT_CONSENSUS회 연속 확인) → Start만.
+        - 한 스킵이 SKIP_FALLBACK_BOTH_SECONDS 넘게 안 사라지면 A·Start 둘 다(안전망).
+
+        반환 True면 매칭이 _skip_active_until까지 잠시 멈춥니다. 미감지 시 False이고
+        스킵 상태(타이머·연속카운트)를 초기화합니다.
         """
-        if winapi.vg is None or not rank_ocr.ocr_available():
-            return False
-        # SKIP은 대상 창(매니저)이 있어야 가짜 포커스로 입력을 보낼 수 있습니다.
-        # 화면영역 캡처 모드(매니저 None)에선 버튼을 헛누르지 않도록 건너뜁니다.
-        if manager is None:
+        if winapi.vg is None or not rank_ocr.ocr_available() or manager is None:
+            # 대상 창 없음/화면영역 모드 → 헛누름 방지로 건너뛰고 상태 초기화.
+            self._skip_seen_since = None
+            self._skip_text_streak = 0
             return False
         try:
             h, w = screen_gray.shape[:2]
@@ -1633,35 +1668,77 @@ class AutomationApp:
             x2 = min(w, int(w * SKIP_OCR_RIGHT_FRACTION))
             y1 = max(0, int(h * SKIP_OCR_TOP_FRACTION))
             y2 = min(h, int(h * SKIP_OCR_BOTTOM_FRACTION))
-            crop = screen_gray[y1:y2, x1:x2]
-            # 속도: 큰 프레임은 OCR 전에 폭 기준으로 축소(SKIP 글자는 크므로 인식 유지).
-            if SKIP_OCR_MAX_WIDTH and crop.shape[1] > SKIP_OCR_MAX_WIDTH:
-                scale = SKIP_OCR_MAX_WIDTH / crop.shape[1]
-                crop = cv2.resize(
-                    crop, (SKIP_OCR_MAX_WIDTH, max(1, int(crop.shape[0] * scale))),
-                    interpolation=cv2.INTER_AREA,
-                )
-            if not rank_ocr.contains_skip(crop, logger=None):
-                return False
+            crop = screen_gray[y1:y2, x1:x2]   # 원본 해상도 — (A) 템플릿은 여기서 매칭
+            # 1) (A) SKIP 템플릿 우선(정밀). 매칭되면 OCR을 안 보므로 A형이 Start로 안 샌다.
+            is_a, _score = rank_ocr.match_skip_a(crop, self.base_dir)
+            has_text = False
+            if not is_a:
+                # 2) 일반 스킵: OCR용으로만 폭 축소 후 텍스트 확인(글자는 크므로 인식 유지).
+                ocr_crop = crop
+                if SKIP_OCR_MAX_WIDTH and ocr_crop.shape[1] > SKIP_OCR_MAX_WIDTH:
+                    scale = SKIP_OCR_MAX_WIDTH / ocr_crop.shape[1]
+                    ocr_crop = cv2.resize(
+                        ocr_crop, (SKIP_OCR_MAX_WIDTH, max(1, int(ocr_crop.shape[0] * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                has_text = rank_ocr.contains_skip(ocr_crop, logger=None)
         except Exception:
             return False
 
-        # SKIP 감지됨 → A, Start 입력 (대상 창이 비활성이면 가짜 포커스 먼저).
+        if not is_a and not has_text:
+            # 스킵 없음 → 에피소드 종료(상태 리셋).
+            self._skip_seen_since = None
+            self._skip_text_streak = 0
+            self._skip_kind = None
+            return False
+
+        now = time.monotonic()
+        if self._skip_seen_since is None:
+            self._skip_seen_since = now
+        # 감지 중엔 매칭을 잠시 멈춰 스킵 화면에서의 오클릭을 막는다(입력 여부와 무관).
+        self._skip_active_until = now + 0.5
+
+        press_a = press_start = False
+        if is_a or self._skip_kind == "a":
+            # A형: 이번 프레임 템플릿이 맞았거나, '이미 이 에피소드가 A형으로 확정'된 경우.
+            # → 움직이는 배경(리플레이) 위에서 템플릿이 프레임마다 깜빡여도 A를 '매 주기' 누른다.
+            # 한 번 A로 분류되면 에피소드 끝까지 A로 고정(sticky) → A 입력이 끊기지 않는다.
+            self._skip_kind = "a"
+            self._skip_text_streak = 0
+            press_a = True
+            kind = "A"
+        else:
+            # 아직 A로 분류 안 됨 + 이번 프레임 템플릿도 미스 → 일반(Start) 후보.
+            # 단발 OCR 노이즈 + 'A형 첫 프레임이 깜빡인' 경우를 막기 위해 N연속 후에만 Start.
+            self._skip_text_streak += 1
+            if self._skip_text_streak < SKIP_TEXT_CONSENSUS:
+                self.queue_status("SKIP 넘기는 중")
+                return True   # 확정 전 — 매칭만 멈추고 입력은 보류(다음 프레임에 A로 바뀔 수도)
+            self._skip_kind = "start"
+            press_start = True
+            kind = "Start"
+
+        # 안전망: 일반(Start) 에피소드에서만, 스킵이 오래 안 사라지면 둘 다 누른다.
+        # '확정된 A형'은 절대 Start를 안 눌러(계약: A형은 A만) 오작동을 막고, A형인데 템플릿이
+        # 한 번도 안 맞아 Start 경로로 빠진 경우는 여기서 A까지 눌러 스킵에 갇히지 않게 한다.
+        if self._skip_kind != "a" and (now - self._skip_seen_since) >= SKIP_FALLBACK_BOTH_SECONDS:
+            press_a = press_start = True
+            kind = "A·Start(안전망)"
+
         try:
-            if manager is not None and manager.hwnd and winapi.win32gui is not None:
+            if manager.hwnd and winapi.win32gui is not None:
                 WM_ACTIVATE = 0x0006
                 WA_ACTIVE = 1
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
             a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
-            if a_btn is not None:
+            if press_a and a_btn is not None:
                 send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
-            if start_btn is not None:
+            if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
-            # 매칭 루프가 잠깐 멈춰 입력 충돌을 피하도록 짧은 윈도우 설정.
             self._skip_active_until = time.monotonic() + 0.5
             self.queue_status("SKIP 넘기는 중")
-            self.queue_log("[SKIP] 감지 → A·Start 입력")
+            self.queue_log(f"[SKIP] 감지({kind}) → 입력")
             return True
         except Exception as exc:  # noqa: BLE001
             self.queue_log(f"[SKIP] 입력 중 오류: {exc}")

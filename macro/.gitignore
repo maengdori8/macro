@@ -33,3 +33,8 @@ macroapp/_assets.py
 
 # 시작 오류 진단 로그(런타임 생성)
 startup_error.log
+
+# 빌드 로그/임시 캡처(로컬 빌드 산출물 — 커밋 금지)
+build_*.log
+build_*.err
+_skip_src.png

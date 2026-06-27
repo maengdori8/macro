@@ -33,6 +33,7 @@ from macroapp.config import (
     RANK_OCR_VOTE_MIN,
     RANK_OCR_PANEL_GAP_SECONDS,
     RANK_OCR_COMMIT_AFTER_GONE,
+    SKIP_A_MATCH_THRESHOLD,
 )
 
 # 등수 현실 범위(거짓 양성·자릿수 폭주 차단). 0/음수/비현실값은 버린다.
@@ -71,6 +72,18 @@ _TIER_DISPLAY = {"슈퍼챔피언스": "슈퍼 챔피언스"}
 _SKIP_TOKENS = ("skip", "스킵")
 
 
+def _normalize_ocr_text(raw: str) -> str:
+    """OCR 텍스트의 공백류를 일관되게 제거한다(ASCII 공백 + 줄바꿈 + 전각공백 U+3000 + NBSP).
+
+    winocr가 작은 박스를 멀티라인으로 돌려줄 때('2229\\n점' · 's\\nkip' · '팀\\n정\\n보')
+    부분일치 검사(게이트·점수·SKIP)가 깨지지 않게 한다. 쉼표는 숫자 필드에서만 따로 제거.
+    """
+    if not raw:
+        return ""
+    return (raw.replace("\r", "").replace("\n", "")
+               .replace("　", "").replace("\xa0", "").replace(" ", ""))
+
+
 def on_match_screen(image_bgr_or_gray: np.ndarray, tokens=("팀정보", "유니폼"), logger=None) -> bool:
     """탭 바 영역에 '팀 정보/유니폼' 글자가 보이면 True(=공식경기 감독모드 화면).
 
@@ -86,7 +99,7 @@ def on_match_screen(image_bgr_or_gray: np.ndarray, tokens=("팀정보", "유니�
         if logger:
             logger(f"[게이트 OCR] 인식 중 오류: {exc}")
         return False
-    cleaned = (text or "").replace(" ", "")
+    cleaned = _normalize_ocr_text(text)
     return any(tok in cleaned for tok in tokens)
 
 
@@ -183,6 +196,10 @@ def _canon_tier(tier_text: str) -> Optional[str]:
     if not name_part:
         return None
     best = min(_TIER_CANON, key=lambda c: _levenshtein(name_part, c))
+    # 길이 가드: 표준명이 읽은 조각보다 크게 길면(짧은 노이즈→긴 티어 스냅) 거부.
+    # '공'·'경기' 같은 짧은 노이즈가 '슈퍼챔피언스' 등으로 둔갑하는 거짓 티어를 차단.
+    if len(best) > len(name_part) + 1:
+        return None
     if _levenshtein(name_part, best) <= max(1, len(best) // 4):
         disp = _TIER_DISPLAY.get(best, best)
         return f"{disp} {floor.group(1)}부 감독" if floor else f"{disp} 감독"
@@ -197,7 +214,7 @@ def _parse_rank_text(raw: str) -> dict:
     result = {"rank": None, "is_champion": False, "tier": None,
               "score": None, "has_panel": False}
     raw = raw or ""
-    cleaned = raw.replace(",", "").replace(" ", "")
+    cleaned = _normalize_ocr_text(raw).replace(",", "")
     m = _RANK_RE.search(cleaned)
     if m:
         rank = int(m.group(1))
@@ -378,5 +395,67 @@ def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
         if logger:
             logger(f"[SKIP OCR] 인식 중 오류: {exc}")
         return False
-    cleaned = (text or "").lower().replace(" ", "")
+    cleaned = _normalize_ocr_text(text).lower()
     return any(tok in cleaned for tok in _SKIP_TOKENS)
+
+
+# '(A) SKIP'(초록 A 버튼이 붙은 스킵) 전용 템플릿. 빌드 시 gen_assets가 target_skip_a.png를
+# _assets에 박아 넣으면 거기서, 개발 중엔 exe/소스 옆 느슨한 파일에서 로드한다.
+# None=아직 시도 안 함, False=없음(다시 안 찾음), ndarray=로드된 grayscale 템플릿.
+_SKIP_A_TEMPLATE = None
+_SKIP_A_FILENAME = "target_skip_a.png"
+
+
+def _load_skip_a_template(base_dir):
+    """(A) SKIP 템플릿(grayscale)을 1회 로드해 캐시한다. 없거나 cv2 불가면 None."""
+    global _SKIP_A_TEMPLATE
+    if _SKIP_A_TEMPLATE is not None:
+        return _SKIP_A_TEMPLATE if _SKIP_A_TEMPLATE is not False else None
+    if cv2 is None:
+        _SKIP_A_TEMPLATE = False
+        return None
+    try:
+        from macroapp import config as _cfg
+        raw = _cfg.read_target_image_bytes(base_dir, _SKIP_A_FILENAME)
+        if not raw:
+            _SKIP_A_TEMPLATE = False
+            return None
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None or img.size == 0:
+            _SKIP_A_TEMPLATE = False
+            return None
+        _SKIP_A_TEMPLATE = img
+        return img
+    except Exception:
+        _SKIP_A_TEMPLATE = False
+        return None
+
+
+def reset_skip_a_template() -> None:
+    """캐시를 비워 다음 호출 때 템플릿을 다시 로드하게 한다(런 시작 시 호출)."""
+    global _SKIP_A_TEMPLATE
+    _SKIP_A_TEMPLATE = None
+
+
+def match_skip_a(image_gray: np.ndarray, base_dir,
+                 threshold: float = SKIP_A_MATCH_THRESHOLD):
+    """'(A) SKIP' 버튼 템플릿이 image_gray 안에 보이면 (True, score)를 반환한다.
+
+    템플릿(target_skip_a.png)이 없거나 cv2 불가/이미지 이상이면 (False, 0.0) — 호출부는
+    이 경우 OCR 텍스트→Start 경로로 안전하게 폴백한다. 매칭은 원본 해상도 grayscale에서
+    수행해야 하므로(템플릿이 게임 해상도로 캡처됨) OCR용 축소본이 아닌 원본 crop을 넘길 것.
+    """
+    tmpl = _load_skip_a_template(base_dir)
+    if tmpl is None or cv2 is None or image_gray is None or image_gray.size == 0:
+        return (False, 0.0)
+    th, tw = tmpl.shape[:2]
+    ih, iw = image_gray.shape[:2]
+    if th > ih or tw > iw:
+        return (False, 0.0)
+    try:
+        res = cv2.matchTemplate(image_gray, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, _ = cv2.minMaxLoc(res)
+    except Exception:
+        return (False, 0.0)
+    return (float(mx) >= threshold, float(mx))
