@@ -76,7 +76,7 @@ class AutomationApp:
         self.license_key = license_key
         self.license_info: Optional[dict] = None
 
-        self.root.title("비활성 창 이미지 자동화 테스트")
+        self.root.title("mAuto")
         # LicenseDialog가 고정 크기로 만든 root를 재사용하므로 리사이즈를 다시 허용합니다.
         self.root.resizable(True, True)
         # 1366x768 같은 작은 화면에서도 하단 시작/정지 버튼이 잘리지 않게 높이를 화면에 맞춥니다.
@@ -85,12 +85,8 @@ class AutomationApp:
         offset_y = max(0, min(60, screen_height - window_height - 90))
         self.root.geometry(f"1180x{window_height}+80+{offset_y}")
         self.root.minsize(1080, 560)
-        self.ui_preview_only = platform.system() != "Windows"
-        if self.ui_preview_only:
-            self.root.title("비활성 창 이미지 자동화 테스트 - UI 미리보기")
-
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
-        initial_status = "UI 미리보기" if self.ui_preview_only else "대기 중"
+        initial_status = "대기 중"
         self.status_var = tk.StringVar(value=initial_status)
         self.base_dir = app_dir()
         self.target_definitions = load_target_definitions(self.base_dir)
@@ -197,7 +193,7 @@ class AutomationApp:
         self._tick_clock()
 
         # 가상 게임패드를 미리 생성해 게임이 컨트롤러를 일찍 인식하게 합니다.
-        if winapi.vg is not None and not self.ui_preview_only:
+        if winapi.vg is not None:
             try:
                 _get_gamepad()
                 self.log("[게임패드] 가상 Xbox 컨트롤러를 연결했습니다.")
@@ -210,9 +206,6 @@ class AutomationApp:
             self.log(f"[라이센스] {self.license_info['days']}일권 인증됨 - {remaining}")
         self.log("F8: 시작, F9 또는 ESC: 중지")
         self.log("대상 창은 백그라운드에 있어도 되지만 최소화되어 있으면 안 됩니다.")
-        if self.ui_preview_only:
-            self.log("[UI 미리보기] 현재 OS가 Windows가 아니므로 자동화 실행은 비활성화했습니다.")
-            self.log("              UI 확인만 가능하며, 실제 캡처/클릭은 Windows에서 실행하세요.")
 
     def _bring_window_to_front(self) -> None:
         """창이 뒤에 숨어 보이지 않는 일을 줄이기 위해 잠깐 최상위로 올립니다."""
@@ -283,10 +276,6 @@ class AutomationApp:
 
     def _build_ui(self) -> None:
         """다크 + 레드 테마의 2단 레이아웃 UI를 만듭니다."""
-
-        if self.ui_preview_only:
-            self._build_preview_ui()
-            return
 
         c = self.COLORS
         self.root.configure(bg=c["bg"])
@@ -417,32 +406,6 @@ class AutomationApp:
             font=self._font(8),
         ).pack(pady=(8, 0))
 
-        title_row = tk.Frame(settings_panel, bg=c["panel"])
-        title_row.pack(fill=tk.X, pady=2)
-        tk.Label(
-            title_row,
-            text="대상 창",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
-        ).pack(side=tk.LEFT)
-        self.title_entry = tk.Entry(
-            title_row,
-            textvariable=self.window_title_var,
-            bg=c["input"],
-            fg=c["text"],
-            insertbackground=c["text"],
-            disabledbackground=c["bg"],
-            disabledforeground=c["muted"],
-            relief=tk.FLAT,
-            highlightbackground=c["border"],
-            highlightcolor=c["accent"],
-            highlightthickness=1,
-        )
-        self.title_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
-
         capture_row = tk.Frame(settings_panel, bg=c["panel"])
         capture_row.pack(fill=tk.X, pady=2)
         tk.Label(
@@ -543,7 +506,7 @@ class AutomationApp:
             anchor=tk.W,
             font=self._font(10),
         ).pack(side=tk.LEFT)
-        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score"), ("슈퍼챔스 등수", "super_rank")):
+        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score")):
             tk.Radiobutton(
                 stop_row,
                 text=text,
@@ -699,9 +662,6 @@ class AutomationApp:
     def capture_target_template(self, name: str) -> None:
         """화면 드래그 캡처로 타겟 템플릿을 교체합니다."""
 
-        if self.ui_preview_only:
-            self.log("[UI 미리보기] 템플릿 캡처는 Windows에서만 사용할 수 있습니다.")
-            return
         if self.worker_thread is not None and self.worker_thread.is_alive():
             self.log("[캡처] 자동화 실행 중에는 템플릿을 변경할 수 없습니다. 정지 후 다시 시도하세요.")
             return
@@ -781,9 +741,6 @@ class AutomationApp:
     def reset_target_template(self, name: str) -> None:
         """커스텀 캡처를 삭제하고 빌드에 포함된 기본 템플릿으로 되돌립니다."""
 
-        if self.ui_preview_only:
-            self.log("[UI 미리보기] 템플릿 복원은 Windows에서만 사용할 수 있습니다.")
-            return
         if self.worker_thread is not None and self.worker_thread.is_alive():
             self.log("[캡처] 자동화 실행 중에는 템플릿을 변경할 수 없습니다. 정지 후 다시 시도하세요.")
             return
@@ -810,8 +767,6 @@ class AutomationApp:
     def _refresh_target_row(self, name: str) -> None:
         """타겟 행의 템플릿 출처(기본/커스텀) 표시와 썸네일을 갱신합니다."""
 
-        if self.ui_preview_only:
-            return
         target = self._find_target_definition(name)
         if target is None:
             return
@@ -862,111 +817,6 @@ class AutomationApp:
         self._thumb_refs[name] = photo
         label.configure(image=photo, text="")
 
-    def _build_preview_ui(self) -> None:
-        """
-        Mac 전용 UI 미리보기입니다.
-
-        일부 Mac Tcl/Tk 조합에서는 Label, Entry, Text가 보이지 않는 경우가 있어
-        미리보기 모드에서는 화면에 확실히 표시되는 Button 위젯만 사용합니다.
-        Windows 실행 시에는 위의 일반 UI가 사용됩니다.
-        """
-
-        self.root.configure(bg="#1E1E1E")
-        main_frame = tk.Frame(self.root, bg="#1E1E1E", padx=18, pady=18)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.title_entry = tk.Button(
-            main_frame,
-            text=f"대상 창 제목: {self.window_title_var.get()}",
-            anchor=tk.W,
-            justify=tk.LEFT,
-            relief=tk.GROOVE,
-            height=2,
-        )
-        self.title_entry.pack(fill=tk.X, pady=(0, 12))
-
-        button_frame = tk.Frame(main_frame, bg="#1E1E1E")
-        button_frame.pack(fill=tk.X, pady=(0, 12))
-
-        self.start_button = tk.Button(
-            button_frame,
-            text="시작 (F8) - 미리보기 로그만 표시",
-            command=self.start_automation,
-            width=28,
-            height=2,
-        )
-        self.start_button.pack(side=tk.LEFT)
-
-        self.stop_button = tk.Button(
-            button_frame,
-            text="종료 (F9/ESC)",
-            command=self.stop_automation,
-            width=18,
-            height=2,
-        )
-        self.stop_button.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.status_label = tk.Button(
-            main_frame,
-            textvariable=self.status_var,
-            anchor=tk.W,
-            justify=tk.LEFT,
-            relief=tk.GROOVE,
-            height=2,
-        )
-        self.status_label.pack(fill=tk.X, pady=(0, 12))
-
-        mode_text = (
-            f"캡처 모드: {self.capture_mode_var.get()}\n"
-            f"클릭 모드: {self.click_mode_var.get()}\n"
-            f"영역: {DEFAULT_REGION_X}, {DEFAULT_REGION_Y}, "
-            f"{DEFAULT_REGION_WIDTH}, {DEFAULT_REGION_HEIGHT}"
-        )
-        self.preview_mode_button = tk.Button(
-            main_frame,
-            text=mode_text,
-            anchor=tk.W,
-            justify=tk.LEFT,
-            relief=tk.GROOVE,
-            height=3,
-        )
-        self.preview_mode_button.pack(fill=tk.X, pady=(0, 12))
-
-        threshold_text = "\n".join(
-            f"{name} 임계값: {self.get_threshold(name):.2f}"
-            for name in self.target_names
-        )
-        self.preview_threshold_button = tk.Button(
-            main_frame,
-            text=threshold_text,
-            anchor=tk.W,
-            justify=tk.LEFT,
-            relief=tk.GROOVE,
-            height=len(self.target_names),
-        )
-        self.preview_threshold_button.pack(fill=tk.X, pady=(0, 12))
-
-        self.preview_log_messages: list[str] = []
-        self.preview_log_frame = tk.Frame(
-            main_frame,
-            relief=tk.GROOVE,
-            bd=2,
-        )
-        self.preview_log_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.preview_log_rows: list[tk.Button] = []
-        for _index in range(12):
-            row = tk.Button(
-                self.preview_log_frame,
-                text="",
-                anchor=tk.W,
-                justify=tk.LEFT,
-                relief=tk.FLAT,
-                height=1,
-            )
-            row.pack(fill=tk.X, padx=6, pady=1)
-            self.preview_log_rows.append(row)
-
     def _bind_shortcuts(self) -> None:
         """UI가 활성화되어 있을 때 동작하는 단축키를 등록합니다."""
 
@@ -974,18 +824,7 @@ class AutomationApp:
         self.root.bind("<F9>", lambda _event: self.stop_automation())
         self.root.bind("<Escape>", lambda _event: self.stop_automation())
 
-        # 기존 콘솔 예제의 q 종료 습관을 보조로 유지합니다.
-        self.root.bind("<KeyPress-q>", self._on_stop_hotkey)
-        self.root.bind("<KeyPress-Q>", self._on_stop_hotkey)
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _on_stop_hotkey(self, event: tk.Event) -> None:
-        """q/Q 정지 단축키. Entry 입력 중에는 무시해 텍스트 입력과 충돌하지 않게 합니다."""
-
-        if isinstance(getattr(event, "widget", None), tk.Entry):
-            return
-        self.stop_automation()
 
     def on_capture_mode_changed(self) -> None:
         """화면 영역 캡처 모드에서는 기본 클릭 방식을 마우스 이동/복귀로 맞춥니다."""
@@ -1028,7 +867,7 @@ class AutomationApp:
         self._starting = True
         self._set_button_state(running=True)
 
-        if self.license_key and not self.ui_preview_only:
+        if self.license_key:
             self.set_status("인증 확인 중...")
             threading.Thread(target=self._verify_then_start, daemon=True).start()
         else:
@@ -1063,13 +902,6 @@ class AutomationApp:
         """실제 자동화 시작 (라이센스 통과 후)."""
         self._starting = False
 
-        if self.ui_preview_only:
-            self.log("[UI 미리보기] Mac에서는 자동화 루프를 실행하지 않습니다.")
-            self.log("              Windows에서 실행하면 시작 버튼과 F8이 자동화를 시작합니다.")
-            self.set_status("UI 미리보기")
-            self._set_button_state(running=False)
-            return
-
         capture_mode = self.capture_mode_var.get()
         click_mode = self.click_mode_var.get()
         region = self.get_region_from_ui()
@@ -1082,17 +914,9 @@ class AutomationApp:
             click_mode = "mouse"
             self.click_mode_var.set("mouse")
 
+        # 대상 창은 프로세스명(fczf 등)으로 찾으므로 제목 입력이 없어도 된다(빈 문자열 허용).
+        # find_window가 프로세스 우선 매칭하고, 제목은 비어 있으면 자동으로 건너뛴다.
         window_title = self.window_title_var.get().strip()
-        needs_window = (
-            capture_mode == "wgc"
-            or click_mode == "postmessage"
-            or any(target.action == "message" for target in self.target_definitions)
-        )
-        if needs_window and not window_title:
-            self.log("[오류] 대상 창 제목을 입력하세요.")
-            self.set_status("오류 발생")
-            self._set_button_state(running=False)
-            return
 
         # 목표 도달 자동 정지 조건 + 등수 OCR 박스를 시작 시점에 스냅샷(메인 스레드 → 안전).
         self._snapshot_stop_condition()
@@ -1134,13 +958,7 @@ class AutomationApp:
             target.threshold = self.get_threshold(target.name)
 
     def stop_automation(self) -> None:
-        """종료 버튼, F9, ESC, q 키로 자동화를 안전하게 중단 요청합니다."""
-
-        if self.ui_preview_only:
-            self.log("[UI 미리보기] 실행 중인 자동화가 없습니다.")
-            self.set_status("UI 미리보기")
-            self._set_button_state(running=False)
-            return
+        """종료 버튼, F9, ESC로 자동화를 안전하게 중단 요청합니다."""
 
         if self.worker_thread is None or not self.worker_thread.is_alive():
             self.log("[안내] 현재 실행 중인 자동화가 없습니다.")
@@ -1162,7 +980,7 @@ class AutomationApp:
         """
         self._stop_triggered = False
         mode = self.stop_mode_var.get()
-        if mode not in ("rank", "score", "super_rank"):
+        if mode not in ("rank", "score"):
             self._stop_mode = "off"
             self._stop_value = 0
             return
@@ -1182,8 +1000,6 @@ class AutomationApp:
             self.log(f"[자동 정지] 현재 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
         elif mode == "score":
             self.log(f"[자동 정지] 현재 점수가 {value}점 이상이 되면 자동으로 정지합니다.")
-        else:  # super_rank
-            self.log(f"[자동 정지] 슈퍼 챔피언스이고 등수가 {value}위 이내가 되면 자동으로 정지합니다.")
 
     def _snapshot_ocr_box(self) -> None:
         """시작 시 UI의 등수 OCR 박스(%)를 평문 비율로 고정합니다(메인 스레드 전용).
@@ -1223,17 +1039,11 @@ class AutomationApp:
         """
         if self._stop_triggered or self._stop_mode == "off":
             return
-        # 슈퍼 챔피언스 여부: 정규화된 티어가 '슈퍼 챔피언스 감독'이면 '슈퍼'+'챔피언스'를 모두 포함.
-        # (일반 '챔피언스 감독'은 '슈퍼'가 없어 제외됨.) tier는 '이번 패널에서 실제로 읽힌' 값만
-        # 받는다 — 직전 매치의 스테일 티어로는 절대 슈퍼 판정을 하지 않아 거짓 정지를 막는다(#5).
-        is_super = bool(tier and "슈퍼" in tier and "챔피언스" in tier)
         hit_msg = None
         if self._stop_mode == "rank" and rank is not None and rank <= self._stop_value:
             hit_msg = f"목표 등수 도달: 현재 {rank}위 ≤ 목표 {self._stop_value}위"
         elif self._stop_mode == "score" and score is not None and score >= self._stop_value:
             hit_msg = f"목표 점수 도달: 현재 {score}점 ≥ 목표 {self._stop_value}점"
-        elif self._stop_mode == "super_rank" and is_super and rank is not None and rank <= self._stop_value:
-            hit_msg = f"슈퍼챔스 목표 도달: {tier} {rank}위 ≤ 목표 {self._stop_value}위"
         if hit_msg is None:
             # 조건 미충족 → 연속 확정 카운트 리셋(스트릭이 끊기면 처음부터 다시).
             self._stop_confirm_count = 0
@@ -1967,15 +1777,6 @@ class AutomationApp:
             except Exception:
                 pass
 
-        if hasattr(self, "preview_log_rows"):
-            self.preview_log_messages.append(line.rstrip())
-            self.preview_log_messages = self.preview_log_messages[-12:]
-            empty_count = 12 - len(self.preview_log_messages)
-            visible_lines = [""] * empty_count + self.preview_log_messages
-            for row, text in zip(self.preview_log_rows, visible_lines):
-                row.configure(text=text)
-            return
-
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, line)
 
@@ -2047,15 +1848,8 @@ class AutomationApp:
     def _set_button_state(self, running: bool) -> None:
         """실행 상태에 따라 시작/종료/캡처 버튼 활성화를 조절합니다."""
 
-        if self.ui_preview_only:
-            self.start_button.configure(state=tk.NORMAL)
-            self.stop_button.configure(state=tk.DISABLED)
-            self.title_entry.configure(state=tk.NORMAL)
-            return
-
         self._set_accent_button_state(self.start_button, enabled=not running)
         self._set_accent_button_state(self.stop_button, enabled=running)
-        self.title_entry.configure(state=tk.DISABLED if running else tk.NORMAL)
 
         # 실행 중 템플릿 교체는 다음 시작까지 반영되지 않으므로 혼동을 막기 위해 잠급니다.
         for button in self._capture_buttons.values():

@@ -149,8 +149,9 @@ def _read_embedded_targets_json() -> Optional[str]:
         return getattr(a, "TARGETS_JSON", None)
     return None
 
-# UI 입력칸의 기본값입니다.
-WINDOW_TITLE = "FC Online"
+# 대상 창 제목 기본값. 빈 값이면 제목으로 찾지 않고 프로세스명(FC_ONLINE_PROCESS_NAMES,
+# 예: fczf)으로만 대상을 찾습니다. 창 제목이 바뀌어도 영향받지 않게 프로세스 기반이 기본.
+WINDOW_TITLE = ""
 
 # 아무것도 발견되지 않았을 때 CPU 과부하를 막기 위한 기본 대기 시간입니다.
 LOOP_SLEEP_SECONDS = 0.03
