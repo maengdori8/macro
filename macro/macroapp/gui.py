@@ -25,6 +25,7 @@ except Exception:  # noqa: BLE001 - 썸네일 표시는 선택 기능이라 없�
 
 from macroapp import winapi
 from macroapp import input_gamepad
+from macroapp import input_message
 from macroapp.input_gamepad import _get_gamepad, send_gamepad_button, send_gamepad_trigger
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.logging_util import LogCallback
@@ -37,6 +38,7 @@ from macroapp.config import (
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
+    SKIP_A_HOLD_SECONDS, SKIP_A_SENDINPUT_AFTER_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -1457,6 +1459,17 @@ class AutomationApp:
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 
+    @staticmethod
+    def _skip_a_plan(elapsed: float) -> str:
+        """(A) SKIP 에스컬레이션 결정(순수 로직 — Mac 단위검증용).
+
+        처음엔 가상패드 A 롱홀드("hold"), SKIP_A_SENDINPUT_AFTER_SECONDS 넘게
+        안 사라지면 전면 전환+키보드 s("sendinput"). 설정이 0이면 항상 "hold".
+        """
+        if SKIP_A_SENDINPUT_AFTER_SECONDS and elapsed >= SKIP_A_SENDINPUT_AFTER_SECONDS:
+            return "sendinput"
+        return "hold"
+
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
         """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
 
@@ -1542,23 +1555,44 @@ class AutomationApp:
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
             a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
-            did_click = False
+            action_label = "입력"
             if press_a:
-                # 가상패드 A가 인식 안 되는 게임 대응: A형 버튼 '위치를 클릭'해서 넘긴다.
-                # (마우스 PostMessage는 비활성 창에서도 잘 전달됨.) 위치를 알면 클릭, 아니면 A.
+                # 홀드가 끝날 때까지 매칭이 스킵 화면을 오클릭하지 않게 정지 시간을 넉넉히.
+                self._skip_active_until = now + SKIP_A_HOLD_SECONDS + 0.8
+                did_click = False
                 if SKIP_A_CLICK and a_center is not None and manager.hwnd:
+                    # (선택) 버튼 위치 클릭 — 이 게임은 실측상 안 통해 기본 꺼짐(config).
                     fx = x1 + int(a_center[0])
                     fy = y1 + int(a_center[1])
                     start_pos = manager.get_virtual_start_position(fx, fy)
                     sx, sy = start_pos if start_pos else (fx, fy)
                     did_click = bool(manager.post_curved_click(sx, sy, fx, fy))
-                if not did_click and a_btn is not None:
-                    send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
+                    if did_click:
+                        action_label = "클릭"
+                if not did_click:
+                    plan = self._skip_a_plan(now - self._skip_seen_since)
+                    if plan == "sendinput" and manager.hwnd:
+                        # 최후수단: 창을 잠깐 전면으로 → '진짜 키보드' s(스캔코드) → 원래 창 복원.
+                        # 가상 A 롱홀드로도 안 사라질 때만 온다(게임이 가상 A를 무시하는 경우).
+                        if input_message.press_key_foreground(
+                                manager.hwnd, input_message.SCAN_S, hold=0.12):
+                            action_label = "키보드s(전면전환)"
+                        elif a_btn is not None:
+                            # 전면 전환 실패 → 가상 A 롱홀드로 폴백.
+                            send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
+                            action_label = "A 롱홀드(전환실패 폴백)"
+                    elif a_btn is not None:
+                        # 1차: 가상패드 A '길게 홀드' — hold-to-skip 프롬프트는 탭(50ms)으론
+                        # 게이지가 안 차서 안 넘어간다. 릴레이가 사라질 때까지 반복 홀드.
+                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
+                        action_label = "A 롱홀드"
             if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
-            self._skip_active_until = time.monotonic() + 0.5
+            self._skip_active_until = max(
+                self._skip_active_until, time.monotonic() + 0.5
+            )
             self.queue_status("SKIP 넘기는 중")
-            self.queue_log(f"[SKIP] 감지({kind}) → {'클릭' if did_click else '입력'}")
+            self.queue_log(f"[SKIP] 감지({kind}) → {action_label}")
             return True
         except Exception as exc:  # noqa: BLE001
             self.queue_log(f"[SKIP] 입력 중 오류: {exc}")

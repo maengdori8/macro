@@ -203,11 +203,17 @@ RANK_OCR_COMMIT_AFTER_GONE = 0.35 # 패널이 사라진 뒤 이 시간 지나면
 SKIP_ENABLED = True
 SKIP_OCR_INTERVAL_SECONDS = 0.3   # 이 간격마다 SKIP 텍스트 확인(작을수록 빨리 반응·무거움)
 SKIP_PRESS_DELAY_SECONDS = 0.05   # A·Start 누름 사이 지연
-# '(A) SKIP' 버튼을 가상패드 A로 누르는 대신, 감지된 버튼 '위치를 클릭'해서 넘긴다.
-# 이유: 일부 게임/설정에서 가상패드 A만 인식이 안 되는데(Start는 됨), 마우스 클릭은
-# 비활성 창에서도 잘 전달된다. A형 스킵은 템플릿으로 위치를 알고 있으니 그 자리를 클릭.
-# 클릭이 안 통하는 환경이면 False로 두면 기존처럼 가상패드 A를 누른다.
-SKIP_A_CLICK = True
+# '(A) SKIP' 버튼 위치 클릭 시도 — 실측 결과 이 게임은 클릭으론 스킵 안 됨 → 기본 False.
+SKIP_A_CLICK = False
+# (A) SKIP 에스컬레이션:
+# 1차 — 가상패드 A를 '길게 홀드'. FIFA류 스킵 프롬프트는 탭(50ms)이 아니라
+#       홀드(hold-to-skip)인 경우가 많아, 탭만 하면 게이지가 안 차서 "A가 안 먹는" 걸로 보임.
+SKIP_A_HOLD_SECONDS = 1.0
+# 2차(최후수단) — 이 시간 넘게 (A) SKIP이 안 사라지면, 게임 창을 잠깐 전면으로 올려
+#       '진짜 키보드' s(SendInput 스캔코드)를 치고 원래 전면 창을 복원한다(~0.2초).
+#       게임이 RawInput이라 PostMessage 키/비활성 키보드는 원리적으로 안 먹기 때문.
+#       0이면 이 최후수단을 끈다(비활성 100%를 절대 안 깨고 싶을 때).
+SKIP_A_SENDINPUT_AFTER_SECONDS = 2.5
 SKIP_OCR_MAX_WIDTH = 1280         # OCR 전 이 폭으로 축소(0=축소 안 함). 속도용.
 # SKIP을 찾을 영역(프레임 비율). FC온라인 스킵 안내(일반·(A)형)는 항상 화면 하단에 뜨므로
 # 하단 22%만 본다 → skip-A matchTemplate + OCR 비용을 ~5배 줄이고 노이즈도 차단(CPU 대폭↓).

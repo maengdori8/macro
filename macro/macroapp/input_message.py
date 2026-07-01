@@ -62,6 +62,109 @@ KEY_TO_VK: dict[str, int] = {
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 
+# ─── SendInput 스캔코드 키 입력 (전면 전환 최후수단) ───
+# RawInput/DirectInput 게임은 PostMessage 키를 무시하므로, '진짜 키보드'처럼 보이는
+# SendInput 스캔코드가 필요하다. 단 SendInput은 전면(포커스) 창으로만 가므로,
+# press_key_foreground()가 잠깐 전면 전환→키 입력→원래 창 복원까지 묶어 처리한다.
+_KEYEVENTF_SCANCODE = 0x0008
+_KEYEVENTF_KEYUP = 0x0002
+_INPUT_KEYBOARD = 1
+SCAN_S = 0x1F     # 키보드 's' (set-1 스캔코드) — FC ONLINE에서 A 버튼과 동일 동작
+_SCAN_ALT = 0x38  # ALT — SetForegroundWindow 잠금 해제 트릭용
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        # MOUSEINPUT(최대 멤버)와 크기를 맞추기 위한 패딩 포함 → sizeof(INPUT)=40(x64) 보장.
+        _fields_ = [("ki", _KEYBDINPUT), ("_pad", ctypes.c_byte * 32)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+def _send_scancode(scan: int, keyup: bool) -> bool:
+    """SendInput으로 스캔코드 down 또는 up 이벤트 1개를 보낸다(전면 창으로 감)."""
+    if not hasattr(ctypes, "windll"):
+        return False
+    inp = _INPUT()
+    inp.type = _INPUT_KEYBOARD
+    inp.ki.wVk = 0
+    inp.ki.wScan = scan
+    inp.ki.dwFlags = _KEYEVENTF_SCANCODE | (_KEYEVENTF_KEYUP if keyup else 0)
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    return sent == 1
+
+
+def send_scancode_key(scan: int, hold: float = 0.1) -> bool:
+    """SendInput 스캔코드 키를 눌렀다 뗀다. 전면 창에만 전달되므로 보통
+    press_key_foreground()를 통해 사용한다."""
+    if not _send_scancode(scan, keyup=False):
+        return False
+    time.sleep(max(0.0, hold))
+    _send_scancode(scan, keyup=True)
+    return True
+
+
+def _bring_to_foreground(hwnd: int) -> bool:
+    """대상 창을 전면으로. 포그라운드 잠금에 막히면 ALT 트릭으로 한 번 더 시도."""
+    u = ctypes.windll.user32
+    hwnd = int(hwnd)
+    if u.GetForegroundWindow() == hwnd:
+        return True
+    try:
+        SW_RESTORE = 9
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, SW_RESTORE)
+    except Exception:
+        pass
+    u.SetForegroundWindow(hwnd)
+    if u.GetForegroundWindow() == hwnd:
+        return True
+    # ALT 트릭: 우리 프로세스가 '마지막 입력'을 만든 상태면 잠금이 풀린다.
+    _send_scancode(_SCAN_ALT, keyup=False)
+    _send_scancode(_SCAN_ALT, keyup=True)
+    u.SetForegroundWindow(hwnd)
+    return u.GetForegroundWindow() == hwnd
+
+
+def press_key_foreground(hwnd: int, scan: int = SCAN_S, hold: float = 0.12,
+                         settle: float = 0.06) -> bool:
+    """게임 창을 잠깐 전면으로 올려 SendInput 스캔코드 키를 보내고, 원래 창을 복원한다.
+
+    PostMessage 키를 무시하는(RawInput) 게임에 '진짜 키보드'로 인식되는 최후수단.
+    포커스를 ~0.2초 훔치므로 (A) SKIP 같은 드문 이벤트에서만 사용할 것.
+    실패(전면 전환 불가/Windows 아님)하면 False — 호출부는 다른 수단으로 폴백.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    try:
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        prev = u.GetForegroundWindow()
+        if not _bring_to_foreground(hwnd):
+            return False
+        time.sleep(max(0.0, settle))   # 포커스 정착 대기(게임이 입력 장치 전환할 시간)
+        ok = send_scancode_key(scan, hold)
+        time.sleep(0.03)
+        if prev and prev != int(hwnd):
+            try:
+                _bring_to_foreground(prev)   # 원래 전면 창 복원
+            except Exception:
+                pass
+        return bool(ok)
+    except Exception:
+        return False
+
 def send_key_to_window(hwnd: int, vk_code: int, press_delay: float = 0.05) -> bool:
     """PostMessage로 대상 창에 WM_KEYDOWN/WM_KEYUP을 전송합니다."""
     if winapi.win32gui is None:
