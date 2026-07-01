@@ -440,22 +440,25 @@ def reset_skip_a_template() -> None:
 
 def match_skip_a(image_gray: np.ndarray, base_dir,
                  threshold: float = SKIP_A_MATCH_THRESHOLD):
-    """'(A) SKIP' 버튼 템플릿이 image_gray 안에 보이면 (True, score)를 반환한다.
+    """'(A) SKIP' 버튼 템플릿이 image_gray 안에 보이면 (True, score, (cx,cy))를 반환한다.
 
-    템플릿(target_skip_a.png)이 없거나 cv2 불가/이미지 이상이면 (False, 0.0) — 호출부는
+    (cx,cy)는 매칭 중심(이미지 좌표) — 그 자리를 클릭해 A 버튼 없이 스킵할 때 쓴다.
+    템플릿(target_skip_a.png)이 없거나 cv2 불가/이미지 이상이면 (False, 0.0, None) — 호출부는
     이 경우 OCR 텍스트→Start 경로로 안전하게 폴백한다. 매칭은 원본 해상도 grayscale에서
     수행해야 하므로(템플릿이 게임 해상도로 캡처됨) OCR용 축소본이 아닌 원본 crop을 넘길 것.
     """
     tmpl = _load_skip_a_template(base_dir)
     if tmpl is None or cv2 is None or image_gray is None or image_gray.size == 0:
-        return (False, 0.0)
+        return (False, 0.0, None)
     th, tw = tmpl.shape[:2]
     ih, iw = image_gray.shape[:2]
     if th > ih or tw > iw:
-        return (False, 0.0)
+        return (False, 0.0, None)
     try:
         res = cv2.matchTemplate(image_gray, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, mx, _, _ = cv2.minMaxLoc(res)
+        _, mx, _, max_loc = cv2.minMaxLoc(res)
     except Exception:
-        return (False, 0.0)
-    return (float(mx) >= threshold, float(mx))
+        return (False, 0.0, None)
+    # 매칭 중심(이미지 좌표) — 호출부가 이 자리를 '클릭'해서 A 없이 스킵할 수 있게 반환.
+    center = (int(max_loc[0] + tw // 2), int(max_loc[1] + th // 2))
+    return (float(mx) >= threshold, float(mx), center)

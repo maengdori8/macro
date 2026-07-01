@@ -36,7 +36,7 @@ from macroapp.config import (
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
-    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
+    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -1480,7 +1480,7 @@ class AutomationApp:
             y2 = min(h, int(h * SKIP_OCR_BOTTOM_FRACTION))
             crop = screen_gray[y1:y2, x1:x2]   # 원본 해상도 — (A) 템플릿은 여기서 매칭
             # 1) (A) SKIP 템플릿 우선(정밀). 매칭되면 OCR을 안 보므로 A형이 Start로 안 샌다.
-            is_a, _score = rank_ocr.match_skip_a(crop, self.base_dir)
+            is_a, _score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
             has_text = False
             if not is_a:
                 # 2) 일반 스킵: OCR용으로만 폭 축소 후 텍스트 확인(글자는 크므로 인식 유지).
@@ -1542,13 +1542,23 @@ class AutomationApp:
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
             a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
-            if press_a and a_btn is not None:
-                send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
+            did_click = False
+            if press_a:
+                # 가상패드 A가 인식 안 되는 게임 대응: A형 버튼 '위치를 클릭'해서 넘긴다.
+                # (마우스 PostMessage는 비활성 창에서도 잘 전달됨.) 위치를 알면 클릭, 아니면 A.
+                if SKIP_A_CLICK and a_center is not None and manager.hwnd:
+                    fx = x1 + int(a_center[0])
+                    fy = y1 + int(a_center[1])
+                    start_pos = manager.get_virtual_start_position(fx, fy)
+                    sx, sy = start_pos if start_pos else (fx, fy)
+                    did_click = bool(manager.post_curved_click(sx, sy, fx, fy))
+                if not did_click and a_btn is not None:
+                    send_gamepad_button(a_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             self._skip_active_until = time.monotonic() + 0.5
             self.queue_status("SKIP 넘기는 중")
-            self.queue_log(f"[SKIP] 감지({kind}) → 입력")
+            self.queue_log(f"[SKIP] 감지({kind}) → {'클릭' if did_click else '입력'}")
             return True
         except Exception as exc:  # noqa: BLE001
             self.queue_log(f"[SKIP] 입력 중 오류: {exc}")
