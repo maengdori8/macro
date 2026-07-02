@@ -114,6 +114,87 @@ def send_scancode_key(scan: int, hold: float = 0.1) -> bool:
     return True
 
 
+def post_key_deep(hwnd: int, vk_code: int, press_delay: float = 0.08) -> bool:
+    """WM_KEYDOWN/UP을 최상위 + 포커스 자식 + 모든 자식 창에 전송합니다(비활성 유지).
+
+    단순 PostMessage(최상위만)가 무시되던 게임도, 실제 키 처리가 자식 창(CEF 등)에
+    있으면 이 딥 버전은 통할 수 있다. 스캔코드 lParam을 실제 키처럼 구성한다.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    try:
+        _setup_user32_sigs()
+        scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+        lparam_down = (scan_code << 16) | 1
+        lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
+        targets = [int(hwnd)]
+        focus = _get_thread_focus_hwnd(hwnd)
+        if focus:
+            targets.append(int(focus))
+        targets.extend(_get_child_windows(hwnd))
+        targets = _unique_hwnds(targets)
+        if not targets:
+            return False
+        for t in targets:
+            try:
+                winapi.win32gui.PostMessage(t, WM_KEYDOWN, vk_code, lparam_down)
+            except Exception:
+                pass
+        time.sleep(max(0.0, press_delay))
+        for t in targets:
+            try:
+                winapi.win32gui.PostMessage(t, WM_KEYUP, vk_code, lparam_up)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> bool:
+    """창을 전면으로 올리지 않고(화면 변화 0) 키보드 포커스만 잠깐 붙여 키를 보냅니다.
+
+    AttachThreadInput으로 우리 스레드를 대상(및 현재 포그라운드) 스레드의 입력 큐에
+    붙인 뒤 SetFocus(hwnd) → SendInput 스캔코드 → 포커스 원복 → 분리.
+    z순서·활성 창은 그대로라 사용자 화면이 깜빡이지 않는다. 메시지/DirectInput
+    키보드 게임에 통하는 경우가 있고, RawInput 포그라운드 게이트면 무시될 수 있다.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    attached = []
+    tid_cur = k.GetCurrentThreadId()
+    try:
+        _setup_user32_sigs()
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        tid_target = u.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
+        fg = u.GetForegroundWindow()
+        tid_fg = u.GetWindowThreadProcessId(wintypes.HWND(fg), None) if fg else 0
+        for tid in {tid_target, tid_fg}:
+            if tid and tid != tid_cur and u.AttachThreadInput(tid_cur, tid, True):
+                attached.append(tid)
+        prev_focus = u.GetFocus()
+        u.SetFocus(int(hwnd))
+        time.sleep(0.03)
+        ok = send_scancode_key(scan, hold)
+        try:
+            if prev_focus:
+                u.SetFocus(prev_focus)
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception:
+        return False
+    finally:
+        for tid in attached:
+            try:
+                u.AttachThreadInput(tid_cur, tid, False)
+            except Exception:
+                pass
+
+
 def _bring_to_foreground(hwnd: int) -> bool:
     """대상 창을 전면으로. 포그라운드 잠금에 막히면 ALT 트릭으로 한 번 더 시도."""
     u = ctypes.windll.user32

@@ -213,8 +213,14 @@ SKIP_A_CLICK = False
 # 그 버튼을 '학습'해 다음부터 바로 사용한다 — 비활성 100% 유지.
 # 이미 답을 알면 SKIP_A_BUTTON에 지정(예: "b")하면 탐색 없이 바로 그 버튼만 쓴다.
 SKIP_A_BUTTON = ""
-SKIP_A_SWEEP_BUTTONS = ("a", "b", "x", "y", "rb", "lb", "rt", "lt", "down", "pm_s")
-#   pm_s = PostMessage로 키보드 s를 창에 직접 전송(비활성 유지; 일부 UI 레이어는 받음)
+# 실측: 가상패드는 START 외 전부 무시 → '비활성 유지 키보드 s' 3기법을 먼저 시도한다.
+#   pm_s    = WM_KEYDOWN(s)을 최상위+포커스 자식+모든 자식 창(CEF 포함)에 딥 전송
+#   focus_s = AttachThreadInput+SetFocus로 화면 변화 없이 포커스만 잠깐 붙여 SendInput s
+#   si_s    = SendInput s(전역 키 상태) — 게임이 GetAsyncKeyState 폴링형이면 비활성에도 먹음
+#             (주의: 그 순간 활성인 다른 앱에 s가 입력될 수 있음 — 학습되면 알려줄 것)
+# 그 뒤 가상패드 후보(a,b,…)를 순회. 통한 입력은 학습돼 다음부턴 바로 사용.
+SKIP_A_SWEEP_BUTTONS = ("pm_s", "focus_s", "si_s",
+                        "a", "b", "x", "y", "rb", "lb", "rt", "lt", "down")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 # 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.
 # 0 = 완전 끄기(기본) → 비활성 100% 보장. 스킵을 못 넘겨도 컷신은 자연 종료되므로 안전.

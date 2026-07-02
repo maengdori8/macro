@@ -1490,21 +1490,29 @@ class AutomationApp:
         return ("restart", None)
 
     def _press_skip_candidate(self, name: str, manager: InactiveManager) -> bool:
-        """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식).
+        """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식 — 화면 변화 0).
 
-        - "pm_s": PostMessage로 키보드 s를 창(과 포커스 자식)에 직접 전송
-        - "lt"/"rt": 가상패드 트리거
-        - 그 외: 가상패드 버튼(KEY_TO_GAMEPAD 매핑)
+        - "pm_s":    WM_KEYDOWN(s)을 최상위+포커스 자식+모든 자식 창에 딥 전송
+        - "focus_s": AttachThreadInput+SetFocus로 포커스만 잠깐 붙여 SendInput s
+        - "si_s":    SendInput s(전역 키 상태) — GetAsyncKeyState 폴링 게임용
+        - "lt"/"rt": 가상패드 트리거 / 그 외: 가상패드 버튼(KEY_TO_GAMEPAD 매핑)
         """
         try:
             if name == "pm_s":
                 if manager.hwnd and winapi.win32gui is not None:
                     vk = input_message.KEY_TO_VK.get("s")
                     if vk:
-                        input_message.send_key_to_window(manager.hwnd, vk,
-                                                         press_delay=SKIP_A_TAP_SECONDS)
-                        return True
+                        return input_message.post_key_deep(
+                            manager.hwnd, vk, press_delay=SKIP_A_TAP_SECONDS)
                 return False
+            if name == "focus_s":
+                if manager.hwnd:
+                    return input_message.send_key_focus_attach(
+                        manager.hwnd, input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
+                return False
+            if name == "si_s":
+                return input_message.send_scancode_key(
+                    input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
             if name in input_gamepad.TRIGGER_KEYS:
                 send_gamepad_trigger(name, press_delay=SKIP_A_TAP_SECONDS)
                 return True
