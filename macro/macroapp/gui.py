@@ -38,7 +38,8 @@ from macroapp.config import (
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
-    SKIP_A_HOLD_SECONDS, SKIP_A_SENDINPUT_AFTER_SECONDS,
+    SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS,
+    SKIP_A_SENDINPUT_AFTER_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -158,6 +159,12 @@ class AutomationApp:
         self._skip_seen_since = None    # 현재 스킵이 처음 감지된 시각(안전망 타이머용)
         self._skip_text_streak = 0      # 일반 스킵(OCR) 연속 감지 횟수(단발 노이즈 차단)
         self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start" (A형은 sticky)
+        # (A) SKIP 자동 버튼 탐색·학습 상태 — 게임이 가상 A를 무시해서, 어떤 입력이
+        # 실제로 스킵을 넘기는지 후보를 하나씩 눌러보고 성공한 것을 학습한다.
+        self._skip_a_learned = None     # 학습된(또는 SKIP_A_BUTTON 지정) 입력 이름
+        self._skip_a_sweep_idx = 0      # 다음에 시도할 후보 인덱스
+        self._skip_last_press = None    # (입력이름, 시각) — 에피소드 종료 시 학습 판정용
+        self._skip_learned_fail = 0     # 학습된 입력이 연속 무효면 학습 취소용
         self._gate_fail_log_at = 0.0    # 게이트 미검출 로그 스로틀(과다 로그 방지)
         # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
         self._stop_mode = "off"         # off | rank | score
@@ -1170,6 +1177,11 @@ class AutomationApp:
             self._skip_seen_since = None
             self._skip_text_streak = 0
             self._skip_kind = None
+            # (A) SKIP 버튼 탐색·학습 초기화. SKIP_A_BUTTON이 지정돼 있으면 그걸 바로 사용.
+            self._skip_a_learned = (SKIP_A_BUTTON or "").strip().lower() or None
+            self._skip_a_sweep_idx = 0
+            self._skip_last_press = None
+            self._skip_learned_fail = 0
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
@@ -1460,15 +1472,49 @@ class AutomationApp:
         self._report_status(running=True)
 
     @staticmethod
-    def _skip_a_plan(elapsed: float) -> str:
-        """(A) SKIP 에스컬레이션 결정(순수 로직 — Mac 단위검증용).
+    def _skip_a_choose(learned, sweep_idx: int, elapsed: float):
+        """(A) SKIP 다음 행동 결정(순수 로직 — Mac 단위검증용).
 
-        처음엔 가상패드 A 롱홀드("hold"), SKIP_A_SENDINPUT_AFTER_SECONDS 넘게
-        안 사라지면 전면 전환+키보드 s("sendinput"). 설정이 0이면 항상 "hold".
+        1) 학습된(또는 SKIP_A_BUTTON 지정) 입력이 있으면 그걸 누른다.
+        2) 없으면 후보 목록을 앞에서부터 하나씩(스윕).
+        3) 스윕을 다 돌았으면: 최후수단이 켜져 있고(elapsed 조건 충족) → sendinput,
+           꺼져 있으면(기본) → ("restart", None)로 스윕 재시작(비활성 100% 유지).
         """
-        if SKIP_A_SENDINPUT_AFTER_SECONDS and elapsed >= SKIP_A_SENDINPUT_AFTER_SECONDS:
-            return "sendinput"
-        return "hold"
+        if learned:
+            return ("press", learned)
+        if sweep_idx < len(SKIP_A_SWEEP_BUTTONS):
+            return ("press", SKIP_A_SWEEP_BUTTONS[sweep_idx])
+        if (SKIP_A_SENDINPUT_AFTER_SECONDS
+                and elapsed >= SKIP_A_SENDINPUT_AFTER_SECONDS):
+            return ("sendinput", None)
+        return ("restart", None)
+
+    def _press_skip_candidate(self, name: str, manager: InactiveManager) -> bool:
+        """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식).
+
+        - "pm_s": PostMessage로 키보드 s를 창(과 포커스 자식)에 직접 전송
+        - "lt"/"rt": 가상패드 트리거
+        - 그 외: 가상패드 버튼(KEY_TO_GAMEPAD 매핑)
+        """
+        try:
+            if name == "pm_s":
+                if manager.hwnd and winapi.win32gui is not None:
+                    vk = input_message.KEY_TO_VK.get("s")
+                    if vk:
+                        input_message.send_key_to_window(manager.hwnd, vk,
+                                                         press_delay=SKIP_A_TAP_SECONDS)
+                        return True
+                return False
+            if name in input_gamepad.TRIGGER_KEYS:
+                send_gamepad_trigger(name, press_delay=SKIP_A_TAP_SECONDS)
+                return True
+            btn = input_gamepad.KEY_TO_GAMEPAD.get(name)
+            if btn is None:
+                return False
+            send_gamepad_button(btn, press_delay=SKIP_A_TAP_SECONDS)
+            return True
+        except Exception:
+            return False
 
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
         """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
@@ -1509,10 +1555,22 @@ class AutomationApp:
             return False
 
         if not is_a and not has_text:
-            # 스킵 없음 → 에피소드 종료(상태 리셋).
+            # 스킵 없음 → 에피소드 종료. 종료 직전(1.5초 내)에 누른 후보가 있으면
+            # 그 입력이 스킵을 넘긴 것으로 보고 '학습'한다(다음부턴 바로 그 버튼).
+            if self._skip_kind == "a" and self._skip_last_press is not None:
+                name, t = self._skip_last_press
+                if (name != "sendinput" and time.monotonic() - t <= 1.5
+                        and self._skip_a_learned != name):
+                    self._skip_a_learned = name
+                    self._skip_learned_fail = 0
+                    self.queue_log(
+                        f"[SKIP] 학습 완료: (A) SKIP은 '{name.upper()}' 입력으로 넘어감 — 다음부터 바로 사용"
+                    )
             self._skip_seen_since = None
             self._skip_text_streak = 0
             self._skip_kind = None
+            self._skip_last_press = None
+            self._skip_a_sweep_idx = 0   # 다음 에피소드는 처음부터(학습됐으면 학습값 우선)
             return False
 
         now = time.monotonic()
@@ -1553,12 +1611,9 @@ class AutomationApp:
                 WM_ACTIVATE = 0x0006
                 WA_ACTIVE = 1
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
-            a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             action_label = "입력"
             if press_a:
-                # 홀드가 끝날 때까지 매칭이 스킵 화면을 오클릭하지 않게 정지 시간을 넉넉히.
-                self._skip_active_until = now + SKIP_A_HOLD_SECONDS + 0.8
                 did_click = False
                 if SKIP_A_CLICK and a_center is not None and manager.hwnd:
                     # (선택) 버튼 위치 클릭 — 이 게임은 실측상 안 통해 기본 꺼짐(config).
@@ -1570,22 +1625,35 @@ class AutomationApp:
                     if did_click:
                         action_label = "클릭"
                 if not did_click:
-                    plan = self._skip_a_plan(now - self._skip_seen_since)
-                    if plan == "sendinput" and manager.hwnd:
-                        # 최후수단: 창을 잠깐 전면으로 → '진짜 키보드' s(스캔코드) → 원래 창 복원.
-                        # 가상 A 롱홀드로도 안 사라질 때만 온다(게임이 가상 A를 무시하는 경우).
+                    plan, name = self._skip_a_choose(
+                        self._skip_a_learned,
+                        self._skip_a_sweep_idx,
+                        now - self._skip_seen_since,
+                    )
+                    if plan == "press":
+                        # 후보(또는 학습된) 입력을 탭. 성공 여부는 에피소드 종료 시 학습으로 판정.
+                        if name == self._skip_a_learned:
+                            self._skip_learned_fail += 1
+                            if self._skip_learned_fail > 3:
+                                # 학습된 입력이 3번 연속 무효 → 학습 취소하고 탐색 재개.
+                                self.queue_log(f"[SKIP] '{name.upper()}' 무효 — 자동 탐색 재개")
+                                self._skip_a_learned = None
+                                self._skip_learned_fail = 0
+                        else:
+                            self._skip_a_sweep_idx += 1
+                        if self._press_skip_candidate(name, manager):
+                            self._skip_last_press = (name, time.monotonic())
+                            action_label = f"시도:{name.upper()}"
+                    elif plan == "sendinput" and manager.hwnd:
+                        # 최후수단(기본 꺼짐): 잠깐 전면 전환+진짜 키보드 s → 원래 창 복원.
                         if input_message.press_key_foreground(
                                 manager.hwnd, input_message.SCAN_S, hold=0.12):
+                            self._skip_last_press = ("sendinput", time.monotonic())
                             action_label = "키보드s(전면전환)"
-                        elif a_btn is not None:
-                            # 전면 전환 실패 → 가상 A 롱홀드로 폴백.
-                            send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
-                            action_label = "A 롱홀드(전환실패 폴백)"
-                    elif a_btn is not None:
-                        # 1차: 가상패드 A '길게 홀드' — hold-to-skip 프롬프트는 탭(50ms)으론
-                        # 게이지가 안 차서 안 넘어간다. 릴레이가 사라질 때까지 반복 홀드.
-                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
-                        action_label = "A 롱홀드"
+                    else:
+                        # 탐색을 한 바퀴 다 돌았고 최후수단은 꺼짐 → 처음부터 다시 탐색.
+                        self._skip_a_sweep_idx = 0
+                        action_label = "탐색 재시작"
             if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             self._skip_active_until = max(

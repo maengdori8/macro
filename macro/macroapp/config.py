@@ -205,15 +205,20 @@ SKIP_OCR_INTERVAL_SECONDS = 0.3   # 이 간격마다 SKIP 텍스트 확인(작�
 SKIP_PRESS_DELAY_SECONDS = 0.05   # A·Start 누름 사이 지연
 # '(A) SKIP' 버튼 위치 클릭 시도 — 실측 결과 이 게임은 클릭으론 스킵 안 됨 → 기본 False.
 SKIP_A_CLICK = False
-# (A) SKIP 에스컬레이션:
-# 1차 — 가상패드 A를 '길게 홀드'. FIFA류 스킵 프롬프트는 탭(50ms)이 아니라
-#       홀드(hold-to-skip)인 경우가 많아, 탭만 하면 게이지가 안 차서 "A가 안 먹는" 걸로 보임.
-SKIP_A_HOLD_SECONDS = 1.0
-# 2차(최후수단) — 이 시간 넘게 (A) SKIP이 안 사라지면, 게임 창을 잠깐 전면으로 올려
-#       '진짜 키보드' s(SendInput 스캔코드)를 치고 원래 전면 창을 복원한다(~0.2초).
-#       게임이 RawInput이라 PostMessage 키/비활성 키보드는 원리적으로 안 먹기 때문.
-#       0이면 이 최후수단을 끈다(비활성 100%를 절대 안 깨고 싶을 때).
-SKIP_A_SENDINPUT_AFTER_SECONDS = 2.5
+# (A) SKIP 처리 — 실측: 게임이 가상 START는 인식하지만 가상 A는 무시(탭·1s 홀드 모두).
+# 키보드 s '탭'은 통함 → 프롬프트는 탭 기반이고, 게임이 생각하는 'A 동작'이
+# XInput A와 어긋나 있을 가능성(자체 DirectInput 매핑/컨트롤러 설정)이 높다.
+#
+# 전략: 아래 후보 버튼을 한 사이클에 하나씩 눌러보고(자동 탐색), 스킵이 사라지면
+# 그 버튼을 '학습'해 다음부터 바로 사용한다 — 비활성 100% 유지.
+# 이미 답을 알면 SKIP_A_BUTTON에 지정(예: "b")하면 탐색 없이 바로 그 버튼만 쓴다.
+SKIP_A_BUTTON = ""
+SKIP_A_SWEEP_BUTTONS = ("a", "b", "x", "y", "rb", "lb", "rt", "lt", "down", "pm_s")
+#   pm_s = PostMessage로 키보드 s를 창에 직접 전송(비활성 유지; 일부 UI 레이어는 받음)
+SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
+# 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.
+# 0 = 완전 끄기(기본) → 비활성 100% 보장. 스킵을 못 넘겨도 컷신은 자연 종료되므로 안전.
+SKIP_A_SENDINPUT_AFTER_SECONDS = 0.0
 SKIP_OCR_MAX_WIDTH = 1280         # OCR 전 이 폭으로 축소(0=축소 안 함). 속도용.
 # SKIP을 찾을 영역(프레임 비율). FC온라인 스킵 안내(일반·(A)형)는 항상 화면 하단에 뜨므로
 # 하단 22%만 본다 → skip-A matchTemplate + OCR 비용을 ~5배 줄이고 노이즈도 차단(CPU 대폭↓).
