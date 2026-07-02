@@ -111,7 +111,7 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 
 ## 📝 결정 로그 (왜 이렇게 했는지 — 최신순)
 
-- `2026-07-03` 실측 "가상패드 START 외 전부 무시" 확정 → 스윕 선두에 **비활성 유지 키보드 s 3기법** 추가: `pm_s`(딥 PostMessage — 최상위+포커스자식+전체 자식/CEF), `focus_s`(AttachThreadInput+SetFocus, 화면 변화 0), `si_s`(SendInput 전역 — GetAsyncKeyState 폴링 게임용, 활성 앱에 s 새는 부작용 유의). **이유:** 예전 'PostMessage 키 실패'는 최상위 창에만 보낸 테스트였음 — 자식 창 딥 전송·포커스 어태치·전역 폴링은 미검증 경로. 어느 게 통하는지는 기존 학습 시스템이 자동 판별.
+- `2026-07-03` **깜빡임 0 요구** 반영(자동화라 화면 변화 절대 불가). 적대적 리뷰로 확인: `focus_s`(SetFocus)는 백그라운드 top-level을 activate시켜 **반드시 깜빡임** → 기본 스윕에서 제외(수동 opt-in만). `si_s`(SendInput 전역)는 깜빡임 0이나 **활성 앱에 s 유출** → 제외. 기본 스윕 = 깜빡임0·유출0 4종: `attach_state_s`(AttachThreadInput+SetKeyboardState, GetKeyState 폴링 속이기), `char_s`(WM_KEYDOWN+WM_CHAR+WM_KEYUP 딥, CEF용), `attach_post_s`(큐 공유 후 SetFocus 없이 포커스창에 Post), `pm_s`(WM_KEYDOWN 딥). **경계:** 게임이 RawInput/GetAsyncKeyState 포그라운드 전용이면 유저모드론 원리적 불가(커널 드라이버만) → 첫 (A) SKIP에 창 클래스 덤프 로그(`[SKIP 진단]`)로 CEF(Chrome_RenderWidgetHostHWND) 여부 판별. ⚠️ `send_key_focus_attach` docstring이 '화면 변화 0'이라 거짓 표기했던 것 정정.
 - `2026-07-02` (A) SKIP = **자동 버튼 탐색(스윕)+학습**으로 전환, 전면전환 최후수단은 **기본 꺼짐(=0)**. **이유:** 실측 — 가상 A는 탭·1s 홀드 모두 무시, 클릭 무효, 전면전환+키보드 s '탭'은 통함 → 프롬프트는 탭 기반이고 게임의 'A 동작'이 XInput A와 어긋난 것(자체 매핑/DirectInput 인덱스 추정). 후보(a,b,x,y,rb,lb,rt,lt,down,pm_s)를 사이클당 1개 탭 → 스킵이 사라지면 그 입력을 학습(로그 "[SKIP] 학습 완료"). 사용자가 비활성 100%를 요구 → sendinput은 옵트인(`SKIP_A_SENDINPUT_AFTER_SECONDS>0`)일 때만, 스윕 소진+시간 경과 후. 답을 알면 `SKIP_A_BUTTON="b"`처럼 고정. 스킵 실패해도 컷신은 자연 종료라 안전.
 - `2026-06-29` 등수/티어/점수를 **각각 독립 "마지막 값 유지"**. **이유:** 로비(등수 없음) 읽기가 매칭 때 잡은 등수를 덮어쓰던 버그. 챔/슈챔이면 등수가 무조건 있음.
 - `2026-06-29` 목표 도달 자동 정지(등수 이내 / 점수 이상 / 안 함). 컨센서스로 확정된 값에서만 판정.

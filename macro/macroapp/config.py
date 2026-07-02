@@ -212,14 +212,25 @@ SKIP_A_CLICK = False
 # 전략: 아래 후보 버튼을 한 사이클에 하나씩 눌러보고(자동 탐색), 스킵이 사라지면
 # 그 버튼을 '학습'해 다음부터 바로 사용한다 — 비활성 100% 유지.
 # 이미 답을 알면 SKIP_A_BUTTON에 지정(예: "b")하면 탐색 없이 바로 그 버튼만 쓴다.
+# 실측(2026-07-03): focus_s가 통하지만 포커스 전환 때문에 화면이 깜빡임.
+# → 깜빡임 0인 무포커스 기법(attach_post_s, attach_state_s)을 먼저 재학습하도록 비워둔다.
+# 무깜빡임 기법이 통하면 그게 학습되고, 안 통하면 focus_s로 폴백(깜빡이지만 동작).
 SKIP_A_BUTTON = ""
-# 실측: 가상패드는 START 외 전부 무시 → '비활성 유지 키보드 s' 3기법을 먼저 시도한다.
-#   pm_s    = WM_KEYDOWN(s)을 최상위+포커스 자식+모든 자식 창(CEF 포함)에 딥 전송
-#   focus_s = AttachThreadInput+SetFocus로 화면 변화 없이 포커스만 잠깐 붙여 SendInput s
-#   si_s    = SendInput s(전역 키 상태) — 게임이 GetAsyncKeyState 폴링형이면 비활성에도 먹음
-#             (주의: 그 순간 활성인 다른 앱에 s가 입력될 수 있음 — 학습되면 알려줄 것)
-# 그 뒤 가상패드 후보(a,b,…)를 순회. 통한 입력은 학습돼 다음부턴 바로 사용.
-SKIP_A_SWEEP_BUTTONS = ("pm_s", "focus_s", "si_s",
+# 실측: 가상패드는 START 외 전부 무시. 그리고 사용자 요구 = '화면 변화 0'(자동화).
+# 기본 스윕은 '깜빡임 0 + 유출 0' 방식만 넣는다(적대적 리뷰로 검증한 4기법):
+#   attach_state_s = AttachThreadInput+SetKeyboardState로 GetKeyState 폴링을 속임
+#   char_s         = WM_KEYDOWN+WM_CHAR+WM_KEYUP 딥 전송(CEF 크롬 UI가 WM_CHAR로 받음)
+#   attach_post_s  = AttachThreadInput(큐 공유)+포커스창에 WM_KEYDOWN/UP(SetFocus 없음)
+#   pm_s           = WM_KEYDOWN 딥 전송(WM_CHAR 없이)
+#   (가상패드 후보도 화면 변화 0이라 함께 순회 — 이 게임엔 대부분 무효지만 무해)
+# 통한 입력은 학습돼 다음부턴 바로 사용된다.
+#
+# ⚠️ 스윕에 일부러 뺀 것(부작용 있음, 필요하면 SKIP_A_BUTTON로 수동 지정):
+#   "focus_s" = 확실히 동작하지만 SetFocus가 top-level을 활성화해 '화면이 깜빡임'.
+#   "si_s"    = 깜빡임은 없지만 그 순간 활성인 다른 앱에 's'가 새어 들어갈 수 있음.
+# 진단: 어떤 것도 안 통하면 게임 입력이 RawInput/DirectInput 포그라운드 전용이라
+# 유저모드로는 '비활성+깜빡임0+유출0'이 원리적으로 불가(로그의 창 클래스 덤프로 판별).
+SKIP_A_SWEEP_BUTTONS = ("attach_state_s", "char_s", "attach_post_s", "pm_s",
                         "a", "b", "x", "y", "rb", "lb", "rt", "lt", "down")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 # 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.

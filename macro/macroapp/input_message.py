@@ -61,6 +61,7 @@ KEY_TO_VK: dict[str, int] = {
 
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
 
 # ─── SendInput 스캔코드 키 입력 (전면 전환 최후수단) ───
 # RawInput/DirectInput 게임은 PostMessage 키를 무시하므로, '진짜 키보드'처럼 보이는
@@ -151,13 +152,159 @@ def post_key_deep(hwnd: int, vk_code: int, press_delay: float = 0.08) -> bool:
         return False
 
 
-def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> bool:
-    """창을 전면으로 올리지 않고(화면 변화 0) 키보드 포커스만 잠깐 붙여 키를 보냅니다.
+def post_char_deep(hwnd: int, vk_code: int, char_code: int,
+                   press_delay: float = 0.08) -> bool:
+    """WM_KEYDOWN → WM_CHAR → WM_KEYUP을 최상위+포커스 자식+모든 자식 창에 전송.
 
-    AttachThreadInput으로 우리 스레드를 대상(및 현재 포그라운드) 스레드의 입력 큐에
-    붙인 뒤 SetFocus(hwnd) → SendInput 스캔코드 → 포커스 원복 → 분리.
-    z순서·활성 창은 그대로라 사용자 화면이 깜빡이지 않는다. 메시지/DirectInput
-    키보드 게임에 통하는 경우가 있고, RawInput 포그라운드 게이트면 무시될 수 있다.
+    포커스를 전혀 안 건드려 화면 변화가 0이다(활성 창·z순서 불변 → 깜빡임 없음).
+    FC ONLINE의 CEF(크롬 기반) UI 자식 창은 문자 입력을 WM_CHAR로 받는 경우가 있어,
+    WM_KEYDOWN만 보내던 pm_s가 무시됐어도 이 경로는 통할 수 있다.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    try:
+        _setup_user32_sigs()
+        scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+        lparam_down = (scan_code << 16) | 1
+        lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
+        targets = [int(hwnd)]
+        focus = _get_thread_focus_hwnd(hwnd)
+        if focus:
+            targets.append(int(focus))
+        targets.extend(_get_child_windows(hwnd))
+        targets = _unique_hwnds(targets)
+        if not targets:
+            return False
+        for t in targets:
+            try:
+                winapi.win32gui.PostMessage(t, WM_KEYDOWN, vk_code, lparam_down)
+                winapi.win32gui.PostMessage(t, WM_CHAR, char_code, lparam_down)
+            except Exception:
+                pass
+        time.sleep(max(0.0, press_delay))
+        for t in targets:
+            try:
+                winapi.win32gui.PostMessage(t, WM_KEYUP, vk_code, lparam_up)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def send_key_attach_state(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
+    """AttachThreadInput으로 게임 큐에 붙어 SetKeyboardState로 '키 눌림'을 위조합니다.
+
+    깜빡임 0(포커스·활성 안 건드림), 유출 0(전역 SendInput 아님). 게임이 GetKeyState
+    (동기, 큐-로컬)로 s를 폴링하면 통한다. GetAsyncKeyState/RawInput/DirectInput이면 무시.
+    SetKeyboardState는 '붙은 큐'의 상태를 바꾸므로 AttachThreadInput이 필수 전제.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    tid_cur = k.GetCurrentThreadId()
+    tid_target = 0
+    attached = False
+    try:
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        tid_target = u.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
+        if not tid_target or tid_target == tid_cur:
+            return False
+        attached = bool(u.AttachThreadInput(tid_cur, tid_target, True))
+        if not attached:
+            return False   # 미부착이면 SetKeyboardState가 우리 큐만 바꿔 무의미
+        state = (ctypes.c_ubyte * 256)()
+        u.GetKeyboardState(ctypes.byref(state))
+        state[vk_code & 0xFF] = 0x80    # high bit = 눌림
+        u.SetKeyboardState(ctypes.byref(state))
+        time.sleep(max(0.0, hold))
+        u.GetKeyboardState(ctypes.byref(state))
+        state[vk_code & 0xFF] = 0x00
+        u.SetKeyboardState(ctypes.byref(state))
+        return True
+    except Exception:
+        return False
+    finally:
+        if attached and tid_target:
+            try:
+                u.AttachThreadInput(tid_cur, tid_target, False)
+            except Exception:
+                pass
+
+
+def send_key_attach_post(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
+    """AttachThreadInput으로 큐만 공유(SetFocus 없음)한 뒤, 게임이 이미 자기 포커스로
+    여기는 창(GUITHREADINFO.hwndFocus)에 WM_KEYDOWN/UP을 PostMessage.
+
+    SetFocus를 안 하므로 activate/깜빡임이 없다. 큐가 공유돼 메시지 문맥이 게임 관점과
+    일치 → post_key_deep(비부착)이 놓친 메시지 기반 처리를 잡을 수 있다. RawInput은 무시.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    tid_cur = k.GetCurrentThreadId()
+    tid_target = 0
+    attached = False
+    try:
+        _setup_user32_sigs()
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        tid_target = u.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
+        if not tid_target or tid_target == tid_cur:
+            return False
+        attached = bool(u.AttachThreadInput(tid_cur, tid_target, True))
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        target = int(hwnd)
+        if u.GetGUIThreadInfo(tid_target, ctypes.byref(info)) and info.hwndFocus:
+            target = int(info.hwndFocus)
+        scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+        lparam_down = (scan_code << 16) | 1
+        lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
+        winapi.win32gui.PostMessage(target, WM_KEYDOWN, vk_code, lparam_down)
+        time.sleep(max(0.0, hold))
+        winapi.win32gui.PostMessage(target, WM_KEYUP, vk_code, lparam_up)
+        return True
+    except Exception:
+        return False
+    finally:
+        if attached and tid_target:
+            try:
+                u.AttachThreadInput(tid_cur, tid_target, False)
+            except Exception:
+                pass
+
+
+def dump_window_classes(hwnd: int, limit: int = 60) -> str:
+    """대상 창 + 자식들의 클래스명을 한 줄 문자열로 덤프(진단용).
+
+    'Chrome_RenderWidgetHostHWND'가 보이면 UI가 CEF(크롬) → 메시지 기반 키 주입 가망.
+    안 보이면 네이티브 렌더(입력이 RawInput/DirectInput일 확률↑ → 유저모드 한계).
+    """
+    if winapi.win32gui is None:
+        return "(win32 불가)"
+    try:
+        top = _get_class_name_safe(hwnd)
+        counts: dict[str, int] = {}
+        for ch in _get_child_windows(hwnd, limit=limit):
+            cn = _get_class_name_safe(ch) or "?"
+            counts[cn] = counts.get(cn, 0) + 1
+        parts = [f"{c}×{n}" if n > 1 else c for c, n in sorted(counts.items())]
+        return f"top='{top}' children[{sum(counts.values())}]: " + ", ".join(parts)
+    except Exception as exc:  # noqa: BLE001
+        return f"(덤프 실패: {exc})"
+
+
+def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> bool:
+    """AttachThreadInput+SetFocus로 대상 창에 포커스를 붙여 SendInput 키를 보냅니다.
+
+    ⚠️ 주의(적대적 리뷰 확인): 백그라운드 top-level 창에 SetFocus하면 그 창이
+    activate되어 z순서/활성창이 바뀐다 → '화면 깜빡임'이 발생한다. 즉 이 경로는
+    깜빡임 0이 아니다(focus_s와 동급). 확실히 동작하지만 화면 변화가 있어,
+    기본 스윕에서 제외하고 SKIP_A_BUTTON로 수동 지정할 때만 쓴다(최후수단).
     """
     if winapi.win32gui is None or not hasattr(ctypes, "windll"):
         return False

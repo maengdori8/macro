@@ -165,6 +165,7 @@ class AutomationApp:
         self._skip_a_sweep_idx = 0      # 다음에 시도할 후보 인덱스
         self._skip_last_press = None    # (입력이름, 시각) — 에피소드 종료 시 학습 판정용
         self._skip_learned_fail = 0     # 학습된 입력이 연속 무효면 학습 취소용
+        self._skip_a_dumped = False     # (A) SKIP 첫 감지 시 창 클래스 1회 진단 덤프
         self._gate_fail_log_at = 0.0    # 게이트 미검출 로그 스로틀(과다 로그 방지)
         # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
         self._stop_mode = "off"         # off | rank | score
@@ -1182,6 +1183,7 @@ class AutomationApp:
             self._skip_a_sweep_idx = 0
             self._skip_last_press = None
             self._skip_learned_fail = 0
+            self._skip_a_dumped = False
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
@@ -1492,9 +1494,14 @@ class AutomationApp:
     def _press_skip_candidate(self, name: str, manager: InactiveManager) -> bool:
         """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식 — 화면 변화 0).
 
+        깜빡임 0 · 유출 0(포커스·활성 안 건드림):
+        - "attach_state_s": AttachThreadInput+SetKeyboardState(GetKeyState 폴링 속이기)
+        - "char_s":  WM_KEYDOWN+WM_CHAR+WM_KEYUP 딥 전송(CEF UI가 WM_CHAR로 받는 경우)
+        - "attach_post_s": AttachThreadInput(큐 공유)+포커스창 WM_KEYDOWN/UP(SetFocus 없음)
         - "pm_s":    WM_KEYDOWN(s)을 최상위+포커스 자식+모든 자식 창에 딥 전송
-        - "focus_s": AttachThreadInput+SetFocus로 포커스만 잠깐 붙여 SendInput s
-        - "si_s":    SendInput s(전역 키 상태) — GetAsyncKeyState 폴링 게임용
+        부작용 있음(수동 지정 전용):
+        - "focus_s": AttachThreadInput+SetFocus — 동작하나 창 활성화로 화면 깜빡임
+        - "si_s":    SendInput s(전역) — 깜빡임 0이나 활성 앱에 s 유출 가능
         - "lt"/"rt": 가상패드 트리거 / 그 외: 가상패드 버튼(KEY_TO_GAMEPAD 매핑)
         """
         try:
@@ -1504,6 +1511,25 @@ class AutomationApp:
                     if vk:
                         return input_message.post_key_deep(
                             manager.hwnd, vk, press_delay=SKIP_A_TAP_SECONDS)
+                return False
+            if name == "char_s":
+                if manager.hwnd and winapi.win32gui is not None:
+                    vk = input_message.KEY_TO_VK.get("s")
+                    if vk:
+                        return input_message.post_char_deep(
+                            manager.hwnd, vk, ord("s"), press_delay=SKIP_A_TAP_SECONDS)
+                return False
+            if name == "attach_state_s":
+                vk = input_message.KEY_TO_VK.get("s")
+                if manager.hwnd and vk:
+                    return input_message.send_key_attach_state(
+                        manager.hwnd, vk, hold=SKIP_A_TAP_SECONDS)
+                return False
+            if name == "attach_post_s":
+                vk = input_message.KEY_TO_VK.get("s")
+                if manager.hwnd and vk:
+                    return input_message.send_key_attach_post(
+                        manager.hwnd, vk, hold=SKIP_A_TAP_SECONDS)
                 return False
             if name == "focus_s":
                 if manager.hwnd:
@@ -1622,6 +1648,11 @@ class AutomationApp:
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             action_label = "입력"
             if press_a:
+                # 첫 (A) SKIP에서 창 클래스 1회 진단 — CEF(Chrome_RenderWidgetHostHWND)면
+                # 메시지 주입 가망, 없으면 네이티브(RawInput/DirectInput일 확률↑).
+                if not self._skip_a_dumped and manager.hwnd:
+                    self._skip_a_dumped = True
+                    self.queue_log("[SKIP 진단] " + input_message.dump_window_classes(manager.hwnd))
                 did_click = False
                 if SKIP_A_CLICK and a_center is not None and manager.hwnd:
                     # (선택) 버튼 위치 클릭 — 이 게임은 실측상 안 통해 기본 꺼짐(config).
