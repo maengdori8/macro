@@ -1,13 +1,16 @@
-"""대화형 가상패드 테스트 도구 (X360 ↔ DS4 전환 지원).
+"""대화형 가상패드 테스트 도구 (X360 ↔ DS4, 게임 자동 전면화).
 
-FC ONLINE을 띄워둔 채 실행하고, 콘솔에서 키를 눌러 가상 버튼을 하나씩 쏴 봅니다.
-게임 화면을 보면서 어떤 모드/버튼에서 반응(커서 이동·확인·일시정지)이 있는지 확인하세요.
+FC ONLINE을 띄워둔 채 실행하고, 콘솔에서 키를 누르면:
+  ① 도구가 FC ONLINE 창을 자동으로 '전면(활성)'으로 올리고
+  ② 그 상태에서 가상 버튼을 쏜 뒤
+  ③ 콘솔로 포커스를 되돌려 줍니다.
+→ 버튼은 항상 게임이 활성인 순간에 나가므로 "활성인데 A가 되나"를 정확히 검증합니다.
 
-핵심 시나리오 2가지:
-  ① 패드 할당 가설 — 9(START)를 먼저 눌러 게임이 패드를 인지하게 한 '직후' 1(A)을
-     눌러보세요. EA류 게임은 패드 할당 전엔 START만 받고 A/B/X/Y를 무시하기도 합니다.
-  ② DirectInput 가설 — m 으로 DS4 모드로 바꾼 뒤 같은 테스트를 반복하세요.
-     게임이 XInput이 아니라 DirectInput만 읽으면 DS4(×버튼)는 먹힐 수 있습니다.
+핵심 시나리오:
+  p : START 탭 → 0.6초 → A 탭 (한 번의 활성 세션에서 연속 실행)
+      EA류 게임은 패드 '할당' 전엔 START만 받고 A/B/X/Y를 무시하기도 합니다.
+  m : X360 ↔ DS4 전환 — 게임이 XInput 대신 DirectInput만 읽으면 DS4(×)가 먹힐 수 있음.
+  b : 전면화 끄기/켜기 — 끄면 비활성(백그라운드) 상태에서의 인식을 테스트.
 """
 
 import sys
@@ -25,6 +28,70 @@ try:
     import msvcrt  # Windows 콘솔 즉시 키 입력
 except Exception:  # noqa: BLE001
     msvcrt = None
+
+import ctypes
+from ctypes import wintypes
+
+_user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
+_kernel32 = ctypes.windll.kernel32 if hasattr(ctypes, "windll") else None
+
+GAME_TITLE_TOKENS = ("fc online", "fc 온라인")
+
+
+def _window_title(hwnd) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    _user32.GetWindowTextW(hwnd, buf, 256)
+    return buf.value or ""
+
+
+def find_game_window() -> int:
+    """제목에 'FC ONLINE'이 들어간 보이는 최상위 창을 찾습니다(없으면 0)."""
+    if _user32 is None:
+        return 0
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_cb(hwnd, _l):
+        if _user32.IsWindowVisible(hwnd):
+            t = _window_title(hwnd).lower()
+            if t and any(tok in t for tok in GAME_TITLE_TOKENS):
+                found.append(int(hwnd))
+                return False
+        return True
+
+    try:
+        _user32.EnumWindows(enum_cb, 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return found[0] if found else 0
+
+
+def _alt_tap() -> None:
+    """ALT 탭 — SetForegroundWindow 포그라운드 잠금 해제 트릭."""
+    KEYEVENTF_KEYUP = 0x0002
+    _user32.keybd_event(0x12, 0, 0, 0)
+    _user32.keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0)
+
+
+def bring_to_front(hwnd: int) -> bool:
+    if _user32 is None or not hwnd:
+        return False
+    if _user32.GetForegroundWindow() == hwnd:
+        return True
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    _user32.SetForegroundWindow(hwnd)
+    if _user32.GetForegroundWindow() == hwnd:
+        return True
+    _alt_tap()
+    _user32.SetForegroundWindow(hwnd)
+    return _user32.GetForegroundWindow() == hwnd
+
+
+def console_hwnd() -> int:
+    if _kernel32 is None:
+        return 0
+    return int(_kernel32.GetConsoleWindow() or 0)
 
 
 class X360:
@@ -123,34 +190,57 @@ class DS4:
 
 HELP = """
 ────────────────────────────────────────────────────────
- [모드: {mode}]   (m: X360↔DS4 전환, ?: 도움말, q: 종료)
+ [모드: {mode}]  [전면화: {fg}]
   1=A/×   2=B/○   3=X/□   4=Y/△
   5=LB/L1 6=RB/R1 7=LT/L2 8=RT/R2
-  9=START/OPTIONS   0=BACK/SHARE
-  u=↑  j=↓  h=←  k=→   (방향패드)
-  같은 키를 Shift와 함께(!@#$…) 누르면 1초 '길게 홀드'
-  ex) ① 9 누르고 곧바로 1 → START로 패드 인지시킨 직후 A 테스트
-      ② m 으로 DS4 전환 후 1 → DirectInput 게임에서 × 버튼 테스트
+  9=START/OPTIONS   0=BACK/SHARE   u/j/h/k=방향패드
+  Shift+키 = 1초 '길게 홀드'
+  p = START→(0.6s)→A 콤보 (패드 할당 가설 판별, 한 활성 세션에서)
+  m = X360↔DS4 전환    b = 전면화 켜기/끄기(끄면 비활성 테스트)
+  ? = 도움말    q = 종료
+ 사용법: 이 콘솔에서 키만 누르세요. 도구가 게임을 잠깐 활성으로 올려
+ 버튼을 쏜 뒤 콘솔로 돌아옵니다. 게임 화면의 반응을 관찰하세요.
 ────────────────────────────────────────────────────────"""
 
-# Shift+숫자 → 길게 홀드 매핑 (미국 배열 기준)
 SHIFT_MAP = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
              "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
              "U": "u", "J": "j", "H": "h", "K": "k"}
 
 
 def main() -> None:
-    print("가상패드 대화형 테스트를 시작합니다. FC ONLINE 창을 화면에 보이게 두세요.")
+    game = find_game_window()
+    if game:
+        print(f"게임 창 발견: '{_window_title(game)}' — 키 입력 시 자동으로 활성화 후 버튼을 쏩니다.")
+    else:
+        print("[경고] FC ONLINE 창을 못 찾았습니다. 게임을 켜고 다시 실행하거나,")
+        print("       b 로 전면화를 끈 채(비활성 모드) 테스트할 수 있습니다.")
+
     pads = {"x360": None, "ds4": None}
     mode = "x360"
     pads[mode] = X360()
-    print(HELP.format(mode=pads[mode].name))
+    use_fg = True
+    print(HELP.format(mode=pads[mode].name, fg="켜짐" if use_fg else "꺼짐(비활성 테스트)"))
+
+    con = console_hwnd()
 
     def read_key() -> str:
         if msvcrt is not None:
-            ch = msvcrt.getwch()
-            return ch
+            return msvcrt.getwch()
         return (input("키 입력 후 엔터: ").strip() or " ")[0]
+
+    def fire(fn) -> None:
+        """게임을 활성으로 올린 상태에서 fn()을 실행하고 콘솔로 복귀합니다."""
+        nonlocal game
+        if use_fg:
+            if not game or (_user32 and not _user32.IsWindow(game)):
+                game = find_game_window()
+            if game and not bring_to_front(game):
+                print("[경고] 게임 창 전면화 실패 — 그대로 쏩니다(비활성 상태).")
+            time.sleep(0.30)   # 게임이 포커스/입력장치를 인지할 시간
+        fn()
+        if use_fg and con:
+            time.sleep(0.10)
+            bring_to_front(con)
 
     while True:
         ch = read_key()
@@ -158,31 +248,55 @@ def main() -> None:
             print("종료합니다.")
             return
         if ch in ("?", "/"):
-            print(HELP.format(mode=pads[mode].name))
+            print(HELP.format(mode=pads[mode].name, fg="켜짐" if use_fg else "꺼짐(비활성 테스트)"))
+            continue
+        if ch in ("b", "B"):
+            use_fg = not use_fg
+            print(f">>> 전면화 {'켜짐 — 활성 상태 테스트' if use_fg else '꺼짐 — 비활성(백그라운드) 테스트'}")
             continue
         if ch in ("m", "M"):
-            mode = "ds4" if mode == "x360" else "x360"
-            if pads[mode] is None:
+            new_mode = "ds4" if mode == "x360" else "x360"
+            if pads[new_mode] is None:
                 try:
-                    pads[mode] = DS4() if mode == "ds4" else X360()
+                    pads[new_mode] = DS4() if new_mode == "ds4" else X360()
                 except Exception as e:  # noqa: BLE001
-                    print(f"[오류] {mode} 패드 생성 실패: {e}")
-                    mode = "ds4" if mode == "x360" else "x360"
+                    print(f"[오류] {new_mode} 패드 생성 실패: {e}")
                     continue
-            print(f"\n>>> 모드 전환: {pads[mode].name} (패드가 새로 연결됐습니다 — 게임이 인지할 시간을 1~2초 주세요)")
+            mode = new_mode
+            print(f"\n>>> 모드 전환: {pads[mode].name} (새 패드 연결 — 게임이 인지하도록 1~2초 기다렸다 테스트)")
+            continue
+        if ch in ("p", "P"):
+            pad = pads[mode]
+
+            def combo():
+                n1 = pad.press("9", 0.15)
+                print(f">>> [{pad.name}] {n1} 탭")
+                time.sleep(0.6)
+                n2 = pad.press("1", 0.15)
+                print(f">>> [{pad.name}] {n2} 탭 (START 직후 — 반응을 보세요!)")
+
+            fire(combo)
             continue
         hold = 0.15
         if ch in SHIFT_MAP:
             ch = SHIFT_MAP[ch]
             hold = 1.0
-        try:
-            name = pads[mode].press(ch, hold)
-        except Exception as e:  # noqa: BLE001
-            print(f"[오류] 입력 실패: {e}")
+        key = ch
+        pad = pads[mode]
+        if key not in pad.buttons and key not in ("7", "8") and not (hasattr(pad, "dpad") and key in getattr(pad, "dpad", {})):
             continue
-        if name:
-            tag = "길게(1s)" if hold >= 1.0 else "탭"
-            print(f">>> [{pads[mode].name}] {name} {tag}")
+
+        def single():
+            try:
+                name = pad.press(key, hold)
+            except Exception as e:  # noqa: BLE001
+                print(f"[오류] 입력 실패: {e}")
+                return
+            if name:
+                tag = "길게(1s)" if hold >= 1.0 else "탭"
+                print(f">>> [{pad.name}] {name} {tag}")
+
+        fire(single)
 
 
 if __name__ == "__main__":
