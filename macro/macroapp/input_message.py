@@ -40,6 +40,12 @@ def _setup_user32_sigs() -> None:
     u.MapVirtualKeyW.argtypes = [ctypes.c_uint, ctypes.c_uint]
     u.GetWindowThreadProcessId.restype = wintypes.DWORD
     u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+    # HWND 반환 함수는 restype를 HWND로 지정해야 x64에서 64비트 포인터가 안 잘린다
+    # (기본 c_int면 절단→포커스 복원이 엉뚱한 창으로 가는 잠재 버그).
+    u.GetFocus.restype = wintypes.HWND
+    u.SetFocus.restype = wintypes.HWND
+    u.SetFocus.argtypes = [wintypes.HWND]
+    u.GetForegroundWindow.restype = wintypes.HWND
     _USER32_SIG_READY = True
 
 KEY_TO_VK: dict[str, int] = {
@@ -296,6 +302,80 @@ def dump_window_classes(hwnd: int, limit: int = 60) -> str:
         return f"top='{top}' children[{sum(counts.values())}]: " + ", ".join(parts)
     except Exception as exc:  # noqa: BLE001
         return f"(덤프 실패: {exc})"
+
+
+def _pick_focus_child(hwnd: int) -> int:
+    """SetFocus 대상으로 쓸 '자식 창'을 고른다(top-level activation 회피용).
+
+    우선순위: 게임이 이미 포커스로 보는 자식(GUITHREADINFO.hwndFocus) →
+    CEF 렌더 위젯(Chrome_RenderWidgetHostHWND) → 첫 자식. 없으면 0.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return 0
+    try:
+        _setup_user32_sigs()
+        tid = ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if tid and ctypes.windll.user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            f = int(info.hwndFocus or 0)
+            if f and f != int(hwnd) and _is_child_or_same(int(hwnd), f):
+                return f
+        children = _get_child_windows(hwnd)
+        for ch in children:
+            if "renderwidgethost" in _get_class_name_safe(ch).lower():
+                return int(ch)
+        return int(children[0]) if children else 0
+    except Exception:
+        return 0
+
+
+def send_key_focus_child(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> bool:
+    """focus_s와 같은 원리(AttachThreadInput+포커스+SendInput)지만, top-level이 아니라
+    '자식 창'에 SetFocus한다 → 깜빡임(top-level activate)을 피한다.
+
+    자식 창은 '활성' 개념이 없어 SetFocus해도 WM_ACTIVATE/캡션 하이라이트/z순서 변화가
+    없다(화면 변화 0). focus_s가 전면화 없이 동작한 사실이 '큐 포커스 + SendInput'만으로
+    게임이 s를 받는다는 증거이므로, 자식 포커스로도 전달될 것으로 기대한다.
+    자식 창이 없으면(OSR CEF 등) 대상이 없어 False → 스윕이 다음 후보로.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    attached = []
+    tid_cur = k.GetCurrentThreadId()
+    try:
+        _setup_user32_sigs()
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        child = _pick_focus_child(hwnd)
+        if not child:
+            return False   # 자식 창 없음 → top-level SetFocus는 깜빡이므로 하지 않는다
+        tid_target = u.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), None)
+        fg = u.GetForegroundWindow()
+        tid_fg = u.GetWindowThreadProcessId(wintypes.HWND(fg), None) if fg else 0
+        for tid in {tid_target, tid_fg}:
+            if tid and tid != tid_cur and u.AttachThreadInput(tid_cur, tid, True):
+                attached.append(tid)
+        prev_focus = u.GetFocus()
+        u.SetFocus(int(child))
+        time.sleep(0.02)
+        ok = send_scancode_key(scan, hold)
+        try:
+            if prev_focus:
+                u.SetFocus(prev_focus)
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception:
+        return False
+    finally:
+        for tid in attached:
+            try:
+                u.AttachThreadInput(tid_cur, tid, False)
+            except Exception:
+                pass
 
 
 def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> bool:

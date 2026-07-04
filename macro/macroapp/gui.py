@@ -1519,6 +1519,11 @@ class AutomationApp:
                         return input_message.post_char_deep(
                             manager.hwnd, vk, ord("s"), press_delay=SKIP_A_TAP_SECONDS)
                 return False
+            if name == "focus_child_s":
+                if manager.hwnd:
+                    return input_message.send_key_focus_child(
+                        manager.hwnd, input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
+                return False
             if name == "attach_state_s":
                 vk = input_message.KEY_TO_VK.get("s")
                 if manager.hwnd and vk:

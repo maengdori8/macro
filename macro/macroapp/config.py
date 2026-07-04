@@ -230,7 +230,10 @@ SKIP_A_BUTTON = ""
 #   "si_s"    = 깜빡임은 없지만 그 순간 활성인 다른 앱에 's'가 새어 들어갈 수 있음.
 # 진단: 어떤 것도 안 통하면 게임 입력이 RawInput/DirectInput 포그라운드 전용이라
 # 유저모드로는 '비활성+깜빡임0+유출0'이 원리적으로 불가(로그의 창 클래스 덤프로 판별).
-SKIP_A_SWEEP_BUTTONS = ("attach_state_s", "char_s", "attach_post_s", "pm_s",
+# focus_child_s = focus_s와 같은 원리인데 자식 창에 SetFocus → 깜빡임 없이 동작 기대.
+# 실측상 focus_s(top-level)만 먹혔으므로, 그 '먹히는 원리'를 유지하되 깜빡임만 제거한 이게
+# 1순위. 안 되면(자식 창 없음 등) 나머지 무깜빡임 기법으로 순회.
+SKIP_A_SWEEP_BUTTONS = ("focus_child_s", "attach_state_s", "char_s", "attach_post_s", "pm_s",
                         "a", "b", "x", "y", "rb", "lb", "rt", "lt", "down")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 # 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.
