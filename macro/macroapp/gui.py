@@ -39,7 +39,7 @@ from macroapp.config import (
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
     SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS,
-    SKIP_A_SENDINPUT_AFTER_SECONDS,
+    SKIP_A_SENDINPUT_AFTER_SECONDS, SKIP_A_FOREGROUND, SKIP_A_HOLD_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -1653,51 +1653,24 @@ class AutomationApp:
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             action_label = "입력"
             if press_a:
-                # 첫 (A) SKIP에서 창 클래스 1회 진단 — CEF(Chrome_RenderWidgetHostHWND)면
-                # 메시지 주입 가망, 없으면 네이티브(RawInput/DirectInput일 확률↑).
-                if not self._skip_a_dumped and manager.hwnd:
-                    self._skip_a_dumped = True
-                    self.queue_log("[SKIP 진단] " + input_message.dump_window_classes(manager.hwnd))
-                did_click = False
-                if SKIP_A_CLICK and a_center is not None and manager.hwnd:
-                    # (선택) 버튼 위치 클릭 — 이 게임은 실측상 안 통해 기본 꺼짐(config).
-                    fx = x1 + int(a_center[0])
-                    fy = y1 + int(a_center[1])
-                    start_pos = manager.get_virtual_start_position(fx, fy)
-                    sx, sy = start_pos if start_pos else (fx, fy)
-                    did_click = bool(manager.post_curved_click(sx, sy, fx, fy))
-                    if did_click:
-                        action_label = "클릭"
-                if not did_click:
-                    plan, name = self._skip_a_choose(
-                        self._skip_a_learned,
-                        self._skip_a_sweep_idx,
-                        now - self._skip_seen_since,
-                    )
-                    if plan == "press":
-                        # 후보(또는 학습된) 입력을 탭. 성공 여부는 에피소드 종료 시 학습으로 판정.
-                        if name == self._skip_a_learned:
-                            self._skip_learned_fail += 1
-                            if self._skip_learned_fail > 3:
-                                # 학습된 입력이 3번 연속 무효 → 학습 취소하고 탐색 재개.
-                                self.queue_log(f"[SKIP] '{name.upper()}' 무효 — 자동 탐색 재개")
-                                self._skip_a_learned = None
-                                self._skip_learned_fail = 0
-                        else:
-                            self._skip_a_sweep_idx += 1
-                        if self._press_skip_candidate(name, manager):
-                            self._skip_last_press = (name, time.monotonic())
-                            action_label = f"시도:{name.upper()}"
-                    elif plan == "sendinput" and manager.hwnd:
-                        # 최후수단(기본 꺼짐): 잠깐 전면 전환+진짜 키보드 s → 원래 창 복원.
-                        if input_message.press_key_foreground(
-                                manager.hwnd, input_message.SCAN_S, hold=0.12):
-                            self._skip_last_press = ("sendinput", time.monotonic())
-                            action_label = "키보드s(전면전환)"
+                # 실측 결론: 컷신 스킵은 게임이 '전면'일 때만 A를 읽는다(배경 불가).
+                # SKIP_A_FOREGROUND=True면 사용자의 알트탭을 자동화: 게임 잠깐 전면화 →
+                # A 홀드(hold-to-skip) → 원래 창 복원. 화면이 잠깐 바뀌지만 스킵은 된다.
+                a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
+                if SKIP_A_FOREGROUND and manager.hwnd and a_btn is not None:
+                    prev = input_message.get_foreground_hwnd()
+                    if input_message.bring_foreground(manager.hwnd):
+                        time.sleep(0.10)   # FIFA가 전면을 인지할 시간
+                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)  # A 홀드
+                        if prev and prev != int(manager.hwnd):
+                            input_message.bring_foreground(prev)   # 원래 창 복원
+                        action_label = "전면화+A홀드"
                     else:
-                        # 탐색을 한 바퀴 다 돌았고 최후수단은 꺼짐 → 처음부터 다시 탐색.
-                        self._skip_a_sweep_idx = 0
-                        action_label = "탐색 재시작"
+                        action_label = "전면화 실패"
+                    self._skip_active_until = time.monotonic() + 0.5
+                else:
+                    # 기본(꺼짐): 스킵 안 함 → 컷신 자연 종료 대기(화면 변화 0 유지).
+                    action_label = "스킵끔(자연종료 대기)"
             if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             self._skip_active_until = max(

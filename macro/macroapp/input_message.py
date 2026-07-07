@@ -422,6 +422,30 @@ def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> 
                 pass
 
 
+def get_foreground_hwnd() -> int:
+    """현재 전면(포그라운드) 창 HWND. 실패 시 0."""
+    if not hasattr(ctypes, "windll"):
+        return 0
+    try:
+        _setup_user32_sigs()
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def bring_foreground(hwnd: int) -> bool:
+    """대상 창을 전면으로 올린다(공개 래퍼). 실패 시 False."""
+    if winapi.win32gui is None or not hasattr(ctypes, "windll") or not hwnd:
+        return False
+    try:
+        _setup_user32_sigs()
+        if not winapi.win32gui.IsWindow(int(hwnd)):
+            return False
+        return _bring_to_foreground(int(hwnd))
+    except Exception:
+        return False
+
+
 def _bring_to_foreground(hwnd: int) -> bool:
     """대상 창을 전면으로. 포그라운드 잠금에 막히면 ALT 트릭으로 한 번 더 시도."""
     u = ctypes.windll.user32
