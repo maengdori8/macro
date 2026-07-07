@@ -248,7 +248,10 @@ SKIP_A_SENDINPUT_AFTER_SECONDS = 0.0
 # 기본 False(화면 변화 0 유지, 스킵은 안 함 → 컷신 자연 종료 대기).
 # 스킵을 원하면 True로: 컷신마다 ~1초 FIFA가 전면에 번쩍인다(피할 수 없음, 스킵의 대가).
 SKIP_A_FOREGROUND = False
-SKIP_A_HOLD_SECONDS = 1.0         # 전면화 중 A를 홀드하는 시간(hold-to-skip). ~1초 권장.
+SKIP_A_HOLD_SECONDS = 1.0         # 전면화 중 A를 홀드하는 시간(hold-to-skip). 스킵되는 최소값으로
+                                  # 낮출수록 번쩍임이 짧아짐(예: 0.6). 너무 낮으면 게이지가 안 참.
+SKIP_A_FG_COOLDOWN_SECONDS = 2.5  # 전면화-홀드 사이 최소 간격. (A) SKIP이 떠 있는 내내 매 사이클
+                                  # 전면화하면 FIFA가 반복해서 번쩍이므로, 컷신당 사실상 1번만 하게 막음.
 SKIP_OCR_MAX_WIDTH = 1280         # OCR 전 이 폭으로 축소(0=축소 안 함). 속도용.
 # SKIP을 찾을 영역(프레임 비율). FC온라인 스킵 안내(일반·(A)형)는 항상 화면 하단에 뜨므로
 # 하단 22%만 본다 → skip-A matchTemplate + OCR 비용을 ~5배 줄이고 노이즈도 차단(CPU 대폭↓).

@@ -40,6 +40,7 @@ from macroapp.config import (
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
     SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS,
     SKIP_A_SENDINPUT_AFTER_SECONDS, SKIP_A_FOREGROUND, SKIP_A_HOLD_SECONDS,
+    SKIP_A_FG_COOLDOWN_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -166,6 +167,7 @@ class AutomationApp:
         self._skip_last_press = None    # (입력이름, 시각) — 에피소드 종료 시 학습 판정용
         self._skip_learned_fail = 0     # 학습된 입력이 연속 무효면 학습 취소용
         self._skip_a_dumped = False     # (A) SKIP 첫 감지 시 창 클래스 1회 진단 덤프
+        self._skip_fg_last_at = 0.0     # 마지막 전면화-홀드 시각(쿨다운 — 반복 번쩍임 방지)
         self._gate_fail_log_at = 0.0    # 게이트 미검출 로그 스로틀(과다 로그 방지)
         # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
         self._stop_mode = "off"         # off | rank | score
@@ -1184,6 +1186,7 @@ class AutomationApp:
             self._skip_last_press = None
             self._skip_learned_fail = 0
             self._skip_a_dumped = False
+            self._skip_fg_last_at = 0.0
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
@@ -1658,15 +1661,21 @@ class AutomationApp:
                 # A 홀드(hold-to-skip) → 원래 창 복원. 화면이 잠깐 바뀌지만 스킵은 된다.
                 a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
                 if SKIP_A_FOREGROUND and manager.hwnd and a_btn is not None:
-                    prev = input_message.get_foreground_hwnd()
-                    if input_message.bring_foreground(manager.hwnd):
-                        time.sleep(0.10)   # FIFA가 전면을 인지할 시간
-                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)  # A 홀드
-                        if prev and prev != int(manager.hwnd):
-                            input_message.bring_foreground(prev)   # 원래 창 복원
-                        action_label = "전면화+A홀드"
+                    # 컷신당 사실상 1번만 전면화(쿨다운). 안 그러면 (A) SKIP이 떠 있는 내내
+                    # 매 사이클 전면화해 FIFA가 반복 번쩍인다.
+                    if now - self._skip_fg_last_at >= SKIP_A_FG_COOLDOWN_SECONDS:
+                        self._skip_fg_last_at = now
+                        prev = input_message.get_foreground_hwnd()
+                        if input_message.bring_foreground(manager.hwnd):
+                            time.sleep(0.10)   # FIFA가 전면을 인지할 시간
+                            send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)  # A 홀드
+                            if prev and prev != int(manager.hwnd):
+                                input_message.bring_foreground(prev)   # 원래 창 복원
+                            action_label = "전면화+A홀드"
+                        else:
+                            action_label = "전면화 실패"
                     else:
-                        action_label = "전면화 실패"
+                        action_label = "전면화 쿨다운 대기"
                     self._skip_active_until = time.monotonic() + 0.5
                 else:
                     # 기본(꺼짐): 스킵 안 함 → 컷신 자연 종료 대기(화면 변화 0 유지).
