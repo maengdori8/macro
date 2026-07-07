@@ -322,6 +322,8 @@ class X360:
             "3": ("X", B.XUSB_GAMEPAD_X), "4": ("Y", B.XUSB_GAMEPAD_Y),
             "5": ("LB", B.XUSB_GAMEPAD_LEFT_SHOULDER), "6": ("RB", B.XUSB_GAMEPAD_RIGHT_SHOULDER),
             "9": ("START", B.XUSB_GAMEPAD_START), "0": ("BACK", B.XUSB_GAMEPAD_BACK),
+            "[": ("L3(왼스틱클릭=게임BACK)", B.XUSB_GAMEPAD_LEFT_THUMB),
+            "]": ("R3(오른스틱클릭=게임START)", B.XUSB_GAMEPAD_RIGHT_THUMB),
             "u": ("DPAD_UP", B.XUSB_GAMEPAD_DPAD_UP), "j": ("DPAD_DOWN", B.XUSB_GAMEPAD_DPAD_DOWN),
             "h": ("DPAD_LEFT", B.XUSB_GAMEPAD_DPAD_LEFT), "k": ("DPAD_RIGHT", B.XUSB_GAMEPAD_DPAD_RIGHT),
         }
@@ -352,6 +354,7 @@ class DS4:
             "3": ("사각(□)", B.DS4_BUTTON_SQUARE), "4": ("삼각(△)", B.DS4_BUTTON_TRIANGLE),
             "5": ("L1", B.DS4_BUTTON_SHOULDER_LEFT), "6": ("R1", B.DS4_BUTTON_SHOULDER_RIGHT),
             "9": ("OPTIONS", B.DS4_BUTTON_OPTIONS), "0": ("SHARE", B.DS4_BUTTON_SHARE),
+            "[": ("L3", B.DS4_BUTTON_THUMB_LEFT), "]": ("R3", B.DS4_BUTTON_THUMB_RIGHT),
         }
         D = vg.DS4_DPAD_DIRECTIONS
         self.dpad = {"u": ("↑", D.DS4_BUTTON_DPAD_NORTH), "j": ("↓", D.DS4_BUTTON_DPAD_SOUTH),
@@ -387,8 +390,8 @@ HELP = """
    . focus_s(★됨·깜빡임 비교용)     d 창 클래스 진단 덤프
    ※ 대문자(Z X C V N)·Shift = 같은 기법을 '1초 홀드'(hold-to-skip 대응)
  ── 가상패드(전역·무깜빡임) ──
-   1 A  2 B  3 X  4 Y   5 LB 6 RB 7 LT 8 RT   9 START 0 BACK
-   u ↑  j ↓  h ←  k →      Shift+키 = 1초 홀드
+   1 A  2 B  3 X  4 Y   5 LB 6 RB 7 LT 8 RT   9 START 0 BACK   [ L3(=게임BACK)  ] R3(=게임START·스킵후보)
+   u ↑  j ↓  h ←  k →      Shift+키 = 1초 홀드 ({ }=[ ]홀드)
    m X360↔DS4   p START→A콤보   ? 도움말   q 종료
  사용법: 이 콘솔에서 키만 누르세요. (A) SKIP 화면에서 눌러보고
  게임이 넘어가는 기법을 찾으세요. 넘어가면 그게 정답입니다.
@@ -396,6 +399,7 @@ HELP = """
 
 SHIFT_MAP = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
              "&": "7", "*": "8", "(": "9", ")": "0",
+             "{": "[", "}": "]",
              "U": "u", "J": "j", "H": "h", "K": "k"}
 
 
