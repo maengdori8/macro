@@ -276,6 +276,9 @@ KBD_TESTS = {
     ".": ("focus_s(최상위 SetFocus·깜빡임)", focus_s),
 }
 
+# 대문자·Shift = 같은 기법을 '1초 홀드'로 (hold-to-skip 스킵 대응). <,> = Shift+,.
+KBD_HOLD_MAP = {"Z": "z", "X": "x", "C": "c", "V": "v", "N": "n", "<": ",", ">": "."}
+
 
 def _window_title(hwnd):
     b = ctypes.create_unicode_buffer(256)
@@ -382,6 +385,7 @@ HELP = """
    z si_s(전역)   x pm_s(자식Post)   c char_s(WM_CHAR)
    v state_s(키상태)  n post_s(Attach+Post)  , child_s(자식포커스)
    . focus_s(★됨·깜빡임 비교용)     d 창 클래스 진단 덤프
+   ※ 대문자(Z X C V N)·Shift = 같은 기법을 '1초 홀드'(hold-to-skip 대응)
  ── 가상패드(전역·무깜빡임) ──
    1 A  2 B  3 X  4 Y   5 LB 6 RB 7 LT 8 RT   9 START 0 BACK
    u ↑  j ↓  h ←  k →      Shift+키 = 1초 홀드
@@ -433,20 +437,24 @@ def main():
             mode = nm
             print(f"\n>>> 패드 전환: {pads[mode].name} (게임이 인지하도록 1~2초 대기 후 테스트)")
             continue
-        # ── 비활성 키보드 s 기법 ──
-        if ch in KBD_TESTS:
+        # ── 비활성 키보드 s 기법 (소문자=탭 0.12s / 대문자·Shift=홀드 1초) ──
+        kbd_key, kbd_hold = ch, 0.12
+        if ch in KBD_HOLD_MAP:
+            kbd_key, kbd_hold = KBD_HOLD_MAP[ch], 1.0
+        if kbd_key in KBD_TESTS:
             game = find_game_window()
             if not game:
                 print(">>> [키보드] 게임창을 못 찾음 — 게임을 켜세요.")
                 continue
-            label, fn = KBD_TESTS[ch]
+            label, fn = KBD_TESTS[kbd_key]
             try:
-                ok = fn(game, 0.12)
+                ok = fn(game, kbd_hold)
             except Exception as e:  # noqa: BLE001
                 print(f">>> [키보드] {label} 오류: {e}")
                 continue
-            note = "" if ch != "." else "  ← 이건 깜빡임 있음(비교 기준)"
-            print(f">>> [키보드 s] {label} → {'전송' if ok else '실패/불가'}{note}")
+            note = "  ← 이건 깜빡임 있음(비교 기준)" if kbd_key == "." else ""
+            tag = "홀드1s" if kbd_hold >= 1.0 else "탭"
+            print(f">>> [키보드 s] {label} {tag} → {'전송' if ok else '실패/불가'}{note}")
             continue
         if ch in ("p", "P"):
             pad = pads[mode]
