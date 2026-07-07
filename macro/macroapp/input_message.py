@@ -422,6 +422,31 @@ def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> 
                 pass
 
 
+def spoof_window_active(hwnd: int, active: bool = True) -> bool:
+    """전면화 없이(화면 변화 0) 대상 창에 '활성' 메시지를 주입해 포커스가 있다고 속입니다.
+
+    WM_ACTIVATEAPP(앱 전체 활성) + WM_ACTIVATE(창 활성) + WM_NCACTIVATE를 Post.
+    엔진이 '스레드-로컬 활성 플래그'로 입력 게이팅을 하면(SDL #4450류) 이걸로 속아
+    비활성 상태에서도 컷신 스킵 입력을 받는다. GetForegroundWindow를 직접 보면 안 통함.
+    실제 z순서/포그라운드는 안 바뀌므로 깜빡임이 없다.
+    """
+    if winapi.win32gui is None:
+        return False
+    WM_ACTIVATE = 0x0006
+    WM_ACTIVATEAPP = 0x001C
+    WM_NCACTIVATE = 0x0086
+    WA_ACTIVE = 1
+    w = 1 if active else 0
+    try:
+        winapi.win32gui.PostMessage(int(hwnd), WM_ACTIVATEAPP, w, 0)
+        winapi.win32gui.PostMessage(int(hwnd), WM_NCACTIVATE, w, 0)
+        winapi.win32gui.PostMessage(int(hwnd), WM_ACTIVATE,
+                                    WA_ACTIVE if active else 0, 0)
+        return True
+    except Exception:
+        return False
+
+
 def get_foreground_hwnd() -> int:
     """현재 전면(포그라운드) 창 HWND. 실패 시 0."""
     if not hasattr(ctypes, "windll"):

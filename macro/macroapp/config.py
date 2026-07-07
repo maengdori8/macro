@@ -247,6 +247,12 @@ SKIP_A_SENDINPUT_AFTER_SECONDS = 0.0
 # 화면이 잠깐 바뀌지만 스킵은 확실히 되고 큰 시간손해를 없앤다.
 # 기본 False(화면 변화 0 유지, 스킵은 안 함 → 컷신 자연 종료 대기).
 # 스킵을 원하면 True로: 컷신마다 ~1초 FIFA가 전면에 번쩍인다(피할 수 없음, 스킵의 대가).
+# 배경 활성 스푸핑(깜빡임 0): WM_ACTIVATEAPP+WM_ACTIVATE로 '나 활성' 속인 뒤 A 홀드.
+# 엔진이 스레드-로컬 활성 플래그로 게이팅하면 배경에서 스킵됨(SDL #4450류). 통하면 이걸로 끝.
+# GetForegroundWindow 직접 확인 게임이면 무효 → 아래 전면화 폴백으로.
+SKIP_A_ACTIVATE_SPOOF = True
+SKIP_A_FOREGROUND_AFTER_SECONDS = 2.0  # 스푸핑으로 이 시간 넘게 안 사라지면 전면화 폴백 시도
+                                       # (SKIP_A_FOREGROUND=True일 때만).
 SKIP_A_FOREGROUND = False
 SKIP_A_HOLD_SECONDS = 1.0         # 전면화 중 A를 홀드하는 시간(hold-to-skip). 스킵되는 최소값으로
                                   # 낮출수록 번쩍임이 짧아짐(예: 0.6). 너무 낮으면 게이지가 안 참.
