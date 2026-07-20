@@ -62,6 +62,49 @@ def find_template_center(
             )
         return None, 0.0
 
+    def remember(top_left_x: int, top_left_y: int) -> None:
+        # 게임 UI 타겟은 같은 해상도에서 같은 위치에 반복 등장하는 경우가 많습니다.
+        # 좌표 두 개만 기억하고, 위치가 달라지면 아래 전체 화면 탐색으로 즉시 폴백합니다.
+        target._last_match = (
+            (screen_height, screen_width),
+            (int(top_left_x), int(top_left_y)),
+        )
+        target._last_match_misses = 0
+
+    cached = getattr(target, "_last_match", None)
+    if cached is not None and cached[0] == (screen_height, screen_width):
+        cached_x, cached_y = cached[1]
+        cache_margin = max(12, max(target_width, target_height) // 3)
+        cx1 = max(0, cached_x - cache_margin)
+        cy1 = max(0, cached_y - cache_margin)
+        cx2 = min(screen_width, cached_x + target_width + cache_margin)
+        cy2 = min(screen_height, cached_y + target_height + cache_margin)
+        cached_roi = screen_gray[cy1:cy2, cx1:cx2]
+        if cached_roi.shape[1] >= target_width and cached_roi.shape[0] >= target_height:
+            try:
+                cached_result = cv2.matchTemplate(
+                    cached_roi, target.image_gray, cv2.TM_CCOEFF_NORMED
+                )
+                _, cached_max, _, cached_loc = cv2.minMaxLoc(cached_result)
+                cached_score = float(cached_max)
+                if cached_score >= target.threshold:
+                    top_left_x = cached_loc[0] + cx1
+                    top_left_y = cached_loc[1] + cy1
+                    remember(top_left_x, top_left_y)
+                    return (
+                        top_left_x + target_width // 2,
+                        top_left_y + target_height // 2,
+                    ), cached_score
+            except cv2.error:
+                pass
+        misses = int(getattr(target, "_last_match_misses", 0)) + 1
+        target._last_match_misses = misses
+        if misses >= 3:
+            target._last_match = None
+    elif cached is not None:
+        target._last_match = None
+        target._last_match_misses = 0
+
     f = DOWNSCALE_FACTOR
     small_tw = target_width // f
     small_th = target_height // f
@@ -73,6 +116,7 @@ def find_template_center(
         if score < target.threshold:
             return None, score
         top_left_x, top_left_y = max_location
+        remember(top_left_x, top_left_y)
         return (top_left_x + target_width // 2, top_left_y + target_height // 2), score
 
     if not hasattr(target, '_small_gray') or target._small_gray is None:
@@ -110,6 +154,7 @@ def find_template_center(
         if score < target.threshold:
             return None, score
         top_left_x, top_left_y = max_location
+        remember(top_left_x, top_left_y)
         return (top_left_x + target_width // 2, top_left_y + target_height // 2), score
 
     roi = screen_gray[roi_y1:roi_y2, roi_x1:roi_x2]
@@ -128,4 +173,5 @@ def find_template_center(
     center_x = top_left_x + target_width // 2
     center_y = top_left_y + target_height // 2
 
+    remember(top_left_x, top_left_y)
     return (center_x, center_y), score

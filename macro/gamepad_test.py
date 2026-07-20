@@ -391,7 +391,7 @@ HELP = """
    ※ 대문자(Z X C V N)·Shift = 같은 기법을 '1초 홀드'(hold-to-skip 대응)
  ── 가상패드(전역·무깜빡임) ──
    1 A  2 B  3 X  4 Y   5 LB 6 RB 7 LT 8 RT   9 START 0 BACK   [ L3(=게임BACK)  ] R3(=게임START·스킵후보)
-   u ↑  j ↓  h ←  k →      Shift+키 = 1초 홀드 ({ }=[ ]홀드)
+   u ↑  j ↓  h ←  k →      Shift+키 = 1초 홀드 ({{ }}=[ ]홀드)
    m X360↔DS4   p START→A콤보   ? 도움말   q 종료
  사용법: 이 콘솔에서 키만 누르세요. (A) SKIP 화면에서 눌러보고
  게임이 넘어가는 기법을 찾으세요. 넘어가면 그게 정답입니다.

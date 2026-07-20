@@ -1,7 +1,7 @@
 from __future__ import annotations
 import ctypes
 from ctypes import wintypes
-from typing import Any, Optional
+from typing import Optional
 
 from macroapp import winapi
 from macroapp.config import (

@@ -1,6 +1,5 @@
 from __future__ import annotations
 import threading
-import time
 from typing import Any, Optional
 
 import cv2
@@ -8,19 +7,20 @@ import numpy as np
 
 from macroapp import winapi
 from macroapp.logging_util import LogCallback
-from macroapp.config import WGC_FIRST_FRAME_TIMEOUT_SECONDS
-
 class WGCCaptureEngine:
     """windows-capture 기반 비동기 WGC 창 캡처 엔진입니다."""
 
     def __init__(self, hwnd: int, logger: Optional[LogCallback] = None):
         self.hwnd = int(hwnd)
         self.logger = logger or print
+        # 아직 소비되지 않은 최신 grayscale 프레임 하나만 유지합니다.
         self.latest_frame: Optional[np.ndarray] = None
+        self.last_frame_size: Optional[tuple[int, int]] = None
         self.capture: Optional[Any] = None
         self.capture_control: Optional[Any] = None
         self.frame_lock = threading.Lock()
         self.first_frame_event = threading.Event()
+        self.frame_ready_event = threading.Event()
         self.closed_event = threading.Event()
         self.started = False
         self.logged_first_frame = False
@@ -33,17 +33,31 @@ class WGCCaptureEngine:
         self.logger(message)
 
     def on_frame_arrived(self, frame: winapi.Frame, _capture_control: Any = None) -> None:
-        """WGC 캡처 스레드에서 프레임이 도착할 때마다 최신 BGRA 배열을 저장합니다."""
+        """WGC 프레임을 grayscale 단일 슬롯에 넣고 밀린 프레임은 버립니다."""
 
         try:
+            # 소비자가 아직 이전 프레임을 처리 중이면 새 전체 프레임 복사/변환을 생략합니다.
+            # 큐를 쌓지 않고 가장 이른 다음 프레임을 받으므로 RAM과 지연이 함께 제한됩니다.
+            with self.frame_lock:
+                if self.latest_frame is not None:
+                    return
+
             image_bgra = np.asarray(frame.frame_buffer)
             if image_bgra.size == 0:
                 return
+            if image_bgra.ndim != 3 or image_bgra.shape[2] < 3:
+                return
 
-            frame_copy = image_bgra.copy()
+            # BGRA 전체 복사(픽셀당 4바이트) 대신 독립된 grayscale(1바이트)만 생성합니다.
+            color_code = cv2.COLOR_BGRA2GRAY if image_bgra.shape[2] >= 4 else cv2.COLOR_BGR2GRAY
+            gray = cv2.cvtColor(image_bgra, color_code)
             with self.frame_lock:
-                self.latest_frame = frame_copy
+                if self.latest_frame is not None:
+                    return
+                self.latest_frame = gray
+                self.last_frame_size = (int(frame.width), int(frame.height))
                 self._frame_seq += 1
+                self.frame_ready_event.set()
 
             self.first_frame_event.set()
             if not self.logged_first_frame:
@@ -58,6 +72,7 @@ class WGCCaptureEngine:
         """WGC 캡처 세션이 닫혔을 때 호출됩니다."""
 
         self.closed_event.set()
+        self.frame_ready_event.set()  # 대기 중인 소비자를 즉시 깨워 종료 상태를 확인시킵니다.
         self.log("[캡처 종료] WGC 캡처 세션이 닫혔습니다.")
 
     def start_capture(self) -> bool:
@@ -77,11 +92,13 @@ class WGCCaptureEngine:
                 self.stop_capture()
 
         self.first_frame_event.clear()
+        self.frame_ready_event.clear()
         self.closed_event.clear()
         self.logged_first_frame = False
 
         with self.frame_lock:
             self.latest_frame = None
+            self.last_frame_size = None
 
         capture_kwargs: dict[str, object] = {
             "cursor_capture": False,
@@ -122,27 +139,26 @@ class WGCCaptureEngine:
             return False
 
     def get_latest_frame(self, timeout: float = 0.0) -> Optional[np.ndarray]:
-        """최신 WGC 프레임을 BGRA NumPy 배열로 반환합니다. 새 프레임이 없으면 None."""
+        """소비되지 않은 최신 grayscale 프레임을 반환합니다. 없으면 None."""
 
-        if timeout > 0 and not self.first_frame_event.wait(timeout):
+        if timeout > 0 and not self.frame_ready_event.wait(timeout):
             return None
 
         with self.frame_lock:
             if self.latest_frame is None:
+                self.frame_ready_event.clear()
                 return None
-            if self._frame_seq == self._last_consumed_seq:
-                return None  # 동일 프레임 재처리 방지
+            frame = self.latest_frame
+            self.latest_frame = None
             self._last_consumed_seq = self._frame_seq
-            return self.latest_frame
+            self.frame_ready_event.clear()
+            return frame
 
     def get_frame_size(self) -> Optional[tuple[int, int]]:
         """최신 WGC 프레임의 (width, height)를 반환합니다."""
 
         with self.frame_lock:
-            if self.latest_frame is None:
-                return None
-            height, width = self.latest_frame.shape[:2]
-            return int(width), int(height)
+            return self.last_frame_size
 
     def stop_capture(self) -> None:
         """실행 중인 WGC 세션을 안전하게 중지합니다."""
@@ -152,9 +168,11 @@ class WGCCaptureEngine:
         self.capture = None
         self.started = False
         self.first_frame_event.clear()
+        self.frame_ready_event.clear()
 
         with self.frame_lock:
             self.latest_frame = None
+            self.last_frame_size = None
 
         if capture_control is None:
             return

@@ -3,9 +3,8 @@ import ctypes
 import os
 import platform
 import time
-from typing import Any, Optional
+from typing import Optional
 
-import cv2
 import numpy as np
 
 from macroapp import winapi
@@ -14,6 +13,7 @@ from macroapp.config import (
     TargetImage,
     DWMWA_EXTENDED_FRAME_BOUNDS,
     FC_ONLINE_PROCESS_NAMES,
+    WGC_FRAME_WAIT_SECONDS,
     WGC_FIRST_FRAME_TIMEOUT_SECONDS,
 )
 from macroapp.capture import WGCCaptureEngine
@@ -168,7 +168,7 @@ class InactiveManager:
         self.last_capture_wait_log_time = 0.0
         self.virtual_mouse_wgc_pos: Optional[tuple[int, int]] = None
         self.virtual_mouse_client_pos: Optional[tuple[int, int]] = None
-        self._cached_gray: Optional[np.ndarray] = None
+        self._received_frame = False
 
         if winapi.WIN32_IMPORT_ERROR is not None:
             self.log("[오류] pywin32 모듈을 불러올 수 없습니다.")
@@ -299,7 +299,7 @@ class InactiveManager:
             self.log(f"[오류] 창 검색 중 문제가 발생했습니다: {exc}")
             return False
 
-        self.log(f"[창 검색] FC Online 프로세스를 검색했습니다.")
+        self.log("[창 검색] FC Online 프로세스를 검색했습니다.")
 
         if minimized_matches:
             self.log("[제외] 최소화된 창은 지원하지 않아 제외했습니다.")
@@ -360,15 +360,15 @@ class InactiveManager:
             self.log(f"[주의] 대상 창 상태 확인 중 오류가 발생했습니다: {exc}")
             return False
 
-    def capture_client_area(self) -> Optional[np.ndarray]:
+    def capture_client_area(self, *, window_validated: bool = False) -> Optional[np.ndarray]:
         """
-        WGC 최신 프레임을 가져와 OpenCV 템플릿 매칭용 GrayScale 배열로 반환합니다.
+        WGC 최신 프레임을 OpenCV 템플릿 매칭용 GrayScale 배열로 반환합니다.
 
-        windows-capture는 별도 프레임 스레드에서 BGRA 버퍼를 밀어주므로,
-        여기서는 WGCCaptureEngine의 최신 프레임만 읽고 cv2.cvtColor로 변환합니다.
+        windows-capture 콜백이 소비되지 않은 프레임 하나만 grayscale로 변환하므로,
+        여기서는 추가 전체 프레임 복사나 색상 변환 없이 배열을 넘깁니다.
         """
 
-        if not self.is_valid_window():
+        if not window_validated and not self.is_valid_window():
             self.stop_capture()
             return None
 
@@ -387,34 +387,32 @@ class InactiveManager:
             self.stop_capture()
             return None
 
-        frame_bgra = self.capture_engine.get_latest_frame(
-            timeout=WGC_FIRST_FRAME_TIMEOUT_SECONDS,
+        gray = self.capture_engine.get_latest_frame(
+            timeout=(
+                WGC_FRAME_WAIT_SECONDS
+                if self._received_frame
+                else WGC_FIRST_FRAME_TIMEOUT_SECONDS
+            ),
         )
-        if frame_bgra is None:
+        if gray is None:
             # 새 프레임이 없으면(화면 정지) None을 반환해 재매칭을 건너뜁니다.
             # 같은 픽셀은 매칭 결과도 같으므로 재매칭은 순수 낭비이며,
             # 새 프레임이 도착하면 그때 다시 매칭합니다. → 정지 화면 CPU ~0.
-            if self._cached_gray is None:
+            if not self._received_frame:
                 self._log_capture_wait("[대기] WGC 첫 프레임을 아직 받지 못했습니다.")
             return None
 
-        if frame_bgra.ndim != 3 or frame_bgra.shape[2] < 3:
-            self.log(f"[캡처 오류] 지원하지 않는 WGC 프레임 형태입니다: {frame_bgra.shape}")
+        if gray.ndim != 2:
+            self.log(f"[캡처 오류] 지원하지 않는 WGC 프레임 형태입니다: {gray.shape}")
             return None
 
-        sampled = frame_bgra[::16, ::16, :3]
+        sampled = gray[::16, ::16]
         if sampled.max() == 0:
             self._log_capture_wait("[캡처 오류] WGC 캡처 이미지가 완전히 검은색입니다.")
             return None
 
-        try:
-            frame_bgr = frame_bgra[:, :, :3]
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            self._cached_gray = gray
-            return gray
-        except Exception as exc:
-            self.log(f"[캡처 오류] WGC 프레임을 GrayScale로 변환하지 못했습니다: {exc}")
-            return None
+        self._received_frame = True
+        return gray
 
     def stop_capture(self) -> None:
         """실행 중인 WGC 캡처 엔진을 정리합니다."""
@@ -424,7 +422,7 @@ class InactiveManager:
 
         self.capture_engine.stop_capture()
         self.capture_engine = None
-        self._cached_gray = None
+        self._received_frame = False
 
     def _log_capture_wait(self, message: str) -> None:
         """반복 루프에서 같은 캡처 메시지가 과도하게 쌓이지 않게 합니다."""
@@ -627,7 +625,6 @@ class InactiveManager:
             message_id = _resolve_win32_message(target.message)
             constants = winapi._require_win32con()
             use_send_message = target.message_mode == "sendmessage"
-            mode_name = "SendMessage" if use_send_message else "PostMessage"
             target_hwnds = self._resolve_message_targets(target)
 
             if not target_hwnds:

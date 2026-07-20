@@ -83,8 +83,6 @@ def post_curved_click(
 ) -> bool:
     """클라이언트 좌표 기준으로 베지에 곡선 이동 후 왼쪽 클릭 메시지를 보냅니다."""
 
-    log = logger or print
-
     if winapi.win32gui is None:
         raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
     if not winapi.win32gui.IsWindow(hwnd):

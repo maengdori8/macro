@@ -4,13 +4,12 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
 
 from macroapp.logging_util import LogCallback
-from macroapp.paths import app_dir
 
 FC_ONLINE_PROCESS_NAMES = ["fczf"]
 
@@ -161,6 +160,9 @@ WINDOW_RETRY_SECONDS = 2.0
 
 # WGC 세션 시작 뒤 첫 프레임을 기다리는 최대 시간입니다.
 WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
+# 시작 후에는 이벤트를 이 시간까지만 기다려 정지 요청에도 빠르게 반응합니다.
+# 새 프레임이 오면 즉시 깨어나므로 폴링 지연이나 불필요한 busy loop가 없습니다.
+WGC_FRAME_WAIT_SECONDS = 0.1
 
 # ─── 등수/티어/점수 OCR (공식경기 감독모드 화면에서 내 정보 읽기) ───
 # 내 팀=왼쪽, 상대=오른쪽. 내 점수/티어는 왼쪽 팀 아래에 뜬다(예: '2229점', '챌린저 3부 감독').
@@ -233,9 +235,23 @@ SKIP_A_BUTTON = ""
 # focus_child_s = focus_s와 같은 원리인데 자식 창에 SetFocus → 깜빡임 없이 동작 기대.
 # 실측상 focus_s(top-level)만 먹혔으므로, 그 '먹히는 원리'를 유지하되 깜빡임만 제거한 이게
 # 1순위. 안 되면(자식 창 없음 등) 나머지 무깜빡임 기법으로 순회.
-SKIP_A_SWEEP_BUTTONS = ("focus_child_s", "attach_state_s", "char_s", "attach_post_s", "pm_s",
-                        "a", "b", "x", "y", "rb", "lb", "rt", "lt", "down")
+# 실측 확정(사용자): 컷신 스킵을 넘기는 입력은 오직 '키보드 s' 또는 '게임패드 A' 뿐이다.
+# (다른 버튼·키·pause 메뉴로는 안 넘어감.) 게다가 hold-to-skip — 전면에서 'A 홀드'로 넘어감.
+# → 스윕이 훑는 축은 '다른 동작'이 아니라 [스킵 입력=s/A] × [전달 경로] × [탭 vs 홀드].
+#   원래 스윕은 0.15초 '탭'만 했다 → hold-to-skip이면 탭은 원리상 못 넘김. '홀드'가 빠진 축.
+# 배경 유일 희망 = s를 '메시지'로 딥 전송(게임이 메시지 계층=CEF로 스킵을 읽을 때만 통함).
+#   게임패드 A는 값이 배경에 도달하나 컷신은 전면 게이팅이라 실패 예상(그래도 사실 확인용 포함).
+#   si_s(SendInput 전역)·focus_s(top-level SetFocus)는 유출/깜빡임이라 스윕 제외(수동 지정만).
+# 전달 경로: char_s=WM_CHAR 딥(CEF), attach_state_s=GetKeyState 속이기, attach_post_s=큐공유+Post,
+#   pm_s=WM_KEYDOWN 딥, focus_child_s=자식 SetFocus(무깜빡임 기대). '*_hold'=1초 홀드.
+SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
+                        "attach_state_s_hold", "attach_state_s",
+                        "attach_post_s_hold", "attach_post_s",
+                        "pm_s_hold", "pm_s",
+                        "focus_child_s_hold", "focus_child_s",
+                        "a_hold", "a")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
+SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-skip 대응)
 # 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.
 # 0 = 완전 끄기(기본) → 비활성 100% 보장. 스킵을 못 넘겨도 컷신은 자연 종료되므로 안전.
 SKIP_A_SENDINPUT_AFTER_SECONDS = 0.0
@@ -606,7 +622,17 @@ def load_targets(
             log("       파일이 손상되었거나 OpenCV가 읽을 수 없는 형식일 수 있습니다.")
             return None
 
+        # 화면 캡처와 동일한 BGR→gray 변환식을 유지해야 템플릿 점수가 달라지지 않습니다.
         target.image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        # 첫 인식 프레임에서 각 템플릿을 따로 축소하지 않도록 시작 시 한 번만 준비합니다.
+        height, width = target.image_gray.shape[:2]
+        small_width = width // DOWNSCALE_FACTOR
+        small_height = height // DOWNSCALE_FACTOR
+        target._small_gray = (
+            cv2.resize(target.image_gray, (small_width, small_height), interpolation=cv2.INTER_AREA)
+            if small_width >= 4 and small_height >= 4
+            else None
+        )
         source = "커스텀 캡처" if is_custom else "기본"
         log(
             f"[이미지 로드] {target.filename} ({source}), "

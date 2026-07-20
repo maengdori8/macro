@@ -1,17 +1,14 @@
 from __future__ import annotations
 import io
-import os
 import platform
 import queue
 import random
-import sys
 import threading
 import time
 import traceback
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import scrolledtext
 from typing import Any, Optional
 
 import cv2
@@ -28,7 +25,6 @@ from macroapp import input_gamepad
 from macroapp import input_message
 from macroapp.input_gamepad import _get_gamepad, send_gamepad_button, send_gamepad_trigger
 from macroapp.paths import APP_VERSION, app_dir
-from macroapp.logging_util import LogCallback
 from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
@@ -37,8 +33,8 @@ from macroapp.config import (
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
-    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS, SKIP_A_CLICK,
-    SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS,
+    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
+    SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS, SKIP_A_SWEEP_HOLD_SECONDS,
     SKIP_A_SENDINPUT_AFTER_SECONDS, SKIP_A_FOREGROUND, SKIP_A_HOLD_SECONDS,
     SKIP_A_FG_COOLDOWN_SECONDS, SKIP_A_ACTIVATE_SPOOF, SKIP_A_FOREGROUND_AFTER_SECONDS,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
@@ -96,6 +92,7 @@ class AutomationApp:
         self.target_definitions = load_target_definitions(self.base_dir)
         self.target_names = tuple(target.name for target in self.target_definitions)
         self.threshold_lock = threading.Lock()
+        self._threshold_revision = 0
         self.threshold_values = {
             target.name: target.threshold
             for target in self.target_definitions
@@ -141,11 +138,13 @@ class AutomationApp:
 
         self.stop_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
-        self.ui_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.ui_queue: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
+        self._last_queued_status: Optional[str] = None
         self.closing = False
         # 상태 전송 전용 단일 워커 풀 (스레드 누적 방지)
         self._status_executor = ThreadPoolExecutor(max_workers=1)
         self._log_dirty = False
+        self._log_lock = threading.Lock()
         self._close_deadline = 0.0
         # (등수, 상태메시지)를 한 튜플로 묶어 스레드 간 원자적으로 교체/읽기.
         self._rank_state = (None, "실행 중")
@@ -182,7 +181,7 @@ class AutomationApp:
         # OCR 박스(프레임 비율 l,t,r,b) — 시작 시 UI에서 스냅샷(스레드 안전)
         self._ocr_box = (0.35, 0.50, 0.48, 0.64)
 
-        # 로그 파일 초기화
+        # UI 로그는 만들지 않고 진단 파일만 유지합니다.
         self._log_file = None
         try:
             log_dir = self.base_dir / "logs"
@@ -628,7 +627,7 @@ class AutomationApp:
         )
         self.status_label.pack(side=tk.LEFT)
 
-        # 시작/정지 패널을 로그보다 먼저 pack해, 높이가 부족하면 로그가 먼저 줄어듭니다.
+        # UI 로그 패널은 제거하고 상태와 제어만 간결하게 표시합니다.
         control_panel = self._panel(right_column, "시작/정지 & ETC")
         control_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
         button_row = tk.Frame(control_panel, bg=c["panel"])
@@ -638,30 +637,14 @@ class AutomationApp:
         self.stop_button = self._accent_button(button_row, "정지 (F9/ESC)", self.stop_automation)
         self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
-        log_panel = self._panel(right_column, "로그")
-        log_panel.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-        self.log_text = scrolledtext.ScrolledText(
-            log_panel,
-            height=10,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            bg=c["input"],
-            fg=c["text"],
-            insertbackground=c["text"],
-            relief=tk.FLAT,
-            bd=0,
-            font=("Consolas", 9),
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
         self._refresh_all_target_rows()
 
     def _tick_clock(self) -> None:
-        """오른쪽 패널의 시계를 0.5초마다 갱신합니다."""
+        """오른쪽 패널의 시계를 1초마다 갱신합니다."""
 
         self.clock_var.set(time.strftime("%H:%M:%S"))
         if not self.closing:
-            self.root.after(500, self._tick_clock)
+            self.root.after(1000, self._tick_clock)
 
     # ── 타겟 템플릿 캡처 ──
 
@@ -955,6 +938,7 @@ class AutomationApp:
         threshold = max(0.0, min(1.0, float(value)))
         with self.threshold_lock:
             self.threshold_values[target_name] = threshold
+            self._threshold_revision += 1
         self.threshold_label_vars[target_name].set(f"{threshold:.2f}")
 
     def get_threshold(self, target_name: str) -> float:
@@ -963,11 +947,21 @@ class AutomationApp:
         with self.threshold_lock:
             return float(self.threshold_values.get(target_name, 0.8))
 
-    def apply_current_thresholds(self, targets: list[TargetImage]) -> None:
-        """UI에서 조절한 임계값을 TargetImage 목록에 반영합니다."""
+    def apply_current_thresholds(
+        self,
+        targets: list[TargetImage],
+        applied_revision: int = -1,
+    ) -> int:
+        """변경된 경우에만 UI 임계값을 타겟 목록에 한 번에 반영합니다."""
 
+        with self.threshold_lock:
+            revision = self._threshold_revision
+            if revision == applied_revision:
+                return revision
+            values = self.threshold_values.copy()
         for target in targets:
-            target.threshold = self.get_threshold(target.name)
+            target.threshold = float(values.get(target.name, target.threshold))
+        return revision
 
     def stop_automation(self) -> None:
         """종료 버튼, F9, ESC로 자동화를 안전하게 중단 요청합니다."""
@@ -1093,13 +1087,14 @@ class AutomationApp:
 
     def _close_log_file(self) -> None:
         """로그 파일을 안전하게 닫습니다."""
-        if self._log_file is not None:
-            try:
-                self._log_file.write(f"세션 종료: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                self._log_file.close()
-            except Exception:
-                pass
-            self._log_file = None
+        with self._log_lock:
+            if self._log_file is not None:
+                try:
+                    self._log_file.write(f"세션 종료: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    self._log_file.close()
+                except Exception:
+                    pass
+                self._log_file = None
 
     def _destroy_when_worker_stops(self) -> None:
         """작업 스레드가 끝난 뒤 tkinter 창을 닫습니다."""
@@ -1195,6 +1190,7 @@ class AutomationApp:
 
             # 상태 전송 타이머
             last_status_report = 0.0
+            applied_threshold_revision = -1
 
             # 시작 상태 전송 (단일 워커 풀)
             self._report_status(running=True, message="매크로 시작")
@@ -1205,7 +1201,10 @@ class AutomationApp:
                 if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
                     last_status_report = now_mono
                     self._report_status(running=True)
-                self.apply_current_thresholds(targets)
+                if applied_threshold_revision != self._threshold_revision:
+                    applied_threshold_revision = self.apply_current_thresholds(
+                        targets, applied_threshold_revision
+                    )
 
                 if requires_window and manager is not None and not manager.is_valid_window():
                     self.queue_status("대상 창 검색 중")
@@ -1223,13 +1222,15 @@ class AutomationApp:
                 if capture_mode == "region":
                     screen_gray = self.capture_screen_region(region)
                 elif manager is not None:
-                    screen_gray = manager.capture_client_area()
+                    screen_gray = manager.capture_client_area(window_validated=True)
                 else:
                     self.queue_log("[오류] 캡처 관리자가 준비되지 않았습니다.")
                     screen_gray = None
 
                 if screen_gray is None:
-                    self.interruptible_sleep(LOOP_SLEEP_SECONDS)
+                    # WGC는 새 프레임 이벤트를 이미 기다렸으므로 추가 polling sleep이 필요 없습니다.
+                    if capture_mode != "wgc":
+                        self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
                 # 최신 프레임을 OCR 워커 스레드에 공개. (seq, gray) 튜플 대입은 원자적이라
@@ -1497,63 +1498,69 @@ class AutomationApp:
     def _press_skip_candidate(self, name: str, manager: InactiveManager) -> bool:
         """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식 — 화면 변화 0).
 
-        깜빡임 0 · 유출 0(포커스·활성 안 건드림):
-        - "attach_state_s": AttachThreadInput+SetKeyboardState(GetKeyState 폴링 속이기)
-        - "char_s":  WM_KEYDOWN+WM_CHAR+WM_KEYUP 딥 전송(CEF UI가 WM_CHAR로 받는 경우)
-        - "attach_post_s": AttachThreadInput(큐 공유)+포커스창 WM_KEYDOWN/UP(SetFocus 없음)
-        - "pm_s":    WM_KEYDOWN(s)을 최상위+포커스 자식+모든 자식 창에 딥 전송
-        부작용 있음(수동 지정 전용):
-        - "focus_s": AttachThreadInput+SetFocus — 동작하나 창 활성화로 화면 깜빡임
-        - "si_s":    SendInput s(전역) — 깜빡임 0이나 활성 앱에 s 유출 가능
-        - "lt"/"rt": 가상패드 트리거 / 그 외: 가상패드 버튼(KEY_TO_GAMEPAD 매핑)
+        실측 확정: 컷신 스킵 입력은 '키보드 s' 또는 '게임패드 A' 뿐(다른 키·버튼 무효).
+        따라서 현재 키는 s만 쓰지만, 전달 경로 분기와 홀드 변형을 깔끔히 다루려고
+        '<방법>_<키>'(vk 기반)로 일반화해 둔다.
+        - 키보드 '<방법>_s' (딥 메시지 — 게임이 메시지 계층=CEF로 s를 읽을 때 배경 통과):
+          · "pm_s":           WM_KEYDOWN 딥 전송(최상위+포커스 자식+모든 자식 창)
+          · "char_s":         WM_KEYDOWN+WM_CHAR+WM_KEYUP 딥(CEF UI가 WM_CHAR로 받음)
+          · "attach_state_s": AttachThreadInput+SetKeyboardState(GetKeyState 폴링 속이기)
+          · "attach_post_s":  AttachThreadInput(큐 공유)+포커스창 WM_KEYDOWN/UP
+        - 스캔코드 전용('s' 고정): "focus_child_s", "focus_s"(깜빡임), "si_s"(유출)
+        - "a": 가상패드 A(vgamepad A=게임 A 확정) / "lt"/"rt": 트리거
+        - "*_hold": 위 입력을 1초 홀드(hold-to-skip 대응 — 탭으론 원리상 못 넘김)
         """
+        # '*_hold' 후보 = 같은 버튼을 길게 홀드(hold-to-skip 프롬프트 대응).
+        # 이름에서 '_hold'를 떼어 실제 버튼을 얻고, 탭 대신 홀드 길이를 쓴다.
+        hold_secs = SKIP_A_TAP_SECONDS
+        if name.endswith("_hold"):
+            name = name[:-len("_hold")]
+            hold_secs = SKIP_A_SWEEP_HOLD_SECONDS
         try:
-            if name == "pm_s":
-                if manager.hwnd and winapi.win32gui is not None:
-                    vk = input_message.KEY_TO_VK.get("s")
-                    if vk:
-                        return input_message.post_key_deep(
-                            manager.hwnd, vk, press_delay=SKIP_A_TAP_SECONDS)
-                return False
-            if name == "char_s":
-                if manager.hwnd and winapi.win32gui is not None:
-                    vk = input_message.KEY_TO_VK.get("s")
-                    if vk:
-                        return input_message.post_char_deep(
-                            manager.hwnd, vk, ord("s"), press_delay=SKIP_A_TAP_SECONDS)
-                return False
+            # 스캔코드 전용(아무 키 일반화 불가 — 's' 고정).
             if name == "focus_child_s":
                 if manager.hwnd:
                     return input_message.send_key_focus_child(
-                        manager.hwnd, input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
-                return False
-            if name == "attach_state_s":
-                vk = input_message.KEY_TO_VK.get("s")
-                if manager.hwnd and vk:
-                    return input_message.send_key_attach_state(
-                        manager.hwnd, vk, hold=SKIP_A_TAP_SECONDS)
-                return False
-            if name == "attach_post_s":
-                vk = input_message.KEY_TO_VK.get("s")
-                if manager.hwnd and vk:
-                    return input_message.send_key_attach_post(
-                        manager.hwnd, vk, hold=SKIP_A_TAP_SECONDS)
+                        manager.hwnd, input_message.SCAN_S, hold=hold_secs)
                 return False
             if name == "focus_s":
                 if manager.hwnd:
                     return input_message.send_key_focus_attach(
-                        manager.hwnd, input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
+                        manager.hwnd, input_message.SCAN_S, hold=hold_secs)
                 return False
             if name == "si_s":
                 return input_message.send_scancode_key(
-                    input_message.SCAN_S, hold=SKIP_A_TAP_SECONDS)
+                    input_message.SCAN_S, hold=hold_secs)
+            # 일반화 키보드: '<방법>_<키>'(vk 기반). 스캔코드 분기를 안 탄 키보드 후보 처리.
+            # 현재 키는 s만 사용(스킵=s 확정) — 파싱 일반화는 홀드/딜리버리 분기 정리용.
+            if "_" in name:
+                method, key = name.rsplit("_", 1)
+                vk = input_message.KEY_TO_VK.get(key)
+                if vk and manager.hwnd:
+                    if method == "pm":
+                        return input_message.post_key_deep(
+                            manager.hwnd, vk, press_delay=hold_secs)
+                    if method == "char":
+                        char_code = {"enter": 0x0D, "return": 0x0D,
+                                     "space": 0x20, "tab": 0x09}.get(
+                            key, ord(key) if len(key) == 1 else 0)
+                        if char_code:
+                            return input_message.post_char_deep(
+                                manager.hwnd, vk, char_code, press_delay=hold_secs)
+                        return False
+                    if method == "attach_state":
+                        return input_message.send_key_attach_state(
+                            manager.hwnd, vk, hold=hold_secs)
+                    if method == "attach_post":
+                        return input_message.send_key_attach_post(
+                            manager.hwnd, vk, hold=hold_secs)
             if name in input_gamepad.TRIGGER_KEYS:
-                send_gamepad_trigger(name, press_delay=SKIP_A_TAP_SECONDS)
+                send_gamepad_trigger(name, press_delay=hold_secs)
                 return True
             btn = input_gamepad.KEY_TO_GAMEPAD.get(name)
             if btn is None:
                 return False
-            send_gamepad_button(btn, press_delay=SKIP_A_TAP_SECONDS)
+            send_gamepad_button(btn, press_delay=hold_secs)
             return True
         except Exception:
             return False
@@ -1703,12 +1710,13 @@ class AutomationApp:
 
     def _log_to_file_only(self, text: str) -> None:
         """UI를 거치지 않고 로그 파일에만 기록합니다(트레이스백 등)."""
-        if self._log_file is not None:
-            try:
-                self._log_file.write(text + "\n")
-                self._log_file.flush()
-            except Exception:
-                pass
+        with self._log_lock:
+            if self._log_file is not None:
+                try:
+                    self._log_file.write(text + "\n")
+                    self._log_file.flush()
+                except Exception:
+                    pass
 
     def apply_click_jitter(
         self,
@@ -1911,34 +1919,25 @@ class AutomationApp:
         return self.stop_event.is_set()
 
     def log(self, message: str) -> None:
-        """UI 스레드에서 바로 로그를 남깁니다."""
+        """UI에는 표시하지 않고 진단 파일에만 로그를 남깁니다."""
 
         timestamp = time.strftime("%H:%M:%S")
         line = f"{timestamp} {message}\n"
 
-        # 로그 파일에 기록 (flush는 _flush_log_periodic이 1초마다 묶어서 처리)
-        if self._log_file is not None:
-            try:
-                self._log_file.write(line)
-                self._log_dirty = True
-            except Exception:
-                pass
-
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, line)
-
-        line_count = int(self.log_text.index("end-1c").split(".")[0])
-        if line_count > 500:
-            self.log_text.delete("1.0", "200.0")
-
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
-        self.log_text.update_idletasks()
+        # 여러 작업 스레드에서 호출될 수 있으므로 파일 객체를 잠깐만 잠급니다.
+        # flush는 _flush_log_periodic이 1초마다 묶어서 처리합니다.
+        with self._log_lock:
+            if self._log_file is not None:
+                try:
+                    self._log_file.write(line)
+                    self._log_dirty = True
+                except Exception:
+                    pass
 
     def queue_log(self, message: str) -> None:
-        """작업 스레드에서 로그 메시지를 UI 큐에 넣습니다."""
+        """작업 스레드 로그를 UI 큐 없이 진단 파일에 바로 기록합니다."""
 
-        self.ui_queue.put(("log", message))
+        self.log(message)
 
     def set_status(self, status: str) -> None:
         """UI 스레드에서 상태 라벨을 갱신합니다."""
@@ -1946,24 +1945,24 @@ class AutomationApp:
         self.status_var.set(status)
 
     def queue_status(self, status: str) -> None:
-        """작업 스레드에서 상태 변경 메시지를 UI 큐에 넣습니다."""
+        """변경된 상태만 UI 큐에 넣어 반복 프레임의 큐 적재를 피합니다."""
 
+        if status == self._last_queued_status:
+            return
+        self._last_queued_status = status
         self.ui_queue.put(("status", status))
 
     def _poll_ui_queue(self) -> None:
         """root.after로 UI 큐를 주기적으로 확인하고 위젯을 갱신합니다."""
 
         processed = 0
-        # 상한을 두되(이벤트 루프 기아 방지) 로그 폭주 시 따라잡도록 200으로.
-        while processed < 200:
+        while processed < 32:
             try:
                 kind, message = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
 
-            if kind == "log":
-                self.log(message)
-            elif kind == "status":
+            if kind == "status":
                 self.set_status(message)
             elif kind == "finished":
                 self._set_button_state(running=False)
@@ -1974,12 +1973,13 @@ class AutomationApp:
 
     def _flush_log_periodic(self) -> None:
         """로그 파일을 1초마다 한 번씩 묶어서 flush합니다(매 줄 flush 제거)."""
-        if self._log_file is not None and self._log_dirty:
-            try:
-                self._log_file.flush()
-                self._log_dirty = False
-            except Exception:
-                pass
+        with self._log_lock:
+            if self._log_file is not None and self._log_dirty:
+                try:
+                    self._log_file.flush()
+                    self._log_dirty = False
+                except Exception:
+                    pass
         if not self.closing:
             self.root.after(1000, self._flush_log_periodic)
 
@@ -2018,7 +2018,6 @@ class LicenseDialog:
         self.root.resizable(False, False)
 
         bg = "#101010"
-        panel_bg = "#1A1A1A"
         input_bg = "#262626"
         text_color = "#F3F3F3"
         accent = "#D93A2B"
