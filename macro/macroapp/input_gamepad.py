@@ -87,12 +87,18 @@ def send_gamepad_button(button: Any, press_delay: float = 0.08) -> bool:
     """
     with _gamepad_lock:
         pad = _get_gamepad()
-        pad.press_button(button=button)
-        pad.update()
-        time.sleep(press_delay)
-        pad.release_button(button=button)
-        pad.update()
-        time.sleep(_POST_RELEASE_SETTLE_SECONDS)
+        pressed = False
+        try:
+            pad.press_button(button=button)
+            pressed = True
+            pad.update()
+            time.sleep(press_delay)
+        finally:
+            # 홀드 도중 예외가 나도 A가 가상패드에 눌린 채 남지 않게 반드시 해제합니다.
+            if pressed:
+                pad.release_button(button=button)
+                pad.update()
+            time.sleep(_POST_RELEASE_SETTLE_SECONDS)
     return True
 
 

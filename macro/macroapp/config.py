@@ -270,7 +270,7 @@ SKIP_A_ACTIVATE_SPOOF = True
 SKIP_A_FOREGROUND_AFTER_SECONDS = 2.0  # 스푸핑으로 이 시간 넘게 안 사라지면 전면화 폴백 시도
                                        # (SKIP_A_FOREGROUND=True일 때만).
 SKIP_A_FOREGROUND = False
-SKIP_A_HOLD_SECONDS = 1.0         # 전면화 중 A를 홀드하는 시간(hold-to-skip). 스킵되는 최소값으로
+SKIP_A_HOLD_SECONDS = 1.2         # A를 홀드하는 시간. 1.0초 경계 누락을 피하도록 여유를 둠.
                                   # 낮출수록 번쩍임이 짧아짐(예: 0.6). 너무 낮으면 게이지가 안 참.
 SKIP_A_FG_COOLDOWN_SECONDS = 2.5  # 전면화-홀드 사이 최소 간격. (A) SKIP이 떠 있는 내내 매 사이클
                                   # 전면화하면 FIFA가 반복해서 번쩍이므로, 컷신당 사실상 1번만 하게 막음.

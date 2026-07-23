@@ -14,7 +14,7 @@ if exist "setup.iss" (
     python -c "import re,sys; t=open('setup.iss','r',encoding='utf-8').read(); t=re.sub(r'AppVersion=.*','AppVersion=%APP_VER%',t); open('setup.iss','w',encoding='utf-8').write(t)"
     if errorlevel 1 (
         echo [오류] setup.iss 버전 동기화 실패. 빌드를 중단합니다.
-        pause
+        if not defined MAUTO_NONINTERACTIVE pause
         exit /b 1
     )
     echo setup.iss 버전 동기화 완료
@@ -45,7 +45,7 @@ python check_cv2_headless.py
 if %errorlevel% neq 0 (
     echo [오류] cv2.pyd가 Media Foundation을 임포트합니다. opencv-python-headless 설치 실패.
     echo        pip uninstall opencv-python opencv-python-headless 후 다시 실행하세요.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 
@@ -54,7 +54,7 @@ echo vgamepad DLL 경로 탐색 중...
 for /f "delims=" %%i in ('python -c "import importlib.util,os; s=importlib.util.find_spec('vgamepad'); print(os.path.dirname(s.origin) if s and s.origin else '')"') do set "VGAMEPAD_DIR=%%i"
 if not defined VGAMEPAD_DIR (
     echo [오류] vgamepad 패키지를 찾을 수 없습니다. 'pip install vgamepad' 후 다시 실행하세요.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 
@@ -63,12 +63,12 @@ echo 자산 임베드 중...
 python gen_assets.py
 if %errorlevel% neq 0 (
     echo [오류] 자산 임베드 실패. 빌드를 중단합니다.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 if not exist "macroapp\_assets.py" (
     echo [오류] macroapp\_assets.py가 생성되지 않았습니다. 빌드를 중단합니다.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 
@@ -76,10 +76,10 @@ rem Syntax gate before the slow compile. cmd does not expand wildcards,
 rem so use compileall (handles directories) instead of py_compile.
 rem (NOTE: keep this comment ASCII - cmd misparses some UTF-8 Korean in :: comments)
 echo 문법 검사 중...
-python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py check_cv2_headless.py
+python -m compileall -q macroapp macro_main.py renewal_macro.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py check_cv2_headless.py
 if %errorlevel% neq 0 (
     echo [오류] 문법 검사 실패. 빌드를 중단합니다.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 
@@ -89,16 +89,18 @@ rem running it LOCKS the file, del fails, Nuitka cannot overwrite, and the old e
 rem passes the "if exist" checks below -> stale (e.g. pre-headless cv2) gets shipped.
 rem So: try to kill it, then ABORT LOUDLY if it still cannot be removed.
 taskkill /f /im macro.exe >nul 2>&1
+taskkill /f /im renewal_macro.exe >nul 2>&1
 taskkill /f /im launcher.exe >nul 2>&1
 taskkill /f /im gamepad_test.exe >nul 2>&1
 if exist "dist\macro_app" rmdir /s /q "dist\macro_app"
 if exist "dist\macro_main.dist" rmdir /s /q "dist\macro_main.dist"
 if exist "dist\macro" rmdir /s /q "dist\macro"
 if exist "dist\macro.exe" del /f /q "dist\macro.exe"
+if exist "dist\renewal_macro.exe" del /f /q "dist\renewal_macro.exe"
 if exist "dist\macro_app\macro.exe" (
     echo [오류] 이전 macro 빌드 폴더 삭제 불가 - 실행 중이거나 잠겨 있습니다. 빌드를 중단합니다.
     echo        실행 중인 macro.exe 를 관리자 권한으로 종료한 뒤 다시 빌드하세요.
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 if exist "dist\launcher.exe" del /f /q "dist\launcher.exe"
@@ -158,6 +160,19 @@ if not exist "dist\launcher.exe" (
 )
 
 echo.
+echo [추가] renewal_macro.exe 빌드 중 (갱신 전용 단일 파일)...
+python -m nuitka --onefile --assume-yes-for-downloads ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --output-dir=dist --output-filename=renewal_macro.exe ^
+  --windows-console-mode=disable --windows-uac-admin ^
+  --enable-plugin=tk-inter ^
+  renewal_macro.py
+if not exist "dist\renewal_macro.exe" (
+    echo [경고] Nuitka 갱신매크로 빌드 실패 - PyInstaller로 폴백합니다.
+    python -m PyInstaller --onefile --noconsole --uac-admin --name renewal_macro --distpath dist renewal_macro.py
+)
+
+echo.
 echo [추가] gamepad_test.exe 빌드 중 (버튼 테스트용, 콘솔 표시)...
 python -m nuitka --onefile --assume-yes-for-downloads ^
   --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
@@ -177,17 +192,24 @@ if exist "macro_main.build" rmdir /s /q "macro_main.build"
 if exist "macro_main.onefile-build" rmdir /s /q "macro_main.onefile-build"
 if exist "launcher.build" rmdir /s /q "launcher.build"
 if exist "launcher.onefile-build" rmdir /s /q "launcher.onefile-build"
+if exist "renewal_macro.build" rmdir /s /q "renewal_macro.build"
+if exist "renewal_macro.onefile-build" rmdir /s /q "renewal_macro.onefile-build"
 if exist "gamepad_test.build" rmdir /s /q "gamepad_test.build"
 if exist "gamepad_test.onefile-build" rmdir /s /q "gamepad_test.onefile-build"
 
 if not exist "dist\macro_app\macro.exe" (
     echo macro 빌드 실패!
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 if not exist "dist\launcher.exe" (
     echo launcher.exe 빌드 실패!
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
+    exit /b 1
+)
+if not exist "dist\renewal_macro.exe" (
+    echo renewal_macro.exe 빌드 실패!
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 1
 )
 
@@ -206,9 +228,10 @@ if not defined ISCC_PATH (
     echo        https://jrsoftware.org/isdl.php 에서 설치 후 다시 실행하세요.
     echo.
     echo        EXE 빌드는 완료되었습니다:
-    echo        - dist\macro.exe
+    echo        - dist\macro_app\macro.exe
+    echo        - dist\renewal_macro.exe
     echo        - dist\launcher.exe
-    pause
+    if not defined MAUTO_NONINTERACTIVE pause
     exit /b 0
 )
 
@@ -227,4 +250,4 @@ if exist "dist\macro_setup.exe" (
 ) else (
     echo 설치 파일 생성 실패!
 )
-pause
+if not defined MAUTO_NONINTERACTIVE pause

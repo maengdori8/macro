@@ -52,7 +52,6 @@ from macroapp.license_client import (
 )
 from macroapp.matching import find_template_center, downscale_screen
 from macroapp.window import InactiveManager
-
 class AutomationApp:
     """tkinter UI와 자동화 스레드를 관리합니다."""
 
@@ -1689,9 +1688,24 @@ class AutomationApp:
                     # 홀드끼리 안 겹치게 '홀드시간+여유' 간격으로만 재발사.
                     if now - self._skip_fg_last_at >= SKIP_A_HOLD_SECONDS + 0.3:
                         self._skip_fg_last_at = now
-                        input_message.spoof_window_active(manager.hwnd, True)
-                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
-                        action_label = "활성스푸핑+A홀드(배경)"
+                        spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                        try:
+                            if spoofed:
+                                send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
+                                still_inactive = (
+                                    input_message.get_foreground_hwnd() != int(manager.hwnd)
+                                )
+                                action_label = (
+                                    "활성스푸핑+A홀드(비활성 유지)"
+                                    if still_inactive else "비활성 유지 실패"
+                                )
+                            else:
+                                # 실제 전면 창이 바뀌거나 메시지 전달이 지연되면 A도 보내지
+                                # 않아 '비활성 유지' 계약을 우선합니다.
+                                action_label = "활성스푸핑 실패(A 미전송)"
+                        finally:
+                            # 게임 내부 활성 플래그가 남지 않게 가짜 비활성 메시지도 짝으로 보냅니다.
+                            input_message.spoof_window_active(manager.hwnd, False)
                     self._skip_active_until = time.monotonic() + 0.3
                 else:
                     # 둘 다 꺼짐 → 스킵 안 함, 컷신 자연 종료 대기(화면 변화 0).
@@ -1997,7 +2011,6 @@ class AutomationApp:
 
         self._set_accent_button_state(self.start_button, enabled=not running)
         self._set_accent_button_state(self.stop_button, enabled=running)
-
         # 실행 중 템플릿 교체는 다음 시작까지 반영되지 않으므로 혼동을 막기 위해 잠급니다.
         for button in self._capture_buttons.values():
             self._set_accent_button_state(button, enabled=not running)

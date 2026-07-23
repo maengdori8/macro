@@ -46,6 +46,18 @@ def _setup_user32_sigs() -> None:
     u.SetFocus.restype = wintypes.HWND
     u.SetFocus.argtypes = [wintypes.HWND]
     u.GetForegroundWindow.restype = wintypes.HWND
+    # SendMessageTimeoutW는 다른 프로세스의 창 프로시저가 멈춰도 매크로가 같이
+    # 멈추지 않게 제한 시간 안에서 활성 메시지를 동기 전달할 때 사용합니다.
+    u.SendMessageTimeoutW.restype = wintypes.LPARAM
+    u.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
     _USER32_SIG_READY = True
 
 KEY_TO_VK: dict[str, int] = {
@@ -425,24 +437,83 @@ def send_key_focus_attach(hwnd: int, scan: int = SCAN_S, hold: float = 0.12) -> 
 def spoof_window_active(hwnd: int, active: bool = True) -> bool:
     """전면화 없이(화면 변화 0) 대상 창에 '활성' 메시지를 주입해 포커스가 있다고 속입니다.
 
-    WM_ACTIVATEAPP(앱 전체 활성) + WM_ACTIVATE(창 활성) + WM_NCACTIVATE를 Post.
+    WM_ACTIVATEAPP(앱 전체 활성) + WM_NCACTIVATE + WM_ACTIVATE + WM_SETFOCUS를
+    실제 활성 전환과 같은 인자로 동기 전달합니다. SetForegroundWindow/SetActiveWindow/
+    SetFocus API는 호출하지 않으며, 호출 전후 실제 전면 창이 같을 때만 성공으로 봅니다.
     엔진이 '스레드-로컬 활성 플래그'로 입력 게이팅을 하면(SDL #4450류) 이걸로 속아
     비활성 상태에서도 컷신 스킵 입력을 받는다. GetForegroundWindow를 직접 보면 안 통함.
     실제 z순서/포그라운드는 안 바뀌므로 깜빡임이 없다.
     """
-    if winapi.win32gui is None:
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
         return False
     WM_ACTIVATE = 0x0006
+    WM_SETFOCUS = 0x0007
+    WM_KILLFOCUS = 0x0008
     WM_ACTIVATEAPP = 0x001C
     WM_NCACTIVATE = 0x0086
     WA_ACTIVE = 1
-    w = 1 if active else 0
+    SMTO_BLOCK = 0x0001
+    SMTO_ABORTIFHUNG = 0x0002
+    SMTO_ERRORONEXIT = 0x0020
     try:
-        winapi.win32gui.PostMessage(int(hwnd), WM_ACTIVATEAPP, w, 0)
-        winapi.win32gui.PostMessage(int(hwnd), WM_NCACTIVATE, w, 0)
-        winapi.win32gui.PostMessage(int(hwnd), WM_ACTIVATE,
-                                    WA_ACTIVE if active else 0, 0)
-        return True
+        _setup_user32_sigs()
+        hwnd = int(hwnd)
+        if not winapi.win32gui.IsWindow(hwnd):
+            return False
+
+        u = ctypes.windll.user32
+        foreground_before = int(u.GetForegroundWindow() or 0)
+        if not foreground_before or foreground_before == hwnd:
+            return False
+        foreground_tid = (
+            int(u.GetWindowThreadProcessId(wintypes.HWND(foreground_before), None) or 0)
+            if foreground_before else 0
+        )
+        if not foreground_tid:
+            return False
+        foreground_focus = int(
+            _get_thread_focus_hwnd(foreground_before) or foreground_before
+        )
+        # WM_ACTIVATEAPP(TRUE)의 lParam은 비활성화되는 전면 창의 스레드 ID,
+        # WM_ACTIVATE(WA_ACTIVE)의 lParam은 비활성화되는 전면 창 HWND여야 합니다.
+        focus_target = int(_get_thread_focus_hwnd(hwnd) or hwnd)
+        if active:
+            messages = [
+                (hwnd, WM_ACTIVATEAPP, 1, foreground_tid),
+                # lParam=-1이면 캡션을 실제 활성처럼 다시 그리지 않아 깜빡임을 막습니다.
+                (hwnd, WM_NCACTIVATE, 1, -1),
+                (hwnd, WM_ACTIVATE, WA_ACTIVE, foreground_before),
+                (focus_target, WM_SETFOCUS, foreground_focus, 0),
+            ]
+        else:
+            messages = [
+                (focus_target, WM_KILLFOCUS, foreground_focus, 0),
+                (hwnd, WM_ACTIVATE, 0, foreground_before),
+                (hwnd, WM_NCACTIVATE, 0, -1),
+                (hwnd, WM_ACTIVATEAPP, 0, foreground_tid),
+            ]
+
+        delivered = 0
+        for target, message, wparam, lparam in messages:
+            result = ctypes.c_size_t()
+            ok = u.SendMessageTimeoutW(
+                wintypes.HWND(target),
+                message,
+                wintypes.WPARAM(wparam),
+                wintypes.LPARAM(lparam),
+                SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                120,
+                ctypes.byref(result),
+            )
+            if not ok or int(u.GetForegroundWindow() or 0) != foreground_before:
+                return False
+            delivered += 1
+
+        # 메시지가 처리된 뒤 A 홀드를 시작하도록 아주 짧게 양보합니다. 실제 전면 창이
+        # 달라졌다면 '비활성 유지' 계약을 어긴 것이므로 성공으로 취급하지 않습니다.
+        time.sleep(0.03)
+        foreground_after = int(u.GetForegroundWindow() or 0)
+        return delivered == len(messages) and foreground_after == foreground_before
     except Exception:
         return False
 
