@@ -27,6 +27,68 @@ StatusCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
+class RenewalSpeedTuning:
+    open_settle_ms: int
+    close_settle_ms: int
+    change_threshold: float
+    confirm_frames: int
+
+
+_RENEWAL_SPEED_PRESETS: dict[int, RenewalSpeedTuning] = {
+    1: RenewalSpeedTuning(100, 80, 0.060, 3),
+    2: RenewalSpeedTuning(90, 70, 0.057, 3),
+    3: RenewalSpeedTuning(80, 60, 0.055, 3),
+    4: RenewalSpeedTuning(67, 50, 0.051, 2),
+    5: RenewalSpeedTuning(55, 40, 0.047, 2),
+    6: RenewalSpeedTuning(45, 25, 0.045, 2),
+    7: RenewalSpeedTuning(35, 22, 0.042, 2),
+    8: RenewalSpeedTuning(28, 18, 0.039, 2),
+    9: RenewalSpeedTuning(22, 14, 0.036, 1),
+    10: RenewalSpeedTuning(18, 10, 0.033, 1),
+}
+
+
+def clamp_speed_level(value: object) -> int:
+    try:
+        return min(10, max(1, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 6
+
+
+def renewal_speed_tuning(value: object) -> RenewalSpeedTuning:
+    return _RENEWAL_SPEED_PRESETS[clamp_speed_level(value)]
+
+
+def infer_speed_level(
+    open_settle_ms: object,
+    close_settle_ms: object,
+    change_threshold: object,
+    confirm_frames: object,
+) -> int:
+    """기존 네 개 설정과 가장 가까운 단일 속도 단계를 찾습니다."""
+    try:
+        current = RenewalSpeedTuning(
+            int(open_settle_ms),
+            int(close_settle_ms),
+            float(change_threshold),
+            int(confirm_frames),
+        )
+    except (TypeError, ValueError):
+        return 6
+
+    def distance(item: tuple[int, RenewalSpeedTuning]) -> float:
+        _level, preset = item
+        return (
+            abs(current.open_settle_ms - preset.open_settle_ms) / 100.0
+            + abs(current.close_settle_ms - preset.close_settle_ms) / 80.0
+            + abs(current.change_threshold - preset.change_threshold) / 0.060
+            + abs(current.confirm_frames - preset.confirm_frames)
+        )
+
+    return min(_RENEWAL_SPEED_PRESETS.items(), key=distance)[0]
+
+
+@dataclass(frozen=True)
 class NormalizedPoint:
     x: float
     y: float
@@ -95,15 +157,23 @@ class NormalizedRect:
 
 @dataclass
 class RenewalSideProfile:
+    # 화면에서 가격 창을 열고, 가격 변경 시 주문을 확정하는 구매/판매 버튼.
+    action_point: Optional[NormalizedPoint] = None
     price_rect: Optional[NormalizedRect] = None
     limit_point: Optional[NormalizedPoint] = None
     baseline_png: str = ""
 
     def complete(self) -> bool:
-        return bool(self.price_rect and self.limit_point and self.baseline_png)
+        return bool(
+            self.action_point
+            and self.price_rect
+            and self.limit_point
+            and self.baseline_png
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "action_point": self.action_point.to_dict() if self.action_point else None,
             "price_rect": self.price_rect.to_dict() if self.price_rect else None,
             "limit_point": self.limit_point.to_dict() if self.limit_point else None,
             "baseline_png": self.baseline_png,
@@ -114,6 +184,7 @@ class RenewalSideProfile:
         if not isinstance(value, dict):
             return cls()
         return cls(
+            action_point=NormalizedPoint.from_dict(value.get("action_point")),
             price_rect=NormalizedRect.from_dict(value.get("price_rect")),
             limit_point=NormalizedPoint.from_dict(value.get("limit_point")),
             baseline_png=str(value.get("baseline_png") or ""),
@@ -127,6 +198,7 @@ class RenewalProfile:
     cancel_point: Optional[NormalizedPoint] = None
     buy: RenewalSideProfile = field(default_factory=RenewalSideProfile)
     sell: RenewalSideProfile = field(default_factory=RenewalSideProfile)
+    speed_level: int = 6
     change_threshold: float = 0.045
     open_settle_ms: int = 45
     close_settle_ms: int = 25
@@ -136,15 +208,19 @@ class RenewalProfile:
     def side(self, side: str) -> RenewalSideProfile:
         return self.buy if side == "buy" else self.sell
 
+    def apply_speed_level(self, value: object) -> None:
+        self.speed_level = clamp_speed_level(value)
+        tuning = renewal_speed_tuning(self.speed_level)
+        self.change_threshold = tuning.change_threshold
+        self.open_settle_ms = tuning.open_settle_ms
+        self.close_settle_ms = tuning.close_settle_ms
+        self.confirm_frames = tuning.confirm_frames
+
     def missing(self, side: str) -> list[str]:
         missing: list[str] = []
         side_profile = self.side(side)
-        if self.re_register_point is None:
-            missing.append("재등록 위치")
-        if self.confirm_point is None:
-            missing.append("확정 위치")
-        if self.cancel_point is None:
-            missing.append("취소 위치")
+        if side_profile.action_point is None:
+            missing.append("구매/판매 버튼 위치")
         if side_profile.price_rect is None or not side_profile.baseline_png:
             missing.append("가격 감지영역")
         if side_profile.limit_point is None:
@@ -153,7 +229,7 @@ class RenewalProfile:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": 3,
             "re_register_point": (
                 self.re_register_point.to_dict() if self.re_register_point else None
             ),
@@ -161,6 +237,7 @@ class RenewalProfile:
             "cancel_point": self.cancel_point.to_dict() if self.cancel_point else None,
             "buy": self.buy.to_dict(),
             "sell": self.sell.to_dict(),
+            "speed_level": int(self.speed_level),
             "change_threshold": float(self.change_threshold),
             "open_settle_ms": int(self.open_settle_ms),
             "close_settle_ms": int(self.close_settle_ms),
@@ -172,26 +249,26 @@ class RenewalProfile:
     def from_dict(cls, value: object) -> "RenewalProfile":
         if not isinstance(value, dict):
             return cls()
+        buy = RenewalSideProfile.from_dict(value.get("buy"))
+        sell = RenewalSideProfile.from_dict(value.get("sell"))
         profile = cls(
             re_register_point=NormalizedPoint.from_dict(value.get("re_register_point")),
             confirm_point=NormalizedPoint.from_dict(value.get("confirm_point")),
             cancel_point=NormalizedPoint.from_dict(value.get("cancel_point")),
-            buy=RenewalSideProfile.from_dict(value.get("buy")),
-            sell=RenewalSideProfile.from_dict(value.get("sell")),
+            buy=buy,
+            sell=sell,
         )
         try:
-            profile.change_threshold = min(
-                0.30, max(0.003, float(value.get("change_threshold", 0.045)))
-            )
-            profile.open_settle_ms = min(
-                500, max(20, int(value.get("open_settle_ms", 45)))
-            )
-            profile.close_settle_ms = min(
-                500, max(10, int(value.get("close_settle_ms", 25)))
-            )
-            profile.confirm_frames = min(
-                3, max(1, int(value.get("confirm_frames", 2)))
-            )
+            if "speed_level" in value:
+                speed_level = clamp_speed_level(value.get("speed_level"))
+            else:
+                speed_level = infer_speed_level(
+                    value.get("open_settle_ms", 45),
+                    value.get("close_settle_ms", 25),
+                    value.get("change_threshold", 0.045),
+                    value.get("confirm_frames", 2),
+                )
+            profile.apply_speed_level(speed_level)
             profile.modal_max_score = min(
                 0.95, max(0.10, float(value.get("modal_max_score", 0.75)))
             )
@@ -300,9 +377,16 @@ class _FastClicker:
         input_message.post_mouse_down(self.hwnd, x, y)
         input_message.post_mouse_up(self.hwnd, x, y)
 
+    def press_escape(self) -> None:
+        """구매/판매 창을 닫는 ESC를 최상위 창에 한 번 전달합니다."""
+        vk_escape = input_message.KEY_TO_VK["esc"]
+        # ESC는 모든 자식 HWND에 브로드캐스트하면 팝업이 두 번 닫힐 수 있어
+        # 최상위 창에 한 번만 보냅니다. FC의 전역 UI 단축키는 이 경로로 처리됩니다.
+        input_message.send_key_to_window(self.hwnd, vk_escape, press_delay=0.005)
+
 
 class FastRenewalRunner:
-    """재등록 창을 열고 가격 변경이 확정되는 즉시 제한가와 확정을 클릭합니다."""
+    """구매/판매 창을 열고 가격 변경 시 제한가와 같은 버튼을 즉시 클릭합니다."""
 
     def __init__(
         self,
@@ -342,33 +426,69 @@ class FastRenewalRunner:
             raise RuntimeError("WGC 캡처 엔진이 시작되지 않았습니다.")
 
         side_profile = self.profile.side(self.side_name)
-        assert self.profile.re_register_point is not None
-        assert self.profile.confirm_point is not None
-        assert self.profile.cancel_point is not None
+        assert side_profile.action_point is not None
         assert side_profile.price_rect is not None
         assert side_profile.limit_point is not None
 
         detector = RenewalChangeDetector(decode_gray_png(side_profile.baseline_png))
         region = side_profile.price_rect.to_pixels(frame_width, frame_height)
         clicker = _FastClicker(self.manager, frame_width, frame_height)
-        re_register = clicker.resolve(self.profile.re_register_point)
+        action = clicker.resolve(side_profile.action_point)
         limit_price = clicker.resolve(side_profile.limit_point)
-        confirm = clicker.resolve(self.profile.confirm_point)
-        cancel = clicker.resolve(self.profile.cancel_point)
 
         # 이후 WGC 콜백은 이 작은 가격 영역만 grayscale로 변환합니다.
         engine.set_capture_region(region)
         cycle_count = 0
-        self.status("초고속 갱신 확인 중")
+        recovery_count = 0
+        self.status("가격 변경 전까지 무한 반복 중")
         self.log(
             f"[갱신] {'구매 상한가' if self.side_name == 'buy' else '판매 하한가'} "
-            f"재등록 열기/닫기 반복 시작 (에지 기준 {self.profile.change_threshold:.3f})"
+            f"{'구매' if self.side_name == 'buy' else '판매'} 버튼/ESC 반복 시작 "
+            f"(속도 {self.profile.speed_level}, 에지 기준 {self.profile.change_threshold:.3f})"
         )
 
+        def close_modal() -> bool:
+            """ESC를 보내고 가격 창이 닫힐 시간을 확보합니다.
+
+            화면 확인이 늦어져도 전체 반복은 종료하지 않습니다. 반환값은 다음
+            상태 표시와 진단 로그에만 사용하고, 사용자가 F9를 누르거나 WGC가
+            종료된 경우에만 러너를 멈춥니다.
+            """
+            clicker.press_escape()
+            started_at = time.monotonic()
+            # 30/60fps 및 UI 전환 지연을 고려해 확인 상한은 넉넉히 두되,
+            # 목록 프레임 2장이 확인되면 즉시 빠져나와 실제 속도는 늦추지 않습니다.
+            deadline = started_at + 0.35
+            not_before = started_at + max(
+                0.010,
+                self.profile.close_settle_ms / 1000.0,
+            )
+            closed_streak = 0
+            while not self.stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                crop = engine.get_latest_frame(timeout=min(0.020, remaining))
+                if crop is None:
+                    if engine.closed_event.is_set():
+                        raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
+                    continue
+                if (
+                    time.monotonic() >= not_before
+                    and detector.score(crop) > self.profile.modal_max_score
+                ):
+                    closed_streak += 1
+                    if closed_streak >= 2:
+                        return True
+                else:
+                    closed_streak = 0
+            return False
+
         while not self.stop_event.is_set():
-            # 목록 화면에서 재등록을 열고, 전환 초기에 잡힌 프레임은 버립니다.
+            # 구매/판매 버튼으로 가격 창을 열고, 전환 초기에 잡힌 프레임은 버립니다.
+            cycle_count += 1
             engine.get_latest_frame(timeout=0.0)
-            clicker.click_client(re_register)
+            clicker.click_client(action)
             if self._wait(self.profile.open_settle_ms / 1000.0):
                 return False
             engine.get_latest_frame(timeout=0.0)
@@ -376,10 +496,11 @@ class FastRenewalRunner:
             modal_seen = False
             changed_streak = 0
             unchanged = False
-            check_deadline = time.monotonic() + 0.20
+            check_deadline = time.monotonic() + 0.35
+            grace_extended = False
 
             while not self.stop_event.is_set() and time.monotonic() < check_deadline:
-                crop = engine.get_latest_frame(timeout=0.04)
+                crop = engine.get_latest_frame(timeout=0.020)
                 if crop is None:
                     if engine.closed_event.is_set():
                         raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
@@ -397,18 +518,30 @@ class FastRenewalRunner:
                     break
 
                 changed_streak += 1
+                if not grace_extended:
+                    # WGC가 프레임을 건너뛰는 순간에도 확정 프레임을 받을
+                    # 짧은 여유를 한 번만 추가합니다. 가격 변경을 본 뒤
+                    # 곧바로 ESC로 닫고 다시 여는 것을 방지합니다.
+                    check_deadline = max(check_deadline, time.monotonic() + 0.08)
+                    grace_extended = True
                 if changed_streak < self.profile.confirm_frames:
                     continue
 
                 detected_at = time.perf_counter()
-                self.status("가격 변경 감지 — 즉시 등록")
+                self.status(
+                    "가격 변경 감지 — 즉시 "
+                    + ("구매" if self.side_name == "buy" else "판매")
+                )
                 # 같은 HWND 메시지 큐에 순서대로 들어가므로 별도 sleep 없이 처리됩니다.
                 clicker.click_client(limit_price)
-                clicker.click_client(confirm)
+                # 구매/판매 버튼은 창을 여는 동작과 최종 주문 동작에 동일하게
+                # 사용됩니다. side별 좌표를 재사용해 판매에서 구매 좌표를 누르지 않습니다.
+                clicker.click_client(action)
                 elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
                 self.log(
-                    f"[갱신 완료] {cycle_count + 1}회 확인, 가격 변경 "
-                    f"{changed_streak}프레임 확정 → 제한가/확정 입력 {elapsed_ms:.2f}ms"
+                    f"[갱신 완료] {cycle_count}회 확인, 가격 변경 "
+                    f"{changed_streak}프레임 확정 → 제한가/{'구매' if self.side_name == 'buy' else '판매'} "
+                    f"입력 {elapsed_ms:.2f}ms"
                 )
                 # 클릭 지연에는 포함하지 않고, 다음 갱신 실행을 위해 새 가격을 기준값으로 저장합니다.
                 try:
@@ -416,25 +549,34 @@ class FastRenewalRunner:
                     save_renewal_profile(self.profile)
                 except Exception as exc:
                     self.log(f"[갱신 주의] 새 기준 가격 저장 실패: {exc}")
-                self.status("갱신 입력 완료")
+                self.status("갱신 입력 완료 — 중복 주문 방지 정지")
                 return True
 
             if self.stop_event.is_set():
                 return False
 
             if modal_seen and unchanged:
-                # 그대로면 취소로 닫고 곧바로 다음 재등록 화면을 엽니다.
-                clicker.click_client(cancel)
-                cycle_count += 1
+                # 그대로면 ESC로 닫고 곧바로 다음 가격 창을 엽니다.
+                if close_modal():
+                    recovery_count = 0
+                else:
+                    recovery_count += 1
                 if cycle_count % 100 == 0:
                     self.log(f"[갱신] {cycle_count}회 확인 중")
-                if self._wait(self.profile.close_settle_ms / 1000.0):
-                    return False
                 continue
 
-            # 모달을 제시간에 확인하지 못했으면 무작정 취소 좌표를 누르지 않습니다.
-            # 아주 짧게 양보한 뒤 재등록 위치를 다시 눌러 복구합니다.
-            if self._wait(0.02):
-                return False
+            # 전환 프레임을 놓치거나 닫힘 확인이 지연돼도 단일 실패로 전체
+            # 매크로를 끝내지 않습니다. ESC로 입력 상태를 초기화하고 다음
+            # 사이클에서 다시 엽니다.
+            closed = close_modal()
+            recovery_count = 0 if closed else recovery_count + 1
+            if recovery_count == 1 or recovery_count % 25 == 0:
+                self.log(
+                    f"[갱신 복구] 화면 전환 확인 실패 {recovery_count}회 — "
+                    "ESC 후 무한 반복을 계속합니다."
+                )
+            self.status(
+                f"가격 변경 전까지 무한 반복 중 · {cycle_count}회"
+            )
 
         return False

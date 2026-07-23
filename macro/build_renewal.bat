@@ -9,6 +9,10 @@ if errorlevel 1 goto :failed
 echo [2/3] Building renewal_macro.exe...
 taskkill /f /im renewal_macro.exe >nul 2>&1
 if exist "dist\renewal_macro.exe" del /f /q "dist\renewal_macro.exe"
+if exist "dist\renewal_macro.exe" (
+  echo Existing renewal_macro.exe is locked; refusing to report a stale build.
+  goto :failed
+)
 
 python -m nuitka --onefile --assume-yes-for-downloads ^
   --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
@@ -25,6 +29,8 @@ python -m PyInstaller --onefile --noconsole --uac-admin ^
 if not exist "dist\renewal_macro.exe" goto :failed
 
 :success
+copy /y "version.txt" "dist\version.txt" >nul
+if not exist "dist\version.txt" goto :failed
 echo [3/3] Build complete: dist\renewal_macro.exe
 exit /b 0
 

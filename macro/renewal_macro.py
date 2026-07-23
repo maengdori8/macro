@@ -34,6 +34,7 @@ from macroapp.renewal import (
     NormalizedRect,
     encode_gray_png,
     load_renewal_profile,
+    renewal_speed_tuning,
     save_renewal_profile,
 )
 from macroapp.window import InactiveManager
@@ -199,10 +200,8 @@ class RenewalApp:
 
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         self.side_var = tk.StringVar(value="buy")
-        self.threshold_var = tk.DoubleVar(value=self.profile.change_threshold)
-        self.open_ms_var = tk.IntVar(value=self.profile.open_settle_ms)
-        self.close_ms_var = tk.IntVar(value=self.profile.close_settle_ms)
-        self.confirm_frames_var = tk.IntVar(value=self.profile.confirm_frames)
+        self.speed_var = tk.IntVar(value=self.profile.speed_level)
+        self.speed_status_var = tk.StringVar()
         self.status_var = tk.StringVar(value="좌표 설정 후 F8")
         self.clock_var = tk.StringVar(value="--:--:--")
         self.setting_status_var = tk.StringVar(value="")
@@ -325,7 +324,7 @@ class RenewalApp:
         calibration_panel.pack(fill=tk.X, pady=(0, 10))
         tk.Label(
             calibration_panel,
-            text="목록 화면: 재등록  |  재등록 창: 가격 숫자·상/하한가·확정·취소",
+            text="현재 화면: 구매/판매 버튼  |  열린 창: 가격 숫자·상/하한가  |  닫기: ESC",
             bg=c["panel"],
             fg=c["muted"],
             font=self._font(9),
@@ -333,11 +332,9 @@ class RenewalApp:
         button_row = tk.Frame(calibration_panel, bg=c["panel"])
         button_row.pack(fill=tk.X)
         for text, item in (
-            ("재등록", "re_register"),
+            ("구매/판매 버튼", "action"),
             ("가격 숫자영역", "price"),
             ("상한가/하한가", "limit"),
-            ("확정", "confirm"),
-            ("취소", "cancel"),
         ):
             button = self._button(
                 button_row,
@@ -363,36 +360,53 @@ class RenewalApp:
         speed_panel.pack(fill=tk.X, pady=(0, 10))
         speed_row = tk.Frame(speed_panel, bg=c["panel"])
         speed_row.pack(fill=tk.X)
-        for label, variable, width in (
-            ("민감도", self.threshold_var, 7),
-            ("열기 대기 ms", self.open_ms_var, 6),
-            ("닫기 대기 ms", self.close_ms_var, 6),
-            ("변경 확인 프레임", self.confirm_frames_var, 4),
-        ):
-            tk.Label(
-                speed_row,
-                text=label,
-                bg=c["panel"],
-                fg=c["muted"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT, padx=(0, 4))
-            tk.Entry(
-                speed_row,
-                textvariable=variable,
-                width=width,
-                bg=c["input"],
-                fg=c["text"],
-                insertbackground=c["text"],
-                relief=tk.FLAT,
-                justify=tk.CENTER,
-            ).pack(side=tk.LEFT, padx=(0, 12), ipady=3)
+        tk.Label(
+            speed_row,
+            text="안정",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(9),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.speed_scale = tk.Scale(
+            speed_row,
+            from_=1,
+            to=10,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            variable=self.speed_var,
+            command=self._on_speed_changed,
+            bg=c["panel"],
+            fg=c["text"],
+            troughcolor=c["input"],
+            activebackground=c["accent"],
+            highlightthickness=0,
+            bd=0,
+            sliderrelief=tk.FLAT,
+        )
+        self.speed_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            speed_row,
+            text="극한",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(9),
+        ).pack(side=tk.LEFT, padx=(8, 0))
         tk.Label(
             speed_panel,
-            text="기본값 45/25ms · 가격이 그대로면 즉시 취소 후 다시 열기 · 변경은 2프레임 확인",
+            textvariable=self.speed_status_var,
+            bg=c["panel"],
+            fg=c["text"],
+            font=self._font(9, bold=True),
+        ).pack(anchor=tk.W, pady=(7, 0))
+        tk.Label(
+            speed_panel,
+            text="한 슬라이더로 클릭 대기·인식 민감도·확정 프레임을 함께 조절합니다.",
             bg=c["panel"],
             fg=c["muted"],
             font=self._font(8),
         ).pack(anchor=tk.W, pady=(8, 0))
+        self._on_speed_changed(str(self.speed_var.get()))
 
         status_panel = self._panel(body, "상태")
         status_panel.pack(fill=tk.X, pady=(0, 10))
@@ -419,36 +433,32 @@ class RenewalApp:
         side_name = "구매" if self.side_var.get() == "buy" else "판매"
         limit_name = "상한가" if self.side_var.get() == "buy" else "하한가"
         self.setting_status_var.set(
-            f"공통: 재등록 {mark(self.profile.re_register_point)} / "
-            f"확정 {mark(self.profile.confirm_point)} / 취소 {mark(self.profile.cancel_point)}\n"
-            f"{side_name}: 가격영역 {mark(side.price_rect and side.baseline_png)} / "
+            "공통: 닫기 ESC / 가격 변경 시 같은 버튼 재클릭\n"
+            f"{side_name}: 버튼 {mark(side.action_point)} / "
+            f"가격영역 {mark(side.price_rect and side.baseline_png)} / "
             f"{limit_name} {mark(side.limit_point)}"
         )
 
     def _save_settings(self) -> bool:
         try:
-            self.profile.change_threshold = min(
-                0.30, max(0.003, float(self.threshold_var.get()))
-            )
-            self.profile.open_settle_ms = min(
-                500, max(20, int(self.open_ms_var.get()))
-            )
-            self.profile.close_settle_ms = min(
-                500, max(10, int(self.close_ms_var.get()))
-            )
-            self.profile.confirm_frames = min(
-                3, max(1, int(self.confirm_frames_var.get()))
-            )
-            self.threshold_var.set(self.profile.change_threshold)
-            self.open_ms_var.set(self.profile.open_settle_ms)
-            self.close_ms_var.set(self.profile.close_settle_ms)
-            self.confirm_frames_var.set(self.profile.confirm_frames)
+            self.profile.apply_speed_level(self.speed_var.get())
+            self.speed_var.set(self.profile.speed_level)
+            self._on_speed_changed(str(self.profile.speed_level))
             save_renewal_profile(self.profile)
             return True
         except Exception as exc:
             self.log(f"[설정 오류] {exc}")
             self.status_var.set("설정값 오류")
             return False
+
+    def _on_speed_changed(self, value: str) -> None:
+        tuning = renewal_speed_tuning(value)
+        level = int(round(float(value)))
+        mode = "안정" if level <= 3 else ("균형" if level <= 6 else "빠름")
+        self.speed_status_var.set(
+            f"속도 {level}/10 · {mode} · "
+            f"열기 {tuning.open_settle_ms}ms · 인식 {tuning.confirm_frames}프레임"
+        )
 
     def _capture_frame(self) -> Optional[np.ndarray]:
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
@@ -475,13 +485,11 @@ class RenewalApp:
         if frame is None:
             return
 
-        side_name = "구매 상한가" if self.side_var.get() == "buy" else "판매 하한가"
+        side_name = "구매" if self.side_var.get() == "buy" else "판매"
         instruction = {
-            "re_register": "거래 목록에서 '재등록' 버튼 가운데를 클릭하세요.",
-            "price": f"{side_name} 가격의 숫자 부분만 좁게 드래그하세요.",
-            "limit": f"재등록 창에서 {side_name} 항목 가운데를 클릭하세요.",
-            "confirm": "최종 구매/판매 확정 버튼 가운데를 클릭하세요.",
-            "cancel": "재등록 창의 취소 버튼 가운데를 클릭하세요.",
+            "action": f"현재 화면에서 '{side_name}' 버튼 가운데를 클릭하세요.",
+            "price": f"{side_name} 창에서 감시할 가격 숫자 부분만 좁게 드래그하세요.",
+            "limit": f"{side_name} 창에서 {'상한가' if self.side_var.get() == 'buy' else '하한가'} 항목 가운데를 클릭하세요.",
         }[item]
         selection = select_from_frame(
             self.root,
@@ -500,14 +508,10 @@ class RenewalApp:
             side.price_rect = selection
             side.baseline_png = encode_gray_png(frame[y1:y2, x1:x2])
         elif isinstance(selection, NormalizedPoint):
-            if item == "re_register":
-                self.profile.re_register_point = selection
+            if item == "action":
+                side.action_point = selection
             elif item == "limit":
                 side.limit_point = selection
-            elif item == "confirm":
-                self.profile.confirm_point = selection
-            elif item == "cancel":
-                self.profile.cancel_point = selection
         else:
             self.status_var.set("잘못된 선택")
             return
@@ -561,7 +565,9 @@ class RenewalApp:
         self.status_var.set("갱신매크로 시작")
         self.log(
             f"[시작] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
-            f"열기={self.profile.open_settle_ms}ms 닫기={self.profile.close_settle_ms}ms"
+            f"속도={self.profile.speed_level}/10 "
+            f"열기={self.profile.open_settle_ms}ms "
+            f"인식={self.profile.confirm_frames}프레임"
         )
         self._report(True, "갱신매크로 시작")
         self.worker_thread = threading.Thread(
@@ -616,6 +622,7 @@ class RenewalApp:
         )
         for button in self._capture_buttons:
             button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.speed_scale.configure(state=tk.DISABLED if running else tk.NORMAL)
 
     def _poll_queue(self) -> None:
         while True:

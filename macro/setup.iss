@@ -1,7 +1,7 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
 [Setup]
 AppName=Macro
-AppVersion=1.0.25
+AppVersion=1.0.27
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
