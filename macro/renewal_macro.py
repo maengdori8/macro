@@ -324,7 +324,7 @@ class RenewalApp:
         calibration_panel.pack(fill=tk.X, pady=(0, 10))
         tk.Label(
             calibration_panel,
-            text="현재 화면: 구매/판매 버튼  |  열린 창: 가격 숫자·상/하한가  |  닫기: ESC",
+            text="목록: 창 열기 버튼  |  열린 창: 가격·상/하한가·최종 버튼  |  닫기: ESC",
             bg=c["panel"],
             fg=c["muted"],
             font=self._font(9),
@@ -332,9 +332,10 @@ class RenewalApp:
         button_row = tk.Frame(calibration_panel, bg=c["panel"])
         button_row.pack(fill=tk.X)
         for text, item in (
-            ("구매/판매 버튼", "action"),
+            ("창 열기 버튼", "action"),
             ("가격 숫자영역", "price"),
             ("상한가/하한가", "limit"),
+            ("창 안 최종 버튼", "confirm"),
         ):
             button = self._button(
                 button_row,
@@ -433,10 +434,11 @@ class RenewalApp:
         side_name = "구매" if self.side_var.get() == "buy" else "판매"
         limit_name = "상한가" if self.side_var.get() == "buy" else "하한가"
         self.setting_status_var.set(
-            "공통: 닫기 ESC / 가격 변경 시 같은 버튼 재클릭\n"
-            f"{side_name}: 버튼 {mark(side.action_point)} / "
+            "공통: 가격이 그대로면 ESC 후 다시 열기\n"
+            f"{side_name}: 열기 {mark(side.action_point)} / "
             f"가격영역 {mark(side.price_rect and side.baseline_png)} / "
-            f"{limit_name} {mark(side.limit_point)}"
+            f"{limit_name} {mark(side.limit_point)} / "
+            f"최종 버튼 {mark(side.confirm_point)}"
         )
 
     def _save_settings(self) -> bool:
@@ -487,9 +489,10 @@ class RenewalApp:
 
         side_name = "구매" if self.side_var.get() == "buy" else "판매"
         instruction = {
-            "action": f"현재 화면에서 '{side_name}' 버튼 가운데를 클릭하세요.",
+            "action": f"목록 화면에서 가격 창을 여는 '{side_name}' 버튼 가운데를 클릭하세요.",
             "price": f"{side_name} 창에서 감시할 가격 숫자 부분만 좁게 드래그하세요.",
             "limit": f"{side_name} 창에서 {'상한가' if self.side_var.get() == 'buy' else '하한가'} 항목 가운데를 클릭하세요.",
+            "confirm": f"열린 {side_name} 창 하단의 최종 '{side_name}' 버튼 가운데를 클릭하세요.",
         }[item]
         selection = select_from_frame(
             self.root,
@@ -512,6 +515,8 @@ class RenewalApp:
                 side.action_point = selection
             elif item == "limit":
                 side.limit_point = selection
+            elif item == "confirm":
+                side.confirm_point = selection
         else:
             self.status_var.set("잘못된 선택")
             return

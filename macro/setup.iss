@@ -1,7 +1,11 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
+#ifndef RenewalSource
+#define RenewalSource "dist\renewal_macro.exe"
+#endif
+
 [Setup]
 AppName=Macro
-AppVersion=1.0.27
+AppVersion=1.0.28
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
@@ -30,7 +34,7 @@ ArchitecturesAllowed=x64compatible
 ;  일으켜, 폴더형으로 전환함. dist\macro_app\ 안의 모든 파일을 재귀로 담는다.)
 Source: "dist\macro_app\*"; DestDir: "{app}"; Excludes: "license.key,logs\*,_update_tmp\*,_update.zip,startup_error.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\renewal_macro.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RenewalSource}"; DestDir: "{app}"; DestName: "renewal_macro.exe"; Flags: ignoreversion
 Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 

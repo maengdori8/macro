@@ -157,8 +157,10 @@ class NormalizedRect:
 
 @dataclass
 class RenewalSideProfile:
-    # 화면에서 가격 창을 열고, 가격 변경 시 주문을 확정하는 구매/판매 버튼.
+    # 목록 화면에서 가격 창을 여는 구매/판매 버튼.
     action_point: Optional[NormalizedPoint] = None
+    # 열린 가격 창 안에서 실제 주문을 넣는 최종 구매/판매 버튼.
+    confirm_point: Optional[NormalizedPoint] = None
     price_rect: Optional[NormalizedRect] = None
     limit_point: Optional[NormalizedPoint] = None
     baseline_png: str = ""
@@ -166,6 +168,7 @@ class RenewalSideProfile:
     def complete(self) -> bool:
         return bool(
             self.action_point
+            and self.confirm_point
             and self.price_rect
             and self.limit_point
             and self.baseline_png
@@ -174,6 +177,9 @@ class RenewalSideProfile:
     def to_dict(self) -> dict[str, object]:
         return {
             "action_point": self.action_point.to_dict() if self.action_point else None,
+            "confirm_point": (
+                self.confirm_point.to_dict() if self.confirm_point else None
+            ),
             "price_rect": self.price_rect.to_dict() if self.price_rect else None,
             "limit_point": self.limit_point.to_dict() if self.limit_point else None,
             "baseline_png": self.baseline_png,
@@ -185,6 +191,7 @@ class RenewalSideProfile:
             return cls()
         return cls(
             action_point=NormalizedPoint.from_dict(value.get("action_point")),
+            confirm_point=NormalizedPoint.from_dict(value.get("confirm_point")),
             price_rect=NormalizedRect.from_dict(value.get("price_rect")),
             limit_point=NormalizedPoint.from_dict(value.get("limit_point")),
             baseline_png=str(value.get("baseline_png") or ""),
@@ -220,7 +227,9 @@ class RenewalProfile:
         missing: list[str] = []
         side_profile = self.side(side)
         if side_profile.action_point is None:
-            missing.append("구매/판매 버튼 위치")
+            missing.append("창 열기 구매/판매 버튼 위치")
+        if side_profile.confirm_point is None:
+            missing.append("창 안 최종 구매/판매 버튼 위치")
         if side_profile.price_rect is None or not side_profile.baseline_png:
             missing.append("가격 감지영역")
         if side_profile.limit_point is None:
@@ -229,7 +238,7 @@ class RenewalProfile:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "version": 3,
+            "version": 4,
             "re_register_point": (
                 self.re_register_point.to_dict() if self.re_register_point else None
             ),
@@ -427,6 +436,7 @@ class FastRenewalRunner:
 
         side_profile = self.profile.side(self.side_name)
         assert side_profile.action_point is not None
+        assert side_profile.confirm_point is not None
         assert side_profile.price_rect is not None
         assert side_profile.limit_point is not None
 
@@ -434,6 +444,7 @@ class FastRenewalRunner:
         region = side_profile.price_rect.to_pixels(frame_width, frame_height)
         clicker = _FastClicker(self.manager, frame_width, frame_height)
         action = clicker.resolve(side_profile.action_point)
+        confirm = clicker.resolve(side_profile.confirm_point)
         limit_price = clicker.resolve(side_profile.limit_point)
 
         # 이후 WGC 콜백은 이 작은 가격 영역만 grayscale로 변환합니다.
@@ -443,7 +454,7 @@ class FastRenewalRunner:
         self.status("가격 변경 전까지 무한 반복 중")
         self.log(
             f"[갱신] {'구매 상한가' if self.side_name == 'buy' else '판매 하한가'} "
-            f"{'구매' if self.side_name == 'buy' else '판매'} 버튼/ESC 반복 시작 "
+            f"열기 버튼/ESC 반복 시작 "
             f"(속도 {self.profile.speed_level}, 에지 기준 {self.profile.change_threshold:.3f})"
         )
 
@@ -534,9 +545,9 @@ class FastRenewalRunner:
                 )
                 # 같은 HWND 메시지 큐에 순서대로 들어가므로 별도 sleep 없이 처리됩니다.
                 clicker.click_client(limit_price)
-                # 구매/판매 버튼은 창을 여는 동작과 최종 주문 동작에 동일하게
-                # 사용됩니다. side별 좌표를 재사용해 판매에서 구매 좌표를 누르지 않습니다.
-                clicker.click_client(action)
+                # 바깥쪽 창 열기 버튼이 아니라, 열린 창 안쪽의 최종 구매/판매
+                # 버튼을 누릅니다. 두 버튼은 화면상 위치가 서로 다릅니다.
+                clicker.click_client(confirm)
                 elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
                 self.log(
                     f"[갱신 완료] {cycle_count}회 확인, 가격 변경 "
