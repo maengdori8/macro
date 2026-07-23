@@ -32,9 +32,13 @@ from macroapp.license_client import (
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.renewal import (
     RENEWAL_CALIBRATION_VERSION,
+    RENEWAL_CALIBRATION_FRAMES_PER_OPENING,
+    RENEWAL_CALIBRATION_OPENINGS,
     FastRenewalRunner,
     NormalizedPoint,
     NormalizedRect,
+    RenewalModalGuard,
+    _FastClicker,
     build_calibration_result,
     build_guard_rect,
     encode_gray_png,
@@ -444,6 +448,7 @@ class RenewalApp:
             and side.guard_rect
             and side.baseline_png
             and side.guard_png
+            and side.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
             and side.calibration_version >= RENEWAL_CALIBRATION_VERSION
         )
         self.setting_status_var.set(
@@ -468,16 +473,16 @@ class RenewalApp:
 
     def _on_speed_changed(self, value: str) -> None:
         level = int(round(float(value)))
-        mode = (
-            "안정"
-            if level <= 3
-            else ("균형" if level <= 7 else "초고속")
-        )
         required_frames = 2 if level >= 8 else 3
-        self.speed_status_var.set(
-            f"속도 {level}/10 · {mode} · "
-            f"안전검증 {required_frames}프레임 고정"
-        )
+        if level == 10:
+            text = "속도 10/10 · 명확한 변경 2프레임 즉시 · 애매하면 주문 금지"
+        else:
+            mode = "안정" if level <= 3 else ("균형" if level <= 7 else "초고속")
+            text = (
+                f"속도 {level}/10 · {mode} · 명확한 변경 "
+                f"{required_frames}프레임 · 애매하면 주문 금지"
+            )
+        self.speed_status_var.set(text)
 
     def _capture_frame(self) -> Optional[np.ndarray]:
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
@@ -499,12 +504,13 @@ class RenewalApp:
     def _capture_guard_samples(
         self,
         guard_rect: NormalizedRect,
+        price_box: tuple[int, int, int, int],
+        action_point: NormalizedPoint,
         expected_size: tuple[int, int],
-        sample_count: int = 8,
-    ) -> list[np.ndarray]:
-        """정지된 팝업에서 서로 다른 새 WGC 프레임을 모읍니다."""
+    ) -> list[list[np.ndarray]]:
+        """서로 다른 5회 팝업 열기에서 회당 새 WGC 프레임 4장을 모읍니다."""
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
-        samples: list[np.ndarray] = []
+        sessions: list[list[np.ndarray]] = []
         try:
             if not manager.find_window():
                 raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
@@ -517,27 +523,102 @@ class RenewalApp:
                     "좌표 선택 중 게임 창 크기가 바뀌었습니다. 다시 설정하세요."
                 )
             gx1, gy1, gx2, gy2 = guard_rect.to_pixels(frame_width, frame_height)
-            samples.append(full_frame[gy1:gy2, gx1:gx2].copy())
+            reference_guard = full_frame[gy1:gy2, gx1:gx2].copy()
+            provisional_guard = RenewalModalGuard(
+                reference_guard,
+                price_box,
+                shift_limit=4,
+            )
             engine = manager.capture_engine
             if engine is None:
                 raise RuntimeError("WGC 캡처 엔진이 시작되지 않았습니다.")
+            if not hasattr(engine, "get_latest_frame_packet"):
+                raise RuntimeError("WGC 프레임 순번 API를 사용할 수 없습니다.")
             engine.set_capture_region((gx1, gy1, gx2, gy2))
-            engine.get_latest_frame(timeout=0.0)
-            deadline = time.monotonic() + 2.0
-            while len(samples) < sample_count and time.monotonic() < deadline:
-                sample = engine.get_latest_frame(timeout=0.10)
-                if sample is None:
-                    if engine.closed_event.is_set():
-                        raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
-                    continue
-                if sample.shape != samples[0].shape:
-                    raise RuntimeError("보정 중 게임 창 크기가 바뀌었습니다.")
-                samples.append(sample.copy())
-            if len(samples) < sample_count:
-                raise RuntimeError(
-                    f"안전 보정 프레임이 부족합니다({len(samples)}/{sample_count})."
+            clicker = _FastClicker(manager, frame_width, frame_height)
+            action = clicker.resolve(action_point)
+            last_sequence = -1
+            last_timestamp = float("-inf")
+
+            def flush() -> None:
+                nonlocal last_sequence, last_timestamp
+                packet = engine.get_latest_frame_packet(timeout=0.0)
+                if packet is not None:
+                    last_sequence = max(last_sequence, packet.sequence_id)
+                    last_timestamp = max(
+                        last_timestamp,
+                        packet.captured_at,
+                    )
+
+            def next_packet(deadline: float):
+                nonlocal last_sequence, last_timestamp
+                while time.monotonic() < deadline:
+                    packet = engine.get_latest_frame_packet(timeout=0.10)
+                    if packet is None:
+                        if engine.closed_event.is_set():
+                            raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
+                        continue
+                    if (
+                        packet.sequence_id <= last_sequence
+                        or packet.captured_at <= last_timestamp
+                    ):
+                        continue
+                    last_sequence = packet.sequence_id
+                    last_timestamp = packet.captured_at
+                    return packet
+                return None
+
+            def wait_until_closed() -> None:
+                deadline = time.monotonic() + 1.0
+                while True:
+                    packet = next_packet(deadline)
+                    if packet is None:
+                        raise RuntimeError("팝업 닫힘을 확인하지 못했습니다.")
+                    registration = provisional_guard.register(
+                        packet.image,
+                        0.0,
+                        0.0,
+                    )
+                    if not registration.valid:
+                        return
+
+            flush()
+            for opening in range(RENEWAL_CALIBRATION_OPENINGS):
+                if opening > 0:
+                    clicker.press_escape()
+                    wait_until_closed()
+                    flush()
+                    clicker.click_client(action)
+                    flush()
+
+                self.status_var.set(
+                    f"v6 안전 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
+                    "창을 조작하지 마세요"
                 )
-            return samples
+                self.root.update_idletasks()
+                session: list[np.ndarray] = []
+                deadline = time.monotonic() + 2.0
+                while (
+                    len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                    and time.monotonic() < deadline
+                ):
+                    packet = next_packet(deadline)
+                    if packet is None:
+                        break
+                    sample = packet.image
+                    if sample.shape != reference_guard.shape:
+                        raise RuntimeError("보정 중 게임 창 크기가 바뀌었습니다.")
+                    registration = provisional_guard.register(sample, 0.0, 0.0)
+                    if not registration.valid:
+                        session.clear()
+                        continue
+                    session.append(sample.copy())
+                if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
+                    raise RuntimeError(
+                        f"{opening + 1}번째 팝업의 안전 프레임이 부족합니다."
+                    )
+                sessions.append(session)
+            return sessions
         finally:
             manager.stop_capture()
 
@@ -634,6 +715,14 @@ class RenewalApp:
 
         side = self.profile.side(self.side_var.get())
         if item == "price" and isinstance(selection, NormalizedRect):
+            if side.action_point is None:
+                self.status_var.set("먼저 창 열기 버튼을 설정하세요")
+                messagebox.showerror(
+                    "창 열기 버튼 필요",
+                    "5회 독립 팝업 보정을 위해 먼저 창 열기 구매/판매 버튼을 설정하세요.",
+                    parent=self.root,
+                )
+                return
             frame_height, frame_width = frame.shape[:2]
             x1, y1, x2, y2 = selection.to_pixels(frame_width, frame_height)
             selected_price = frame[y1:y2, x1:x2]
@@ -659,6 +748,8 @@ class RenewalApp:
             try:
                 samples = self._capture_guard_samples(
                     guard_rect,
+                    price_box,
+                    side.action_point,
                     (frame_width, frame_height),
                 )
                 calibration = build_calibration_result(samples, price_box)
@@ -684,6 +775,10 @@ class RenewalApp:
             side.noise_slice = calibration.noise_slice
             side.guard_luma_noise = calibration.guard_luma_noise
             side.guard_edge_noise = calibration.guard_edge_noise
+            side.unchanged_limit = calibration.unchanged_limit
+            side.stability_limit = calibration.stability_limit
+            side.registration_shift_limit = calibration.registration_shift_limit
+            side.calibration_openings = calibration.calibration_openings
             side.calibration_version = RENEWAL_CALIBRATION_VERSION
         elif isinstance(selection, NormalizedPoint):
             if item == "action":
@@ -744,10 +839,11 @@ class RenewalApp:
         side = self.side_var.get()
         self.status_var.set("갱신매크로 시작")
         self.log(
-            f"[시작] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
+            f"[시작 v6] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
-            f"안전검증={2 if self.profile.speed_level >= 8 else 3}프레임"
+            f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
+            "애매하면 주문 금지"
         )
         self._report(True, "갱신매크로 시작")
         self.worker_thread = threading.Thread(

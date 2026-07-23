@@ -1,6 +1,8 @@
 from __future__ import annotations
 import sys
 import threading
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import cv2
@@ -9,6 +11,15 @@ import numpy as np
 from macroapp import winapi
 from macroapp.border_mask import CaptureBorderMask
 from macroapp.logging_util import LogCallback
+
+
+@dataclass(frozen=True)
+class CapturedFrame:
+    """소비된 WGC 프레임과 신선도 검증용 메타데이터."""
+
+    image: np.ndarray
+    sequence_id: int
+    captured_at: float
 
 
 def _supports_native_borderless_wgc() -> bool:
@@ -42,6 +53,7 @@ class WGCCaptureEngine:
         self.logged_first_frame = False
         self._frame_seq = 0
         self._last_consumed_seq = -1
+        self._latest_frame_timestamp = 0.0
         # 갱신 감시처럼 화면의 극히 일부만 필요한 경우에는 BGRA 전체 프레임을
         # grayscale로 바꾸지 않고 이 영역만 변환합니다. 좌표는 WGC 프레임 기준입니다.
         self.capture_region: Optional[tuple[int, int, int, int]] = None
@@ -89,6 +101,7 @@ class WGCCaptureEngine:
                 self.latest_frame = gray
                 self.last_frame_size = (int(frame.width), int(frame.height))
                 self._frame_seq += 1
+                self._latest_frame_timestamp = time.perf_counter()
                 self.frame_ready_event.set()
 
             self.first_frame_event.set()
@@ -131,6 +144,7 @@ class WGCCaptureEngine:
         with self.frame_lock:
             self.latest_frame = None
             self.last_frame_size = None
+            self._latest_frame_timestamp = 0.0
 
         capture_kwargs: dict[str, object] = {
             "cursor_capture": False,
@@ -183,8 +197,11 @@ class WGCCaptureEngine:
             self.started = False
             return False
 
-    def get_latest_frame(self, timeout: float = 0.0) -> Optional[np.ndarray]:
-        """소비되지 않은 최신 grayscale 프레임을 반환합니다. 없으면 None."""
+    def get_latest_frame_packet(
+        self,
+        timeout: float = 0.0,
+    ) -> Optional[CapturedFrame]:
+        """소비되지 않은 최신 grayscale 프레임과 순번을 반환합니다."""
 
         if timeout > 0 and not self.frame_ready_event.wait(timeout):
             return None
@@ -194,10 +211,18 @@ class WGCCaptureEngine:
                 self.frame_ready_event.clear()
                 return None
             frame = self.latest_frame
+            sequence_id = self._frame_seq
+            captured_at = self._latest_frame_timestamp
             self.latest_frame = None
-            self._last_consumed_seq = self._frame_seq
+            self._last_consumed_seq = sequence_id
             self.frame_ready_event.clear()
-            return frame
+            return CapturedFrame(frame, sequence_id, captured_at)
+
+    def get_latest_frame(self, timeout: float = 0.0) -> Optional[np.ndarray]:
+        """기존 호출부 호환용: 소비되지 않은 최신 grayscale 이미지만 반환합니다."""
+
+        packet = self.get_latest_frame_packet(timeout=timeout)
+        return None if packet is None else packet.image
 
     def get_frame_size(self) -> Optional[tuple[int, int]]:
         """최신 WGC 프레임의 (width, height)를 반환합니다."""
@@ -243,6 +268,7 @@ class WGCCaptureEngine:
             self.latest_frame = None
             self.last_frame_size = None
             self.capture_region = None
+            self._latest_frame_timestamp = 0.0
 
         if capture_control is None:
             if border_mask is not None:
