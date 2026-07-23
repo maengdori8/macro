@@ -14,9 +14,11 @@ import time
 import traceback
 import tkinter as tk
 from pathlib import Path
+from tkinter import messagebox
 from typing import Optional
 
 import numpy as np
+from PIL import Image, ImageTk
 
 from macroapp.config import WINDOW_TITLE
 from macroapp.frame_select import select_from_frame
@@ -29,13 +31,17 @@ from macroapp.license_client import (
 )
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.renewal import (
+    RENEWAL_CALIBRATION_VERSION,
     FastRenewalRunner,
     NormalizedPoint,
     NormalizedRect,
+    build_calibration_result,
+    build_guard_rect,
     encode_gray_png,
     load_renewal_profile,
-    renewal_speed_tuning,
+    price_box_in_guard,
     save_renewal_profile,
+    validate_price_region,
 )
 from macroapp.window import InactiveManager
 
@@ -433,10 +439,17 @@ class RenewalApp:
         side = self.profile.side(self.side_var.get())
         side_name = "구매" if self.side_var.get() == "buy" else "판매"
         limit_name = "상한가" if self.side_var.get() == "buy" else "하한가"
+        safe_price = (
+            side.price_rect
+            and side.guard_rect
+            and side.baseline_png
+            and side.guard_png
+            and side.calibration_version >= RENEWAL_CALIBRATION_VERSION
+        )
         self.setting_status_var.set(
             "공통: 가격이 그대로면 ESC 후 다시 열기\n"
             f"{side_name}: 열기 {mark(side.action_point)} / "
-            f"가격영역 {mark(side.price_rect and side.baseline_png)} / "
+            f"안전 가격영역 {mark(safe_price)} / "
             f"{limit_name} {mark(side.limit_point)} / "
             f"최종 버튼 {mark(side.confirm_point)}"
         )
@@ -454,12 +467,16 @@ class RenewalApp:
             return False
 
     def _on_speed_changed(self, value: str) -> None:
-        tuning = renewal_speed_tuning(value)
         level = int(round(float(value)))
-        mode = "안정" if level <= 3 else ("균형" if level <= 6 else "빠름")
+        mode = (
+            "안정"
+            if level <= 3
+            else ("균형" if level <= 7 else "초고속")
+        )
+        required_frames = 2 if level >= 8 else 3
         self.speed_status_var.set(
             f"속도 {level}/10 · {mode} · "
-            f"열기 {tuning.open_settle_ms}ms · 인식 {tuning.confirm_frames}프레임"
+            f"안전검증 {required_frames}프레임 고정"
         )
 
     def _capture_frame(self) -> Optional[np.ndarray]:
@@ -478,6 +495,116 @@ class RenewalApp:
             return None
         finally:
             manager.stop_capture()
+
+    def _capture_guard_samples(
+        self,
+        guard_rect: NormalizedRect,
+        expected_size: tuple[int, int],
+        sample_count: int = 8,
+    ) -> list[np.ndarray]:
+        """정지된 팝업에서 서로 다른 새 WGC 프레임을 모읍니다."""
+        manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
+        samples: list[np.ndarray] = []
+        try:
+            if not manager.find_window():
+                raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
+            full_frame = manager.capture_client_area(window_validated=True)
+            if full_frame is None:
+                raise RuntimeError("팝업 보정용 WGC 프레임을 받지 못했습니다.")
+            frame_height, frame_width = full_frame.shape[:2]
+            if (frame_width, frame_height) != expected_size:
+                raise RuntimeError(
+                    "좌표 선택 중 게임 창 크기가 바뀌었습니다. 다시 설정하세요."
+                )
+            gx1, gy1, gx2, gy2 = guard_rect.to_pixels(frame_width, frame_height)
+            samples.append(full_frame[gy1:gy2, gx1:gx2].copy())
+            engine = manager.capture_engine
+            if engine is None:
+                raise RuntimeError("WGC 캡처 엔진이 시작되지 않았습니다.")
+            engine.set_capture_region((gx1, gy1, gx2, gy2))
+            engine.get_latest_frame(timeout=0.0)
+            deadline = time.monotonic() + 2.0
+            while len(samples) < sample_count and time.monotonic() < deadline:
+                sample = engine.get_latest_frame(timeout=0.10)
+                if sample is None:
+                    if engine.closed_event.is_set():
+                        raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
+                    continue
+                if sample.shape != samples[0].shape:
+                    raise RuntimeError("보정 중 게임 창 크기가 바뀌었습니다.")
+                samples.append(sample.copy())
+            if len(samples) < sample_count:
+                raise RuntimeError(
+                    f"안전 보정 프레임이 부족합니다({len(samples)}/{sample_count})."
+                )
+            return samples
+        finally:
+            manager.stop_capture()
+
+    def _confirm_price_preview(self, image: np.ndarray) -> bool:
+        """실제 감지될 한 줄을 보여주고 저장 여부를 확인합니다."""
+        result = {"accepted": False}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("실제 가격 감지영역 미리보기")
+        dialog.configure(bg=self.COLORS["bg"], padx=18, pady=18)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        source = Image.fromarray(image)
+        scale = max(2, min(6, 660 // max(1, source.width)))
+        preview = source.resize(
+            (source.width * scale, source.height * scale),
+            Image.Resampling.NEAREST,
+        )
+        photo = ImageTk.PhotoImage(preview, master=dialog)
+        label = tk.Label(
+            dialog,
+            image=photo,
+            bg="#FFFFFF",
+            bd=2,
+            relief=tk.SOLID,
+        )
+        label.image = photo
+        label.pack(pady=(0, 12))
+        tk.Label(
+            dialog,
+            text=(
+                "이 한 줄만 가격으로 감지합니다.\n"
+                "'0회', 다른 가격 줄, 큰 여백이 보이면 다시 선택하세요."
+            ),
+            justify=tk.LEFT,
+            bg=self.COLORS["bg"],
+            fg=self.COLORS["text"],
+            font=self._font(10, bold=True),
+        ).pack(anchor=tk.W, pady=(0, 14))
+
+        buttons = tk.Frame(dialog, bg=self.COLORS["bg"])
+        buttons.pack(fill=tk.X)
+
+        def finish(accepted: bool) -> None:
+            result["accepted"] = accepted
+            dialog.destroy()
+
+        self._button(
+            buttons,
+            "이 영역 저장",
+            lambda: finish(True),
+            small=True,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self._button(
+            buttons,
+            "다시 선택",
+            lambda: finish(False),
+            small=True,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dialog.update_idletasks()
+        dialog.geometry(
+            f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 80}"
+        )
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return bool(result["accepted"])
 
     def calibrate(self, item: str) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -507,9 +634,57 @@ class RenewalApp:
 
         side = self.profile.side(self.side_var.get())
         if item == "price" and isinstance(selection, NormalizedRect):
-            x1, y1, x2, y2 = selection.to_pixels(frame.shape[1], frame.shape[0])
+            frame_height, frame_width = frame.shape[:2]
+            x1, y1, x2, y2 = selection.to_pixels(frame_width, frame_height)
+            selected_price = frame[y1:y2, x1:x2]
+            validation = validate_price_region(selected_price)
+            if not validation.valid:
+                self.status_var.set("가격영역 거부 · 숫자 한 줄만 다시 선택")
+                messagebox.showerror(
+                    "가격영역을 다시 선택하세요",
+                    validation.message,
+                    parent=self.root,
+                )
+                return
+
+            guard_rect = build_guard_rect(selection, frame_width, frame_height)
+            price_box = price_box_in_guard(
+                selection,
+                guard_rect,
+                frame_width,
+                frame_height,
+            )
+            self.status_var.set("팝업 안전 보정 중 · 창을 그대로 두세요")
+            self.root.update_idletasks()
+            try:
+                samples = self._capture_guard_samples(
+                    guard_rect,
+                    (frame_width, frame_height),
+                )
+                calibration = build_calibration_result(samples, price_box)
+            except Exception as exc:
+                self.status_var.set("안전 보정 실패 · 다시 선택")
+                messagebox.showerror(
+                    "안전 보정 실패",
+                    str(exc),
+                    parent=self.root,
+                )
+                return
+
+            if not self._confirm_price_preview(calibration.baseline):
+                self.status_var.set("가격영역 저장 취소 · 다시 선택하세요")
+                return
+
+            # 모든 검증이 끝난 뒤 한 번에 교체하여 실패 시 기존 설정을 보존합니다.
             side.price_rect = selection
-            side.baseline_png = encode_gray_png(frame[y1:y2, x1:x2])
+            side.guard_rect = guard_rect
+            side.baseline_png = encode_gray_png(calibration.baseline)
+            side.guard_png = encode_gray_png(calibration.guard)
+            side.noise_global = calibration.noise_global
+            side.noise_slice = calibration.noise_slice
+            side.guard_luma_noise = calibration.guard_luma_noise
+            side.guard_edge_noise = calibration.guard_edge_noise
+            side.calibration_version = RENEWAL_CALIBRATION_VERSION
         elif isinstance(selection, NormalizedPoint):
             if item == "action":
                 side.action_point = selection
@@ -572,7 +747,7 @@ class RenewalApp:
             f"[시작] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
-            f"인식={self.profile.confirm_frames}프레임"
+            f"안전검증={2 if self.profile.speed_level >= 8 else 3}프레임"
         )
         self._report(True, "갱신매크로 시작")
         self.worker_thread = threading.Thread(
