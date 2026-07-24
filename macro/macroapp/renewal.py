@@ -1065,6 +1065,19 @@ class RenewalPriceClassifier:
             self.baseline_local_glyph_mask,
             RenewalChangeDetector._DILATE_KERNEL,
         )
+        self._baseline_local_glyph_dilated_inverse = cv2.bitwise_not(
+            self.baseline_local_glyph_dilated
+        )
+        glyph_shape = self.baseline.shape
+        self._glyph_background_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_foreground_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_mask_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_dilated_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_inverse_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_first_diff_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_second_diff_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_difference_work = np.empty(glyph_shape, dtype=np.uint8)
+        self._glyph_union_work = np.empty(glyph_shape, dtype=np.uint8)
         self._baseline_classification = PriceClassification(
             PriceState.UNCHANGED,
             self.baseline,
@@ -1136,7 +1149,24 @@ class RenewalPriceClassifier:
     def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
         """Prove glyph equivalence without letting smooth popup light become a change."""
 
-        current_mask = self._local_glyph_mask(image)
+        cv2.GaussianBlur(
+            image,
+            (0, 0),
+            2.0,
+            self._glyph_background_work,
+        )
+        cv2.subtract(
+            self._glyph_background_work,
+            image,
+            self._glyph_foreground_work,
+        )
+        cv2.compare(
+            self._glyph_foreground_work,
+            16,
+            cv2.CMP_GE,
+            self._glyph_mask_work,
+        )
+        current_mask = self._glyph_mask_work
         current_count = int(cv2.countNonZero(current_mask))
         if current_count < 64:
             return False
@@ -1146,26 +1176,37 @@ class RenewalPriceClassifier:
         if not 0.85 <= population_ratio <= 1.18:
             return False
         kernel = RenewalChangeDetector._DILATE_KERNEL
-        current_dilated = cv2.dilate(current_mask, kernel)
-        difference = cv2.bitwise_or(
-            cv2.bitwise_and(
-                self.baseline_local_glyph_mask,
-                cv2.bitwise_not(current_dilated),
-            ),
-            cv2.bitwise_and(
-                current_mask,
-                cv2.bitwise_not(self.baseline_local_glyph_dilated),
-            ),
+        cv2.dilate(current_mask, kernel, self._glyph_dilated_work)
+        cv2.bitwise_not(
+            self._glyph_dilated_work,
+            self._glyph_inverse_work,
         )
-        union = cv2.bitwise_or(
+        cv2.bitwise_and(
+            self.baseline_local_glyph_mask,
+            self._glyph_inverse_work,
+            self._glyph_first_diff_work,
+        )
+        cv2.bitwise_and(
+            current_mask,
+            self._baseline_local_glyph_dilated_inverse,
+            self._glyph_second_diff_work,
+        )
+        cv2.bitwise_or(
+            self._glyph_first_diff_work,
+            self._glyph_second_diff_work,
+            self._glyph_difference_work,
+        )
+        cv2.bitwise_or(
             self.baseline_local_glyph_mask,
             current_mask,
+            self._glyph_union_work,
         )
-        union_count = int(cv2.countNonZero(union))
+        union_count = int(cv2.countNonZero(self._glyph_union_work))
         if union_count <= 0:
             return False
         difference_ratio = (
-            float(cv2.countNonZero(difference)) / float(union_count)
+            float(cv2.countNonZero(self._glyph_difference_work))
+            / float(union_count)
         )
         return difference_ratio <= 0.020
 
