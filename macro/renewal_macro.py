@@ -1834,6 +1834,140 @@ def _headless_fit_wgc() -> int:
             pass
 
 
+def _headless_monitor_existing(
+    side_name: str,
+    duration_seconds: float,
+) -> int:
+    """Run the real renewal loop with all order inputs permanently disabled."""
+
+    report_path = app_dir() / "renewal_headless_monitor.json"
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "side": side_name,
+        "duration_requested_seconds": float(duration_seconds),
+        "started_at_unix": time.time(),
+        "passed": False,
+        "order_inputs": 0,
+    }
+    manager: Optional[InactiveManager] = None
+    runner: Optional[FastRenewalRunner] = None
+    stop_event = threading.Event()
+    timer: Optional[threading.Timer] = None
+    logs: list[str] = []
+    statuses: list[str] = []
+    cleanup_escape_sent = False
+    started = time.perf_counter()
+    try:
+        if side_name not in ("buy", "sell"):
+            raise ValueError("Only buy or sell can be monitored.")
+        duration = min(8.0 * 60.0 * 60.0, max(1.0, float(duration_seconds)))
+        profile = load_renewal_profile()
+        side = profile.side(side_name)
+        missing = profile.missing(side_name)
+        if missing:
+            raise RuntimeError(
+                "Renewal calibration is incomplete: " + ", ".join(missing)
+            )
+        manager = InactiveManager(WINDOW_TITLE, logger=logs.append)
+        runner = FastRenewalRunner(
+            manager,
+            profile,
+            side_name,
+            stop_event,
+            logs.append,
+            statuses.append,
+            monitor_only=True,
+        )
+        timer = threading.Timer(duration, stop_event.set)
+        timer.daemon = True
+        timer.start()
+        runner.run()
+        telemetry = dict(runner.telemetry)
+        order_inputs = int(telemetry.get("order_clicks", 0))
+        armed_openings = int(telemetry.get("armed_openings", 0))
+        initial_mismatch = bool(telemetry.get("initial_mismatch", False))
+        passed = bool(
+            order_inputs == 0
+            and armed_openings >= 2
+            and not initial_mismatch
+        )
+        report.update(
+            {
+                "passed": passed,
+                "order_inputs": order_inputs,
+                "telemetry": telemetry,
+                "stopped_by": (
+                    "price_change_detected"
+                    if telemetry.get("monitor_detected")
+                    else (
+                        "initial_price_mismatch"
+                        if initial_mismatch
+                        else "duration"
+                    )
+                ),
+                "calibrated_frame_size": list(
+                    side.calibrated_frame_size() or ()
+                ),
+            }
+        )
+        return 0 if passed else 1
+    except Exception as exc:
+        report.update(
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "telemetry": (
+                    dict(runner.telemetry) if runner is not None else {}
+                ),
+            }
+        )
+        return 1
+    finally:
+        stop_event.set()
+        if timer is not None:
+            timer.cancel()
+        if (
+            runner is not None
+            and manager is not None
+            and bool(runner.telemetry.get("popup_may_be_open", False))
+            and manager.hwnd is not None
+        ):
+            try:
+                profile = runner.profile
+                calibrated_size = profile.side(
+                    side_name
+                ).calibrated_frame_size()
+                if calibrated_size is not None:
+                    _FastClicker(
+                        manager,
+                        calibrated_size[0],
+                        calibrated_size[1],
+                    ).press_escape()
+                    cleanup_escape_sent = True
+            except Exception:
+                pass
+        if manager is not None:
+            manager.stop_capture()
+        report.update(
+            {
+                "elapsed_seconds": time.perf_counter() - started,
+                "cleanup_escape_sent": cleanup_escape_sent,
+                "log_tail": logs[-100:],
+                "status_tail": statuses[-50:],
+                "finished_at_unix": time.time(),
+            }
+        )
+        temporary = report_path.with_suffix(".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(report_path)
+        except Exception:
+            pass
+
+
 def _headless_calibrate_existing(side_name: str) -> int:
     """Calibrate an existing right-side ROI using open/ESC only.
 
@@ -2021,12 +2155,12 @@ def _headless_calibrate_existing(side_name: str) -> int:
         guard_detector: Optional[RenewalModalGuard] = (
             initial_state_detector if initial_is_open_popup else None
         )
+        popup_may_be_open = initial_is_open_popup
         flush()
         for opening in range(RENEWAL_CALIBRATION_OPENINGS):
             opening_number = opening + 1
             if opening > 0 or not initial_is_open_popup:
                 clicker.click_client(action)
-            popup_may_be_open = True
             deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
             session: list[np.ndarray] = []
             previous_pair = None
@@ -2043,6 +2177,11 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 raw_guard_white_ratio = float(
                     np.count_nonzero(raw_guard >= 220)
                 ) / float(raw_guard.size)
+                if (
+                    float(np.mean(raw_guard)) >= 220.0
+                    and raw_guard_white_ratio >= 0.70
+                ):
+                    popup_may_be_open = True
                 metric: dict[str, object] = {
                     "opening": opening_number,
                     "guard_luma": float(np.mean(raw_guard)),
@@ -2410,6 +2549,19 @@ def main() -> int:
         return _startup_selftest()
     if "--headless-fit-wgc" in sys.argv[1:]:
         return _headless_fit_wgc()
+    monitor_seconds = 30.0
+    for argument in sys.argv[1:]:
+        if argument.startswith("--headless-monitor-seconds="):
+            try:
+                monitor_seconds = float(argument.split("=", 1)[1])
+            except ValueError:
+                return 2
+    for argument in sys.argv[1:]:
+        if argument.startswith("--headless-monitor-existing="):
+            return _headless_monitor_existing(
+                argument.split("=", 1)[1].strip().lower(),
+                monitor_seconds,
+            )
     for argument in sys.argv[1:]:
         if argument.startswith("--verification-soak-seconds="):
             try:

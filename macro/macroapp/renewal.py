@@ -2372,6 +2372,15 @@ class FastRenewalRunner:
         self.log = logger
         self.status = status
         self.monitor_only = bool(monitor_only)
+        self.telemetry: dict[str, object] = {
+            "cycle_count": 0,
+            "armed_openings": 0,
+            "ambiguous_count": 0,
+            "monitor_detected": False,
+            "initial_mismatch": False,
+            "order_clicks": 0,
+            "popup_may_be_open": False,
+        }
 
     def _wait(self, seconds: float) -> bool:
         return bool(self.stop_event.wait(max(0.0, seconds)))
@@ -2553,6 +2562,7 @@ class FastRenewalRunner:
                 not_before=closing_started,
             )
             if ready:
+                self.telemetry["popup_may_be_open"] = False
                 close_latencies.append(
                     (time.perf_counter() - closing_started) * 1000.0
                 )
@@ -2566,8 +2576,10 @@ class FastRenewalRunner:
 
         while not self.stop_event.is_set():
             cycle_count += 1
+            self.telemetry["cycle_count"] = cycle_count
             action_started = time.perf_counter()
             clicker.click_prepared(action_click)
+            self.telemetry["popup_may_be_open"] = True
             opening_not_before = time.perf_counter()
             if self.profile.open_settle_ms > 0 and self._wait(
                 self.profile.open_settle_ms / 1000.0
@@ -2665,6 +2677,9 @@ class FastRenewalRunner:
                 return False
 
             if ambiguous and last_result is not None:
+                self.telemetry["ambiguous_count"] = (
+                    int(self.telemetry["ambiguous_count"]) + 1
+                )
                 self.status("판정 불가 · 주문 금지 후 재감시")
                 save_renewal_diagnostic(
                     self.side_name,
@@ -2695,6 +2710,7 @@ class FastRenewalRunner:
 
             if decision is PriceState.CHANGED and last_result is not None:
                 if armed_openings < required_arm_openings:
+                    self.telemetry["initial_mismatch"] = True
                     self.status("기준 가격 불일치 · v9 우측 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
@@ -2723,6 +2739,7 @@ class FastRenewalRunner:
                     return False
 
                 if self.monitor_only:
+                    self.telemetry["monitor_detected"] = True
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
                         f"[무주문 측정 v9] {cycle_count}회에서 변경 확정, "
@@ -2757,6 +2774,7 @@ class FastRenewalRunner:
                 )
                 clicker.click_prepared(limit_click)
                 clicker.click_prepared(confirm_click)
+                self.telemetry["order_clicks"] = 2
                 input_completed_at = time.perf_counter()
                 elapsed_ms = (input_completed_at - detected_at) * 1000.0
                 second_frame_to_input_ms = (
@@ -2812,6 +2830,7 @@ class FastRenewalRunner:
             if decision is PriceState.UNCHANGED:
                 if armed_openings < required_arm_openings:
                     armed_openings += 1
+                    self.telemetry["armed_openings"] = armed_openings
                     self.status(
                         f"기준 가격 독립 확인 {armed_openings}/{required_arm_openings}"
                     )
