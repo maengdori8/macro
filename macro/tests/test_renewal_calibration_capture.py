@@ -159,7 +159,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         )
 
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):
-        faded = np.full((40, 80), 241, dtype=np.uint8)
+        faded = np.full((40, 80), 249, dtype=np.uint8)
         opaque = np.full((40, 80), 251, dtype=np.uint8)
         faded[:, :4] = 40
         opaque[:, :4] = 40
