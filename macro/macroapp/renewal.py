@@ -1330,6 +1330,7 @@ class RenewalPriceClassifier:
         float,
         Optional[np.ndarray],
         bool,
+        float,
     ]:
         gray = image
         if gray is None or gray.size == 0:
@@ -1341,7 +1342,17 @@ class RenewalPriceClassifier:
         pair = self.detector.prepare_pair_reusable(gray)
         direct_global = self.detector.analyze_pair_global(pair)
         if direct_global <= self.unchanged_limit:
-            return gray, 0, 0, pair, direct_global, 0.0, None, True
+            return (
+                gray,
+                0,
+                0,
+                pair,
+                direct_global,
+                0.0,
+                None,
+                True,
+                direct_global,
+            )
         # Reuse the already prepared 256x64 edge map.  Price text is right
         # aligned, so the right anchor and vertical center yield the residual
         # raw-ROI translation without another Canny + template correlation.
@@ -1357,6 +1368,7 @@ class RenewalPriceClassifier:
                 slice_score,
                 None,
                 False,
+                direct_global,
             )
         bx, by, baseline_width, baseline_height, _baseline_count = (
             self.baseline_prepared_geometry
@@ -1408,6 +1420,7 @@ class RenewalPriceClassifier:
                 slice_score,
                 None,
                 False,
+                direct_global,
             )
         # FC price text is right-aligned.  A genuine last-digit change may
         # alter the left edge/total glyph width, so only the stable right
@@ -1441,6 +1454,7 @@ class RenewalPriceClassifier:
             slice_score,
             None,
             True,
+            direct_global,
         )
 
     def classify(self, image: np.ndarray) -> PriceClassification:
@@ -1475,6 +1489,7 @@ class RenewalPriceClassifier:
                 slice_score,
                 aligned_registration_edges,
                 alignment_valid,
+                direct_global_score,
             ) = self.align(gray_for_cache if gray_for_cache is not None else image)
         except Exception as exc:
             empty = np.empty((0, 0), dtype=np.uint8)
@@ -1515,11 +1530,24 @@ class RenewalPriceClassifier:
                 and self._projection_integrity_edges(structural_edges)
             )
 
-        illumination_same = bool(
-            geometry_valid
-            and global_score > self.unchanged_limit
-            and self._same_glyph_after_illumination(aligned)
-        )
+        illumination_same = False
+        if geometry_valid and global_score > self.unchanged_limit:
+            # Prove glyph identity in whichever integer registration has the
+            # lower edge difference.  The right-anchor heuristic can
+            # occasionally invent a residual ±1 px shift; trying both masks
+            # would double the hot-path blur cost.
+            proof_image = aligned
+            if (
+                (dx != 0 or dy != 0)
+                and gray_for_cache is not None
+                and direct_global_score < global_score
+                and self._boundary_clear(gray_for_cache)
+                and self._render_contrast_valid(gray_for_cache)
+            ):
+                proof_image = gray_for_cache
+            illumination_same = self._same_glyph_after_illumination(
+                proof_image
+            )
         if not geometry_valid:
             state = PriceState.AMBIGUOUS
             reason = "incomplete_price_row"
@@ -2905,6 +2933,7 @@ class FastRenewalRunner:
                         aligned_frames=aligned_prices,
                         guard_frames=raw_guards,
                     )
+                    close_modal()
                     update_performance_telemetry()
                     return False
 
@@ -2932,6 +2961,7 @@ class FastRenewalRunner:
                         aligned_frames=aligned_prices,
                         guard_frames=raw_guards,
                     )
+                    close_modal()
                     update_performance_telemetry()
                     return False
 
