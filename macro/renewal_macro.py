@@ -96,6 +96,15 @@ WGC_SIZE_STABLE_SECONDS = 0.50
 WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
 
 
+def _calibration_guard_delta(
+    previous: Optional[np.ndarray],
+    current: np.ndarray,
+) -> float:
+    if previous is None or previous.shape != current.shape:
+        return float("inf")
+    return float(cv2.mean(cv2.absdiff(previous, current))[0])
+
+
 def _wait_for_stable_wgc_frame(
     manager: InactiveManager,
     *,
@@ -1253,6 +1262,7 @@ class RenewalApp:
                 last_luma_delta = 255.0
                 last_edge_delta = 1.0
                 previous_price_pair = None
+                previous_stable_guard = None
                 while (
                     len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
                     and time.monotonic() < deadline
@@ -1265,6 +1275,7 @@ class RenewalApp:
                         wrong_shape_count += 1
                         session.clear()
                         previous_price_pair = None
+                        previous_stable_guard = None
                         continue
                     registration = provisional_guard.register(sample, 0.0, 0.0)
                     last_luma_delta = registration.luma_delta
@@ -1273,6 +1284,7 @@ class RenewalApp:
                         invalid_count += 1
                         session.clear()
                         previous_price_pair = None
+                        previous_stable_guard = None
                         continue
                     price = crop_price_from_guard(
                         registration.aligned,
@@ -1283,22 +1295,33 @@ class RenewalApp:
                         incomplete_price_count += 1
                         session.clear()
                         previous_price_pair = None
+                        previous_stable_guard = None
                         continue
                     price_pair = RenewalChangeDetector.prepare_pair(price)
-                    if previous_price_pair is None:
-                        session[:] = [sample.copy()]
-                    elif (
-                        RenewalChangeDetector.pair_stability(
+                    guard_stability = _calibration_guard_delta(
+                        previous_stable_guard,
+                        registration.aligned,
+                    )
+                    pair_stability = (
+                        float("inf")
+                        if previous_price_pair is None
+                        else RenewalChangeDetector.pair_stability(
                             previous_price_pair,
                             price_pair,
                         )
-                        <= 0.030
+                    )
+                    if previous_price_pair is None:
+                        session[:] = [sample.copy()]
+                    elif (
+                        pair_stability <= 0.030
+                        and guard_stability <= CALIBRATION_STABLE_FRAME_DELTA
                     ):
                         session.append(sample.copy())
                     else:
                         unstable_price_count += 1
                         session[:] = [sample.copy()]
                     previous_price_pair = price_pair
+                    previous_stable_guard = registration.aligned.copy()
                 if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
                     if opening == 0:
                         hint = (
@@ -2207,6 +2230,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
             deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
             session: list[np.ndarray] = []
             previous_pair = None
+            previous_stable_guard = None
             while (
                 len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
                 and time.monotonic() < deadline
@@ -2248,6 +2272,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                         del capture_metrics[:-1000]
                         session.clear()
                         previous_pair = None
+                        previous_stable_guard = None
                         continue
                     aligned_guard = raw_guard
                     metric["guard_valid"] = True
@@ -2268,6 +2293,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                         del capture_metrics[:-1000]
                         session.clear()
                         previous_pair = None
+                        previous_stable_guard = None
                         continue
                     aligned_guard = registration.aligned
                     metric.update(
@@ -2296,32 +2322,38 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     del capture_metrics[:-1000]
                     session.clear()
                     previous_pair = None
+                    previous_stable_guard = None
                     continue
                 metric["price_valid"] = True
                 pair = RenewalChangeDetector.prepare_pair(price)
+                guard_stability = _calibration_guard_delta(
+                    previous_stable_guard,
+                    aligned_guard,
+                )
+                pair_stability = (
+                    float("inf")
+                    if previous_pair is None
+                    else RenewalChangeDetector.pair_stability(previous_pair, pair)
+                )
+                metric["guard_stability"] = (
+                    None
+                    if previous_stable_guard is None
+                    else guard_stability
+                )
                 if previous_pair is None:
                     session[:] = [raw_guard]
                     metric["pair_stability"] = None
                 elif (
-                    RenewalChangeDetector.pair_stability(previous_pair, pair)
-                    <= 0.030
+                    pair_stability <= 0.030
+                    and guard_stability <= CALIBRATION_STABLE_FRAME_DELTA
                 ):
-                    metric["pair_stability"] = (
-                        RenewalChangeDetector.pair_stability(
-                            previous_pair,
-                            pair,
-                        )
-                    )
+                    metric["pair_stability"] = pair_stability
                     session.append(raw_guard)
                 else:
-                    metric["pair_stability"] = (
-                        RenewalChangeDetector.pair_stability(
-                            previous_pair,
-                            pair,
-                        )
-                    )
+                    metric["pair_stability"] = pair_stability
                     session[:] = [raw_guard]
                 previous_pair = pair
+                previous_stable_guard = aligned_guard.copy()
                 capture_metrics.append(metric)
                 del capture_metrics[:-1000]
 

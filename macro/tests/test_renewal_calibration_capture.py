@@ -120,6 +120,19 @@ class _Detector:
 
 
 class RenewalCalibrationCaptureTests(unittest.TestCase):
+    def test_calibration_guard_stability_rejects_crossfade_frames(self):
+        early = np.full((40, 80), 223, dtype=np.uint8)
+        later = np.full((40, 80), 225, dtype=np.uint8)
+
+        self.assertEqual(
+            renewal_macro._calibration_guard_delta(early, early.copy()),
+            0.0,
+        )
+        self.assertGreater(
+            renewal_macro._calibration_guard_delta(early, later),
+            renewal_macro.CALIBRATION_STABLE_FRAME_DELTA,
+        )
+
     def test_stable_wgc_wait_discards_transient_oversized_frame(self):
         transient = np.zeros((1056, 1936), dtype=np.uint8)
         stable = np.zeros((1048, 1928), dtype=np.uint8)
