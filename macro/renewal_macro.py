@@ -91,9 +91,29 @@ from macroapp.window import InactiveManager
 ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 CALIBRATION_CLOSE_TIMEOUT_SECONDS = 3.0
 CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
+CALIBRATION_POPUP_LUMA_FLOOR = 220.0
+CALIBRATION_POPUP_WHITE_FLOOR = 245
+CALIBRATION_POPUP_WHITE_RATIO = 0.70
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
 WGC_SIZE_STABLE_SECONDS = 0.50
 WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
+
+
+def _calibration_popup_opacity(
+    guard: np.ndarray,
+) -> tuple[float, float, bool]:
+    if guard.size == 0:
+        return 0.0, 0.0, False
+    luma = float(np.mean(guard))
+    white_ratio = float(
+        np.count_nonzero(guard >= CALIBRATION_POPUP_WHITE_FLOOR)
+    ) / float(guard.size)
+    return (
+        luma,
+        white_ratio,
+        luma >= CALIBRATION_POPUP_LUMA_FLOOR
+        and white_ratio >= CALIBRATION_POPUP_WHITE_RATIO,
+    )
 
 
 def _calibration_guard_delta(
@@ -1277,6 +1297,13 @@ class RenewalApp:
                         previous_price_pair = None
                         previous_stable_guard = None
                         continue
+                    _, _, popup_is_opaque = _calibration_popup_opacity(sample)
+                    if not popup_is_opaque:
+                        invalid_count += 1
+                        session.clear()
+                        previous_price_pair = None
+                        previous_stable_guard = None
+                        continue
                     registration = provisional_guard.register(sample, 0.0, 0.0)
                     last_luma_delta = registration.luma_delta
                     last_edge_delta = registration.edge_delta
@@ -2123,10 +2150,11 @@ def _headless_calibrate_existing(side_name: str) -> int:
             frame_height,
         )
         initial_guard = full_frame[gy1:gy2, gx1:gx2].copy()
-        initial_guard_luma = float(np.mean(initial_guard))
-        initial_guard_white_ratio = float(
-            np.count_nonzero(initial_guard >= 220)
-        ) / float(initial_guard.size)
+        (
+            initial_guard_luma,
+            initial_guard_white_ratio,
+            initial_guard_is_opaque,
+        ) = _calibration_popup_opacity(initial_guard)
         initial_price = crop_price_from_guard(initial_guard, price_box)
         initial_price_validation = validate_limit_price_selection(
             initial_price,
@@ -2137,8 +2165,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
         )
         initial_is_open_popup = bool(
             initial_price_validation.valid
-            and initial_guard_luma >= 220.0
-            and initial_guard_white_ratio >= 0.70
+            and initial_guard_is_opaque
         )
         initial_state_detector = RenewalModalGuard(
             initial_guard,
@@ -2241,18 +2268,18 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 raw_guard = frame[gy1:gy2, gx1:gx2].copy()
                 recent_guard_frames.append(raw_guard.copy())
                 del recent_guard_frames[:-1000]
-                raw_guard_white_ratio = float(
-                    np.count_nonzero(raw_guard >= 220)
-                ) / float(raw_guard.size)
-                if (
-                    float(np.mean(raw_guard)) >= 220.0
-                    and raw_guard_white_ratio >= 0.70
-                ):
+                (
+                    raw_guard_luma,
+                    raw_guard_white_ratio,
+                    raw_guard_is_opaque,
+                ) = _calibration_popup_opacity(raw_guard)
+                if raw_guard_is_opaque:
                     popup_may_be_open = True
                 metric: dict[str, object] = {
                     "opening": opening_number,
-                    "guard_luma": float(np.mean(raw_guard)),
+                    "guard_luma": raw_guard_luma,
                     "guard_white_ratio": raw_guard_white_ratio,
+                    "guard_opaque": raw_guard_is_opaque,
                     "guard_valid": False,
                     "price_valid": False,
                 }
@@ -2265,8 +2292,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     metric["still_initial_state"] = still_initial
                     if (
                         still_initial
-                        or float(np.mean(raw_guard)) < 220.0
-                        or raw_guard_white_ratio < 0.70
+                        or not raw_guard_is_opaque
                     ):
                         capture_metrics.append(metric)
                         del capture_metrics[:-1000]
@@ -2277,6 +2303,13 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     aligned_guard = raw_guard
                     metric["guard_valid"] = True
                 else:
+                    if not raw_guard_is_opaque:
+                        capture_metrics.append(metric)
+                        del capture_metrics[:-1000]
+                        session.clear()
+                        previous_pair = None
+                        previous_stable_guard = None
+                        continue
                     registration = guard_detector.register(
                         raw_guard,
                         0.0,

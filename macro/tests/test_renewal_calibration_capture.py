@@ -120,6 +120,38 @@ class _Detector:
 
 
 class RenewalCalibrationCaptureTests(unittest.TestCase):
+    def test_calibration_popup_opacity_rejects_stable_crossfade(self):
+        faded = np.full((40, 80), 241, dtype=np.uint8)
+        opaque = np.full((40, 80), 251, dtype=np.uint8)
+        faded[:, :4] = 40
+        opaque[:, :4] = 40
+
+        faded_luma, faded_white_ratio, faded_valid = (
+            renewal_macro._calibration_popup_opacity(faded)
+        )
+        opaque_luma, opaque_white_ratio, opaque_valid = (
+            renewal_macro._calibration_popup_opacity(opaque)
+        )
+
+        self.assertGreaterEqual(
+            faded_luma,
+            renewal_macro.CALIBRATION_POPUP_LUMA_FLOOR,
+        )
+        self.assertLess(
+            faded_white_ratio,
+            renewal_macro.CALIBRATION_POPUP_WHITE_RATIO,
+        )
+        self.assertFalse(faded_valid)
+        self.assertGreaterEqual(
+            opaque_luma,
+            renewal_macro.CALIBRATION_POPUP_LUMA_FLOOR,
+        )
+        self.assertGreaterEqual(
+            opaque_white_ratio,
+            renewal_macro.CALIBRATION_POPUP_WHITE_RATIO,
+        )
+        self.assertTrue(opaque_valid)
+
     def test_calibration_guard_stability_rejects_crossfade_frames(self):
         early = np.full((40, 80), 223, dtype=np.uint8)
         later = np.full((40, 80), 225, dtype=np.uint8)
@@ -270,10 +302,12 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
     def test_five_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
-        opened = np.ones((height, width), dtype=np.uint8)
+        opened = np.full((height, width), 251, dtype=np.uint8)
+        opened[0, 0] = 1
         closed = np.zeros((height, width), dtype=np.uint8)
-        stale = np.ones((height + 1, width), dtype=np.uint8)
-        transition = np.full((height, width), 2, dtype=np.uint8)
+        stale = np.full((height + 1, width), 251, dtype=np.uint8)
+        stale[0, 0] = 1
+        transition = np.full((height, width), 241, dtype=np.uint8)
         transition[0, 0] = 1
 
         frames = [opened.copy()]
@@ -352,7 +386,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         ]
         self.assertEqual(len(popup_logs), 5)
         self.assertTrue(
-            all("가격 전환 1장" in line for line in popup_logs)
+            all("불일치 1장" in line for line in popup_logs)
         )
 
 
