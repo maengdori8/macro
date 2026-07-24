@@ -94,7 +94,7 @@ CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_POPUP_LUMA_FLOOR = 220.0
 CALIBRATION_POPUP_WHITE_FLOOR = 250
 CALIBRATION_POPUP_WHITE_RATIO = 0.70
-CALIBRATION_PRICE_BOTTOM_PADDING = 8
+CALIBRATION_PRICE_TARGET_HEIGHT = 48
 CALIBRATION_PRICE_TARGET_WIDTH = 220
 CALIBRATION_PRICE_RIGHT_PADDING = 8
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
@@ -131,12 +131,15 @@ def _expand_headless_price_rect(
     extra = max(0, CALIBRATION_PRICE_TARGET_WIDTH - width)
     right = min(CALIBRATION_PRICE_RIGHT_PADDING, extra)
     left = extra - right
+    target_bottom = y1 + max(
+        y2 - y1,
+        CALIBRATION_PRICE_TARGET_HEIGHT,
+    )
     return NormalizedRect(
         max(0, x1 - left) / frame_width,
         y1 / frame_height,
         min(frame_width, x2 + right) / frame_width,
-        min(frame_height, y2 + CALIBRATION_PRICE_BOTTOM_PADDING)
-        / frame_height,
+        min(frame_height, target_bottom) / frame_height,
     )
 
 

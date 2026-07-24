@@ -158,6 +158,25 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             (1300, 423, 1530, 471),
         )
 
+    def test_headless_price_rect_is_idempotent_after_expansion(self):
+        original = NormalizedRect(
+            1312 / 1928,
+            423 / 1048,
+            1532 / 1928,
+            471 / 1048,
+        )
+
+        expanded = renewal_macro._expand_headless_price_rect(
+            original,
+            1928,
+            1048,
+        )
+
+        self.assertEqual(
+            expanded.to_pixels(1928, 1048),
+            original.to_pixels(1928, 1048),
+        )
+
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):
         faded = np.full((40, 80), 249, dtype=np.uint8)
         opaque = np.full((40, 80), 251, dtype=np.uint8)
