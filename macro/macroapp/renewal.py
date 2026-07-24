@@ -1582,6 +1582,12 @@ class RenewalModalGuard:
             )
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
         ]
+        unit_local_scores = [
+            self._local_registration_luma(
+                _translate_image(self.baseline, dx, dy)
+            )
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        ]
         # A direct/cached match must remain well below the weakest visible
         # one-pixel translation of this exact guard.  This prevents measured
         # brightness noise from ever widening the shortcut enough to swallow
@@ -1589,6 +1595,10 @@ class RenewalModalGuard:
         self._direct_spatial_limit = max(
             0.20,
             min(1.50, min(unit_shift_scores) * 0.45),
+        )
+        self._local_spatial_limit = max(
+            0.20,
+            min(1.00, min(unit_local_scores) * 0.55),
         )
         self._registration_templates: list[
             tuple[int, int, int, int, np.ndarray]
@@ -1649,6 +1659,37 @@ class RenewalModalGuard:
         brightness_offset = float(cv2.mean(difference, mask=self.mask)[0])
         spatial_difference = np.abs(difference - brightness_offset)
         return float(cv2.mean(spatial_difference, mask=self.mask)[0])
+
+    def _local_registration_luma(self, gray: np.ndarray) -> float:
+        """Remove only smooth illumination drift, retaining spatial structure."""
+
+        difference = gray.astype(np.float32) - self._baseline_float
+        illumination = cv2.GaussianBlur(
+            difference,
+            (0, 0),
+            2.0,
+        )
+        residual = np.abs(difference - illumination)
+        return float(cv2.mean(residual, mask=self.mask)[0])
+
+    def _spatial_match(
+        self,
+        gray: np.ndarray,
+        raw_spatial: float,
+        luma_delta: float,
+        edge_delta: float,
+    ) -> bool:
+        if raw_spatial <= self._direct_spatial_limit:
+            return True
+        # A smooth white-popup render drift is allowed only when the static
+        # edge structure is virtually exact.  Position shifts and a different
+        # popup therefore cannot enter through this illumination-only path.
+        return bool(
+            luma_delta <= 10.0
+            and edge_delta <= 0.03
+            and self._local_registration_luma(gray)
+            <= self._local_spatial_limit
+        )
 
     def _template_shift(
         self,
@@ -1745,7 +1786,12 @@ class RenewalModalGuard:
         direct_luma, direct_edge = self.metrics(gray)
         direct_spatial = self._registration_luma(gray)
         if (
-            direct_spatial <= self._direct_spatial_limit
+            self._spatial_match(
+                gray,
+                direct_spatial,
+                direct_luma,
+                direct_edge,
+            )
             and direct_luma <= luma_limit
             and direct_edge <= registered_edge_limit
         ):
@@ -1769,7 +1815,12 @@ class RenewalModalGuard:
             cached_luma, cached_edge = self.metrics(cached_aligned)
             cached_spatial = self._registration_luma(cached_aligned)
             if (
-                cached_spatial <= self._direct_spatial_limit
+                self._spatial_match(
+                    cached_aligned,
+                    cached_spatial,
+                    cached_luma,
+                    cached_edge,
+                )
                 and cached_luma <= luma_limit
                 and cached_edge <= registered_edge_limit
             ):
@@ -1806,7 +1857,12 @@ class RenewalModalGuard:
                 template_aligned
             )
             if (
-                template_spatial <= self._direct_spatial_limit
+                self._spatial_match(
+                    template_aligned,
+                    template_spatial,
+                    template_luma,
+                    template_edge,
+                )
                 and template_luma <= luma_limit
                 and template_edge <= registered_edge_limit
             ):
@@ -1879,7 +1935,12 @@ class RenewalModalGuard:
         # Luminance still remains strict and prevents a different popup from
         # passing this relaxed registered-edge ceiling.
         valid = (
-            aligned_spatial <= self._direct_spatial_limit
+            self._spatial_match(
+                aligned,
+                aligned_spatial,
+                luma_delta,
+                edge_delta,
+            )
             and luma_delta <= luma_limit
             and edge_delta <= registered_edge_limit
         )

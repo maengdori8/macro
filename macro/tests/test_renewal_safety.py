@@ -507,6 +507,33 @@ class RenewalSafetyTests(unittest.TestCase):
                             (-shift_x, -shift_y),
                         )
 
+    def test_guard_accepts_only_structure_matched_smooth_illumination_drift(
+        self,
+    ) -> None:
+        guard_detector = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            shift_limit=4,
+        )
+        horizontal_drift = np.linspace(
+            2.0,
+            8.0,
+            self.guard.shape[1],
+            dtype=np.float32,
+        )
+        illuminated = np.clip(
+            self.guard.astype(np.float32) + horizontal_drift[None, :],
+            0,
+            255,
+        ).astype(np.uint8)
+        shifted = renewal._translate_image(illuminated, -2, 1)
+        registration = guard_detector.register(shifted, 0.0, 0.0)
+        self.assertTrue(registration.valid)
+        self.assertEqual(
+            (registration.shift_x, registration.shift_y),
+            (2, -1),
+        )
+
     def test_incomplete_brightness_and_wrong_popup_never_become_changes(self) -> None:
         classifier = renewal.RenewalPriceClassifier(
             self.base_price,
