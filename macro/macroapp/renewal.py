@@ -1066,6 +1066,14 @@ class RenewalPriceClassifier:
     _GLYPH_CHANGE_GLOBAL_FLOOR = 0.006
     _GLYPH_SAME_LIMIT = 0.004
     _GLYPH_CHANGE_LIMIT = 0.006
+    # A square 3x3 tolerance absorbs diagonal WGC antialiasing that the
+    # cross kernel deliberately preserves.  Recorded same-price 15조 reopen
+    # drift scores 0.000 here, while the closest different-price pair in the
+    # 25-popup FC corpus starts above 0.0029.  Keep a fail-closed gap between
+    # equivalence and change.
+    _GLYPH_RECT_SAME_LIMIT = 0.001
+    _GLYPH_RECT_CHANGE_LIMIT = 0.002
+    _GLYPH_RECT_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
     def __init__(
         self,
@@ -1120,6 +1128,13 @@ class RenewalPriceClassifier:
         )
         self._baseline_local_glyph_dilated_inverse = cv2.bitwise_not(
             self.baseline_local_glyph_dilated
+        )
+        self.baseline_local_glyph_rect_dilated = cv2.dilate(
+            self.baseline_local_glyph_mask,
+            self._GLYPH_RECT_KERNEL,
+        )
+        self._baseline_local_glyph_rect_dilated_inverse = cv2.bitwise_not(
+            self.baseline_local_glyph_rect_dilated
         )
         glyph_shape = self.baseline.shape
         self._glyph_background_work = np.empty(glyph_shape, dtype=np.uint8)
@@ -1212,11 +1227,11 @@ class RenewalPriceClassifier:
         foreground = cv2.subtract(background, image)
         return cv2.compare(foreground, 16, cv2.CMP_GE)
 
-    def _glyph_difference_after_illumination(
+    def _glyph_difference_evidence_after_illumination(
         self,
         image: np.ndarray,
-    ) -> Optional[float]:
-        """Return native glyph difference after removing smooth popup light."""
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Return cross- and square-tolerant native glyph differences."""
 
         cv2.blur(
             image,
@@ -1237,12 +1252,12 @@ class RenewalPriceClassifier:
         current_mask = self._glyph_mask_work
         current_count = int(cv2.countNonZero(current_mask))
         if current_count < 64:
-            return None
+            return None, None
         population_ratio = (
             float(current_count) / float(self.baseline_local_glyph_count)
         )
         if not 0.85 <= population_ratio <= 1.18:
-            return None
+            return None, None
         kernel = RenewalChangeDetector._DILATE_KERNEL
         cv2.dilate(current_mask, kernel, self._glyph_dilated_work)
         cv2.bitwise_not(
@@ -1271,11 +1286,51 @@ class RenewalPriceClassifier:
         )
         union_count = int(cv2.countNonZero(self._glyph_union_work))
         if union_count <= 0:
-            return None
-        return (
+            return None, None
+        cross_difference = (
             float(cv2.countNonZero(self._glyph_difference_work))
             / float(union_count)
         )
+        # Reuse the work buffers after the cross score is complete.  The
+        # square kernel is an independent proof that a borderline cross score
+        # is only diagonal antialiasing, not a changed digit.
+        cv2.dilate(
+            current_mask,
+            self._GLYPH_RECT_KERNEL,
+            self._glyph_dilated_work,
+        )
+        cv2.bitwise_not(
+            self._glyph_dilated_work,
+            self._glyph_inverse_work,
+        )
+        cv2.bitwise_and(
+            self.baseline_local_glyph_mask,
+            self._glyph_inverse_work,
+            self._glyph_first_diff_work,
+        )
+        cv2.bitwise_and(
+            current_mask,
+            self._baseline_local_glyph_rect_dilated_inverse,
+            self._glyph_second_diff_work,
+        )
+        cv2.bitwise_or(
+            self._glyph_first_diff_work,
+            self._glyph_second_diff_work,
+            self._glyph_difference_work,
+        )
+        rectangular_difference = (
+            float(cv2.countNonZero(self._glyph_difference_work))
+            / float(union_count)
+        )
+        return cross_difference, rectangular_difference
+
+    def _glyph_difference_after_illumination(
+        self,
+        image: np.ndarray,
+    ) -> Optional[float]:
+        """Return the primary native glyph difference."""
+
+        return self._glyph_difference_evidence_after_illumination(image)[0]
 
     def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
         """Prove glyph equivalence without hiding a similar real digit change."""
@@ -1709,16 +1764,25 @@ class RenewalPriceClassifier:
             geometry_valid = full_structure_valid
 
         glyph_difference: Optional[float] = None
+        rectangular_glyph_difference: Optional[float] = None
         if geometry_valid and global_score >= self._GLYPH_ANALYSIS_FLOOR:
             # A residual right-anchor shift can be one pixel worse than the
             # raw ROI for the same glyph. The smaller native difference is
             # the safe choice because either registration can veto an order.
             differences: list[float] = []
-            aligned_difference = self._glyph_difference_after_illumination(
-                aligned
+            rectangular_differences: list[float] = []
+            (
+                aligned_difference,
+                aligned_rectangular_difference,
+            ) = self._glyph_difference_evidence_after_illumination(
+                aligned,
             )
             if aligned_difference is not None:
                 differences.append(aligned_difference)
+            if aligned_rectangular_difference is not None:
+                rectangular_differences.append(
+                    aligned_rectangular_difference
+                )
             if (
                 (dx != 0 or dy != 0)
                 and gray_for_cache is not None
@@ -1726,24 +1790,46 @@ class RenewalPriceClassifier:
                 and self._boundary_clear(gray_for_cache)
                 and self._render_contrast_valid(gray_for_cache)
             ):
-                raw_difference = (
-                    self._glyph_difference_after_illumination(
-                        gray_for_cache
-                    )
+                (
+                    raw_difference,
+                    raw_rectangular_difference,
+                ) = self._glyph_difference_evidence_after_illumination(
+                    gray_for_cache
                 )
                 if raw_difference is not None:
                     differences.append(raw_difference)
+                if raw_rectangular_difference is not None:
+                    rectangular_differences.append(
+                        raw_rectangular_difference
+                    )
             if differences:
                 glyph_difference = min(differences)
+            if rectangular_differences:
+                rectangular_glyph_difference = min(
+                    rectangular_differences
+                )
 
         illumination_same = bool(
-            glyph_difference is not None
-            and glyph_difference <= self._GLYPH_SAME_LIMIT
+            (
+                glyph_difference is not None
+                and glyph_difference <= self._GLYPH_SAME_LIMIT
+            )
+            or (
+                rectangular_glyph_difference is not None
+                and rectangular_glyph_difference
+                <= self._GLYPH_RECT_SAME_LIMIT
+            )
+        )
+        rectangular_structure_change = bool(
+            rectangular_glyph_difference is not None
+            and rectangular_glyph_difference
+            >= self._GLYPH_RECT_CHANGE_LIMIT
         )
         native_structure_change = bool(
             glyph_difference is not None
             and global_score >= self._GLYPH_CHANGE_GLOBAL_FLOOR
             and glyph_difference >= self._GLYPH_CHANGE_LIMIT
+            and rectangular_structure_change
         )
         if not geometry_valid:
             state = PriceState.AMBIGUOUS
@@ -1760,8 +1846,22 @@ class RenewalPriceClassifier:
         elif global_score <= self.unchanged_limit:
             state = PriceState.AMBIGUOUS
             reason = "native_glyph_gray_zone"
-        elif global_score >= self.changed_global_limit or (
-            global_score >= 0.040 and slice_score >= 0.250
+        elif (
+            rectangular_structure_change
+            and (
+                global_score >= self.changed_global_limit
+                or (global_score >= 0.040 and slice_score >= 0.250)
+            )
+        ) or (
+            # A radically different but complete glyph can fall outside the
+            # native mask population window.  Preserve detection only for the
+            # very large two-axis separation used by the synthetic soak; the
+            # recorded 15조 reopen drift (global 0.079, slice 0.128) remains
+            # far below this fail-closed path.
+            glyph_difference is None
+            and rectangular_glyph_difference is None
+            and global_score >= 0.250
+            and slice_score >= 0.250
         ):
             state = PriceState.CHANGED
             reason = "stable_glyph_change"
