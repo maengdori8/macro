@@ -51,6 +51,78 @@ RENEWAL_PROFILE_VERSION = 9
 RENEWAL_CALIBRATION_VERSION = 5
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
+SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
+    {
+        (1928, 1048),
+        # FC ONLINE on a 1920-wide desktop keeps an 8 px non-client frame.
+        # WGC therefore settles at 1920x1040 even though GetWindowRect reports
+        # 1928x1048.  Calibration remains fail-closed by binding the profile to
+        # this exact stable size.
+        (1920, 1040),
+    }
+)
+WGC_SIZE_SETTLE_SECONDS = 0.50
+WGC_SIZE_SETTLE_TIMEOUT_SECONDS = 4.0
+
+
+def is_supported_renewal_wgc_size(width: int, height: int) -> bool:
+    return (int(width), int(height)) in SUPPORTED_RENEWAL_WGC_SIZES
+
+
+def wait_for_stable_wgc_frame(
+    manager: InactiveManager,
+    *,
+    settle_seconds: float = WGC_SIZE_SETTLE_SECONDS,
+    timeout_seconds: float = WGC_SIZE_SETTLE_TIMEOUT_SECONDS,
+    minimum_unique_frames: int = 2,
+    first_frame: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return a unique WGC frame only after its size has stopped transitioning."""
+
+    first = (
+        first_frame
+        if first_frame is not None
+        else manager.capture_client_area(window_validated=True)
+    )
+    if first is None:
+        raise RuntimeError("Could not receive the first WGC frame.")
+    engine = manager.capture_engine
+    if engine is None or not hasattr(engine, "get_latest_frame_packet"):
+        raise RuntimeError("The unique-frame WGC API is unavailable.")
+
+    latest = first
+    candidate_size = (int(first.shape[1]), int(first.shape[0]))
+    candidate_since = time.monotonic()
+    candidate_frames = 1
+    required_frames = max(2, int(minimum_unique_frames))
+    deadline = candidate_since + max(1.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if (
+            now - candidate_since >= max(0.0, float(settle_seconds))
+            and candidate_frames >= required_frames
+        ):
+            return latest
+        packet = engine.get_latest_frame_packet(
+            timeout=min(0.10, max(0.0, deadline - now)),
+        )
+        if packet is None:
+            if engine.closed_event.is_set():
+                raise RuntimeError("WGC closed while its size was settling.")
+            continue
+        frame = packet.image
+        size = (int(frame.shape[1]), int(frame.shape[0]))
+        if size != candidate_size:
+            candidate_size = size
+            candidate_since = time.monotonic()
+            candidate_frames = 1
+        else:
+            candidate_frames += 1
+        latest = frame
+    raise RuntimeError(
+        f"WGC size did not settle within {timeout_seconds:.1f}s; "
+        f"last size was {candidate_size[0]}x{candidate_size[1]}."
+    )
 
 
 @dataclass(frozen=True)
@@ -562,10 +634,10 @@ def validate_limit_price_selection(
     row_validation = validate_price_region(image)
     if not row_validation.valid:
         return row_validation
-    if (int(frame_width), int(frame_height)) != (1928, 1048):
+    if not is_supported_renewal_wgc_size(frame_width, frame_height):
         return PriceRegionValidation(
             False,
-            "v9 우측 가격 보정은 WGC 1928x1048에서만 저장할 수 있습니다.",
+            "v9 우측 가격 보정은 검증된 1080p 안정 WGC 크기에서만 저장할 수 있습니다.",
             row_validation.band_count,
         )
     if side not in ("buy", "sell"):
@@ -2189,13 +2261,19 @@ class FastRenewalRunner:
         if not self.manager.find_window():
             raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
 
+        side_profile = self.profile.side(self.side_name)
+        calibrated_size = side_profile.calibrated_frame_size()
         self.status("WGC 연결 중")
         full_frame = self.manager.capture_client_area(window_validated=True)
         if full_frame is None:
             raise RuntimeError("FC ONLINE 첫 화면을 캡처하지 못했습니다.")
         frame_height, frame_width = full_frame.shape[:2]
-        side_profile = self.profile.side(self.side_name)
-        calibrated_size = side_profile.calibrated_frame_size()
+        if calibrated_size != (frame_width, frame_height):
+            full_frame = wait_for_stable_wgc_frame(
+                self.manager,
+                first_frame=full_frame,
+            )
+            frame_height, frame_width = full_frame.shape[:2]
         if calibrated_size != (frame_width, frame_height):
             expected_text = (
                 f"{calibrated_size[0]}x{calibrated_size[1]}"

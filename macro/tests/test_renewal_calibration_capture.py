@@ -132,23 +132,50 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             )
         self.assertEqual(result.shape, stable.shape)
 
-    def test_wgc_fit_compensates_and_rolls_back_failed_verification(self):
+    def test_wgc_fit_accepts_verified_fallback_and_fits_unsupported_size(self):
         from macroapp.turbo_session import WindowRect
 
         current_outer = WindowRect(0, 0, 1928, 1048)
-        resized_outer = WindowRect(0, 0, 1936, 1056)
-        snapshot = renewal_macro.WindowResizeSnapshot(
-            100,
-            current_outer,
-            resized_outer,
-        )
-        before = np.zeros((1040, 1920), dtype=np.uint8)
-        after = np.zeros((1048, 1928), dtype=np.uint8)
+        fallback = np.zeros((1040, 1920), dtype=np.uint8)
         with (
             mock.patch.object(
                 renewal_macro,
                 "get_window_rect",
                 return_value=current_outer,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "_measure_stable_wgc_frame",
+                return_value=fallback,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "resize_window_no_activate",
+            ) as resize,
+        ):
+            result, before_size, after_size = (
+                renewal_macro._fit_game_window_to_wgc(100)
+            )
+        self.assertEqual(result.original, current_outer)
+        self.assertEqual(result.resized, current_outer)
+        self.assertEqual(before_size, (1920, 1040))
+        self.assertEqual(after_size, (1920, 1040))
+        resize.assert_not_called()
+
+        unsupported_outer = WindowRect(0, 0, 1608, 908)
+        resized_outer = WindowRect(0, 0, 1936, 1056)
+        snapshot = renewal_macro.WindowResizeSnapshot(
+            100,
+            unsupported_outer,
+            resized_outer,
+        )
+        before = np.zeros((900, 1600), dtype=np.uint8)
+        after = np.zeros((1048, 1928), dtype=np.uint8)
+        with (
+            mock.patch.object(
+                renewal_macro,
+                "get_window_rect",
+                return_value=unsupported_outer,
             ),
             mock.patch.object(
                 renewal_macro,
@@ -169,7 +196,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 renewal_macro._fit_game_window_to_wgc(100)
             )
         self.assertEqual(result, snapshot)
-        self.assertEqual(before_size, (1920, 1040))
+        self.assertEqual(before_size, (1600, 900))
         self.assertEqual(after_size, (1928, 1048))
         resize.assert_called_once_with(100, (1936, 1056))
         restore.assert_not_called()
@@ -179,7 +206,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             mock.patch.object(
                 renewal_macro,
                 "get_window_rect",
-                return_value=current_outer,
+                return_value=unsupported_outer,
             ),
             mock.patch.object(
                 renewal_macro,

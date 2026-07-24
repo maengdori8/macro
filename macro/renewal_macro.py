@@ -45,6 +45,7 @@ from macroapp.renewal import (
     RENEWAL_CALIBRATION_VERSION,
     RENEWAL_CALIBRATION_FRAMES_PER_OPENING,
     RENEWAL_CALIBRATION_OPENINGS,
+    SUPPORTED_RENEWAL_WGC_SIZES,
     FastRenewalRunner,
     NormalizedPoint,
     NormalizedRect,
@@ -56,12 +57,14 @@ from macroapp.renewal import (
     crop_price_from_guard,
     decode_gray_png,
     encode_gray_png,
+    is_supported_renewal_wgc_size,
     load_renewal_profile,
     price_box_in_guard,
     save_renewal_profile,
     save_renewal_diagnostic,
     validate_limit_price_selection,
     validate_price_region,
+    wait_for_stable_wgc_frame,
 )
 from macroapp.renewal_soak import run_verification_soak
 from macroapp.turbo_session import (
@@ -96,40 +99,15 @@ def _wait_for_stable_wgc_frame(
     manager: InactiveManager,
     *,
     timeout_seconds: float = WGC_SIZE_STABLE_TIMEOUT_SECONDS,
+    first_frame: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Return only after one WGC size remains stable across the settle window."""
 
-    first = manager.capture_client_area(window_validated=True)
-    if first is None:
-        raise RuntimeError("Could not receive the first WGC frame.")
-    engine = manager.capture_engine
-    if engine is None or not hasattr(engine, "get_latest_frame_packet"):
-        raise RuntimeError("The unique-frame WGC API is unavailable.")
-
-    latest = first
-    candidate_size = (int(first.shape[1]), int(first.shape[0]))
-    candidate_since = time.monotonic()
-    deadline = candidate_since + max(1.0, float(timeout_seconds))
-    while time.monotonic() < deadline:
-        now = time.monotonic()
-        if now - candidate_since >= WGC_SIZE_STABLE_SECONDS:
-            return latest
-        packet = engine.get_latest_frame_packet(
-            timeout=min(0.10, max(0.0, deadline - now)),
-        )
-        if packet is None:
-            if engine.closed_event.is_set():
-                raise RuntimeError("WGC closed while its size was settling.")
-            continue
-        frame = packet.image
-        size = (int(frame.shape[1]), int(frame.shape[0]))
-        if size != candidate_size:
-            candidate_size = size
-            candidate_since = time.monotonic()
-        latest = frame
-    raise RuntimeError(
-        f"WGC size did not settle within {timeout_seconds:.1f}s; "
-        f"last size was {candidate_size[0]}x{candidate_size[1]}."
+    return wait_for_stable_wgc_frame(
+        manager,
+        settle_seconds=WGC_SIZE_STABLE_SECONDS,
+        timeout_seconds=timeout_seconds,
+        first_frame=first_frame,
     )
 
 
@@ -157,7 +135,7 @@ def _fit_game_window_to_wgc(
     original = get_window_rect(hwnd)
     before_frame = _measure_stable_wgc_frame(hwnd, logger)
     before_size = (int(before_frame.shape[1]), int(before_frame.shape[0]))
-    if before_size == TARGET_WGC_SIZE:
+    if is_supported_renewal_wgc_size(*before_size):
         return (
             WindowResizeSnapshot(int(hwnd), original, original),
             before_size,
@@ -1082,11 +1060,10 @@ class RenewalApp:
                 return None
             self.status_var.set("WGC 화면 캡처 중")
             self.root.update_idletasks()
-            for _attempt in range(2):
-                frame = manager.capture_client_area(window_validated=True)
-                if frame is not None:
-                    return frame.copy()
-            self.status_var.set("WGC 화면 캡처 실패")
+            return _wait_for_stable_wgc_frame(manager).copy()
+        except Exception as exc:
+            self.log(f"[WGC 안정화 실패] {exc}")
+            self.status_var.set("WGC 화면 안정화 실패")
             return None
         finally:
             manager.stop_capture()
@@ -1113,9 +1090,15 @@ class RenewalApp:
                 raise RuntimeError("팝업 보정용 WGC 프레임을 받지 못했습니다.")
             frame_height, frame_width = full_frame.shape[:2]
             if (frame_width, frame_height) != expected_size:
-                raise RuntimeError(
-                    "좌표 선택 중 게임 창 크기가 바뀌었습니다. 다시 설정하세요."
+                full_frame = _wait_for_stable_wgc_frame(
+                    manager,
+                    first_frame=full_frame,
                 )
+                frame_height, frame_width = full_frame.shape[:2]
+                if (frame_width, frame_height) != expected_size:
+                    raise RuntimeError(
+                        "좌표 선택 중 게임 창 크기가 바뀌었습니다. 다시 설정하세요."
+                    )
             gx1, gy1, gx2, gy2 = guard_rect.to_pixels(frame_width, frame_height)
             reference_guard = full_frame[gy1:gy2, gx1:gx2].copy()
             provisional_guard = RenewalModalGuard(
@@ -1777,7 +1760,7 @@ def _startup_selftest() -> int:
 
 
 def _headless_fit_wgc() -> int:
-    """Fit the FC window to a verified stable 1928x1048 WGC frame."""
+    """Verify a supported stable 1080p WGC frame, fitting when possible."""
 
     report_path = app_dir() / "renewal_headless_fit_wgc.json"
     report: dict[str, object] = {
@@ -1798,6 +1781,15 @@ def _headless_fit_wgc() -> int:
                 "hwnd": int(manager.hwnd),
                 "wgc_size_before": list(before_size),
                 "wgc_size_after": list(after_size),
+                "wgc_size_mode": (
+                    "preferred"
+                    if after_size == TARGET_WGC_SIZE
+                    else "verified_stable_fallback"
+                ),
+                "supported_wgc_sizes": [
+                    list(size)
+                    for size in sorted(SUPPORTED_RENEWAL_WGC_SIZES)
+                ],
                 "outer_size_before": [
                     snapshot.original.width,
                     snapshot.original.height,
@@ -1871,10 +1863,10 @@ def _headless_calibrate_existing(side_name: str) -> int:
         )
         full_frame = _wait_for_stable_wgc_frame(manager)
         frame_height, frame_width = full_frame.shape[:2]
-        if (frame_width, frame_height) != (1928, 1048):
+        if not is_supported_renewal_wgc_size(frame_width, frame_height):
             raise RuntimeError(
                 f"WGC 크기가 {frame_width}x{frame_height}입니다. "
-                "1928x1048에서만 v9 자동 보정을 실행합니다."
+                "검증된 1080p 안정 크기에서만 v9 자동 보정을 실행합니다."
             )
 
         price_rect = side.price_rect

@@ -291,6 +291,15 @@ class RenewalSafetyTests(unittest.TestCase):
                 1048,
             ).valid
         )
+        self.assertTrue(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                buy_rect,
+                "buy",
+                1920,
+                1040,
+            ).valid
+        )
 
         amount_input = renewal.NormalizedRect(0.610, 0.485, 0.765, 0.555)
         wrong_side_row = renewal.NormalizedRect(0.7128, 0.3660, 0.7904, 0.4042)
