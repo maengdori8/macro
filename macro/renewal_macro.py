@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 from tkinter import messagebox
 from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
@@ -48,6 +50,68 @@ from macroapp.renewal import (
     validate_price_region,
 )
 from macroapp.window import InactiveManager
+
+
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+
+
+def _enable_safe_process_priority() -> Optional[int]:
+    """현재 매크로만 Above Normal로 올리고 원래 우선순위를 반환합니다."""
+
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetCurrentProcess()
+        original = int(kernel32.GetPriorityClass(handle))
+        if original and original != ABOVE_NORMAL_PRIORITY_CLASS:
+            if not kernel32.SetPriorityClass(
+                handle,
+                ABOVE_NORMAL_PRIORITY_CLASS,
+            ):
+                return None
+        return original
+    except Exception:
+        return None
+
+
+def _restore_process_priority(original: Optional[int]) -> None:
+    if os.name != "nt" or not original:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), int(original))
+    except Exception:
+        pass
+
+
+def _available_ram_gb() -> Optional[float]:
+    if os.name != "nt":
+        return None
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    try:
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(MemoryStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
+            ctypes.byref(status)
+        ):
+            return None
+        return float(status.ullAvailPhys) / float(1024**3)
+    except Exception:
+        return None
 
 
 class RenewalLicenseDialog:
@@ -207,10 +271,12 @@ class RenewalApp:
         self.closing = False
         self._starting = False
         self._capture_buttons: list[tk.Button] = []
+        self._original_priority_class = _enable_safe_process_priority()
 
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         self.side_var = tk.StringVar(value="buy")
         self.speed_var = tk.IntVar(value=self.profile.speed_level)
+        self.monitor_only_var = tk.BooleanVar(value=False)
         self.speed_status_var = tk.StringVar()
         self.status_var = tk.StringVar(value="좌표 설정 후 F8")
         self.clock_var = tk.StringVar(value="--:--:--")
@@ -417,6 +483,19 @@ class RenewalApp:
             fg=c["muted"],
             font=self._font(8),
         ).pack(anchor=tk.W, pady=(8, 0))
+        self.monitor_checkbox = tk.Checkbutton(
+            speed_panel,
+            text="무주문 측정 모드 (가격 변경을 감지해도 클릭하지 않음)",
+            variable=self.monitor_only_var,
+            bg=c["panel"],
+            fg=c["text"],
+            activebackground=c["panel"],
+            activeforeground=c["text"],
+            selectcolor=c["input"],
+            highlightthickness=0,
+            font=self._font(9, bold=True),
+        )
+        self.monitor_checkbox.pack(anchor=tk.W, pady=(8, 0))
         self._on_speed_changed(str(self.speed_var.get()))
 
         status_panel = self._panel(body, "상태")
@@ -448,6 +527,7 @@ class RenewalApp:
             and side.guard_rect
             and side.baseline_png
             and side.guard_png
+            and side.closed_guard_png
             and side.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
             and side.calibration_version >= RENEWAL_CALIBRATION_VERSION
         )
@@ -475,7 +555,7 @@ class RenewalApp:
         level = int(round(float(value)))
         required_frames = 2 if level >= 8 else 3
         if level == 10:
-            text = "속도 10/10 · 명확한 변경 2프레임 즉시 · 애매하면 주문 금지"
+            text = "속도 10/10 · 120Hz 프레임 직결 · 고정 대기 0ms · 변경 2프레임"
         else:
             mode = "안정" if level <= 3 else ("균형" if level <= 7 else "초고속")
             text = (
@@ -507,10 +587,11 @@ class RenewalApp:
         price_box: tuple[int, int, int, int],
         action_point: NormalizedPoint,
         expected_size: tuple[int, int],
-    ) -> list[list[np.ndarray]]:
-        """서로 다른 5회 팝업 열기에서 회당 새 WGC 프레임 4장을 모읍니다."""
+    ) -> tuple[list[list[np.ndarray]], list[np.ndarray]]:
+        """열린 팝업 5회와 안정된 닫힘 화면의 고유 WGC 프레임을 모읍니다."""
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
         sessions: list[list[np.ndarray]] = []
+        closed_samples: list[np.ndarray] = []
         try:
             if not manager.find_window():
                 raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
@@ -568,8 +649,9 @@ class RenewalApp:
                     return packet
                 return None
 
-            def wait_until_closed() -> None:
+            def wait_until_closed() -> list[np.ndarray]:
                 deadline = time.monotonic() + 1.0
+                stable: list[np.ndarray] = []
                 while True:
                     packet = next_packet(deadline)
                     if packet is None:
@@ -579,20 +661,31 @@ class RenewalApp:
                         0.0,
                         0.0,
                     )
-                    if not registration.valid:
-                        return
+                    if registration.valid:
+                        stable.clear()
+                        continue
+                    sample = packet.image
+                    if stable:
+                        delta = float(
+                            cv2.mean(cv2.absdiff(stable[-1], sample))[0]
+                        )
+                        if delta > 1.5:
+                            stable.clear()
+                    stable.append(sample.copy())
+                    if len(stable) >= 4:
+                        return stable[-4:]
 
             flush()
             for opening in range(RENEWAL_CALIBRATION_OPENINGS):
                 if opening > 0:
                     clicker.press_escape()
-                    wait_until_closed()
+                    closed_samples = wait_until_closed()
                     flush()
                     clicker.click_client(action)
                     flush()
 
                 self.status_var.set(
-                    f"v6 안전 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
+                    f"v7 120Hz 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
                     "창을 조작하지 마세요"
                 )
                 self.root.update_idletasks()
@@ -618,7 +711,7 @@ class RenewalApp:
                         f"{opening + 1}번째 팝업의 안전 프레임이 부족합니다."
                     )
                 sessions.append(session)
-            return sessions
+            return sessions, closed_samples
         finally:
             manager.stop_capture()
 
@@ -746,13 +839,17 @@ class RenewalApp:
             self.status_var.set("팝업 안전 보정 중 · 창을 그대로 두세요")
             self.root.update_idletasks()
             try:
-                samples = self._capture_guard_samples(
+                samples, closed_samples = self._capture_guard_samples(
                     guard_rect,
                     price_box,
                     side.action_point,
                     (frame_width, frame_height),
                 )
-                calibration = build_calibration_result(samples, price_box)
+                calibration = build_calibration_result(
+                    samples,
+                    price_box,
+                    closed_samples,
+                )
             except Exception as exc:
                 self.status_var.set("안전 보정 실패 · 다시 선택")
                 messagebox.showerror(
@@ -771,10 +868,17 @@ class RenewalApp:
             side.guard_rect = guard_rect
             side.baseline_png = encode_gray_png(calibration.baseline)
             side.guard_png = encode_gray_png(calibration.guard)
+            side.closed_guard_png = encode_gray_png(calibration.closed_guard)
             side.noise_global = calibration.noise_global
             side.noise_slice = calibration.noise_slice
             side.guard_luma_noise = calibration.guard_luma_noise
             side.guard_edge_noise = calibration.guard_edge_noise
+            side.closed_guard_luma_noise = (
+                calibration.closed_guard_luma_noise
+            )
+            side.closed_guard_edge_noise = (
+                calibration.closed_guard_edge_noise
+            )
             side.unchanged_limit = calibration.unchanged_limit
             side.stability_limit = calibration.stability_limit
             side.registration_shift_limit = calibration.registration_shift_limit
@@ -837,23 +941,32 @@ class RenewalApp:
         self.stop_event.clear()
         self._set_running(True)
         side = self.side_var.get()
+        monitor_only = bool(self.monitor_only_var.get())
+        available_ram = _available_ram_gb()
         self.status_var.set("갱신매크로 시작")
         self.log(
-            f"[시작 v6] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
+            f"[시작 v7] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
-            "애매하면 주문 금지"
+            f"{'무주문 측정' if monitor_only else '실주문'} · 애매하면 주문 금지"
         )
+        if available_ram is not None:
+            self.log(f"[터보] 사용 가능 RAM {available_ram:.1f}GB · 매크로 Above Normal")
+            if available_ram < 4.0:
+                self.log(
+                    "[주의] 사용 가능 RAM이 4GB 미만입니다. 브라우저/Discord를 "
+                    "정리하면 프레임 끊김을 줄일 수 있습니다."
+                )
         self._report(True, "갱신매크로 시작")
         self.worker_thread = threading.Thread(
             target=self._worker,
-            args=(side,),
+            args=(side, monitor_only),
             daemon=True,
         )
         self.worker_thread.start()
 
-    def _worker(self, side: str) -> None:
+    def _worker(self, side: str, monitor_only: bool) -> None:
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
         completed = False
         failed = False
@@ -865,6 +978,7 @@ class RenewalApp:
                 stop_event=self.stop_event,
                 logger=self.log,
                 status=lambda message: self.ui_queue.put(("status", message)),
+                monitor_only=monitor_only,
             ).run()
         except Exception as exc:
             failed = True
@@ -899,6 +1013,9 @@ class RenewalApp:
         for button in self._capture_buttons:
             button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.speed_scale.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.monitor_checkbox.configure(
+            state=tk.DISABLED if running else tk.NORMAL
+        )
 
     def _poll_queue(self) -> None:
         while True:
@@ -946,6 +1063,7 @@ class RenewalApp:
                 self._log_file.close()
             except Exception:
                 pass
+        _restore_process_priority(self._original_priority_class)
         self.root.destroy()
 
 

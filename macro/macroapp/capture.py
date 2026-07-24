@@ -54,6 +54,7 @@ class WGCCaptureEngine:
         self._frame_seq = 0
         self._last_consumed_seq = -1
         self._latest_frame_timestamp = 0.0
+        self._replaced_frame_count = 0
         # 갱신 감시처럼 화면의 극히 일부만 필요한 경우에는 BGRA 전체 프레임을
         # grayscale로 바꾸지 않고 이 영역만 변환합니다. 좌표는 WGC 프레임 기준입니다.
         self.capture_region: Optional[tuple[int, int, int, int]] = None
@@ -67,12 +68,6 @@ class WGCCaptureEngine:
         """WGC 프레임을 grayscale 단일 슬롯에 넣고 밀린 프레임은 버립니다."""
 
         try:
-            # 소비자가 아직 이전 프레임을 처리 중이면 새 전체 프레임 복사/변환을 생략합니다.
-            # 큐를 쌓지 않고 가장 이른 다음 프레임을 받으므로 RAM과 지연이 함께 제한됩니다.
-            with self.frame_lock:
-                if self.latest_frame is not None:
-                    return
-
             image_bgra = np.asarray(frame.frame_buffer)
             if image_bgra.size == 0:
                 return
@@ -96,8 +91,10 @@ class WGCCaptureEngine:
             color_code = cv2.COLOR_BGRA2GRAY if image_bgra.shape[2] >= 4 else cv2.COLOR_BGR2GRAY
             gray = cv2.cvtColor(image_bgra, color_code)
             with self.frame_lock:
+                # 큐를 쌓지 않고 아직 소비되지 않은 이전 프레임을 최신 프레임으로
+                # 덮어씁니다. 판정이 한 프레임 늦어져도 과거 화면을 처리하지 않습니다.
                 if self.latest_frame is not None:
-                    return
+                    self._replaced_frame_count += 1
                 self.latest_frame = gray
                 self.last_frame_size = (int(frame.width), int(frame.height))
                 self._frame_seq += 1
@@ -145,6 +142,7 @@ class WGCCaptureEngine:
             self.latest_frame = None
             self.last_frame_size = None
             self._latest_frame_timestamp = 0.0
+            self._replaced_frame_count = 0
 
         capture_kwargs: dict[str, object] = {
             "cursor_capture": False,
@@ -229,6 +227,12 @@ class WGCCaptureEngine:
 
         with self.frame_lock:
             return self.last_frame_size
+
+    def get_replaced_frame_count(self) -> int:
+        """소비 전에 더 최신 프레임으로 교체된 누적 횟수입니다."""
+
+        with self.frame_lock:
+            return int(self._replaced_frame_count)
 
     def set_capture_region(
         self,

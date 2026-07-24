@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -31,8 +32,8 @@ cv2.setNumThreads(1)
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 6
-RENEWAL_CALIBRATION_VERSION = 2
+RENEWAL_PROFILE_VERSION = 7
+RENEWAL_CALIBRATION_VERSION = 3
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
 
@@ -185,10 +186,13 @@ class RenewalSideProfile:
     limit_point: Optional[NormalizedPoint] = None
     baseline_png: str = ""
     guard_png: str = ""
+    closed_guard_png: str = ""
     noise_global: float = 0.0
     noise_slice: float = 0.0
     guard_luma_noise: float = 0.0
     guard_edge_noise: float = 0.0
+    closed_guard_luma_noise: float = 0.0
+    closed_guard_edge_noise: float = 0.0
     unchanged_limit: float = 0.035
     stability_limit: float = 0.015
     registration_shift_limit: int = 4
@@ -204,6 +208,7 @@ class RenewalSideProfile:
             and self.limit_point
             and self.baseline_png
             and self.guard_png
+            and self.closed_guard_png
             and self.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
             and self.calibration_version >= RENEWAL_CALIBRATION_VERSION
         )
@@ -219,10 +224,13 @@ class RenewalSideProfile:
             "limit_point": self.limit_point.to_dict() if self.limit_point else None,
             "baseline_png": self.baseline_png,
             "guard_png": self.guard_png,
+            "closed_guard_png": self.closed_guard_png,
             "noise_global": float(self.noise_global),
             "noise_slice": float(self.noise_slice),
             "guard_luma_noise": float(self.guard_luma_noise),
             "guard_edge_noise": float(self.guard_edge_noise),
+            "closed_guard_luma_noise": float(self.closed_guard_luma_noise),
+            "closed_guard_edge_noise": float(self.closed_guard_edge_noise),
             "unchanged_limit": float(self.unchanged_limit),
             "stability_limit": float(self.stability_limit),
             "registration_shift_limit": int(self.registration_shift_limit),
@@ -242,6 +250,7 @@ class RenewalSideProfile:
             limit_point=NormalizedPoint.from_dict(value.get("limit_point")),
             baseline_png=str(value.get("baseline_png") or ""),
             guard_png=str(value.get("guard_png") or ""),
+            closed_guard_png=str(value.get("closed_guard_png") or ""),
         )
         try:
             side.noise_global = min(
@@ -255,6 +264,14 @@ class RenewalSideProfile:
             )
             side.guard_edge_noise = min(
                 1.0, max(0.0, float(value.get("guard_edge_noise", 0.0)))
+            )
+            side.closed_guard_luma_noise = min(
+                255.0,
+                max(0.0, float(value.get("closed_guard_luma_noise", 0.0))),
+            )
+            side.closed_guard_edge_noise = min(
+                1.0,
+                max(0.0, float(value.get("closed_guard_edge_noise", 0.0))),
             )
             side.unchanged_limit = min(
                 0.040, max(0.035, float(value.get("unchanged_limit", 0.035)))
@@ -317,10 +334,11 @@ class RenewalProfile:
             or side_profile.guard_rect is None
             or not side_profile.baseline_png
             or not side_profile.guard_png
+            or not side_profile.closed_guard_png
             or side_profile.calibration_openings < RENEWAL_CALIBRATION_OPENINGS
             or side_profile.calibration_version < RENEWAL_CALIBRATION_VERSION
         ):
-            missing.append("v6 안전 가격영역 재설정")
+            missing.append("v7 120Hz 가격영역 재설정")
         if side_profile.limit_point is None:
             missing.append("상한가 위치" if side == "buy" else "하한가 위치")
         return missing
@@ -564,7 +582,7 @@ def _translate_image(
     if image is None or image.size == 0:
         raise ValueError("이동할 이미지가 비어 있습니다.")
     if dx == 0 and dy == 0:
-        return image.copy()
+        return image
     if fill is None:
         border = np.concatenate(
             (image[0].reshape(-1), image[-1].reshape(-1), image[:, 0], image[:, -1])
@@ -681,6 +699,11 @@ class RenewalChangeDetector:
                 max_slice = ratio
         return global_ratio, max_slice
 
+    def analyze_pair_global(self, pair: tuple) -> float:
+        """동일 가격 빠른 경로용: 슬라이스 순회 없이 전역 변화율만 계산합니다."""
+
+        return self._diff(self.baseline_pair, pair)[2]
+
     @classmethod
     def pair_stability(cls, a: tuple, b: tuple) -> float:
         """두 프레임(둘 다 후보) 사이의 전역 변화율. 작을수록 '같은 화면이 정지'했다는 뜻."""
@@ -712,6 +735,8 @@ class PriceClassification:
     shift_y: int
     geometry_valid: bool
     reason: str
+    fingerprint: int = 0
+    fingerprint_population: int = 0
 
 
 class RenewalPriceClassifier:
@@ -739,6 +764,34 @@ class RenewalPriceClassifier:
         self.baseline_geometry = self._geometry(self.baseline)
         if self.baseline_geometry is None:
             raise ValueError("가격 기준 이미지의 글자 구조가 올바르지 않습니다.")
+        self.baseline_prepared_geometry = self._prepared_geometry(
+            self.detector.baseline_pair[0]
+        )
+        if self.baseline_prepared_geometry is None:
+            raise ValueError("가격 기준 지문을 만들지 못했습니다.")
+        self.baseline_border_contrast = self._border_contrast(self.baseline)
+
+    @staticmethod
+    def _border_contrast(image: np.ndarray) -> float:
+        high = max(
+            int(image[0].max()),
+            int(image[-1].max()),
+            int(image[:, 0].max()),
+            int(image[:, -1].max()),
+        )
+        low = min(
+            int(image[0].min()),
+            int(image[-1].min()),
+            int(image[:, 0].min()),
+            int(image[:, -1].min()),
+        )
+        return float(high - low)
+
+    def _boundary_clear(self, image: np.ndarray) -> bool:
+        return self._border_contrast(image) <= max(
+            18.0,
+            self.baseline_border_contrast + 8.0,
+        )
 
     @staticmethod
     def _registration_edges(image: np.ndarray) -> np.ndarray:
@@ -778,10 +831,68 @@ class RenewalPriceClassifier:
             and baseline_edges * 0.45 <= current_edges <= baseline_edges * 2.20
         )
 
+    @staticmethod
+    def _prepared_geometry(
+        edges: np.ndarray,
+    ) -> Optional[tuple[int, int, int, int, int]]:
+        count = int(cv2.countNonZero(edges))
+        if count <= 0:
+            return None
+        points = cv2.findNonZero(edges)
+        if points is None:
+            return None
+        x, y, width, height = cv2.boundingRect(points)
+        image_height, image_width = edges.shape[:2]
+        if (
+            x <= 0
+            or y <= 0
+            or x + width >= image_width
+            or y + height >= image_height
+        ):
+            return None
+        return x, y, width, height, count
+
+    def _prepared_geometry_matches(
+        self,
+        pair: tuple[np.ndarray, np.ndarray],
+    ) -> bool:
+        current = self._prepared_geometry(pair[0])
+        if current is None:
+            return False
+        _bx, _by, _bw, baseline_height, baseline_count = (
+            self.baseline_prepared_geometry
+        )
+        _cx, _cy, _cw, current_height, current_count = current
+        return (
+            baseline_height * 0.65
+            <= current_height
+            <= baseline_height * 1.35
+            and baseline_count * 0.45
+            <= current_count
+            <= baseline_count * 2.20
+        )
+
+    @staticmethod
+    def _packed_fingerprint(
+        pair: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[int, int]:
+        """팽창 에지를 정수 비트열로 바꿔 같은 후보의 빠른 비교에 사용합니다."""
+
+        packed = np.packbits(pair[1], bitorder="little").tobytes()
+        fingerprint = int.from_bytes(packed, "little", signed=False)
+        return fingerprint, fingerprint.bit_count()
+
     def align(
         self,
         image: np.ndarray,
-    ) -> tuple[np.ndarray, int, int, tuple[np.ndarray, np.ndarray]]:
+    ) -> tuple[
+        np.ndarray,
+        int,
+        int,
+        tuple[np.ndarray, np.ndarray],
+        float,
+        float,
+    ]:
         gray = image
         if gray is None or gray.size == 0:
             raise ValueError("가격 후보 이미지가 비어 있습니다.")
@@ -790,9 +901,9 @@ class RenewalPriceClassifier:
         if gray.shape != self.baseline.shape:
             raise ValueError("가격 후보 이미지 크기가 기준과 다릅니다.")
         pair = self.detector.prepare_pair(gray)
-        direct_global, _direct_slice = self.detector.analyze_pair(pair)
+        direct_global = self.detector.analyze_pair_global(pair)
         if direct_global <= self.unchanged_limit:
-            return gray.copy(), 0, 0, pair
+            return gray, 0, 0, pair, direct_global, 0.0
         # Locate the baseline glyph structure inside a 2 px padded current ROI.
         # One template correlation replaces 25 resized edge comparisons and
         # keeps the speed-10 changed path below the input latency budget.
@@ -818,13 +929,22 @@ class RenewalPriceClassifier:
         dx = limit - int(maximum_location[0])
         dy = limit - int(maximum_location[1])
         aligned = _translate_image(gray, dx, dy)
-        return aligned, dx, dy, self.detector.prepare_pair(aligned)
+        aligned_pair = self.detector.prepare_pair(aligned)
+        global_score, slice_score = self.detector.analyze_pair(aligned_pair)
+        return (
+            aligned,
+            dx,
+            dy,
+            aligned_pair,
+            global_score,
+            slice_score,
+        )
 
     def classify(self, image: np.ndarray) -> PriceClassification:
         try:
-            aligned, dx, dy, pair = self.align(image)
-            global_score, slice_score = self.detector.analyze_pair(pair)
-            geometry_valid = self._geometry_matches(aligned)
+            aligned, dx, dy, pair, global_score, slice_score = self.align(
+                image
+            )
         except Exception as exc:
             empty = np.empty((0, 0), dtype=np.uint8)
             empty_pair = self.detector.prepare_pair(self.baseline)
@@ -838,6 +958,17 @@ class RenewalPriceClassifier:
                 0,
                 False,
                 f"invalid:{exc}",
+            )
+
+        fingerprint, population = self._packed_fingerprint(pair)
+        # 기준과 거의 같은 에지 구조라면 완성된 기준 글자 구조도 동시에 증명됩니다.
+        # 동일 가격의 대부분을 차지하는 이 경로에서는 두 번째 Canny/행 검사를 생략합니다.
+        if global_score <= self.unchanged_limit:
+            geometry_valid = self._boundary_clear(aligned)
+        else:
+            geometry_valid = (
+                self._boundary_clear(aligned)
+                and self._prepared_geometry_matches(pair)
             )
 
         if not geometry_valid:
@@ -865,6 +996,8 @@ class RenewalPriceClassifier:
             dy,
             geometry_valid,
             reason,
+            fingerprint,
+            population,
         )
 
     def same_candidate(
@@ -872,10 +1005,24 @@ class RenewalPriceClassifier:
         first: PriceClassification,
         second: PriceClassification,
     ) -> bool:
+        if (
+            first.state is not second.state
+            or first.state is PriceState.AMBIGUOUS
+        ):
+            return False
+        union_population = (
+            first.fingerprint | second.fingerprint
+        ).bit_count()
+        if union_population > 0:
+            exact_ratio = (
+                first.fingerprint ^ second.fingerprint
+            ).bit_count() / float(union_population)
+            if exact_ratio <= self.stability_limit:
+                return True
+        # 안티앨리어싱으로 정확 비트가 조금 달라진 경우에는 기존 팽창 비교로
+        # 안전하게 되돌아가 판정 의미를 바꾸지 않습니다.
         return (
-            first.state is second.state
-            and first.state is not PriceState.AMBIGUOUS
-            and RenewalChangeDetector.pair_stability(first.pair, second.pair)
+            RenewalChangeDetector.pair_stability(first.pair, second.pair)
             <= self.stability_limit
         )
 
@@ -992,7 +1139,7 @@ class RenewalModalGuard:
         if direct_luma <= luma_limit and direct_edge <= edge_limit:
             return GuardRegistration(
                 True,
-                gray.copy(),
+                gray,
                 0,
                 0,
                 direct_luma,
@@ -1084,10 +1231,13 @@ class RenewalModalGuard:
 class RenewalCalibrationResult:
     baseline: np.ndarray
     guard: np.ndarray
+    closed_guard: np.ndarray
     noise_global: float
     noise_slice: float
     guard_luma_noise: float
     guard_edge_noise: float
+    closed_guard_luma_noise: float
+    closed_guard_edge_noise: float
     unchanged_limit: float
     stability_limit: float
     registration_shift_limit: int
@@ -1097,6 +1247,7 @@ class RenewalCalibrationResult:
 def build_calibration_result(
     guard_sessions: list[list[np.ndarray]],
     price_box: tuple[int, int, int, int],
+    closed_samples: Optional[list[np.ndarray]] = None,
 ) -> RenewalCalibrationResult:
     if len(guard_sessions) < RENEWAL_CALIBRATION_OPENINGS:
         raise ValueError(
@@ -1117,6 +1268,14 @@ def build_calibration_result(
     shape = guard_samples[0].shape
     if any(sample is None or sample.shape != shape for sample in guard_samples):
         raise ValueError("보정 프레임의 크기가 서로 다릅니다.")
+    if closed_samples is None or len(closed_samples) < 4:
+        raise ValueError("v7 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
+    closed_samples = closed_samples[:4]
+    if any(
+        sample is None or sample.shape != shape
+        for sample in closed_samples
+    ):
+        raise ValueError("닫힌 화면 보정 프레임의 크기가 서로 다릅니다.")
 
     reference_guard = guard_samples[0]
     reference_price = crop_price_from_guard(reference_guard, price_box)
@@ -1170,11 +1329,19 @@ def build_calibration_result(
         stability_limit=0.030,
     )
     guard_detector = RenewalModalGuard(guard, price_box, shift_limit=4)
+    closed_guard = np.median(np.stack(closed_samples), axis=0).astype(np.uint8)
+    closed_guard_detector = RenewalModalGuard(
+        closed_guard,
+        price_box,
+        shift_limit=4,
+    )
     global_scores: list[float] = []
     slice_scores: list[float] = []
     pair_scores: list[float] = []
     luma_scores: list[float] = []
     edge_scores: list[float] = []
+    closed_luma_scores: list[float] = []
+    closed_edge_scores: list[float] = []
     previous: Optional[PriceClassification] = None
     for sample in aligned_guards:
         price = crop_price_from_guard(sample, price_box)
@@ -1197,6 +1364,23 @@ def build_calibration_result(
         luma_scores.append(luma_score)
         edge_scores.append(edge_score)
 
+    for sample in closed_samples:
+        if guard_detector.register(sample, 0.0, 0.0).valid:
+            raise ValueError("닫힌 화면과 열린 팝업이 구분되지 않습니다. 가격영역을 다시 설정하세요.")
+        registration = closed_guard_detector.register(sample, 0.0, 0.0)
+        if not registration.valid:
+            raise ValueError("팝업 닫힘 화면이 안정되지 않았습니다. 다시 설정하세요.")
+        closed_luma_scores.append(registration.luma_delta)
+        closed_edge_scores.append(registration.edge_delta)
+    if any(
+        closed_guard_detector.register(sample, 0.0, 0.0).valid
+        for sample in aligned_guards
+    ):
+        raise ValueError(
+            "열린 팝업과 닫힘 화면이 구분되지 않습니다. "
+            "가격영역을 더 넓은 주변 배경과 함께 다시 설정하세요."
+        )
+
     if max(luma_scores) > 10.0 or max(edge_scores) > 0.08:
         raise ValueError("보정 중 팝업 화면이 바뀌었습니다. 창을 연 상태로 다시 설정하세요.")
 
@@ -1211,10 +1395,13 @@ def build_calibration_result(
     return RenewalCalibrationResult(
         baseline=baseline.copy(),
         guard=guard,
+        closed_guard=closed_guard,
         noise_global=max(global_scores),
         noise_slice=max(slice_scores),
         guard_luma_noise=max(luma_scores),
         guard_edge_noise=max(edge_scores),
+        closed_guard_luma_noise=max(closed_luma_scores),
+        closed_guard_edge_noise=max(closed_edge_scores),
         unchanged_limit=unchanged_limit,
         stability_limit=stability_limit,
         registration_shift_limit=registration_shift_limit,
@@ -1306,16 +1493,27 @@ class _FastClicker:
 
     def click_client(self, point: tuple[int, int]) -> None:
         x, y = point
-        input_message.post_mouse_move(self.hwnd, x, y)
-        input_message.post_mouse_down(self.hwnd, x, y)
-        input_message.post_mouse_up(self.hwnd, x, y)
+        input_message.post_prepared_mouse_click(
+            input_message.prepare_mouse_click(self.hwnd, x, y)
+        )
+
+    def prepare_client(
+        self,
+        point: tuple[int, int],
+    ) -> input_message.PreparedMouseClick:
+        x, y = point
+        return input_message.prepare_mouse_click(self.hwnd, x, y)
+
+    @staticmethod
+    def click_prepared(click: input_message.PreparedMouseClick) -> None:
+        input_message.post_prepared_mouse_click(click)
 
     def press_escape(self) -> None:
         """구매/판매 창을 닫는 ESC를 최상위 창에 한 번 전달합니다."""
         vk_escape = input_message.KEY_TO_VK["esc"]
         # ESC는 모든 자식 HWND에 브로드캐스트하면 팝업이 두 번 닫힐 수 있어
         # 최상위 창에 한 번만 보냅니다. FC의 전역 UI 단축키는 이 경로로 처리됩니다.
-        input_message.send_key_to_window(self.hwnd, vk_escape, press_delay=0.005)
+        input_message.send_key_to_window(self.hwnd, vk_escape, press_delay=0.0)
 
 
 class FastRenewalRunner:
@@ -1329,6 +1527,7 @@ class FastRenewalRunner:
         stop_event,
         logger: LogCallback,
         status: StatusCallback,
+        monitor_only: bool = False,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -1338,6 +1537,7 @@ class FastRenewalRunner:
         self.stop_event = stop_event
         self.log = logger
         self.status = status
+        self.monitor_only = bool(monitor_only)
 
     def _wait(self, seconds: float) -> bool:
         return bool(self.stop_event.wait(max(0.0, seconds)))
@@ -1370,6 +1570,9 @@ class FastRenewalRunner:
 
         baseline = decode_gray_png(side_profile.baseline_png)
         guard_baseline = decode_gray_png(side_profile.guard_png)
+        closed_guard_baseline = decode_gray_png(
+            side_profile.closed_guard_png
+        )
         price_box = price_box_in_guard(
             side_profile.price_rect,
             side_profile.guard_rect,
@@ -1386,12 +1589,20 @@ class FastRenewalRunner:
             price_box,
             shift_limit=side_profile.registration_shift_limit,
         )
+        ready_guard = RenewalModalGuard(
+            closed_guard_baseline,
+            price_box,
+            shift_limit=side_profile.registration_shift_limit,
+        )
         guard_region = side_profile.guard_rect.to_pixels(frame_width, frame_height)
 
         clicker = _FastClicker(self.manager, frame_width, frame_height)
         action = clicker.resolve(side_profile.action_point)
         confirm = clicker.resolve(side_profile.confirm_point)
         limit_price = clicker.resolve(side_profile.limit_point)
+        action_click = clicker.prepare_client(action)
+        confirm_click = clicker.prepare_client(confirm)
+        limit_click = clicker.prepare_client(limit_price)
         engine.set_capture_region(guard_region)
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
@@ -1401,26 +1612,25 @@ class FastRenewalRunner:
         cycle_count = 0
         last_sequence_id = -1
         last_captured_at = float("-inf")
+        frame_intervals: deque[float] = deque(maxlen=240)
+        open_latencies: deque[float] = deque(maxlen=120)
+        close_latencies: deque[float] = deque(maxlen=120)
+        classify_latencies: deque[float] = deque(maxlen=240)
         cycle_window_started = time.perf_counter()
+        last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v6] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v7] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
-            "애매하면 주문 금지"
+            f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
 
-        def flush_frame() -> None:
-            nonlocal last_sequence_id, last_captured_at
-            packet = engine.get_latest_frame_packet(timeout=0.0)
-            if packet is not None:
-                last_sequence_id = max(last_sequence_id, packet.sequence_id)
-                last_captured_at = max(
-                    last_captured_at,
-                    packet.captured_at,
-                )
-
-        def next_guard_packet(deadline: float) -> Optional[CapturedFrame]:
+        def next_guard_packet(
+            deadline: float,
+            *,
+            not_before: float = float("-inf"),
+        ) -> Optional[CapturedFrame]:
             nonlocal last_sequence_id, last_captured_at
             while not self.stop_event.is_set():
                 remaining = deadline - time.monotonic()
@@ -1438,45 +1648,70 @@ class FastRenewalRunner:
                     or packet.captured_at <= last_captured_at
                 ):
                     continue
+                if last_captured_at > 0:
+                    interval = packet.captured_at - last_captured_at
+                    if 0.001 <= interval <= 0.100:
+                        frame_intervals.append(interval)
                 last_sequence_id = packet.sequence_id
                 last_captured_at = packet.captured_at
+                if packet.captured_at <= not_before:
+                    continue
                 return packet
             return None
 
+        def wait_until_ready(
+            deadline: float,
+            *,
+            not_before: float = float("-inf"),
+        ) -> bool:
+            while not self.stop_event.is_set():
+                packet = next_guard_packet(
+                    deadline,
+                    not_before=not_before,
+                )
+                if packet is None:
+                    return False
+                registration = ready_guard.register(
+                    packet.image,
+                    side_profile.closed_guard_luma_noise,
+                    side_profile.closed_guard_edge_noise,
+                )
+                if registration.valid:
+                    return True
+            return False
+
         def close_modal() -> bool:
             clicker.press_escape()
+            closing_started = time.perf_counter()
             if self.profile.close_settle_ms > 0 and self._wait(
                 self.profile.close_settle_ms / 1000.0
             ):
                 return False
-            closed_streak = 0
-            deadline = time.monotonic() + 0.35
-            while not self.stop_event.is_set():
-                packet = next_guard_packet(deadline)
-                if packet is None:
-                    return False
-                registration = modal_guard.register(
-                    packet.image,
-                    side_profile.guard_luma_noise,
-                    side_profile.guard_edge_noise,
+            ready = wait_until_ready(
+                time.monotonic() + 0.75,
+                not_before=closing_started,
+            )
+            if ready:
+                close_latencies.append(
+                    (time.perf_counter() - closing_started) * 1000.0
                 )
-                if registration.valid:
-                    closed_streak = 0
-                    continue
-                closed_streak += 1
-                if closed_streak >= max(1, self.profile.closed_streak):
-                    return True
-            return False
+            return ready
+
+        self.status("목록 준비 화면 확인 중")
+        if not wait_until_ready(time.monotonic() + 1.0):
+            raise RuntimeError(
+                "목록 준비 화면을 확인하지 못했습니다. 팝업을 닫고 다시 시작하세요."
+            )
 
         while not self.stop_event.is_set():
             cycle_count += 1
-            flush_frame()
-            clicker.click_client(action)
+            action_started = time.perf_counter()
+            clicker.click_prepared(action_click)
+            opening_not_before = time.perf_counter()
             if self.profile.open_settle_ms > 0 and self._wait(
                 self.profile.open_settle_ms / 1000.0
             ):
                 return False
-            flush_frame()
 
             last_result: Optional[PriceClassification] = None
             stable_count = 0
@@ -1488,10 +1723,14 @@ class FastRenewalRunner:
             guard_shifts: list[tuple[int, int]] = []
             ambiguous = False
             decision: Optional[PriceState] = None
+            open_recorded = False
             deadline = time.monotonic() + 0.45
 
             while not self.stop_event.is_set():
-                packet = next_guard_packet(deadline)
+                packet = next_guard_packet(
+                    deadline,
+                    not_before=opening_not_before,
+                )
                 if packet is None:
                     break
                 registration = modal_guard.register(
@@ -1510,11 +1749,20 @@ class FastRenewalRunner:
                     guard_shifts.clear()
                     continue
 
+                if not open_recorded:
+                    open_latencies.append(
+                        (time.perf_counter() - action_started) * 1000.0
+                    )
+                    open_recorded = True
                 price = crop_price_from_guard(registration.aligned, price_box)
+                classify_started = time.perf_counter()
                 result = classifier.classify(price)
-                raw_prices.append(price.copy())
-                aligned_prices.append(result.aligned.copy())
-                raw_guards.append(packet.image.copy())
+                classify_latencies.append(
+                    (time.perf_counter() - classify_started) * 1000.0
+                )
+                raw_prices.append(price)
+                aligned_prices.append(result.aligned)
+                raw_guards.append(packet.image)
                 sequence_ids.append(packet.sequence_id)
                 capture_timestamps.append(packet.captured_at)
                 guard_shifts.append(
@@ -1579,12 +1827,14 @@ class FastRenewalRunner:
                     aligned_frames=aligned_prices,
                     guard_frames=raw_guards,
                 )
-                close_modal()
+                if not close_modal():
+                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
+                    return False
                 continue
 
             if decision is PriceState.CHANGED and last_result is not None:
                 if armed_openings < required_arm_openings:
-                    self.status("기준 가격 불일치 · v6 가격영역 재설정 필요")
+                    self.status("기준 가격 불일치 · v7 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
                         "주문 없이 정지합니다."
@@ -1611,6 +1861,31 @@ class FastRenewalRunner:
                     )
                     return False
 
+                if self.monitor_only:
+                    self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
+                    self.log(
+                        f"[무주문 측정 v7] {cycle_count}회에서 변경 확정, "
+                        f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
+                    )
+                    save_renewal_diagnostic(
+                        self.side_name,
+                        "monitor_detected",
+                        baseline,
+                        raw_prices,
+                        {
+                            "state": last_result.state.value,
+                            "global_score": last_result.global_score,
+                            "slice_score": last_result.slice_score,
+                            "sequence_ids": sequence_ids,
+                            "capture_timestamps": capture_timestamps,
+                            "cycle": cycle_count,
+                            "ordered": False,
+                        },
+                        aligned_frames=aligned_prices,
+                        guard_frames=raw_guards,
+                    )
+                    return False
+
                 if order_latched:
                     return True
                 order_latched = True
@@ -1619,11 +1894,11 @@ class FastRenewalRunner:
                     "가격 변경 확정 · "
                     + ("상한가 구매" if self.side_name == "buy" else "하한가 판매")
                 )
-                clicker.click_client(limit_price)
-                clicker.click_client(confirm)
+                clicker.click_prepared(limit_click)
+                clicker.click_prepared(confirm_click)
                 elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
                 self.log(
-                    f"[갱신 완료 v6] {cycle_count}회 확인, "
+                    f"[갱신 완료 v7] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -1662,24 +1937,68 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v6] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v7] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
-                close_modal()
+                if not close_modal():
+                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
+                    return False
             else:
                 # 팝업이 완전히 열리지 않았거나 고유 프레임이 부족한 사이클입니다.
-                close_modal()
+                if not close_modal():
+                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
+                    return False
 
             if cycle_count % 100 == 0:
                 window_seconds = time.perf_counter() - cycle_window_started
                 cycle_window_started = time.perf_counter()
-                self.log(
-                    f"[갱신 v6] {cycle_count}회 확인 중 · "
-                    f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클"
+                frame_ms = (
+                    float(np.median(frame_intervals)) * 1000.0
+                    if frame_intervals
+                    else 0.0
                 )
-            if armed_openings >= required_arm_openings:
+                capture_hz = 1000.0 / frame_ms if frame_ms > 0 else 0.0
+                classify_p95 = (
+                    float(np.percentile(classify_latencies, 95))
+                    if classify_latencies
+                    else 0.0
+                )
+                open_p50 = (
+                    float(np.median(open_latencies))
+                    if open_latencies
+                    else 0.0
+                )
+                close_p50 = (
+                    float(np.median(close_latencies))
+                    if close_latencies
+                    else 0.0
+                )
+                replaced = (
+                    engine.get_replaced_frame_count()
+                    if hasattr(engine, "get_replaced_frame_count")
+                    else 0
+                )
+                self.log(
+                    f"[갱신 v7] {cycle_count}회 확인 중 · "
+                    f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
+                    f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
+                    f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "
+                    f"최신교체 {replaced}"
+                )
+            now = time.perf_counter()
+            if (
+                armed_openings >= required_arm_openings
+                and now - last_status_update >= 0.5
+            ):
+                last_status_update = now
+                frame_ms = (
+                    float(np.median(frame_intervals)) * 1000.0
+                    if frame_intervals
+                    else 0.0
+                )
+                capture_hz = 1000.0 / frame_ms if frame_ms > 0 else 0.0
                 self.status(
-                    f"속도 {self.profile.speed_level}/10 · 명확한 변경 "
-                    f"{required_frames}프레임 즉시 · 애매하면 주문 금지 · {cycle_count}회"
+                    f"120Hz 직결 {capture_hz:.0f}Hz · 변경 {required_frames}프레임 · "
+                    f"{'무주문' if self.monitor_only else '실주문'} · {cycle_count}회"
                 )
 
         return False

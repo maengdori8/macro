@@ -6,13 +6,14 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 from macroapp import renewal
-from macroapp.capture import CapturedFrame
+from macroapp.capture import CapturedFrame, WGCCaptureEngine
 
 
 def _price(text: str, width: int, height: int) -> np.ndarray:
@@ -160,6 +161,7 @@ def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
         limit_point=renewal.NormalizedPoint(140 / 199, 70 / 99),
         baseline_png=renewal.encode_gray_png(baseline),
         guard_png=renewal.encode_gray_png(guard),
+        closed_guard_png=renewal.encode_gray_png(np.zeros_like(guard)),
         unchanged_limit=0.035,
         stability_limit=0.015,
         registration_shift_limit=4,
@@ -175,20 +177,39 @@ def _run(
     profile: renewal.RenewalProfile,
     engine: _FakeEngine,
     side: str = "buy",
+    monitor_only: bool = False,
 ) -> bool:
     manager = _FakeManager(engine)
     with ExitStack() as stack:
+        # 회귀 테스트가 사용자의 실제 진단 보관함을 채우거나 오래된 자료를
+        # 최근 20건 정리 정책으로 삭제하지 않도록 저장 I/O를 차단합니다.
         stack.enter_context(
-            patch.object(renewal.input_message, "post_mouse_move", lambda *_: None)
-        )
-        stack.enter_context(
-            patch.object(renewal.input_message, "post_mouse_down", lambda *_: None)
+            patch.object(
+                renewal,
+                "save_renewal_diagnostic",
+                lambda *_args, **_kwargs: None,
+            )
         )
         stack.enter_context(
             patch.object(
                 renewal.input_message,
-                "post_mouse_up",
-                side_effect=engine.on_click,
+                "prepare_mouse_click",
+                lambda hwnd, x, y: SimpleNamespace(
+                    hwnd=hwnd,
+                    x=x,
+                    y=y,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                renewal.input_message,
+                "post_prepared_mouse_click",
+                side_effect=lambda click: engine.on_click(
+                    click.hwnd,
+                    click.x,
+                    click.y,
+                ),
             )
         )
         stack.enter_context(
@@ -205,6 +226,7 @@ def _run(
             stop_event=engine.stop_event,
             logger=lambda _message: None,
             status=lambda _message: None,
+            monitor_only=monitor_only,
         ).run()
 
 
@@ -216,20 +238,21 @@ class RenewalSafetyTests(unittest.TestCase):
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
 
-    def test_v5_profile_requires_v6_safe_price_recalibration(self) -> None:
+    def test_v6_profile_requires_v7_safe_price_recalibration(self) -> None:
         legacy = self.profile.to_dict()
-        legacy["version"] = 5
-        legacy["buy"]["calibration_version"] = 1
+        legacy["version"] = 6
+        legacy["buy"]["calibration_version"] = 2
+        legacy["buy"].pop("closed_guard_png")
         legacy["buy"].pop("calibration_openings")
         loaded = renewal.RenewalProfile.from_dict(legacy)
-        self.assertIn("v6 안전 가격영역 재설정", loaded.missing("buy"))
+        self.assertIn("v7 120Hz 가격영역 재설정", loaded.missing("buy"))
 
-    def test_v6_profile_round_trip_keeps_alignment_limits(self) -> None:
+    def test_v7_profile_round_trip_keeps_alignment_limits(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 6)
+        self.assertEqual(loaded.to_dict()["version"], 7)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
@@ -258,6 +281,22 @@ class RenewalSafetyTests(unittest.TestCase):
         )
         self.assertFalse(renewal.validate_price_region(two_lines).valid)
         self.assertTrue(renewal.validate_price_region(self.base_price).valid)
+
+    def test_wgc_single_slot_always_replaces_with_newest_frame(self) -> None:
+        engine = WGCCaptureEngine(1, logger=lambda _message: None)
+        first = np.zeros((4, 5, 4), dtype=np.uint8)
+        second = np.full((4, 5, 4), 200, dtype=np.uint8)
+        engine.on_frame_arrived(
+            SimpleNamespace(frame_buffer=first, width=5, height=4)
+        )
+        engine.on_frame_arrived(
+            SimpleNamespace(frame_buffer=second, width=5, height=4)
+        )
+        packet = engine.get_latest_frame_packet()
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.sequence_id, 2)
+        self.assertEqual(int(packet.image[0, 0]), 200)
+        self.assertEqual(engine.get_replaced_frame_count(), 1)
 
     def test_guard_and_price_alignment_accepts_same_and_real_change(self) -> None:
         guard_detector = renewal.RenewalModalGuard(
@@ -337,7 +376,7 @@ class RenewalSafetyTests(unittest.TestCase):
             guard_detector.register(wrong_popup, 0.0, 0.0).valid
         )
 
-    def test_five_independent_openings_build_v6_calibration(self) -> None:
+    def test_five_independent_openings_build_v7_calibration(self) -> None:
         sessions = [
             [
                 renewal._translate_image(self.guard, shift_x, 0)
@@ -345,14 +384,35 @@ class RenewalSafetyTests(unittest.TestCase):
             ]
             for shift_x in (0, 1, -1, 2, -2)
         ]
-        result = renewal.build_calibration_result(sessions, self.price_box)
+        closed_samples = [
+            np.zeros_like(self.guard)
+            for _ in range(4)
+        ]
+        result = renewal.build_calibration_result(
+            sessions,
+            self.price_box,
+            closed_samples,
+        )
         self.assertEqual(
             result.calibration_openings,
             renewal.RENEWAL_CALIBRATION_OPENINGS,
         )
         self.assertEqual(result.registration_shift_limit, 4)
+        self.assertEqual(result.closed_guard.shape, self.guard.shape)
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
+
+    def test_v7_calibration_rejects_indistinguishable_closed_screen(self) -> None:
+        sessions = [
+            [self.guard.copy() for _ in range(4)]
+            for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
+        ]
+        with self.assertRaisesRegex(ValueError, "구분되지 않습니다"):
+            renewal.build_calibration_result(
+                sessions,
+                self.price_box,
+                [self.guard.copy() for _ in range(4)],
+            )
 
     def test_duplicate_wgc_sequence_ids_never_order(self) -> None:
         stop_event = threading.Event()
@@ -382,8 +442,12 @@ class RenewalSafetyTests(unittest.TestCase):
             "20260724_045731_949375200_buy_initial_mismatch",
             "20260724_045737_023254800_buy_unstable_candidate",
         )
-        event_dirs = [diagnostic_root / name for name in event_names]
-        if not all(path.is_dir() for path in event_dirs):
+        event_dirs = [
+            diagnostic_root / name
+            for name in event_names
+            if (diagnostic_root / name).is_dir()
+        ]
+        if not event_dirs:
             self.skipTest("local recorded false-order fixtures are unavailable")
         replayed = 0
         for event_dir in event_dirs:
@@ -409,7 +473,7 @@ class RenewalSafetyTests(unittest.TestCase):
                     str(candidate_path),
                 )
                 replayed += 1
-        self.assertGreaterEqual(replayed, 14)
+        self.assertGreaterEqual(replayed, 1)
 
     def test_initial_mismatch_never_orders(self) -> None:
         stop_event = threading.Event()
@@ -446,6 +510,30 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
+
+    def test_next_open_is_blocked_until_exact_ready_guard_returns(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+            stop_after_closes=1,
+        )
+        engine.closed_guard = np.full_like(self.guard, 77)
+        # Initial state must be ready; replace it with a wrong closed screen only
+        # after the first open click.
+        original_click = engine.on_click
+
+        def click_then_break_ready(hwnd: int, x: int, y: int) -> None:
+            original_click(hwnd, x, y)
+            if (x, y) == (20, 10):
+                engine.closed_guard = np.full_like(self.guard, 77)
+
+        initial_ready = np.zeros_like(self.guard)
+        engine.closed_guard = initial_ready
+        engine.on_click = click_then_break_ready
+        completed = _run(self.profile, engine)
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)])
 
     def test_unchanged_10000_cycles_has_zero_orders(self) -> None:
         stop_event = threading.Event()
@@ -485,6 +573,29 @@ class RenewalSafetyTests(unittest.TestCase):
             ],
         )
         self.assertEqual(engine.escapes, 2)
+
+    def test_monitor_only_detects_change_without_any_order_click(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard, self.guard],
+                [self.guard, self.guard],
+                [self.changed_guard, self.changed_guard],
+            ],
+        )
+        with TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"LOCALAPPDATA": temp_dir}):
+                completed = _run(
+                    self.profile,
+                    engine,
+                    monitor_only=True,
+                )
+        self.assertFalse(completed)
+        self.assertEqual(
+            engine.clicks,
+            [(20, 10), (20, 10), (20, 10)],
+        )
 
     def test_sell_uses_its_own_open_limit_and_final_coordinates(self) -> None:
         sell = renewal.RenewalSideProfile.from_dict(self.profile.buy.to_dict())

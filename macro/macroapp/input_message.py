@@ -1,6 +1,7 @@
 from __future__ import annotations
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 from typing import Optional
 
 from macroapp import winapi
@@ -602,7 +603,8 @@ def send_key_to_window(hwnd: int, vk_code: int, press_delay: float = 0.05) -> bo
     lparam_down = (scan_code << 16) | 1
     lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
     winapi.win32gui.PostMessage(hwnd, WM_KEYDOWN, vk_code, lparam_down)
-    time.sleep(press_delay)
+    if press_delay > 0:
+        time.sleep(press_delay)
     winapi.win32gui.PostMessage(hwnd, WM_KEYUP, vk_code, lparam_up)
     return True
 
@@ -615,6 +617,56 @@ def _make_mouse_lparam(x: int, y: int) -> int:
         return int(winapi.win32api.MAKELONG(x, y))
 
     return (y & 0xFFFF) << 16 | (x & 0xFFFF)
+
+
+@dataclass(frozen=True)
+class PreparedMouseClick:
+    hwnd: int
+    x: int
+    y: int
+    lparam: int
+    move_message: int
+    down_message: int
+    up_message: int
+    down_wparam: int
+
+
+def prepare_mouse_click(hwnd: int, x: int, y: int) -> PreparedMouseClick:
+    """좌표와 Win32 상수를 한 번만 계산해 극한 클릭 경로를 준비합니다."""
+
+    if winapi.win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    if not winapi.win32gui.IsWindow(int(hwnd)):
+        raise RuntimeError(f"유효하지 않은 HWND입니다: {hwnd}")
+    constants = winapi._require_win32con()
+    return PreparedMouseClick(
+        int(hwnd),
+        int(x),
+        int(y),
+        _make_mouse_lparam(x, y),
+        int(constants.WM_MOUSEMOVE),
+        int(constants.WM_LBUTTONDOWN),
+        int(constants.WM_LBUTTONUP),
+        int(constants.MK_LBUTTON),
+    )
+
+
+def post_prepared_mouse_click(click: PreparedMouseClick) -> bool:
+    """검증·좌표 변환 없이 MOVE/DOWN/UP을 대상 큐에 연속 게시합니다."""
+
+    if winapi.win32gui is None:
+        raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
+    post = winapi.win32gui.PostMessage
+    post(click.hwnd, click.move_message, 0, click.lparam)
+    post(
+        click.hwnd,
+        click.down_message,
+        click.down_wparam,
+        click.lparam,
+    )
+    post(click.hwnd, click.up_message, 0, click.lparam)
+    return True
+
 
 def _send_mouse_message(
     hwnd: int,
