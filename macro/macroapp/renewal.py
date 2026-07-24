@@ -790,6 +790,48 @@ def _translate_image(
     return result
 
 
+def _translate_image_into(
+    image: np.ndarray,
+    dx: int,
+    dy: int,
+    result: np.ndarray,
+    *,
+    fill: Optional[int] = None,
+) -> np.ndarray:
+    """Translate into a reusable same-shape buffer without allocating."""
+
+    if image is None or image.size == 0:
+        raise ValueError("The translated image is empty.")
+    if result.shape != image.shape or result.dtype != image.dtype:
+        raise ValueError("The translation buffer does not match the image.")
+    if fill is None:
+        border = np.concatenate(
+            (
+                image[0].reshape(-1),
+                image[-1].reshape(-1),
+                image[:, 0],
+                image[:, -1],
+            )
+        )
+        fill = int(round(float(np.median(border))))
+    result.fill(int(fill))
+    height, width = image.shape[:2]
+    src_x1 = max(0, -dx)
+    src_y1 = max(0, -dy)
+    src_x2 = min(width, width - dx)
+    src_y2 = min(height, height - dy)
+    if src_x2 <= src_x1 or src_y2 <= src_y1:
+        return result
+    dst_x1 = max(0, dx)
+    dst_y1 = max(0, dy)
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+    result[dst_y1:dst_y2, dst_x1:dst_x2] = image[
+        src_y1:src_y2, src_x1:src_x2
+    ]
+    return result
+
+
 def _edge_ratio(
     first_edges: np.ndarray,
     second_edges: np.ndarray,
@@ -1013,6 +1055,14 @@ class RenewalPriceClassifier:
     """정수 픽셀 정렬 후 가격을 유지/변경/판정 불가로 분류합니다."""
 
     _LOCAL_SHIFT_LIMIT = 2
+    # Native-resolution glyph evidence complements the resized Canny score.
+    # Captured same-price WGC reopen jitter tops out below 0.003 after the
+    # safer of raw/aligned registration, while the closest captured
+    # different FC digit pair starts above 0.007. Keep a fail-closed gap.
+    _GLYPH_ANALYSIS_FLOOR = 0.005
+    _GLYPH_CHANGE_GLOBAL_FLOOR = 0.006
+    _GLYPH_SAME_LIMIT = 0.004
+    _GLYPH_CHANGE_LIMIT = 0.006
 
     def __init__(
         self,
@@ -1078,6 +1128,17 @@ class RenewalPriceClassifier:
         self._glyph_second_diff_work = np.empty(glyph_shape, dtype=np.uint8)
         self._glyph_difference_work = np.empty(glyph_shape, dtype=np.uint8)
         self._glyph_union_work = np.empty(glyph_shape, dtype=np.uint8)
+        prepared_width, prepared_height = self.detector._SIZE
+        prepared_shape = (prepared_height, prepared_width)
+        self._alignment_slots = [
+            (
+                np.empty_like(self.baseline),
+                np.empty(prepared_shape, dtype=np.uint8),
+                np.empty(prepared_shape, dtype=np.uint8),
+            )
+            for _ in range(4)
+        ]
+        self._alignment_slot_index = 0
         self._baseline_classification = PriceClassification(
             PriceState.UNCHANGED,
             self.baseline,
@@ -1138,21 +1199,25 @@ class RenewalPriceClassifier:
     def _local_glyph_mask(image: np.ndarray) -> np.ndarray:
         """Extract dark glyph strokes after removing smooth white-background light."""
 
-        background = cv2.GaussianBlur(
+        # A 7x7 box estimate separates the captured FC strokes just as
+        # reliably as sigma-2 Gaussian blur (captured different-price floor
+        # remains above 0.006), while taking roughly one quarter of the time.
+        background = cv2.blur(
             image,
-            (0, 0),
-            2.0,
+            (7, 7),
         )
         foreground = cv2.subtract(background, image)
         return cv2.compare(foreground, 16, cv2.CMP_GE)
 
-    def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
-        """Prove glyph equivalence without letting smooth popup light become a change."""
+    def _glyph_difference_after_illumination(
+        self,
+        image: np.ndarray,
+    ) -> Optional[float]:
+        """Return native glyph difference after removing smooth popup light."""
 
-        cv2.GaussianBlur(
+        cv2.blur(
             image,
-            (0, 0),
-            2.0,
+            (7, 7),
             self._glyph_background_work,
         )
         cv2.subtract(
@@ -1169,12 +1234,12 @@ class RenewalPriceClassifier:
         current_mask = self._glyph_mask_work
         current_count = int(cv2.countNonZero(current_mask))
         if current_count < 64:
-            return False
+            return None
         population_ratio = (
             float(current_count) / float(self.baseline_local_glyph_count)
         )
         if not 0.85 <= population_ratio <= 1.18:
-            return False
+            return None
         kernel = RenewalChangeDetector._DILATE_KERNEL
         cv2.dilate(current_mask, kernel, self._glyph_dilated_work)
         cv2.bitwise_not(
@@ -1203,12 +1268,20 @@ class RenewalPriceClassifier:
         )
         union_count = int(cv2.countNonZero(self._glyph_union_work))
         if union_count <= 0:
-            return False
-        difference_ratio = (
+            return None
+        return (
             float(cv2.countNonZero(self._glyph_difference_work))
             / float(union_count)
         )
-        return difference_ratio <= 0.020
+
+    def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
+        """Prove glyph equivalence without hiding a similar real digit change."""
+
+        difference = self._glyph_difference_after_illumination(image)
+        return bool(
+            difference is not None
+            and difference <= self._GLYPH_SAME_LIMIT
+        )
 
     @staticmethod
     def _maximum_zero_run(values: np.ndarray) -> int:
@@ -1486,9 +1559,49 @@ class RenewalPriceClassifier:
         if dx == 0 and dy == 0:
             aligned = gray
             aligned_pair = pair
+            aligned_registration_edges = None
         else:
-            aligned = _translate_image(gray, dx, dy)
-            aligned_pair = self.detector.prepare_pair_reusable(aligned)
+            (
+                aligned_work,
+                aligned_edges_work,
+                aligned_dilated_work,
+            ) = self._alignment_slots[self._alignment_slot_index]
+            self._alignment_slot_index = (
+                self._alignment_slot_index + 1
+            ) % len(self._alignment_slots)
+            aligned = _translate_image_into(
+                gray,
+                dx,
+                dy,
+                aligned_work,
+            )
+            # The prepared edge pair already contains the complete glyph.
+            # Translating it at prepared resolution is equivalent to
+            # re-running resize + blur + Canny for integer registration, but
+            # avoids a second Canny pass on every shifted 120 Hz frame.
+            prepared_dx = int(
+                round(dx * self.detector._SIZE[0] / gray.shape[1])
+            )
+            prepared_dy = int(
+                round(dy * self.detector._SIZE[1] / gray.shape[0])
+            )
+            aligned_registration_edges = _translate_image_into(
+                pair[0],
+                prepared_dx,
+                prepared_dy,
+                aligned_edges_work,
+                fill=0,
+            )
+            aligned_pair = (
+                aligned_registration_edges,
+                _translate_image_into(
+                    pair[1],
+                    prepared_dx,
+                    prepared_dy,
+                    aligned_dilated_work,
+                    fill=0,
+                ),
+            )
         global_score, slice_score = self.detector.analyze_pair(aligned_pair)
         return (
             aligned,
@@ -1497,7 +1610,7 @@ class RenewalPriceClassifier:
             aligned_pair,
             global_score,
             slice_score,
-            None,
+            aligned_registration_edges,
             True,
             direct_global,
         )
@@ -1551,37 +1664,58 @@ class RenewalPriceClassifier:
                 f"invalid:{exc}",
             )
             if gray_for_cache is not None:
-                self._last_raw = gray_for_cache.copy()
+                if (
+                    self._last_raw is None
+                    or self._last_raw.shape != gray_for_cache.shape
+                    or self._last_raw.dtype != gray_for_cache.dtype
+                ):
+                    self._last_raw = gray_for_cache.copy()
+                else:
+                    np.copyto(self._last_raw, gray_for_cache)
                 self._last_classification = classification
             return classification
 
         # 기준과 거의 같은 에지 구조라면 완성된 기준 글자 구조도 동시에 증명됩니다.
         # 동일 가격의 대부분을 차지하는 이 경로에서는 두 번째 Canny/행 검사를 생략합니다.
-        if not alignment_valid:
-            geometry_valid = False
-        elif global_score <= self.unchanged_limit:
-            geometry_valid = self._boundary_clear(aligned)
-        else:
-            structural_edges = (
-                aligned_registration_edges
-                if aligned_registration_edges is not None
-                else pair[0]
-            )
-            geometry_valid = (
-                self._boundary_clear(aligned)
-                and self._render_contrast_valid(aligned)
+        structural_edges = (
+            aligned_registration_edges
+            if aligned_registration_edges is not None
+            else pair[0]
+        )
+        boundary_valid = bool(
+            alignment_valid and self._boundary_clear(aligned)
+        )
+        full_structure_valid = False
+        if (
+            boundary_valid
+            and global_score >= self._GLYPH_ANALYSIS_FLOOR
+        ):
+            full_structure_valid = bool(
+                self._render_contrast_valid(aligned)
                 and self._geometry_matches_edges(structural_edges)
                 and self._prepared_geometry_matches(pair)
                 and self._projection_integrity_edges(structural_edges)
             )
+        if not alignment_valid:
+            geometry_valid = False
+        elif global_score < self._GLYPH_ANALYSIS_FLOOR:
+            geometry_valid = boundary_valid
+        else:
+            # Every non-trivial candidate must still prove it is a complete
+            # one-line price before native glyph evidence can authorize it.
+            geometry_valid = full_structure_valid
 
-        illumination_same = False
-        if geometry_valid and global_score > self.unchanged_limit:
-            # Prove glyph identity in whichever integer registration has the
-            # lower edge difference.  The right-anchor heuristic can
-            # occasionally invent a residual ±1 px shift; trying both masks
-            # would double the hot-path blur cost.
-            proof_image = aligned
+        glyph_difference: Optional[float] = None
+        if geometry_valid and global_score >= self._GLYPH_ANALYSIS_FLOOR:
+            # A residual right-anchor shift can be one pixel worse than the
+            # raw ROI for the same glyph. The smaller native difference is
+            # the safe choice because either registration can veto an order.
+            differences: list[float] = []
+            aligned_difference = self._glyph_difference_after_illumination(
+                aligned
+            )
+            if aligned_difference is not None:
+                differences.append(aligned_difference)
             if (
                 (dx != 0 or dy != 0)
                 and gray_for_cache is not None
@@ -1589,23 +1723,40 @@ class RenewalPriceClassifier:
                 and self._boundary_clear(gray_for_cache)
                 and self._render_contrast_valid(gray_for_cache)
             ):
-                proof_image = gray_for_cache
-            illumination_same = self._same_glyph_after_illumination(
-                proof_image
-            )
+                raw_difference = (
+                    self._glyph_difference_after_illumination(
+                        gray_for_cache
+                    )
+                )
+                if raw_difference is not None:
+                    differences.append(raw_difference)
+            if differences:
+                glyph_difference = min(differences)
+
+        illumination_same = bool(
+            glyph_difference is not None
+            and glyph_difference <= self._GLYPH_SAME_LIMIT
+        )
+        native_structure_change = bool(
+            glyph_difference is not None
+            and global_score >= self._GLYPH_CHANGE_GLOBAL_FLOOR
+            and glyph_difference >= self._GLYPH_CHANGE_LIMIT
+        )
         if not geometry_valid:
             state = PriceState.AMBIGUOUS
             reason = "incomplete_price_row"
-        elif (
-            global_score <= self.unchanged_limit
-            or illumination_same
-        ):
+        elif illumination_same:
             state = PriceState.UNCHANGED
-            reason = (
-                "illumination_normalized_same_glyph"
-                if illumination_same
-                else "aligned_same_price"
-            )
+            reason = "illumination_normalized_same_glyph"
+        elif native_structure_change:
+            state = PriceState.CHANGED
+            reason = "native_glyph_structure_change"
+        elif global_score < self._GLYPH_ANALYSIS_FLOOR:
+            state = PriceState.UNCHANGED
+            reason = "aligned_same_price"
+        elif global_score <= self.unchanged_limit:
+            state = PriceState.AMBIGUOUS
+            reason = "native_glyph_gray_zone"
         elif global_score >= self.changed_global_limit or (
             global_score >= 0.040 and slice_score >= 0.250
         ):
@@ -1629,7 +1780,14 @@ class RenewalPriceClassifier:
             int(cv2.countNonZero(pair[1])),
         )
         if gray_for_cache is not None:
-            self._last_raw = gray_for_cache.copy()
+            if (
+                self._last_raw is None
+                or self._last_raw.shape != gray_for_cache.shape
+                or self._last_raw.dtype != gray_for_cache.dtype
+            ):
+                self._last_raw = gray_for_cache.copy()
+            else:
+                np.copyto(self._last_raw, gray_for_cache)
             self._last_classification = classification
         return classification
 

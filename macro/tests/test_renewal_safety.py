@@ -655,6 +655,31 @@ class RenewalSafetyTests(unittest.TestCase):
             renewal.PriceState.UNCHANGED,
         )
 
+    def test_subthreshold_native_glyph_change_is_not_hidden_as_same(self) -> None:
+        raw = np.frombuffer(
+            base64.b64decode(_REAL_SAME_ILLUMINATION_BASELINE),
+            dtype=np.uint8,
+        )
+        baseline = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(baseline)
+        candidate = baseline.copy()
+        candidate[:, 90:92] = np.fliplr(candidate[:, 90:92])
+
+        classifier = renewal.RenewalPriceClassifier(
+            baseline,
+            unchanged_limit=0.040,
+            stability_limit=0.030,
+        )
+        first = classifier.classify(candidate)
+        second = classifier.classify(candidate.copy())
+
+        # This change is deliberately below the legacy 0.040 unchanged
+        # threshold. Native-resolution glyph evidence must still promote it.
+        self.assertLess(first.global_score, 0.040)
+        self.assertIs(first.state, renewal.PriceState.CHANGED)
+        self.assertEqual(first.reason, "native_glyph_structure_change")
+        self.assertTrue(classifier.same_candidate(first, second))
+
     def test_real_same_glyph_raw_alignment_holdout_is_unchanged(self) -> None:
         def decode(encoded: str) -> np.ndarray:
             raw = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
