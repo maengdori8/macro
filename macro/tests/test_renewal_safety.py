@@ -249,6 +249,12 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
+    def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
+        self.assertGreaterEqual(
+            renewal.RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS,
+            0.80,
+        )
+
     def setUp(self) -> None:
         self.base_price = _price("82400", 40, 20)
         self.changed_price = _price("82401", 40, 20)

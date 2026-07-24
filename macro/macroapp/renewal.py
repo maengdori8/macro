@@ -51,6 +51,9 @@ RENEWAL_PROFILE_VERSION = 9
 RENEWAL_CALIBRATION_VERSION = 5
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
+# This is only a fail-closed deadline. A completed popup is consumed
+# immediately; the longer ceiling does not add a successful-path delay.
+RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
 SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
     {
         (1928, 1048),
@@ -3021,7 +3024,9 @@ class FastRenewalRunner:
             ambiguous = False
             decision: Optional[PriceState] = None
             open_recorded = False
-            deadline = time.monotonic() + 0.45
+            deadline = (
+                time.monotonic() + RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS
+            )
 
             while not self.stop_event.is_set():
                 packet = next_guard_packet(
