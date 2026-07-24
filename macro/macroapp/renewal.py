@@ -2370,7 +2370,22 @@ class FastRenewalRunner:
                 )
                 clicker.click_prepared(limit_click)
                 clicker.click_prepared(confirm_click)
-                elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
+                input_completed_at = time.perf_counter()
+                elapsed_ms = (input_completed_at - detected_at) * 1000.0
+                second_frame_to_input_ms = (
+                    max(
+                        0.0,
+                        input_completed_at - capture_timestamps[-1],
+                    )
+                    * 1000.0
+                )
+                first_frame_to_input_ms = (
+                    max(
+                        0.0,
+                        input_completed_at - capture_timestamps[0],
+                    )
+                    * 1000.0
+                )
                 self.log(
                     f"[갱신 완료 v9] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
@@ -2396,6 +2411,10 @@ class FastRenewalRunner:
                         "sequence_ids": sequence_ids,
                         "capture_timestamps": capture_timestamps,
                         "click_ms": elapsed_ms,
+                        "second_frame_to_input_ms": (
+                            second_frame_to_input_ms
+                        ),
+                        "first_frame_to_input_ms": first_frame_to_input_ms,
                         "cycle": cycle_count,
                     },
                     aligned_frames=aligned_prices,

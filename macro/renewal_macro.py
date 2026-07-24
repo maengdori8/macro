@@ -63,6 +63,7 @@ from macroapp.renewal import (
     validate_limit_price_selection,
     validate_price_region,
 )
+from macroapp.renewal_soak import run_verification_soak
 from macroapp.turbo_session import (
     MIN_AVAILABLE_RAM_GB,
     TARGET_AVAILABLE_RAM_GB,
@@ -2181,6 +2182,15 @@ def main() -> int:
     if "--startup-selftest" in sys.argv[1:]:
         return _startup_selftest()
     for argument in sys.argv[1:]:
+        if argument.startswith("--verification-soak-seconds="):
+            try:
+                seconds = float(argument.split("=", 1)[1])
+            except ValueError:
+                return 2
+            return run_verification_soak(
+                seconds,
+                app_dir() / "renewal_verification_soak.json",
+            )
         if argument.startswith("--headless-calibrate-existing="):
             return _headless_calibrate_existing(argument.split("=", 1)[1])
         if argument.startswith("--startup-selftest-repeat="):

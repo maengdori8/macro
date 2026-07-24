@@ -185,6 +185,7 @@ def _run(
     engine: _FakeEngine,
     side: str = "buy",
     monitor_only: bool = False,
+    diagnostic_sink=None,
 ) -> bool:
     manager = _FakeManager(engine)
     with ExitStack() as stack:
@@ -194,7 +195,11 @@ def _run(
             patch.object(
                 renewal,
                 "save_renewal_diagnostic",
-                lambda *_args, **_kwargs: None,
+                (
+                    diagnostic_sink
+                    if diagnostic_sink is not None
+                    else lambda *_args, **_kwargs: None
+                ),
             )
         )
         stack.enter_context(
@@ -760,6 +765,19 @@ class RenewalSafetyTests(unittest.TestCase):
 
     def test_stable_change_orders_once_in_correct_sequence_and_stops(self) -> None:
         stop_event = threading.Event()
+        ordered_metrics: list[dict[str, object]] = []
+
+        def collect_diagnostic(
+            _side,
+            reason,
+            _baseline,
+            _candidates,
+            metadata,
+            **_kwargs,
+        ) -> None:
+            if reason == "ordered":
+                ordered_metrics.append(metadata)
+
         engine = _FakeEngine(
             stop_event,
             cycles=[
@@ -768,7 +786,11 @@ class RenewalSafetyTests(unittest.TestCase):
                 [self.changed_guard, self.changed_guard],
             ],
         )
-        completed = _run(self.profile, engine)
+        completed = _run(
+            self.profile,
+            engine,
+            diagnostic_sink=collect_diagnostic,
+        )
         self.assertTrue(completed)
         self.assertEqual(
             engine.clicks,
@@ -781,6 +803,15 @@ class RenewalSafetyTests(unittest.TestCase):
             ],
         )
         self.assertEqual(engine.escapes, 2)
+        self.assertEqual(len(ordered_metrics), 1)
+        self.assertLess(
+            float(ordered_metrics[0]["second_frame_to_input_ms"]),
+            4.0,
+        )
+        self.assertLess(
+            float(ordered_metrics[0]["first_frame_to_input_ms"]),
+            20.0,
+        )
 
     def test_monitor_only_detects_change_without_any_order_click(self) -> None:
         stop_event = threading.Event()
