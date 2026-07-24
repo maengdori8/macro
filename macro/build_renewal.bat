@@ -5,6 +5,11 @@ cd /d "%~dp0"
 echo [1/3] Checking renewal source...
 python -m compileall -q macroapp renewal_macro.py
 if errorlevel 1 goto :failed
+python -c "import cv2,numpy; assert cv2.__version__ == '4.12.0'; assert numpy.__version__ == '2.2.6'"
+if errorlevel 1 (
+  echo Local renewal dependencies do not match requirements-renewal-local.txt.
+  goto :failed
+)
 
 echo [2/3] Building local PyInstaller renewal_macro.exe...
 if not exist "dist_local_renewal" mkdir "dist_local_renewal"

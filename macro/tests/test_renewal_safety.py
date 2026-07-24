@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import unittest
@@ -8,6 +9,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import cv2
 import numpy as np
@@ -23,7 +28,7 @@ def _price(text: str, width: int, height: int) -> np.ndarray:
         text,
         (2, height - 5),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
+        0.30,
         30,
         1,
         cv2.LINE_AA,
@@ -440,6 +445,92 @@ class RenewalSafetyTests(unittest.TestCase):
             guard_detector.register(wrong_popup, 0.0, 0.0).valid
         )
 
+    def test_exact_baseline_and_repeated_candidate_use_safe_cache(self) -> None:
+        classifier = renewal.RenewalPriceClassifier(
+            self.base_price,
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        with patch.object(
+            classifier.detector,
+            "prepare_pair_reusable",
+            wraps=classifier.detector.prepare_pair_reusable,
+        ) as prepare_pair:
+            first_baseline = classifier.classify(self.base_price.copy())
+            second_baseline = classifier.classify(self.base_price.copy())
+            self.assertIs(first_baseline, second_baseline)
+            self.assertEqual(prepare_pair.call_count, 0)
+
+            first_changed = classifier.classify(self.changed_price.copy())
+            calls_after_first = prepare_pair.call_count
+            second_changed = classifier.classify(self.changed_price.copy())
+            self.assertIs(first_changed, second_changed)
+            self.assertGreater(calls_after_first, 0)
+            self.assertEqual(prepare_pair.call_count, calls_after_first)
+
+    def test_stable_partial_price_clipping_never_authorizes_change(self) -> None:
+        classifier = renewal.RenewalPriceClassifier(
+            self.base_price,
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        background = int(np.median(self.base_price[:, 0]))
+        for edge, clipping_widths in (
+            ("left", (6, 10, 15)),
+            # A 10 px cut of this tiny synthetic font is pixel-identical in
+            # density and bounds to a legitimate final digit.  Keep only
+            # structurally incomplete right cuts here; the embedded real FC
+            # corpus separately covers its 2..20 px right-edge transitions.
+            ("right", (15, 20)),
+        ):
+            for pixels in clipping_widths:
+                with self.subTest(edge=edge, pixels=pixels):
+                    clipped = self.base_price.copy()
+                    if edge == "left":
+                        clipped[:, :pixels] = background
+                    else:
+                        clipped[:, -pixels:] = background
+                    first = classifier.classify(clipped)
+                    second = classifier.classify(clipped.copy())
+                    self.assertFalse(
+                        first.state is renewal.PriceState.CHANGED
+                        and classifier.same_candidate(first, second)
+                    )
+        for edge in ("top", "bottom"):
+            for pixels in (12, 16, 20):
+                with self.subTest(edge=edge, pixels=pixels):
+                    clipped = self.base_price.copy()
+                    if edge == "top":
+                        clipped[:pixels, :] = background
+                    else:
+                        clipped[-pixels:, :] = background
+                    first = classifier.classify(clipped)
+                    second = classifier.classify(clipped.copy())
+                    self.assertFalse(
+                        first.state is renewal.PriceState.CHANGED
+                        and classifier.same_candidate(first, second)
+                    )
+        for top, bottom in ((6, 10), (8, 12)):
+            with self.subTest(gap="horizontal", top=top, bottom=bottom):
+                occluded = self.base_price.copy()
+                occluded[top:bottom, :] = background
+                first = classifier.classify(occluded)
+                second = classifier.classify(occluded.copy())
+                self.assertFalse(
+                    first.state is renewal.PriceState.CHANGED
+                    and classifier.same_candidate(first, second)
+                )
+        for left, right in ((8, 13), (14, 19), (20, 25)):
+            with self.subTest(gap="vertical", left=left, right=right):
+                occluded = self.base_price.copy()
+                occluded[:, left:right] = background
+                first = classifier.classify(occluded)
+                second = classifier.classify(occluded.copy())
+                self.assertFalse(
+                    first.state is renewal.PriceState.CHANGED
+                    and classifier.same_candidate(first, second)
+                )
+
     def test_five_independent_openings_build_v9_calibration(self) -> None:
         sessions = [
             [
@@ -594,6 +685,30 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
+
+    def test_faded_price_render_is_never_a_confirmed_change(self) -> None:
+        baseline = renewal.decode_gray_png(self.profile.buy.baseline_png)
+        self.assertGreater(baseline.size, 0)
+        background = np.full_like(baseline, int(np.median(baseline[0])))
+        classifier = renewal.RenewalPriceClassifier(
+            baseline,
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        for alpha in (0.20, 0.35, 0.50, 0.65):
+            faded = cv2.addWeighted(
+                baseline,
+                alpha,
+                background,
+                1.0 - alpha,
+                0.0,
+            )
+            result = classifier.classify(faded)
+            self.assertIsNot(
+                result.state,
+                renewal.PriceState.CHANGED,
+                f"partial opacity {alpha:.2f} became an order signal",
+            )
 
     def test_frame_size_mismatch_stops_before_first_click(self) -> None:
         stop_event = threading.Event()

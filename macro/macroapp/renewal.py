@@ -18,6 +18,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
+# This module is also imported directly by local verification tools, outside
+# renewal_macro.py.  Apply the same single-thread numeric runtime policy before
+# NumPy/OpenCV are loaded.
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import cv2
 import numpy as np
 
@@ -26,10 +33,17 @@ from macroapp.capture import CapturedFrame
 from macroapp.window import InactiveManager
 
 
-# The recognition ROIs are tiny.  OpenCV's default worker pool costs more CPU
-# and latency than it saves here, so keep the optimized kernels on one thread.
-cv2.setUseOptimized(True)
+# The recognition ROIs are tiny.  OpenCV's worker pool and IPP/OpenCL lazy
+# caches cost more memory and latency than they save here, so use the
+# predictable scalar/SIMD CPU path on one thread.
+cv2.setUseOptimized(False)
 cv2.setNumThreads(1)
+# A 150x40 price ROI is far below the size where GPU transfer pays off.
+# OpenCL may also allocate a large lazy cache during long runs, so pin this
+# safety-critical classifier to the predictable CPU path.
+cv2.ocl.setUseOpenCL(False)
+if hasattr(cv2, "ipp"):
+    cv2.ipp.setUseIPP(False)
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
@@ -726,6 +740,26 @@ class RenewalChangeDetector:
 
     def __init__(self, baseline: np.ndarray):
         self.baseline_pair = self.prepare_pair(baseline)
+        width, height = self._SIZE
+        shape = (height, width)
+        self._resized_work = np.empty(shape, dtype=np.uint8)
+        self._blurred_work = np.empty(shape, dtype=np.uint8)
+        # Four slots keep the first and second confirmed frame intact while
+        # the direct and aligned candidates are prepared.
+        self._pair_slots = [
+            (
+                np.empty(shape, dtype=np.uint8),
+                np.empty(shape, dtype=np.uint8),
+            )
+            for _ in range(4)
+        ]
+        self._pair_slot_index = 0
+        self._diff_work = np.empty(shape, dtype=np.uint8)
+        self._union_work = np.empty(shape, dtype=np.uint8)
+        self._first_work = np.empty(shape, dtype=np.uint8)
+        self._second_work = np.empty(shape, dtype=np.uint8)
+        self._inverse_first_work = np.empty(shape, dtype=np.uint8)
+        self._inverse_second_work = np.empty(shape, dtype=np.uint8)
 
     @classmethod
     def _prepare(cls, image: np.ndarray) -> np.ndarray:
@@ -742,6 +776,35 @@ class RenewalChangeDetector:
         """(에지, 팽창에지) 쌍을 만든다. 프레임을 여러 번 비교할 때 재사용해 중복 연산을 줄인다."""
         edges = cls._prepare(image)
         return edges, cv2.dilate(edges, cls._DILATE_KERNEL)
+
+    def prepare_pair_reusable(
+        self,
+        image: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if image is None or image.size == 0:
+            raise ValueError("The price detection region is empty.")
+        source = image
+        if source.ndim == 3:
+            source = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        edges, dilated = self._pair_slots[self._pair_slot_index]
+        self._pair_slot_index = (self._pair_slot_index + 1) % len(
+            self._pair_slots
+        )
+        cv2.resize(
+            source,
+            self._SIZE,
+            self._resized_work,
+            interpolation=cv2.INTER_AREA,
+        )
+        cv2.GaussianBlur(
+            self._resized_work,
+            (3, 3),
+            0,
+            self._blurred_work,
+        )
+        cv2.Canny(self._blurred_work, 45, 120, edges)
+        cv2.dilate(edges, self._DILATE_KERNEL, dilated)
+        return edges, dilated
 
     @classmethod
     def _diff(cls, a: tuple, b: tuple) -> tuple[np.ndarray, np.ndarray, float]:
@@ -763,7 +826,10 @@ class RenewalChangeDetector:
 
     def analyze_pair(self, pair: tuple) -> tuple[float, float]:
         """준비된 (에지,팽창) 쌍을 baseline과 비교해 (전역 변화율, 슬라이스 최대 변화율)."""
-        diff, union, global_ratio = self._diff(self.baseline_pair, pair)
+        diff, union, global_ratio = self._diff_reusable(
+            self.baseline_pair,
+            pair,
+        )
         slice_width = self._SIZE[0] // self._SLICES
         max_slice = 0.0
         for index in range(self._SLICES):
@@ -781,7 +847,41 @@ class RenewalChangeDetector:
     def analyze_pair_global(self, pair: tuple) -> float:
         """동일 가격 빠른 경로용: 슬라이스 순회 없이 전역 변화율만 계산합니다."""
 
-        return self._diff(self.baseline_pair, pair)[2]
+        return self._diff_reusable(self.baseline_pair, pair)[2]
+
+    def _diff_reusable(
+        self,
+        a: tuple[np.ndarray, np.ndarray],
+        b: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        a_edges, a_dilated = a
+        b_edges, b_dilated = b
+        cv2.bitwise_not(b_dilated, self._inverse_second_work)
+        cv2.bitwise_and(
+            a_edges,
+            self._inverse_second_work,
+            self._first_work,
+        )
+        cv2.bitwise_not(a_dilated, self._inverse_first_work)
+        cv2.bitwise_and(
+            b_edges,
+            self._inverse_first_work,
+            self._second_work,
+        )
+        cv2.bitwise_or(
+            self._first_work,
+            self._second_work,
+            self._diff_work,
+        )
+        cv2.bitwise_or(a_edges, b_edges, self._union_work)
+        union_count = cv2.countNonZero(self._union_work)
+        ratio = (
+            0.0
+            if union_count <= 0
+            else float(cv2.countNonZero(self._diff_work))
+            / float(union_count)
+        )
+        return self._diff_work, self._union_work, ratio
 
     @classmethod
     def pair_stability(cls, a: tuple, b: tuple) -> float:
@@ -790,7 +890,7 @@ class RenewalChangeDetector:
 
     def analyze(self, image: np.ndarray) -> tuple[float, float]:
         """(전역 변화율, 슬라이스 최대 변화율)을 반환합니다(단일 이미지 편의용)."""
-        return self.analyze_pair(self.prepare_pair(image))
+        return self.analyze_pair(self.prepare_pair_reusable(image))
 
     def score(self, image: np.ndarray) -> float:
         """기존 호환용: 전역 변화율만 반환합니다(모달/목록 분류 등)."""
@@ -839,16 +939,44 @@ class RenewalPriceClassifier:
         self.unchanged_limit = min(0.040, max(0.035, float(unchanged_limit)))
         self.stability_limit = min(0.030, max(0.015, float(stability_limit)))
         self.changed_global_limit = max(0.060, self.unchanged_limit + 0.020)
-        self.baseline_registration_edges = self._registration_edges(self.baseline)
-        self.baseline_geometry = self._geometry(self.baseline)
+        baseline_validation = validate_price_region(self.baseline)
+        if not baseline_validation.valid:
+            raise ValueError(baseline_validation.message)
+        self.baseline_registration_edges = self.detector.baseline_pair[0]
+        self.baseline_geometry = self._geometry_from_edges(
+            self.baseline_registration_edges
+        )
         if self.baseline_geometry is None:
             raise ValueError("가격 기준 이미지의 글자 구조가 올바르지 않습니다.")
+        self.baseline_projection_gaps = self._projection_gaps(
+            self.baseline_registration_edges
+        )
+        if self.baseline_projection_gaps is None:
+            raise ValueError("가격 기준 이미지의 내부 획 구조가 올바르지 않습니다.")
         self.baseline_prepared_geometry = self._prepared_geometry(
             self.detector.baseline_pair[0]
         )
         if self.baseline_prepared_geometry is None:
             raise ValueError("가격 기준 지문을 만들지 못했습니다.")
+        self.baseline_intensity_range = self._intensity_range(self.baseline)
+        if self.baseline_intensity_range < 24.0:
+            raise ValueError("The baseline price glyph is not fully rendered.")
         self.baseline_border_contrast = self._border_contrast(self.baseline)
+        self._baseline_classification = PriceClassification(
+            PriceState.UNCHANGED,
+            self.baseline,
+            self.detector.baseline_pair,
+            0.0,
+            0.0,
+            0,
+            0,
+            True,
+            "exact_baseline",
+            0,
+            int(cv2.countNonZero(self.detector.baseline_pair[1])),
+        )
+        self._last_raw: Optional[np.ndarray] = None
+        self._last_classification: Optional[PriceClassification] = None
 
     @staticmethod
     def _border_contrast(image: np.ndarray) -> float:
@@ -866,6 +994,20 @@ class RenewalPriceClassifier:
         )
         return float(high - low)
 
+    @staticmethod
+    def _intensity_range(image: np.ndarray) -> float:
+        minimum, maximum, _minimum_point, _maximum_point = cv2.minMaxLoc(image)
+        return float(maximum - minimum)
+
+    def _render_contrast_valid(self, image: np.ndarray) -> bool:
+        """Reject partially rendered/faded glyphs before they can become orders."""
+        current = self._intensity_range(image)
+        return (
+            self.baseline_intensity_range * 0.70
+            <= current
+            <= self.baseline_intensity_range * 1.35
+        )
+
     def _boundary_clear(self, image: np.ndarray) -> bool:
         return self._border_contrast(image) <= max(
             18.0,
@@ -877,6 +1019,52 @@ class RenewalPriceClassifier:
         return cv2.Canny(cv2.GaussianBlur(image, (3, 3), 0), 40, 120)
 
     @staticmethod
+    def _maximum_zero_run(values: np.ndarray) -> int:
+        maximum = 0
+        current = 0
+        for value in values:
+            if int(value) == 0:
+                current += 1
+                maximum = max(maximum, current)
+            else:
+                current = 0
+        return maximum
+
+    @classmethod
+    def _projection_gaps(
+        cls,
+        edges: np.ndarray,
+    ) -> Optional[tuple[int, int]]:
+        if cv2.countNonZero(edges) <= 0:
+            return None
+        x, y, width, height = cv2.boundingRect(edges)
+        if width <= 0 or height <= 0:
+            return None
+        glyph_edges = edges[y : y + height, x : x + width]
+        column_counts = np.count_nonzero(glyph_edges, axis=0)
+        row_counts = np.count_nonzero(glyph_edges, axis=1)
+        return (
+            cls._maximum_zero_run(column_counts),
+            cls._maximum_zero_run(row_counts),
+        )
+
+    def _projection_integrity_edges(self, edges: np.ndarray) -> bool:
+        current = self._projection_gaps(edges)
+        if current is None:
+            return False
+        baseline_columns, baseline_rows = self.baseline_projection_gaps
+        current_columns, current_rows = current
+        return (
+            current_columns <= baseline_columns + 2
+            and current_rows <= baseline_rows + 1
+        )
+
+    def _projection_integrity(self, image: np.ndarray) -> bool:
+        return self._projection_integrity_edges(
+            self._registration_edges(image)
+        )
+
+    @staticmethod
     def _geometry(
         image: np.ndarray,
     ) -> Optional[tuple[int, int, int, int, int]]:
@@ -884,31 +1072,53 @@ class RenewalPriceClassifier:
         if not validation.valid:
             return None
         edges = RenewalPriceClassifier._registration_edges(image)
-        ys, xs = np.nonzero(edges)
-        if xs.size == 0 or ys.size == 0:
+        return RenewalPriceClassifier._geometry_from_edges(edges)
+
+    @staticmethod
+    def _geometry_from_edges(
+        edges: np.ndarray,
+    ) -> Optional[tuple[int, int, int, int, int]]:
+        count = int(cv2.countNonZero(edges))
+        if count <= 0:
             return None
-        x1 = int(xs.min())
-        y1 = int(ys.min())
-        x2 = int(xs.max()) + 1
-        y2 = int(ys.max()) + 1
-        height, width = image.shape[:2]
+        x1, y1, width_box, height_box = cv2.boundingRect(edges)
+        x2 = x1 + width_box
+        y2 = y1 + height_box
+        height, width = edges.shape[:2]
         # 글자가 ROI 경계에 직접 닿으면 열림/닫힘 전환 중 잘린 가격일 수 있습니다.
         if x1 <= 0 or y1 <= 0 or x2 >= width or y2 >= height:
             return None
-        return x1, y1, x2, y2, int(xs.size)
+        return x1, y1, x2, y2, count
 
-    def _geometry_matches(self, image: np.ndarray) -> bool:
-        current = self._geometry(image)
+    def _geometry_matches_edges(self, edges: np.ndarray) -> bool:
+        current = self._geometry_from_edges(edges)
         if current is None:
             return False
-        _bx1, by1, _bx2, by2, baseline_edges = self.baseline_geometry
-        _cx1, cy1, _cx2, cy2, current_edges = current
+        bx1, by1, bx2, by2, baseline_edges = self.baseline_geometry
+        cx1, cy1, cx2, cy2, current_edges = current
+        baseline_width = bx2 - bx1
+        current_width = cx2 - cx1
         baseline_height = by2 - by1
         current_height = cy2 - cy1
-        return (
-            baseline_height * 0.65 <= current_height <= baseline_height * 1.35
-            and baseline_edges * 0.45 <= current_edges <= baseline_edges * 2.20
+        image_height, image_width = edges.shape[:2]
+        horizontal_tolerance = max(7, int(round(image_width * 0.020)))
+        left_tolerance = max(
+            horizontal_tolerance,
+            int(round(baseline_width * 0.070)),
         )
+        vertical_tolerance = max(1, int(round(image_height * 0.030)))
+        return (
+            abs(cx1 - bx1) <= left_tolerance
+            and abs(cx2 - bx2) <= horizontal_tolerance
+            and abs(cy1 - by1) <= vertical_tolerance
+            and abs(cy2 - by2) <= vertical_tolerance
+            and baseline_width * 0.80 <= current_width <= baseline_width * 1.20
+            and baseline_height * 0.92 <= current_height <= baseline_height * 1.10
+            and baseline_edges * 0.55 <= current_edges <= baseline_edges * 1.80
+        )
+
+    def _geometry_matches(self, image: np.ndarray) -> bool:
+        return self._geometry_matches_edges(self._registration_edges(image))
 
     @staticmethod
     def _prepared_geometry(
@@ -917,10 +1127,7 @@ class RenewalPriceClassifier:
         count = int(cv2.countNonZero(edges))
         if count <= 0:
             return None
-        points = cv2.findNonZero(edges)
-        if points is None:
-            return None
-        x, y, width, height = cv2.boundingRect(points)
+        x, y, width, height = cv2.boundingRect(edges)
         image_height, image_width = edges.shape[:2]
         if (
             x <= 0
@@ -938,28 +1145,27 @@ class RenewalPriceClassifier:
         current = self._prepared_geometry(pair[0])
         if current is None:
             return False
-        _bx, _by, _bw, baseline_height, baseline_count = (
+        bx, by, baseline_width, baseline_height, baseline_count = (
             self.baseline_prepared_geometry
         )
-        _cx, _cy, _cw, current_height, current_count = current
+        cx, cy, current_width, current_height, current_count = current
+        baseline_right = bx + baseline_width
+        current_right = cx + current_width
+        left_tolerance = max(8, int(round(baseline_width * 0.070)))
         return (
-            baseline_height * 0.65
+            abs(cx - bx) <= left_tolerance
+            and abs(current_right - baseline_right) <= 7
+            and abs(cy - by) <= 2
+            and baseline_width * 0.80
+            <= current_width
+            <= baseline_width * 1.20
+            and baseline_height * 0.92
             <= current_height
-            <= baseline_height * 1.35
-            and baseline_count * 0.45
+            <= baseline_height * 1.10
+            and baseline_count * 0.55
             <= current_count
-            <= baseline_count * 2.20
+            <= baseline_count * 1.80
         )
-
-    @staticmethod
-    def _packed_fingerprint(
-        pair: tuple[np.ndarray, np.ndarray],
-    ) -> tuple[int, int]:
-        """팽창 에지를 정수 비트열로 바꿔 같은 후보의 빠른 비교에 사용합니다."""
-
-        packed = np.packbits(pair[1], bitorder="little").tobytes()
-        fingerprint = int.from_bytes(packed, "little", signed=False)
-        return fingerprint, fingerprint.bit_count()
 
     def align(
         self,
@@ -971,6 +1177,8 @@ class RenewalPriceClassifier:
         tuple[np.ndarray, np.ndarray],
         float,
         float,
+        Optional[np.ndarray],
+        bool,
     ]:
         gray = image
         if gray is None or gray.size == 0:
@@ -979,36 +1187,99 @@ class RenewalPriceClassifier:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         if gray.shape != self.baseline.shape:
             raise ValueError("가격 후보 이미지 크기가 기준과 다릅니다.")
-        pair = self.detector.prepare_pair(gray)
+        pair = self.detector.prepare_pair_reusable(gray)
         direct_global = self.detector.analyze_pair_global(pair)
         if direct_global <= self.unchanged_limit:
-            return gray, 0, 0, pair, direct_global, 0.0
-        # Locate the baseline glyph structure inside a 2 px padded current ROI.
-        # One template correlation replaces 25 resized edge comparisons and
-        # keeps the speed-10 changed path below the input latency budget.
-        current_edges = self._registration_edges(gray)
+            return gray, 0, 0, pair, direct_global, 0.0, None, True
+        # Reuse the already prepared 256x64 edge map.  Price text is right
+        # aligned, so the right anchor and vertical center yield the residual
+        # raw-ROI translation without another Canny + template correlation.
+        current_geometry = self._prepared_geometry(pair[0])
+        if current_geometry is None:
+            global_score, slice_score = self.detector.analyze_pair(pair)
+            return (
+                gray,
+                0,
+                0,
+                pair,
+                global_score,
+                slice_score,
+                None,
+                False,
+            )
+        bx, by, baseline_width, baseline_height, _baseline_count = (
+            self.baseline_prepared_geometry
+        )
+        cx, cy, current_width, current_height, _current_count = (
+            current_geometry
+        )
+        baseline_right = bx + baseline_width
+        current_right = cx + current_width
+        baseline_bottom = by + baseline_height
+        current_bottom = cy + current_height
+        left_dx = bx - cx
+        right_dx = baseline_right - current_right
+        top_dy = by - cy
+        bottom_dy = baseline_bottom - current_bottom
+        horizontal_prepared_limit = (
+            int(
+                np.ceil(
+                    (self._LOCAL_SHIFT_LIMIT + 1)
+                    * self.detector._SIZE[0]
+                    / gray.shape[1]
+                )
+            )
+            + 1
+        )
+        vertical_prepared_limit = (
+            int(
+                np.ceil(
+                    self._LOCAL_SHIFT_LIMIT
+                    * self.detector._SIZE[1]
+                    / gray.shape[0]
+                )
+            )
+            + 1
+        )
+        average_vertical_shift = (top_dy + bottom_dy) * 0.5
+        if (
+            abs(right_dx) > horizontal_prepared_limit
+            or abs(top_dy - bottom_dy) > 4
+            or abs(average_vertical_shift) > vertical_prepared_limit
+        ):
+            global_score, slice_score = self.detector.analyze_pair(pair)
+            return (
+                gray,
+                0,
+                0,
+                pair,
+                global_score,
+                slice_score,
+                None,
+                False,
+            )
+        # FC price text is right-aligned.  A genuine last-digit change may
+        # alter the left edge/total glyph width, so only the stable right
+        # anchor is a valid horizontal registration reference.
+        prepared_dx = float(right_dx)
+        prepared_dy = average_vertical_shift
         limit = self._LOCAL_SHIFT_LIMIT
-        padded = cv2.copyMakeBorder(
-            current_edges,
+        dx = min(
             limit,
-            limit,
-            limit,
-            limit,
-            cv2.BORDER_CONSTANT,
-            value=0,
+            max(
+                -limit,
+                int(round(prepared_dx * gray.shape[1] / self.detector._SIZE[0])),
+            ),
         )
-        correlation = cv2.matchTemplate(
-            padded,
-            self.baseline_registration_edges,
-            cv2.TM_CCOEFF_NORMED,
+        dy = min(
+            limit,
+            max(
+                -limit,
+                int(round(prepared_dy * gray.shape[0] / self.detector._SIZE[1])),
+            ),
         )
-        _minimum, _maximum, _minimum_location, maximum_location = cv2.minMaxLoc(
-            correlation
-        )
-        dx = limit - int(maximum_location[0])
-        dy = limit - int(maximum_location[1])
         aligned = _translate_image(gray, dx, dy)
-        aligned_pair = self.detector.prepare_pair(aligned)
+        aligned_pair = self.detector.prepare_pair_reusable(aligned)
         global_score, slice_score = self.detector.analyze_pair(aligned_pair)
         return (
             aligned,
@@ -1017,17 +1288,47 @@ class RenewalPriceClassifier:
             aligned_pair,
             global_score,
             slice_score,
+            None,
+            True,
         )
 
     def classify(self, image: np.ndarray) -> PriceClassification:
+        gray_for_cache: Optional[np.ndarray] = None
         try:
-            aligned, dx, dy, pair, global_score, slice_score = self.align(
-                image
-            )
+            if image is not None and image.size:
+                gray_for_cache = image
+                if gray_for_cache.ndim == 3:
+                    gray_for_cache = cv2.cvtColor(
+                        gray_for_cache,
+                        cv2.COLOR_BGR2GRAY,
+                    )
+                if gray_for_cache.shape == self.baseline.shape:
+                    if np.array_equal(gray_for_cache, self.baseline):
+                        return self._baseline_classification
+                    if (
+                        self._last_raw is not None
+                        and self._last_classification is not None
+                        and np.array_equal(gray_for_cache, self._last_raw)
+                    ):
+                        return self._last_classification
+        except Exception:
+            gray_for_cache = None
+
+        try:
+            (
+                aligned,
+                dx,
+                dy,
+                pair,
+                global_score,
+                slice_score,
+                aligned_registration_edges,
+                alignment_valid,
+            ) = self.align(gray_for_cache if gray_for_cache is not None else image)
         except Exception as exc:
             empty = np.empty((0, 0), dtype=np.uint8)
-            empty_pair = self.detector.prepare_pair(self.baseline)
-            return PriceClassification(
+            empty_pair = self.detector.baseline_pair
+            classification = PriceClassification(
                 PriceState.AMBIGUOUS,
                 empty,
                 empty_pair,
@@ -1038,16 +1339,29 @@ class RenewalPriceClassifier:
                 False,
                 f"invalid:{exc}",
             )
+            if gray_for_cache is not None:
+                self._last_raw = gray_for_cache.copy()
+                self._last_classification = classification
+            return classification
 
-        fingerprint, population = self._packed_fingerprint(pair)
         # 기준과 거의 같은 에지 구조라면 완성된 기준 글자 구조도 동시에 증명됩니다.
         # 동일 가격의 대부분을 차지하는 이 경로에서는 두 번째 Canny/행 검사를 생략합니다.
-        if global_score <= self.unchanged_limit:
+        if not alignment_valid:
+            geometry_valid = False
+        elif global_score <= self.unchanged_limit:
             geometry_valid = self._boundary_clear(aligned)
         else:
+            structural_edges = (
+                aligned_registration_edges
+                if aligned_registration_edges is not None
+                else pair[0]
+            )
             geometry_valid = (
                 self._boundary_clear(aligned)
+                and self._render_contrast_valid(aligned)
+                and self._geometry_matches_edges(structural_edges)
                 and self._prepared_geometry_matches(pair)
+                and self._projection_integrity_edges(structural_edges)
             )
 
         if not geometry_valid:
@@ -1065,7 +1379,7 @@ class RenewalPriceClassifier:
             state = PriceState.AMBIGUOUS
             reason = "gray_zone"
 
-        return PriceClassification(
+        classification = PriceClassification(
             state,
             aligned,
             pair,
@@ -1075,9 +1389,13 @@ class RenewalPriceClassifier:
             dy,
             geometry_valid,
             reason,
-            fingerprint,
-            population,
+            0,
+            int(cv2.countNonZero(pair[1])),
         )
+        if gray_for_cache is not None:
+            self._last_raw = gray_for_cache.copy()
+            self._last_classification = classification
+        return classification
 
     def same_candidate(
         self,
@@ -1089,15 +1407,8 @@ class RenewalPriceClassifier:
             or first.state is PriceState.AMBIGUOUS
         ):
             return False
-        union_population = (
-            first.fingerprint | second.fingerprint
-        ).bit_count()
-        if union_population > 0:
-            exact_ratio = (
-                first.fingerprint ^ second.fingerprint
-            ).bit_count() / float(union_population)
-            if exact_ratio <= self.stability_limit:
-                return True
+        if np.array_equal(first.pair[1], second.pair[1]):
+            return True
         # 안티앨리어싱으로 정확 비트가 조금 달라진 경우에는 기존 팽창 비교로
         # 안전하게 되돌아가 판정 의미를 바꾸지 않습니다.
         return (

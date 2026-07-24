@@ -21,6 +21,12 @@ from pathlib import Path
 from tkinter import messagebox
 from typing import Optional
 
+# The renewal classifier never performs large matrix multiplication.  Prevent
+# NumPy's BLAS backend from reserving hundreds of MB for idle worker stacks.
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
