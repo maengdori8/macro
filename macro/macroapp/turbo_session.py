@@ -713,6 +713,36 @@ def get_window_rect(hwnd: int) -> WindowRect:
     return _get_window_rect(hwnd)
 
 
+def target_outer_size_for_wgc(
+    current_outer: WindowRect,
+    current_wgc_size: tuple[int, int],
+    target_wgc_size: tuple[int, int] = TARGET_WGC_SIZE,
+) -> tuple[int, int]:
+    """Compensate only for the measured outer-window/WGC size difference."""
+
+    current_wgc_width = int(current_wgc_size[0])
+    current_wgc_height = int(current_wgc_size[1])
+    target_wgc_width = int(target_wgc_size[0])
+    target_wgc_height = int(target_wgc_size[1])
+    if (
+        current_wgc_width < 640
+        or current_wgc_height < 480
+        or target_wgc_width < 640
+        or target_wgc_height < 480
+    ):
+        raise ValueError("WGC size is too small for safe automatic fitting.")
+    width_difference = current_outer.width - current_wgc_width
+    height_difference = current_outer.height - current_wgc_height
+    if abs(width_difference) > 64 or abs(height_difference) > 64:
+        raise ValueError(
+            "Outer-window/WGC size difference exceeds the 64 px safety limit."
+        )
+    return (
+        target_wgc_width + width_difference,
+        target_wgc_height + height_difference,
+    )
+
+
 def resize_window_no_activate(
     hwnd: int,
     target_size: tuple[int, int] = TARGET_WGC_SIZE,

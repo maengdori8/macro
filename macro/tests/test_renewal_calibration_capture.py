@@ -114,6 +114,92 @@ class _Detector:
 
 
 class RenewalCalibrationCaptureTests(unittest.TestCase):
+    def test_stable_wgc_wait_discards_transient_oversized_frame(self):
+        transient = np.zeros((1056, 1936), dtype=np.uint8)
+        stable = np.zeros((1048, 1928), dtype=np.uint8)
+        manager = _Manager(
+            [stable.copy(), stable.copy(), stable.copy()],
+            transient,
+        )
+        with mock.patch.object(
+            renewal_macro,
+            "WGC_SIZE_STABLE_SECONDS",
+            0.001,
+        ):
+            result = renewal_macro._wait_for_stable_wgc_frame(
+                manager,
+                timeout_seconds=0.1,
+            )
+        self.assertEqual(result.shape, stable.shape)
+
+    def test_wgc_fit_compensates_and_rolls_back_failed_verification(self):
+        from macroapp.turbo_session import WindowRect
+
+        current_outer = WindowRect(0, 0, 1928, 1048)
+        resized_outer = WindowRect(0, 0, 1936, 1056)
+        snapshot = renewal_macro.WindowResizeSnapshot(
+            100,
+            current_outer,
+            resized_outer,
+        )
+        before = np.zeros((1040, 1920), dtype=np.uint8)
+        after = np.zeros((1048, 1928), dtype=np.uint8)
+        with (
+            mock.patch.object(
+                renewal_macro,
+                "get_window_rect",
+                return_value=current_outer,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "_measure_stable_wgc_frame",
+                side_effect=(before, after),
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "resize_window_no_activate",
+                return_value=snapshot,
+            ) as resize,
+            mock.patch.object(
+                renewal_macro,
+                "restore_window_no_activate",
+            ) as restore,
+        ):
+            result, before_size, after_size = (
+                renewal_macro._fit_game_window_to_wgc(100)
+            )
+        self.assertEqual(result, snapshot)
+        self.assertEqual(before_size, (1920, 1040))
+        self.assertEqual(after_size, (1928, 1048))
+        resize.assert_called_once_with(100, (1936, 1056))
+        restore.assert_not_called()
+
+        wrong_after = np.zeros((1044, 1924), dtype=np.uint8)
+        with (
+            mock.patch.object(
+                renewal_macro,
+                "get_window_rect",
+                return_value=current_outer,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "_measure_stable_wgc_frame",
+                side_effect=(before, wrong_after),
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "resize_window_no_activate",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "restore_window_no_activate",
+            ) as restore,
+        ):
+            with self.assertRaises(RuntimeError):
+                renewal_macro._fit_game_window_to_wgc(100)
+        restore.assert_called_once_with(snapshot)
+
     def test_five_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.ones((height, width), dtype=np.uint8)

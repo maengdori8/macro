@@ -79,6 +79,7 @@ from macroapp.turbo_session import (
     resize_window_no_activate,
     restore_window_no_activate,
     scan_processes,
+    target_outer_size_for_wgc,
 )
 from macroapp.window import InactiveManager
 
@@ -87,6 +88,100 @@ ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 CALIBRATION_CLOSE_TIMEOUT_SECONDS = 3.0
 CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
+WGC_SIZE_STABLE_SECONDS = 0.50
+WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
+
+
+def _wait_for_stable_wgc_frame(
+    manager: InactiveManager,
+    *,
+    timeout_seconds: float = WGC_SIZE_STABLE_TIMEOUT_SECONDS,
+) -> np.ndarray:
+    """Return only after one WGC size remains stable across the settle window."""
+
+    first = manager.capture_client_area(window_validated=True)
+    if first is None:
+        raise RuntimeError("Could not receive the first WGC frame.")
+    engine = manager.capture_engine
+    if engine is None or not hasattr(engine, "get_latest_frame_packet"):
+        raise RuntimeError("The unique-frame WGC API is unavailable.")
+
+    latest = first
+    candidate_size = (int(first.shape[1]), int(first.shape[0]))
+    candidate_since = time.monotonic()
+    deadline = candidate_since + max(1.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now - candidate_since >= WGC_SIZE_STABLE_SECONDS:
+            return latest
+        packet = engine.get_latest_frame_packet(
+            timeout=min(0.10, max(0.0, deadline - now)),
+        )
+        if packet is None:
+            if engine.closed_event.is_set():
+                raise RuntimeError("WGC closed while its size was settling.")
+            continue
+        frame = packet.image
+        size = (int(frame.shape[1]), int(frame.shape[0]))
+        if size != candidate_size:
+            candidate_size = size
+            candidate_since = time.monotonic()
+        latest = frame
+    raise RuntimeError(
+        f"WGC size did not settle within {timeout_seconds:.1f}s; "
+        f"last size was {candidate_size[0]}x{candidate_size[1]}."
+    )
+
+
+def _measure_stable_wgc_frame(
+    hwnd: int,
+    logger=None,
+) -> np.ndarray:
+    manager = InactiveManager(
+        WINDOW_TITLE,
+        logger=logger or (lambda _message: None),
+    )
+    manager.hwnd = int(hwnd)
+    try:
+        return _wait_for_stable_wgc_frame(manager)
+    finally:
+        manager.stop_capture()
+
+
+def _fit_game_window_to_wgc(
+    hwnd: int,
+    logger=None,
+) -> tuple[WindowResizeSnapshot, tuple[int, int], tuple[int, int]]:
+    """Fit without activation, verify stable WGC size, and roll back on failure."""
+
+    original = get_window_rect(hwnd)
+    before_frame = _measure_stable_wgc_frame(hwnd, logger)
+    before_size = (int(before_frame.shape[1]), int(before_frame.shape[0]))
+    if before_size == TARGET_WGC_SIZE:
+        return (
+            WindowResizeSnapshot(int(hwnd), original, original),
+            before_size,
+            before_size,
+        )
+
+    target_outer_size = target_outer_size_for_wgc(
+        original,
+        before_size,
+        TARGET_WGC_SIZE,
+    )
+    snapshot = resize_window_no_activate(hwnd, target_outer_size)
+    try:
+        after_frame = _measure_stable_wgc_frame(hwnd, logger)
+        after_size = (int(after_frame.shape[1]), int(after_frame.shape[0]))
+        if after_size != TARGET_WGC_SIZE:
+            raise RuntimeError(
+                f"Stable WGC is {after_size[0]}x{after_size[1]} after fitting; "
+                f"expected {TARGET_WGC_SIZE[0]}x{TARGET_WGC_SIZE[1]}."
+            )
+        return snapshot, before_size, after_size
+    except Exception:
+        restore_window_no_activate(snapshot)
+        raise
 
 
 def _save_calibration_diagnostic(
@@ -884,13 +979,15 @@ class RenewalApp:
         if hwnd is None:
             return
         try:
-            current = get_window_rect(hwnd)
-            if (current.width, current.height) == TARGET_WGC_SIZE:
+            snapshot, before_size, after_size = _fit_game_window_to_wgc(
+                hwnd,
+                self.log,
+            )
+            if snapshot.original == snapshot.resized:
                 self.status_var.set(
-                    f"이미 1080p 터보 크기 {current.width}x{current.height}"
+                    f"이미 안정 WGC {after_size[0]}x{after_size[1]}"
                 )
                 return
-            snapshot = resize_window_no_activate(hwnd, TARGET_WGC_SIZE)
         except Exception as exc:
             messagebox.showerror(
                 "1080p 창 맞춤 실패",
@@ -904,7 +1001,8 @@ class RenewalApp:
         self.status_var.set(
             f"FC 창 {snapshot.original.width}x{snapshot.original.height} → "
             f"{snapshot.resized.width}x{snapshot.resized.height} · "
-            "구매/판매 가격영역 재설정 필요"
+            f"WGC {before_size[0]}x{before_size[1]} → "
+            f"{after_size[0]}x{after_size[1]} · 구매/판매 가격영역 재설정 필요"
         )
 
     def _restore_game_window(self) -> None:
@@ -1678,6 +1776,60 @@ def _startup_selftest() -> int:
                 pass
 
 
+def _headless_fit_wgc() -> int:
+    """Fit the FC window to a verified stable 1928x1048 WGC frame."""
+
+    report_path = app_dir() / "renewal_headless_fit_wgc.json"
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "started_at_unix": time.time(),
+        "passed": False,
+    }
+    try:
+        manager = InactiveManager(WINDOW_TITLE, logger=lambda _message: None)
+        if not manager.find_window() or manager.hwnd is None:
+            raise RuntimeError("FC ONLINE window was not found.")
+        snapshot, before_size, after_size = _fit_game_window_to_wgc(
+            manager.hwnd,
+        )
+        report.update(
+            {
+                "passed": True,
+                "hwnd": int(manager.hwnd),
+                "wgc_size_before": list(before_size),
+                "wgc_size_after": list(after_size),
+                "outer_size_before": [
+                    snapshot.original.width,
+                    snapshot.original.height,
+                ],
+                "outer_size_after": [
+                    snapshot.resized.width,
+                    snapshot.resized.height,
+                ],
+            }
+        )
+        return 0
+    except Exception as exc:
+        report.update(
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+        return 1
+    finally:
+        report["finished_at_unix"] = time.time()
+        temporary = report_path.with_suffix(".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(report_path)
+        except Exception:
+            pass
+
+
 def _headless_calibrate_existing(side_name: str) -> int:
     """Calibrate an existing right-side ROI using open/ESC only.
 
@@ -1712,9 +1864,12 @@ def _headless_calibrate_existing(side_name: str) -> int:
         manager = InactiveManager(WINDOW_TITLE, logger=lambda _message: None)
         if not manager.find_window():
             raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
-        full_frame = manager.capture_client_area(window_validated=True)
-        if full_frame is None:
-            raise RuntimeError("첫 WGC 프레임을 받지 못했습니다.")
+        if manager.hwnd is None:
+            raise RuntimeError("FC ONLINE HWND가 없습니다.")
+        fit_snapshot, fit_before_size, fit_after_size = (
+            _fit_game_window_to_wgc(manager.hwnd)
+        )
+        full_frame = _wait_for_stable_wgc_frame(manager)
         frame_height, frame_width = full_frame.shape[:2]
         if (frame_width, frame_height) != (1928, 1048):
             raise RuntimeError(
@@ -2024,6 +2179,12 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 "profile": str(saved_profile),
                 "corpus": str(corpus_dir),
                 "frame_size": [frame_width, frame_height],
+                "wgc_size_before_fit": list(fit_before_size),
+                "wgc_size_after_fit": list(fit_after_size),
+                "outer_size_after_fit": [
+                    fit_snapshot.resized.width,
+                    fit_snapshot.resized.height,
+                ],
                 "openings": len(sessions),
                 "open_frames": sum(len(session) for session in sessions),
                 "closed_frames": len(closed_samples),
@@ -2181,6 +2342,8 @@ def main() -> int:
 
     if "--startup-selftest" in sys.argv[1:]:
         return _startup_selftest()
+    if "--headless-fit-wgc" in sys.argv[1:]:
+        return _headless_fit_wgc()
     for argument in sys.argv[1:]:
         if argument.startswith("--verification-soak-seconds="):
             try:

@@ -167,13 +167,13 @@ class CaptureBorderMask:
                 )
 
             self._mask_hwnd = int(mask_hwnd)
-            self._started = True
-            self._ready_event.set()
-
             last_geometry: Optional[tuple[int, int, int, int]] = None
             visible = False
+            first_update = True
 
-            while not self._stop_event.wait(0.20):
+            while not self._stop_event.is_set():
+                if not first_update and self._stop_event.wait(0.20):
+                    break
                 try:
                     gui.PumpWaitingMessages()
 
@@ -228,6 +228,15 @@ class CaptureBorderMask:
                     # 게임의 전체 화면/창 전환 순간에는 HWND 상태와 DWM bounds가 잠시
                     # 불일치할 수 있습니다. 다음 200ms 주기에서 자연스럽게 복구합니다.
                     continue
+                finally:
+                    if first_update:
+                        # Do not let start() return until the first placement
+                        # attempt finishes. This minimizes the transient visible
+                        # border; callers still wait for a stable capture size
+                        # because Windows may emit oversized transition frames.
+                        self._started = True
+                        self._ready_event.set()
+                        first_update = False
         except Exception as exc:
             self.log(f"[캡처 안내] Windows 10 WGC 테두리 마스크를 만들지 못했습니다: {exc}")
             self._ready_event.set()

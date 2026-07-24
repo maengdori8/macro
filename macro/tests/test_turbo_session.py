@@ -168,6 +168,21 @@ class TurboSessionTests(unittest.TestCase):
         restore_flags = fake_user32.SetWindowPos.call_args.args[-1]
         self.assertTrue(restore_flags & turbo._SWP_NOACTIVATE)
 
+    def test_target_outer_size_uses_measured_wgc_difference(self) -> None:
+        current_outer = turbo.WindowRect(0, 0, 1928, 1048)
+        self.assertEqual(
+            turbo.target_outer_size_for_wgc(
+                current_outer,
+                (1920, 1040),
+            ),
+            (1936, 1056),
+        )
+        with self.assertRaises(ValueError):
+            turbo.target_outer_size_for_wgc(
+                current_outer,
+                (1800, 900),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
