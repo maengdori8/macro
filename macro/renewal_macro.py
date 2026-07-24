@@ -96,7 +96,7 @@ CALIBRATION_POPUP_WHITE_FLOOR = 250
 CALIBRATION_POPUP_WHITE_RATIO = 0.70
 CALIBRATION_PRICE_TARGET_HEIGHT = 48
 CALIBRATION_PRICE_TARGET_WIDTH = 220
-CALIBRATION_PRICE_RIGHT_PADDING = 8
+CALIBRATION_PRICE_RIGHT_X = 0.795
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
 WGC_SIZE_STABLE_SECONDS = 0.50
 WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
@@ -121,25 +121,38 @@ def _calibration_popup_opacity(
 
 def _expand_headless_price_rect(
     rect: NormalizedRect,
+    side_name: str,
     frame_width: int,
     frame_height: int,
 ) -> NormalizedRect:
     """Give right-aligned FC prices enough room for longer current values."""
 
     x1, y1, x2, y2 = rect.to_pixels(frame_width, frame_height)
-    width = x2 - x1
-    extra = max(0, CALIBRATION_PRICE_TARGET_WIDTH - width)
-    right = min(CALIBRATION_PRICE_RIGHT_PADDING, extra)
-    left = extra - right
-    target_bottom = y1 + max(
-        y2 - y1,
-        CALIBRATION_PRICE_TARGET_HEIGHT,
+    if side_name not in ("buy", "sell"):
+        raise ValueError("side_name must be buy or sell")
+    target_width = max(x2 - x1, CALIBRATION_PRICE_TARGET_WIDTH)
+    target_right = min(
+        frame_width,
+        max(x2, int(round(frame_width * CALIBRATION_PRICE_RIGHT_X))),
     )
+    target_left = max(0, target_right - target_width)
+    target_center_y = 0.4733 if side_name == "buy" else 0.4342
+    target_top = int(
+        round(
+            frame_height * target_center_y
+            - CALIBRATION_PRICE_TARGET_HEIGHT * 0.5
+        )
+    )
+    target_top = max(
+        0,
+        min(frame_height - CALIBRATION_PRICE_TARGET_HEIGHT, target_top),
+    )
+    target_bottom = target_top + CALIBRATION_PRICE_TARGET_HEIGHT
     return NormalizedRect(
-        max(0, x1 - left) / frame_width,
-        y1 / frame_height,
-        min(frame_width, x2 + right) / frame_width,
-        min(frame_height, target_bottom) / frame_height,
+        target_left / frame_width,
+        target_top / frame_height,
+        target_right / frame_width,
+        target_bottom / frame_height,
     )
 
 
@@ -2141,6 +2154,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
         original_price_rect = side.price_rect
         price_rect = _expand_headless_price_rect(
             original_price_rect,
+            side_name,
             frame_width,
             frame_height,
         )

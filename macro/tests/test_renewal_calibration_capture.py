@@ -130,13 +130,14 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         expanded = renewal_macro._expand_headless_price_rect(
             original,
+            "buy",
             1928,
             1048,
         )
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            (1312, 423, 1532, 471),
+            (1313, 472, 1533, 520),
         )
 
     def test_headless_price_rect_keeps_already_wide_horizontal_selection(self):
@@ -149,25 +150,27 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         expanded = renewal_macro._expand_headless_price_rect(
             original,
+            "buy",
             1928,
             1048,
         )
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            (1300, 423, 1530, 471),
+            (1303, 472, 1533, 520),
         )
 
     def test_headless_price_rect_is_idempotent_after_expansion(self):
         original = NormalizedRect(
-            1312 / 1928,
-            423 / 1048,
-            1532 / 1928,
-            471 / 1048,
+            1313 / 1928,
+            472 / 1048,
+            1533 / 1928,
+            520 / 1048,
         )
 
         expanded = renewal_macro._expand_headless_price_rect(
             original,
+            "buy",
             1928,
             1048,
         )
@@ -175,6 +178,26 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
             original.to_pixels(1928, 1048),
+        )
+
+    def test_headless_sell_price_rect_targets_lower_limit_row(self):
+        original = NormalizedRect(
+            1420 / 1928,
+            391 / 1048,
+            1511 / 1928,
+            424 / 1048,
+        )
+
+        expanded = renewal_macro._expand_headless_price_rect(
+            original,
+            "sell",
+            1928,
+            1048,
+        )
+
+        self.assertEqual(
+            expanded.to_pixels(1928, 1048),
+            (1313, 431, 1533, 479),
         )
 
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):

@@ -655,9 +655,9 @@ def validate_limit_price_selection(
     center_x = (rect.left + rect.right) * 0.5
     center_y = (rect.top + rect.bottom) * 0.5
     expected_y = (
-        0.410 <= center_y <= 0.455
+        0.458 <= center_y <= 0.490
         if side == "buy"
-        else 0.365 <= center_y <= 0.405
+        else 0.418 <= center_y <= 0.450
     )
     if not (
         0.700 <= center_x <= 0.835

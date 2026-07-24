@@ -283,8 +283,8 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
 
     def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
-        buy_rect = renewal.NormalizedRect(0.7128, 0.4042, 0.7904, 0.4424)
-        sell_rect = renewal.NormalizedRect(0.7128, 0.3660, 0.7904, 0.4042)
+        buy_rect = renewal.NormalizedRect(0.6810, 0.4504, 0.7951, 0.4962)
+        sell_rect = renewal.NormalizedRect(0.6810, 0.4113, 0.7951, 0.4571)
         self.assertTrue(
             renewal.validate_limit_price_selection(
                 self.base_price,
@@ -314,7 +314,7 @@ class RenewalSafetyTests(unittest.TestCase):
         )
 
         amount_input = renewal.NormalizedRect(0.610, 0.485, 0.765, 0.555)
-        wrong_side_row = renewal.NormalizedRect(0.7128, 0.3660, 0.7904, 0.4042)
+        wrong_side_row = sell_rect
         self.assertFalse(
             renewal.validate_limit_price_selection(
                 self.base_price,
