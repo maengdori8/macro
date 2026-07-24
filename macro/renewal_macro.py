@@ -70,6 +70,9 @@ from macroapp.window import InactiveManager
 
 
 ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+CALIBRATION_CLOSE_TIMEOUT_SECONDS = 3.0
+CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
+CALIBRATION_STABLE_FRAME_DELTA = 1.5
 
 
 def _enable_safe_process_priority() -> Optional[int]:
@@ -1003,13 +1006,24 @@ class RenewalApp:
                     return packet
                 return None
 
-            def wait_until_closed() -> list[np.ndarray]:
-                deadline = time.monotonic() + 1.0
+            def wait_until_closed(opening_number: int) -> list[np.ndarray]:
+                deadline = (
+                    time.monotonic() + CALIBRATION_CLOSE_TIMEOUT_SECONDS
+                )
                 stable: list[np.ndarray] = []
+                wrong_shape_count = 0
                 while True:
                     packet = next_packet(deadline)
                     if packet is None:
-                        raise RuntimeError("팝업 닫힘을 확인하지 못했습니다.")
+                        raise RuntimeError(
+                            f"{opening_number}번째 팝업을 ESC로 닫았지만 "
+                            "안정된 닫힘 화면을 확인하지 못했습니다. "
+                            "팝업이 열린 상태인지 확인한 뒤 다시 시도하세요."
+                        )
+                    if packet.image.shape != reference_guard.shape:
+                        wrong_shape_count += 1
+                        stable.clear()
+                        continue
                     registration = provisional_guard.register(
                         packet.image,
                         0.0,
@@ -1023,28 +1037,42 @@ class RenewalApp:
                         delta = float(
                             cv2.mean(cv2.absdiff(stable[-1], sample))[0]
                         )
-                        if delta > 1.5:
+                        if delta > CALIBRATION_STABLE_FRAME_DELTA:
                             stable.clear()
                     stable.append(sample.copy())
                     if len(stable) >= 4:
+                        self.log(
+                            f"[안전 보정] {opening_number}번째 팝업 닫힘 확인 "
+                            f"· 새 프레임 4장 · 다른 크기 {wrong_shape_count}장"
+                        )
                         return stable[-4:]
 
             flush()
             for opening in range(RENEWAL_CALIBRATION_OPENINGS):
+                opening_number = opening + 1
                 if opening > 0:
+                    self.status_var.set(
+                        f"v8 1080p 보정 {opening_number}/"
+                        f"{RENEWAL_CALIBRATION_OPENINGS} · 팝업 닫힘 확인"
+                    )
+                    self.root.update_idletasks()
                     clicker.press_escape()
-                    closed_samples = wait_until_closed()
+                    closed_samples = wait_until_closed(opening)
                     flush()
                     clicker.click_client(action)
-                    flush()
 
                 self.status_var.set(
-                    f"v8 1080p 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
-                    "창을 조작하지 마세요"
+                    f"v8 1080p 보정 {opening_number}/"
+                    f"{RENEWAL_CALIBRATION_OPENINGS} · "
+                    "안정된 팝업 확인 중"
                 )
                 self.root.update_idletasks()
                 session: list[np.ndarray] = []
-                deadline = time.monotonic() + 2.0
+                deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
+                invalid_count = 0
+                wrong_shape_count = 0
+                last_luma_delta = 255.0
+                last_edge_delta = 1.0
                 while (
                     len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
                     and time.monotonic() < deadline
@@ -1054,17 +1082,45 @@ class RenewalApp:
                         break
                     sample = packet.image
                     if sample.shape != reference_guard.shape:
-                        raise RuntimeError("보정 중 게임 창 크기가 바뀌었습니다.")
+                        wrong_shape_count += 1
+                        session.clear()
+                        continue
                     registration = provisional_guard.register(sample, 0.0, 0.0)
+                    last_luma_delta = registration.luma_delta
+                    last_edge_delta = registration.edge_delta
                     if not registration.valid:
+                        invalid_count += 1
                         session.clear()
                         continue
                     session.append(sample.copy())
                 if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
+                    if opening == 0:
+                        hint = (
+                            "가격영역을 선택하기 전에 구매/판매 팝업을 완전히 "
+                            "열어 두고 다시 시도하세요."
+                        )
+                    else:
+                        hint = (
+                            "목록 화면의 구매/판매 버튼 좌표가 맞는지 다시 "
+                            "설정하세요."
+                        )
                     raise RuntimeError(
-                        f"{opening + 1}번째 팝업의 안전 프레임이 부족합니다."
+                        f"{opening_number}번째 팝업이 5초 안에 안정되지 "
+                        f"않았습니다. {hint} "
+                        f"(불일치 {invalid_count}장, 다른 크기 "
+                        f"{wrong_shape_count}장, 밝기 차이 "
+                        f"{last_luma_delta:.2f}, 구조 차이 "
+                        f"{last_edge_delta:.3f})"
                     )
                 sessions.append(session)
+                self.log(
+                    f"[안전 보정] {opening_number}/"
+                    f"{RENEWAL_CALIBRATION_OPENINGS} 팝업 확인 "
+                    f"· 불일치 {invalid_count}장 · 다른 크기 "
+                    f"{wrong_shape_count}장 · 마지막 밝기 "
+                    f"{last_luma_delta:.2f} · 구조 "
+                    f"{last_edge_delta:.3f}"
+                )
             return sessions, closed_samples
         finally:
             manager.stop_capture()
@@ -1205,6 +1261,9 @@ class RenewalApp:
                     closed_samples,
                 )
             except Exception as exc:
+                self.log(
+                    f"[안전 보정 실패] {type(exc).__name__}: {exc}"
+                )
                 self.status_var.set("안전 보정 실패 · 다시 선택")
                 messagebox.showerror(
                     "안전 보정 실패",
