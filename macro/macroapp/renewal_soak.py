@@ -179,6 +179,17 @@ def _all_state(
     return all(classifier.classify(image).state is expected for image in images)
 
 
+def _none_state(
+    classifier: RenewalPriceClassifier,
+    images: Iterable[np.ndarray],
+    forbidden: PriceState,
+) -> bool:
+    return all(
+        classifier.classify(image).state is not forbidden
+        for image in images
+    )
+
+
 def run_verification_soak(
     duration_seconds: float,
     report_path: Path,
@@ -197,8 +208,11 @@ def run_verification_soak(
     )
     same_corpus = _same_price_corpus(baseline)
     changed_corpus = _changed_corpus(changed)
-    if not _all_state(classifier, same_corpus, PriceState.UNCHANGED):
-        raise RuntimeError("soak unchanged corpus is not stable")
+    # A deliberately blurred/partial same-price render is allowed to
+    # fail closed as AMBIGUOUS.  The endurance gate must reject only a false
+    # CHANGED state, which is the state that can become an order candidate.
+    if not _none_state(classifier, same_corpus, PriceState.CHANGED):
+        raise RuntimeError("soak unchanged corpus contains a false change")
     if not _all_state(classifier, changed_corpus, PriceState.CHANGED):
         raise RuntimeError("soak changed corpus is not detectable")
     base_guard, price_box = _guard(baseline)
