@@ -136,10 +136,10 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            (1312, 423, 1532, 463),
+            (1312, 423, 1532, 471),
         )
 
-    def test_headless_price_rect_keeps_already_wide_selection(self):
+    def test_headless_price_rect_keeps_already_wide_horizontal_selection(self):
         original = NormalizedRect(
             1300 / 1928,
             423 / 1048,
@@ -155,7 +155,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            original.to_pixels(1928, 1048),
+            (1300, 423, 1530, 471),
         )
 
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):

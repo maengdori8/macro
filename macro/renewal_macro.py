@@ -94,6 +94,7 @@ CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_POPUP_LUMA_FLOOR = 220.0
 CALIBRATION_POPUP_WHITE_FLOOR = 250
 CALIBRATION_POPUP_WHITE_RATIO = 0.70
+CALIBRATION_PRICE_BOTTOM_PADDING = 8
 CALIBRATION_PRICE_TARGET_WIDTH = 220
 CALIBRATION_PRICE_RIGHT_PADDING = 8
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
@@ -134,7 +135,8 @@ def _expand_headless_price_rect(
         max(0, x1 - left) / frame_width,
         y1 / frame_height,
         min(frame_width, x2 + right) / frame_width,
-        y2 / frame_height,
+        min(frame_height, y2 + CALIBRATION_PRICE_BOTTOM_PADDING)
+        / frame_height,
     )
 
 
