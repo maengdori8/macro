@@ -138,11 +138,18 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             )
         self.assertEqual(result.shape, stable.shape)
 
-    def test_wgc_fit_accepts_verified_fallback_and_fits_unsupported_size(self):
+    def test_wgc_fit_promotes_verified_fallback_and_fits_unsupported_size(self):
         from macroapp.turbo_session import WindowRect
 
         current_outer = WindowRect(0, 0, 1928, 1048)
+        promoted_outer = WindowRect(0, 0, 1936, 1056)
+        promoted_snapshot = renewal_macro.WindowResizeSnapshot(
+            100,
+            current_outer,
+            promoted_outer,
+        )
         fallback = np.zeros((1040, 1920), dtype=np.uint8)
+        preferred = np.zeros((1048, 1928), dtype=np.uint8)
         with (
             mock.patch.object(
                 renewal_macro,
@@ -152,21 +159,21 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             mock.patch.object(
                 renewal_macro,
                 "_measure_stable_wgc_frame",
-                return_value=fallback,
+                side_effect=(fallback, preferred),
             ),
             mock.patch.object(
                 renewal_macro,
                 "resize_window_no_activate",
+                return_value=promoted_snapshot,
             ) as resize,
         ):
             result, before_size, after_size = (
                 renewal_macro._fit_game_window_to_wgc(100)
             )
-        self.assertEqual(result.original, current_outer)
-        self.assertEqual(result.resized, current_outer)
+        self.assertEqual(result, promoted_snapshot)
         self.assertEqual(before_size, (1920, 1040))
-        self.assertEqual(after_size, (1920, 1040))
-        resize.assert_not_called()
+        self.assertEqual(after_size, (1928, 1048))
+        resize.assert_called_once_with(100, (1936, 1056))
 
         unsupported_outer = WindowRect(0, 0, 1608, 908)
         resized_outer = WindowRect(0, 0, 1936, 1056)

@@ -136,7 +136,12 @@ def _fit_game_window_to_wgc(
     original = get_window_rect(hwnd)
     before_frame = _measure_stable_wgc_frame(hwnd, logger)
     before_size = (int(before_frame.shape[1]), int(before_frame.shape[0]))
-    if is_supported_renewal_wgc_size(*before_size):
+    # The 1920x1040 fallback is safe for loading an existing size-bound
+    # profile, but "1080p fit" must still converge on the preferred
+    # 1928x1048 capture size.  Treating every supported size as already fitted
+    # left this machine permanently on the fallback and made the documented
+    # target impossible to calibrate.
+    if before_size == TARGET_WGC_SIZE:
         return (
             WindowResizeSnapshot(int(hwnd), original, original),
             before_size,
