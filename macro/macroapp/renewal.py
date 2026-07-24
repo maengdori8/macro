@@ -1903,7 +1903,7 @@ class RenewalModalGuard:
             min(1.50, min(unit_shift_scores) * 0.45),
         )
         self._local_spatial_limit = max(
-            0.20,
+            0.60,
             min(1.00, min(unit_local_scores) * 0.55),
         )
         self._registration_templates: list[

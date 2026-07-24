@@ -570,6 +570,44 @@ class RenewalSafetyTests(unittest.TestCase):
             (2, -1),
         )
 
+    def test_guard_keeps_measured_antialias_headroom_for_sparse_popup(
+        self,
+    ) -> None:
+        sparse_guard = np.full((144, 412), 251, dtype=np.uint8)
+        cv2.putText(
+            sparse_guard,
+            "4",
+            (290, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            70,
+            2,
+            cv2.LINE_AA,
+        )
+        price_box = (96, 48, 316, 96)
+        guard_detector = renewal.RenewalModalGuard(
+            sparse_guard,
+            price_box,
+            shift_limit=4,
+            dynamic_boxes=renewal.dynamic_limit_price_boxes(
+                price_box,
+                "sell",
+                1048,
+            ),
+        )
+
+        self.assertGreaterEqual(
+            guard_detector._local_spatial_limit,
+            0.60,
+        )
+        self.assertFalse(
+            guard_detector.register(
+                np.zeros_like(sparse_guard),
+                0.0,
+                0.0,
+            ).valid
+        )
+
     def test_incomplete_brightness_and_wrong_popup_never_become_changes(self) -> None:
         classifier = renewal.RenewalPriceClassifier(
             self.base_price,
