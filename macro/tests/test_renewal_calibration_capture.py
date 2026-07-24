@@ -120,6 +120,44 @@ class _Detector:
 
 
 class RenewalCalibrationCaptureTests(unittest.TestCase):
+    def test_headless_price_rect_expands_left_for_long_right_aligned_price(self):
+        original = NormalizedRect(
+            1374 / 1928,
+            423 / 1048,
+            1524 / 1928,
+            463 / 1048,
+        )
+
+        expanded = renewal_macro._expand_headless_price_rect(
+            original,
+            1928,
+            1048,
+        )
+
+        self.assertEqual(
+            expanded.to_pixels(1928, 1048),
+            (1312, 423, 1532, 463),
+        )
+
+    def test_headless_price_rect_keeps_already_wide_selection(self):
+        original = NormalizedRect(
+            1300 / 1928,
+            423 / 1048,
+            1530 / 1928,
+            463 / 1048,
+        )
+
+        expanded = renewal_macro._expand_headless_price_rect(
+            original,
+            1928,
+            1048,
+        )
+
+        self.assertEqual(
+            expanded.to_pixels(1928, 1048),
+            original.to_pixels(1928, 1048),
+        )
+
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):
         faded = np.full((40, 80), 241, dtype=np.uint8)
         opaque = np.full((40, 80), 251, dtype=np.uint8)

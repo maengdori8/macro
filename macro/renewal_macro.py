@@ -94,6 +94,8 @@ CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_POPUP_LUMA_FLOOR = 220.0
 CALIBRATION_POPUP_WHITE_FLOOR = 245
 CALIBRATION_POPUP_WHITE_RATIO = 0.70
+CALIBRATION_PRICE_TARGET_WIDTH = 220
+CALIBRATION_PRICE_RIGHT_PADDING = 8
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
 WGC_SIZE_STABLE_SECONDS = 0.50
 WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
@@ -113,6 +115,26 @@ def _calibration_popup_opacity(
         white_ratio,
         luma >= CALIBRATION_POPUP_LUMA_FLOOR
         and white_ratio >= CALIBRATION_POPUP_WHITE_RATIO,
+    )
+
+
+def _expand_headless_price_rect(
+    rect: NormalizedRect,
+    frame_width: int,
+    frame_height: int,
+) -> NormalizedRect:
+    """Give right-aligned FC prices enough room for longer current values."""
+
+    x1, y1, x2, y2 = rect.to_pixels(frame_width, frame_height)
+    width = x2 - x1
+    extra = max(0, CALIBRATION_PRICE_TARGET_WIDTH - width)
+    right = min(CALIBRATION_PRICE_RIGHT_PADDING, extra)
+    left = extra - right
+    return NormalizedRect(
+        max(0, x1 - left) / frame_width,
+        y1 / frame_height,
+        min(frame_width, x2 + right) / frame_width,
+        y2 / frame_height,
     )
 
 
@@ -2111,7 +2133,12 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 "검증된 1080p 안정 크기에서만 v9 자동 보정을 실행합니다."
             )
 
-        price_rect = side.price_rect
+        original_price_rect = side.price_rect
+        price_rect = _expand_headless_price_rect(
+            original_price_rect,
+            frame_width,
+            frame_height,
+        )
         x1, y1, x2, y2 = price_rect.to_pixels(frame_width, frame_height)
         existing_price = (
             decode_gray_png(side.baseline_png)
