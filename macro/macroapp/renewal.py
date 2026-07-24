@@ -2560,6 +2560,7 @@ class FastRenewalRunner:
         close_latencies: deque[float] = deque(maxlen=120)
         classify_latencies: deque[float] = deque(maxlen=240)
         cycle_window_started = time.perf_counter()
+        run_started = cycle_window_started
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
@@ -2568,6 +2569,51 @@ class FastRenewalRunner:
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
+
+        def update_performance_telemetry() -> None:
+            elapsed = max(1e-9, time.perf_counter() - run_started)
+
+            def percentile(
+                values: deque[float],
+                rank: float,
+            ) -> float:
+                return (
+                    float(np.percentile(values, rank))
+                    if values
+                    else 0.0
+                )
+
+            frame_p50 = percentile(frame_intervals, 50) * 1000.0
+            self.telemetry.update(
+                {
+                    "elapsed_seconds": elapsed,
+                    "cycles_per_second": cycle_count / elapsed,
+                    "frame_interval_p50_ms": frame_p50,
+                    "frame_interval_p95_ms": (
+                        percentile(frame_intervals, 95) * 1000.0
+                    ),
+                    "capture_hz": (
+                        1000.0 / frame_p50 if frame_p50 > 0 else 0.0
+                    ),
+                    "open_p50_ms": percentile(open_latencies, 50),
+                    "open_p95_ms": percentile(open_latencies, 95),
+                    "close_p50_ms": percentile(close_latencies, 50),
+                    "close_p95_ms": percentile(close_latencies, 95),
+                    "classify_p95_ms": percentile(
+                        classify_latencies,
+                        95,
+                    ),
+                    "classify_p99_ms": percentile(
+                        classify_latencies,
+                        99,
+                    ),
+                    "replaced_frames": (
+                        engine.get_replaced_frame_count()
+                        if hasattr(engine, "get_replaced_frame_count")
+                        else 0
+                    ),
+                }
+            )
 
         def next_guard_packet(
             deadline: float,
@@ -2747,6 +2793,7 @@ class FastRenewalRunner:
                 break
 
             if self.stop_event.is_set():
+                update_performance_telemetry()
                 return False
 
             if ambiguous and last_result is not None:
@@ -2809,6 +2856,7 @@ class FastRenewalRunner:
                         aligned_frames=aligned_prices,
                         guard_frames=raw_guards,
                     )
+                    update_performance_telemetry()
                     return False
 
                 if self.monitor_only:
@@ -2835,6 +2883,7 @@ class FastRenewalRunner:
                         aligned_frames=aligned_prices,
                         guard_frames=raw_guards,
                     )
+                    update_performance_telemetry()
                     return False
 
                 if order_latched:
@@ -2898,6 +2947,7 @@ class FastRenewalRunner:
                     aligned_frames=aligned_prices,
                     guard_frames=raw_guards,
                 )
+                update_performance_telemetry()
                 return True
 
             if decision is PriceState.UNCHANGED:
@@ -2921,6 +2971,7 @@ class FastRenewalRunner:
                     return False
 
             if cycle_count % 100 == 0:
+                update_performance_telemetry()
                 window_seconds = time.perf_counter() - cycle_window_started
                 cycle_window_started = time.perf_counter()
                 frame_ms = (
@@ -2973,6 +3024,7 @@ class FastRenewalRunner:
                     f"{'무주문' if self.monitor_only else '실주문'} · {cycle_count}회"
                 )
 
+        update_performance_telemetry()
         return False
 
     def _run_v5_legacy(self) -> bool:
