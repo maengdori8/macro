@@ -883,6 +883,25 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(engine.escapes, 1)
         self.assertEqual(engine.mode, "closed")
 
+    def test_timer_firing_on_escape_still_confirms_closed_state(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+        )
+        original_escape = engine.on_escape
+
+        def close_then_stop(*args, **kwargs) -> None:
+            original_escape(*args, **kwargs)
+            stop_event.set()
+
+        engine.on_escape = close_then_stop
+        completed = _run(self.profile, engine, monitor_only=True)
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)])
+        self.assertEqual(engine.escapes, 1)
+        self.assertEqual(engine.mode, "closed")
+
     def test_transition_and_single_frame_glitch_never_order(self) -> None:
         stop_event = threading.Event()
         wrong_popup = np.full((60, 100), 50, dtype=np.uint8)

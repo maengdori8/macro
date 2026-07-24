@@ -2730,14 +2730,14 @@ class FastRenewalRunner:
             closing_started = time.perf_counter()
             if self.profile.close_settle_ms > 0:
                 settle_seconds = self.profile.close_settle_ms / 1000.0
-                if allow_stopped:
-                    time.sleep(settle_seconds)
-                elif self._wait(settle_seconds):
-                    return False
+                # Once ESC has been sent, finish the bounded cleanup even if a
+                # duration timer fires.  Aborting here can leave the popup
+                # open and make the next run fail its initial state check.
+                time.sleep(settle_seconds)
             ready = wait_until_ready(
                 time.monotonic() + 0.75,
                 not_before=closing_started,
-                allow_stopped=allow_stopped,
+                allow_stopped=True,
             )
             if ready:
                 self.telemetry["popup_may_be_open"] = False
