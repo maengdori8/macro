@@ -1053,6 +1053,14 @@ class RenewalPriceClassifier:
         if self.baseline_intensity_range < 24.0:
             raise ValueError("The baseline price glyph is not fully rendered.")
         self.baseline_border_contrast = self._border_contrast(self.baseline)
+        self.baseline_local_glyph_mask = self._local_glyph_mask(
+            self.baseline
+        )
+        self.baseline_local_glyph_count = int(
+            cv2.countNonZero(self.baseline_local_glyph_mask)
+        )
+        if self.baseline_local_glyph_count < 64:
+            raise ValueError("The baseline price glyph mask is incomplete.")
         self._baseline_classification = PriceClassification(
             PriceState.UNCHANGED,
             self.baseline,
@@ -1108,6 +1116,59 @@ class RenewalPriceClassifier:
     @staticmethod
     def _registration_edges(image: np.ndarray) -> np.ndarray:
         return cv2.Canny(cv2.GaussianBlur(image, (3, 3), 0), 40, 120)
+
+    @staticmethod
+    def _local_glyph_mask(image: np.ndarray) -> np.ndarray:
+        """Extract dark glyph strokes after removing smooth white-background light."""
+
+        floating = image.astype(np.float32)
+        background = cv2.GaussianBlur(
+            floating,
+            (0, 0),
+            2.0,
+        )
+        foreground = cv2.subtract(background, floating)
+        return cv2.compare(foreground, 16.0, cv2.CMP_GE)
+
+    def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
+        """Prove glyph equivalence without letting smooth popup light become a change."""
+
+        current_mask = self._local_glyph_mask(image)
+        current_count = int(cv2.countNonZero(current_mask))
+        if current_count < 64:
+            return False
+        population_ratio = (
+            float(current_count) / float(self.baseline_local_glyph_count)
+        )
+        if not 0.85 <= population_ratio <= 1.18:
+            return False
+        kernel = RenewalChangeDetector._DILATE_KERNEL
+        baseline_dilated = cv2.dilate(
+            self.baseline_local_glyph_mask,
+            kernel,
+        )
+        current_dilated = cv2.dilate(current_mask, kernel)
+        difference = cv2.bitwise_or(
+            cv2.bitwise_and(
+                self.baseline_local_glyph_mask,
+                cv2.bitwise_not(current_dilated),
+            ),
+            cv2.bitwise_and(
+                current_mask,
+                cv2.bitwise_not(baseline_dilated),
+            ),
+        )
+        union = cv2.bitwise_or(
+            self.baseline_local_glyph_mask,
+            current_mask,
+        )
+        union_count = int(cv2.countNonZero(union))
+        if union_count <= 0:
+            return False
+        difference_ratio = (
+            float(cv2.countNonZero(difference)) / float(union_count)
+        )
+        return difference_ratio <= 0.020
 
     @staticmethod
     def _maximum_zero_run(values: np.ndarray) -> int:
@@ -1455,12 +1516,24 @@ class RenewalPriceClassifier:
                 and self._projection_integrity_edges(structural_edges)
             )
 
+        illumination_same = bool(
+            geometry_valid
+            and global_score > self.unchanged_limit
+            and self._same_glyph_after_illumination(aligned)
+        )
         if not geometry_valid:
             state = PriceState.AMBIGUOUS
             reason = "incomplete_price_row"
-        elif global_score <= self.unchanged_limit:
+        elif (
+            global_score <= self.unchanged_limit
+            or illumination_same
+        ):
             state = PriceState.UNCHANGED
-            reason = "aligned_same_price"
+            reason = (
+                "illumination_normalized_same_glyph"
+                if illumination_same
+                else "aligned_same_price"
+            )
         elif global_score >= self.changed_global_limit or (
             global_score >= 0.040 and slice_score >= 0.250
         ):

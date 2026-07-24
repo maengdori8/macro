@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import threading
 import time
@@ -19,6 +20,10 @@ import numpy as np
 
 from macroapp import renewal
 from macroapp.capture import CapturedFrame, WGCCaptureEngine
+
+
+_REAL_SAME_ILLUMINATION_BASELINE = "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"
+_REAL_SAME_ILLUMINATION_CANDIDATE = "iVBORw0KGgoAAAANSUhEUgAAAJUAAAAoCAAAAADSnec4AAAFZklEQVRYCc3Be2yVdx3H8fen5xyhrW1Cb8uGAypYtjHoLsQM3VxYBR1sAlZtNRoSWcSVJbP8gRsxkcUZFkC2EZiapWbU25aReRsDNZaMFnTEbTihcyDXYoBeWEd/ZyCHc77+nqcnuMoejiaPSV8vOd6fCBmeDATGlYmAEZAhPCOKCBgBGQgMRECOaMLwhIHAKEwYnjBhIIwrEIYnDAFGSMgRTRieMEAYhQnDkyEMhHEFwvBkeMIICTkiCcMThieMgoThCUMYCCOaMDxheMIICJMjkjA8YXjCKEgYnjCEgTCiCcMThieMgDA5IskIyAgIoxBheMIAETAiCcMTRkAYnjDkiCIMTxgBYRQiDE8YnjBhRBKGJ4yAMDxhyBFFGJ6MkDAKEYYnI08YkYThyQgJwxOGHFFkBGSEhFGIDE8YIAyEEUmGJ4yQMDwZyBFFhieMkDAKEIYnDE94RiRheMIICQOEgRwRhOHJGCaMAoThyQgIMKIJw5MxTBggDOS4ImH8j4Tx3xPGZeQYheQYheQYheQYheSI0VuHuOT2csj1v77v7VTtzLok3sWTrx5IF3/klgkJvIND/If6BHlyxOj5rVyyahK2f8tRvNI7GlNA52/6DFR5910C1nQzkjaVkCdHjJ7fyiWrJjG07rgRSH7lTji09jyhMS31wJpuRtKmEvLkiNHOVwjYQK8lv30t25+lqG7mQKdjSkvFxe8cI3HjtJN70tSuKIY3h/Byu9+gfG4NgVuS5MkRv/M/2WVTHyjLPXyamhVVud+9cKFs2XXHHs0w4/5i27YlV750GnmZx7sZu/RmRpIjfkfWD6WaGtT7TWPhQjj2VO/Eput3t2V5eCr84/H+RPMc8g6szaBZX2MkOWJnbV2Mb61i7xPQWg8XBio/AH/4WVYbyqB/41HmNxYROrP2pJKZxLL6BO8lR+yOrL7A5+6BXU/DIxPJ63wmq3WV0P9kD3Oaknh24rl91E7fmh3TfFsx7yFH7J7YS8m6EtixGVaX7jx41ccnAn/ZkGXpLDi+xtHQnAJye37Zly277/of/YniGY01/Jsccet5LM0nvwx0tMPKjleMRNPsFOkVaWpWlGd+3gUNzalz7uC2Hihd0JA40/5GDm6dNaEywTA5YpZ78VfZsQ9NAjraoe5QybtZir40O8FLW3KMn9z3VtFFGppTu3+ahuSkT98qGNr+516DylVlDJMjZoM/fJNpy0qAjnZIzZt5pn2AD3+9hgubdxtw5+EeGppTZ1c6Ku65qaL/CKWTk6f+uCPNogXkyRGzv69/V4vuFdDRDjNaZS//ODumpR7ObevMFM392KZDNDSnePnEzDpBV5vVtlSDHdg/byx5csRs+7N8cMnNeDs2wzdugsPf72PxbLzBwdKqtzceZk5TkryuNqttqWYkOWL22N+4urUGb9fT8N3xcGrjCT77GfL6NxxnXmOCvK42q22pZiQ54uUezDJ9ufD++j341hQ4sekkn5+fPXv0yKdK4dT6XjXOF3ldbVbbUs1IShOvjs3QfDeBweVZFi6C19qcltzR80iGJZ+AvRszxYtvO/sOw15/gfFfqCCUrBxDSGni9eRrsHIqAVvTTcX9demn9lv5susyD/VT8+CHBjYepmr5Nb/vYNi5QVLjEoTGfXECIaWJVaZ1CP1gLKHudVmS1X0XYfrSMl7cYiTLB3Nw+332i19zuaqWyYSUJlZHV5/n2kcZ9s/ndmYIVH71Rshs2J/FU+0DlbbnVS5XNvcqQkoTq65nMty1mLzBHb89B4kbFkwRcPqlziykPnrv1ZDL8T4SIqQ0/1eZfaeLp1wjhg3te6fshnEUpDSjkNKMQv8COJQRcmFP78QAAAAASUVORK5CYII="
 
 
 def _price(text: str, width: int, height: int) -> np.ndarray:
@@ -591,6 +596,39 @@ class RenewalSafetyTests(unittest.TestCase):
             self.assertIs(first_changed, second_changed)
             self.assertGreater(calls_after_first, 0)
             self.assertEqual(prepare_pair.call_count, calls_after_first)
+
+    def test_real_same_glyph_illumination_holdout_is_unchanged(self) -> None:
+        def decode(encoded: str) -> np.ndarray:
+            raw = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
+            image = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(image)
+            return image
+
+        baseline = decode(_REAL_SAME_ILLUMINATION_BASELINE)
+        candidate = decode(_REAL_SAME_ILLUMINATION_CANDIDATE)
+        classifier = renewal.RenewalPriceClassifier(
+            baseline,
+            unchanged_limit=0.040,
+            stability_limit=0.030,
+        )
+        first = classifier.classify(candidate)
+        second = classifier.classify(candidate.copy())
+        self.assertIs(first.state, renewal.PriceState.UNCHANGED)
+        self.assertEqual(
+            first.reason,
+            "illumination_normalized_same_glyph",
+        )
+        self.assertTrue(classifier.same_candidate(first, second))
+
+        changed_image = baseline.copy()
+        changed_image[:, 99:111] = np.fliplr(
+            changed_image[:, 99:111]
+        )
+        changed = classifier.classify(changed_image)
+        self.assertIsNot(
+            changed.state,
+            renewal.PriceState.UNCHANGED,
+        )
 
     def test_stable_partial_price_clipping_never_authorizes_change(self) -> None:
         classifier = renewal.RenewalPriceClassifier(
