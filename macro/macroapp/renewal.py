@@ -2209,7 +2209,15 @@ def save_renewal_diagnostic(
                         str(event_dir / f"mask_{index}.png"),
                         difference,
                     )
-        for index, frame in enumerate((guard_frames or [])[-2:], start=1):
+        diagnostic_guards = list(guard_frames or [])
+        if diagnostic_guards:
+            first_guard = diagnostic_guards[0]
+            if first_guard is not None and first_guard.size:
+                cv2.imwrite(
+                    str(event_dir / "guard_baseline.png"),
+                    first_guard,
+                )
+        for index, frame in enumerate(diagnostic_guards[-2:], start=1):
             if frame is not None and frame.size:
                 cv2.imwrite(str(event_dir / f"guard_{index}.png"), frame)
         (event_dir / "metrics.json").write_text(

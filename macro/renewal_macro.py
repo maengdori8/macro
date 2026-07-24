@@ -1857,6 +1857,9 @@ def _headless_calibrate_existing(side_name: str) -> int:
     recent_guard_frames: list[np.ndarray] = []
     capture_metrics: list[dict[str, object]] = []
     diagnostic_price_box: Optional[tuple[int, int, int, int]] = None
+    initial_guard_luma: Optional[float] = None
+    initial_guard_white_ratio: Optional[float] = None
+    initial_is_open_popup = False
     try:
         if side_name not in ("buy", "sell"):
             raise ValueError("구매 또는 판매만 보정할 수 있습니다.")
@@ -1919,8 +1922,30 @@ def _headless_calibrate_existing(side_name: str) -> int:
             frame_width,
             frame_height,
         )
-        initial_closed_guard = full_frame[gy1:gy2, gx1:gx2].copy()
-        initial_closed_luma = float(np.mean(initial_closed_guard))
+        initial_guard = full_frame[gy1:gy2, gx1:gx2].copy()
+        initial_guard_luma = float(np.mean(initial_guard))
+        initial_guard_white_ratio = float(
+            np.count_nonzero(initial_guard >= 220)
+        ) / float(initial_guard.size)
+        initial_price = crop_price_from_guard(initial_guard, price_box)
+        initial_price_validation = validate_limit_price_selection(
+            initial_price,
+            price_rect,
+            side_name,
+            frame_width,
+            frame_height,
+        )
+        initial_is_open_popup = bool(
+            initial_price_validation.valid
+            and initial_guard_luma >= 220.0
+            and initial_guard_white_ratio >= 0.70
+        )
+        initial_state_detector = RenewalModalGuard(
+            initial_guard,
+            price_box,
+            shift_limit=4,
+            dynamic_boxes=dynamic_boxes,
+        )
 
         engine = manager.capture_engine
         if engine is None or not hasattr(engine, "get_latest_frame_packet"):
@@ -1958,7 +1983,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                         "captured_at": last_timestamp,
                     }
                 )
-                del packet_metadata[:-200]
+                del packet_metadata[:-1000]
                 if packet.image.shape != full_frame.shape:
                     continue
                 return packet.image
@@ -1993,11 +2018,14 @@ def _headless_calibrate_existing(side_name: str) -> int:
 
         sessions: list[list[np.ndarray]] = []
         closed_samples: list[np.ndarray] = []
-        guard_detector: Optional[RenewalModalGuard] = None
+        guard_detector: Optional[RenewalModalGuard] = (
+            initial_state_detector if initial_is_open_popup else None
+        )
         flush()
         for opening in range(RENEWAL_CALIBRATION_OPENINGS):
             opening_number = opening + 1
-            clicker.click_client(action)
+            if opening > 0 or not initial_is_open_popup:
+                clicker.click_client(action)
             popup_may_be_open = True
             deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
             session: list[np.ndarray] = []
@@ -2011,20 +2039,31 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     break
                 raw_guard = frame[gy1:gy2, gx1:gx2].copy()
                 recent_guard_frames.append(raw_guard.copy())
-                del recent_guard_frames[:-50]
+                del recent_guard_frames[:-1000]
+                raw_guard_white_ratio = float(
+                    np.count_nonzero(raw_guard >= 220)
+                ) / float(raw_guard.size)
                 metric: dict[str, object] = {
                     "opening": opening_number,
                     "guard_luma": float(np.mean(raw_guard)),
+                    "guard_white_ratio": raw_guard_white_ratio,
                     "guard_valid": False,
                     "price_valid": False,
                 }
                 if guard_detector is None:
-                    if float(np.mean(raw_guard)) < max(
-                        150.0,
-                        initial_closed_luma + 50.0,
+                    still_initial = initial_state_detector.register(
+                        raw_guard,
+                        0.0,
+                        0.0,
+                    ).valid
+                    metric["still_initial_state"] = still_initial
+                    if (
+                        still_initial
+                        or float(np.mean(raw_guard)) < 220.0
+                        or raw_guard_white_ratio < 0.70
                     ):
                         capture_metrics.append(metric)
-                        del capture_metrics[:-200]
+                        del capture_metrics[:-1000]
                         session.clear()
                         previous_pair = None
                         continue
@@ -2044,7 +2083,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                             }
                         )
                         capture_metrics.append(metric)
-                        del capture_metrics[:-200]
+                        del capture_metrics[:-1000]
                         session.clear()
                         previous_pair = None
                         continue
@@ -2072,7 +2111,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 if not price_validation.valid:
                     metric["price_message"] = price_validation.message
                     capture_metrics.append(metric)
-                    del capture_metrics[:-200]
+                    del capture_metrics[:-1000]
                     session.clear()
                     previous_pair = None
                     continue
@@ -2102,7 +2141,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     session[:] = [raw_guard]
                 previous_pair = pair
                 capture_metrics.append(metric)
-                del capture_metrics[:-200]
+                del capture_metrics[:-1000]
 
             if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
                 raise RuntimeError(
@@ -2219,6 +2258,9 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     "error": str(exc),
                     "packets": packet_metadata,
                     "capture_metrics": capture_metrics,
+                    "initial_guard_luma": initial_guard_luma,
+                    "initial_guard_white_ratio": initial_guard_white_ratio,
+                    "initial_is_open_popup": initial_is_open_popup,
                 },
             )
         report.update(
@@ -2227,6 +2269,9 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 "error": str(exc),
                 "packets_seen": len(packet_metadata),
                 "capture_metrics": capture_metrics,
+                "initial_guard_luma": initial_guard_luma,
+                "initial_guard_white_ratio": initial_guard_white_ratio,
+                "initial_is_open_popup": initial_is_open_popup,
             }
         )
         return 1
