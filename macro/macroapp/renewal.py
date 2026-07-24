@@ -1061,6 +1061,10 @@ class RenewalPriceClassifier:
         )
         if self.baseline_local_glyph_count < 64:
             raise ValueError("The baseline price glyph mask is incomplete.")
+        self.baseline_local_glyph_dilated = cv2.dilate(
+            self.baseline_local_glyph_mask,
+            RenewalChangeDetector._DILATE_KERNEL,
+        )
         self._baseline_classification = PriceClassification(
             PriceState.UNCHANGED,
             self.baseline,
@@ -1121,14 +1125,13 @@ class RenewalPriceClassifier:
     def _local_glyph_mask(image: np.ndarray) -> np.ndarray:
         """Extract dark glyph strokes after removing smooth white-background light."""
 
-        floating = image.astype(np.float32)
         background = cv2.GaussianBlur(
-            floating,
+            image,
             (0, 0),
             2.0,
         )
-        foreground = cv2.subtract(background, floating)
-        return cv2.compare(foreground, 16.0, cv2.CMP_GE)
+        foreground = cv2.subtract(background, image)
+        return cv2.compare(foreground, 16, cv2.CMP_GE)
 
     def _same_glyph_after_illumination(self, image: np.ndarray) -> bool:
         """Prove glyph equivalence without letting smooth popup light become a change."""
@@ -1143,10 +1146,6 @@ class RenewalPriceClassifier:
         if not 0.85 <= population_ratio <= 1.18:
             return False
         kernel = RenewalChangeDetector._DILATE_KERNEL
-        baseline_dilated = cv2.dilate(
-            self.baseline_local_glyph_mask,
-            kernel,
-        )
         current_dilated = cv2.dilate(current_mask, kernel)
         difference = cv2.bitwise_or(
             cv2.bitwise_and(
@@ -1155,7 +1154,7 @@ class RenewalPriceClassifier:
             ),
             cv2.bitwise_and(
                 current_mask,
-                cv2.bitwise_not(baseline_dilated),
+                cv2.bitwise_not(self.baseline_local_glyph_dilated),
             ),
         )
         union = cv2.bitwise_or(
@@ -2453,6 +2452,8 @@ class FastRenewalRunner:
             "initial_mismatch": False,
             "order_clicks": 0,
             "popup_may_be_open": False,
+            "current_popup_escape_sent": False,
+            "startup_popup_recovered": False,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -2619,9 +2620,10 @@ class FastRenewalRunner:
             deadline: float,
             *,
             not_before: float = float("-inf"),
+            allow_stopped: bool = False,
         ) -> Optional[CapturedFrame]:
             nonlocal last_sequence_id, last_captured_at
-            while not self.stop_event.is_set():
+            while allow_stopped or not self.stop_event.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -2652,11 +2654,13 @@ class FastRenewalRunner:
             deadline: float,
             *,
             not_before: float = float("-inf"),
+            allow_stopped: bool = False,
         ) -> bool:
-            while not self.stop_event.is_set():
+            while allow_stopped or not self.stop_event.is_set():
                 packet = next_guard_packet(
                     deadline,
                     not_before=not_before,
+                    allow_stopped=allow_stopped,
                 )
                 if packet is None:
                     return False
@@ -2669,16 +2673,43 @@ class FastRenewalRunner:
                     return True
             return False
 
-        def close_modal() -> bool:
+        def detect_start_state(deadline: float) -> str:
+            """Return ready/modal only for a fully registered calibrated state."""
+
+            while not self.stop_event.is_set():
+                packet = next_guard_packet(deadline)
+                if packet is None:
+                    return "unknown"
+                ready_registration = ready_guard.register(
+                    packet.image,
+                    side_profile.closed_guard_luma_noise,
+                    side_profile.closed_guard_edge_noise,
+                )
+                if ready_registration.valid:
+                    return "ready"
+                modal_registration = modal_guard.register(
+                    packet.image,
+                    side_profile.guard_luma_noise,
+                    side_profile.guard_edge_noise,
+                )
+                if modal_registration.valid:
+                    return "modal"
+            return "unknown"
+
+        def close_modal(*, allow_stopped: bool = False) -> bool:
+            self.telemetry["current_popup_escape_sent"] = True
             clicker.press_escape()
             closing_started = time.perf_counter()
-            if self.profile.close_settle_ms > 0 and self._wait(
-                self.profile.close_settle_ms / 1000.0
-            ):
-                return False
+            if self.profile.close_settle_ms > 0:
+                settle_seconds = self.profile.close_settle_ms / 1000.0
+                if allow_stopped:
+                    time.sleep(settle_seconds)
+                elif self._wait(settle_seconds):
+                    return False
             ready = wait_until_ready(
                 time.monotonic() + 0.75,
                 not_before=closing_started,
+                allow_stopped=allow_stopped,
             )
             if ready:
                 self.telemetry["popup_may_be_open"] = False
@@ -2688,9 +2719,22 @@ class FastRenewalRunner:
             return ready
 
         self.status("목록 준비 화면 확인 중")
-        if not wait_until_ready(time.monotonic() + 1.0):
+        start_state = detect_start_state(time.monotonic() + 1.0)
+        if start_state == "modal":
+            self.telemetry["popup_may_be_open"] = True
+            self.telemetry["current_popup_escape_sent"] = False
+            self.status("열린 팝업 확인 · 안전하게 닫는 중")
+            if not close_modal():
+                raise RuntimeError(
+                    "열린 팝업에 ESC를 보냈지만 목록 화면 복귀를 확인하지 "
+                    "못했습니다."
+                )
+            self.telemetry["startup_popup_recovered"] = True
+            self.status("열린 팝업 정리 완료 · 목록 감시 시작")
+        elif start_state != "ready":
             raise RuntimeError(
-                "목록 준비 화면을 확인하지 못했습니다. 팝업을 닫고 다시 시작하세요."
+                "보정된 목록 화면이나 구매/판매 팝업을 확인하지 못했습니다. "
+                "보정한 선수의 목록 화면에서 다시 시작하세요."
             )
 
         while not self.stop_event.is_set():
@@ -2699,10 +2743,13 @@ class FastRenewalRunner:
             action_started = time.perf_counter()
             clicker.click_prepared(action_click)
             self.telemetry["popup_may_be_open"] = True
+            self.telemetry["current_popup_escape_sent"] = False
             opening_not_before = time.perf_counter()
             if self.profile.open_settle_ms > 0 and self._wait(
                 self.profile.open_settle_ms / 1000.0
             ):
+                close_modal(allow_stopped=True)
+                update_performance_telemetry()
                 return False
 
             last_result: Optional[PriceClassification] = None
@@ -2793,6 +2840,8 @@ class FastRenewalRunner:
                 break
 
             if self.stop_event.is_set():
+                if bool(self.telemetry["popup_may_be_open"]):
+                    close_modal(allow_stopped=True)
                 update_performance_telemetry()
                 return False
 

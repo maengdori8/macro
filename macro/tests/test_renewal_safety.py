@@ -824,6 +824,41 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertFalse(completed)
         self.assertEqual(engine.clicks, [(20, 10)])
 
+    def test_existing_open_popup_is_closed_before_any_action_click(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+            stop_after_closes=1,
+        )
+        engine.mode = "open"
+        engine.open_frames = [self.guard, self.guard]
+        completed = _run(self.profile, engine, monitor_only=True)
+        self.assertFalse(completed)
+        self.assertEqual(engine.escapes, 1)
+        self.assertEqual(engine.clicks, [])
+
+    def test_monitor_stop_during_popup_confirms_closed_state(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+        )
+        original_packet = engine.get_latest_frame_packet
+
+        def stop_after_first_open_frame(timeout: float = 0.0):
+            packet = original_packet(timeout)
+            if engine.mode == "open" and engine.open_index >= 1:
+                stop_event.set()
+            return packet
+
+        engine.get_latest_frame_packet = stop_after_first_open_frame
+        completed = _run(self.profile, engine, monitor_only=True)
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)])
+        self.assertEqual(engine.escapes, 1)
+        self.assertEqual(engine.mode, "closed")
+
     def test_transition_and_single_frame_glitch_never_order(self) -> None:
         stop_event = threading.Event()
         wrong_popup = np.full((60, 100), 50, dtype=np.uint8)

@@ -1930,6 +1930,9 @@ def _headless_monitor_existing(
             runner is not None
             and manager is not None
             and bool(runner.telemetry.get("popup_may_be_open", False))
+            and not bool(
+                runner.telemetry.get("current_popup_escape_sent", False)
+            )
             and manager.hwnd is not None
         ):
             try:
