@@ -6,32 +6,25 @@ echo [1/3] Checking renewal source...
 python -m compileall -q macroapp renewal_macro.py
 if errorlevel 1 goto :failed
 
-echo [2/3] Building renewal_macro.exe...
-taskkill /f /im renewal_macro.exe >nul 2>&1
-if exist "dist\renewal_macro.exe" del /f /q "dist\renewal_macro.exe"
-if exist "dist\renewal_macro.exe" (
-  echo Existing renewal_macro.exe is locked; refusing to report a stale build.
+echo [2/3] Building local PyInstaller renewal_macro.exe...
+if not exist "dist_local_renewal" mkdir "dist_local_renewal"
+if exist "dist_local_renewal\renewal_macro.exe" del /f /q "dist_local_renewal\renewal_macro.exe"
+if exist "dist_local_renewal\renewal_macro.exe" (
+  echo Existing local renewal_macro.exe is locked; close it and retry.
   goto :failed
 )
 
-python -m nuitka --onefile --assume-yes-for-downloads ^
-  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
-  --output-dir=dist --output-filename=renewal_macro.exe ^
-  --windows-console-mode=disable --windows-uac-admin ^
-  --enable-plugin=tk-inter ^
-  renewal_macro.py
-
-if exist "dist\renewal_macro.exe" goto :success
-
-echo Nuitka failed. Falling back to PyInstaller...
-python -m PyInstaller --onefile --noconsole --uac-admin ^
-  --name renewal_macro --distpath dist renewal_macro.py
-if not exist "dist\renewal_macro.exe" goto :failed
+python -m PyInstaller --noconfirm --clean ^
+  --distpath "dist_local_renewal" ^
+  --workpath "build_local_renewal" ^
+  "renewal_macro.spec"
+if errorlevel 1 goto :failed
+if not exist "dist_local_renewal\renewal_macro.exe" goto :failed
 
 :success
-copy /y "version.txt" "dist\version.txt" >nul
-if not exist "dist\version.txt" goto :failed
-echo [3/3] Build complete: dist\renewal_macro.exe
+copy /y "version.txt" "dist_local_renewal\version.txt" >nul
+if not exist "dist_local_renewal\version.txt" goto :failed
+echo [3/3] Local build complete: dist_local_renewal\renewal_macro.exe
 exit /b 0
 
 :failed

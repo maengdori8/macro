@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -46,10 +48,13 @@ from macroapp.renewal import (
     build_calibration_result,
     build_guard_rect,
     crop_price_from_guard,
+    decode_gray_png,
     encode_gray_png,
     load_renewal_profile,
     price_box_in_guard,
     save_renewal_profile,
+    save_renewal_diagnostic,
+    validate_limit_price_selection,
     validate_price_region,
 )
 from macroapp.turbo_session import (
@@ -75,6 +80,47 @@ ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 CALIBRATION_CLOSE_TIMEOUT_SECONDS = 3.0
 CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
+
+
+def _save_calibration_diagnostic(
+    side: str,
+    reason: str,
+    guard_frames: list[np.ndarray],
+    price_box: tuple[int, int, int, int],
+    metadata: dict[str, object],
+) -> None:
+    """Best-effort local evidence for a failed calibration; never changes control flow."""
+
+    usable_guards = [
+        frame
+        for frame in guard_frames
+        if frame is not None and frame.size
+    ]
+    if not usable_guards:
+        return
+    price_frames: list[np.ndarray] = []
+    expected_shape = usable_guards[0].shape
+    for frame in usable_guards:
+        if frame.shape != expected_shape:
+            continue
+        try:
+            price = crop_price_from_guard(frame, price_box)
+            if price.ndim == 3:
+                price = cv2.cvtColor(price, cv2.COLOR_BGR2GRAY)
+            if price.size:
+                price_frames.append(price.copy())
+        except Exception:
+            continue
+    if not price_frames:
+        return
+    save_renewal_diagnostic(
+        side,
+        reason,
+        price_frames[0],
+        price_frames,
+        metadata,
+        guard_frames=usable_guards,
+    )
 
 
 def _enable_safe_process_priority() -> Optional[int]:
@@ -951,6 +997,9 @@ class RenewalApp:
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
         sessions: list[list[np.ndarray]] = []
         closed_samples: list[np.ndarray] = []
+        recent_guard_frames: list[np.ndarray] = []
+        recent_packets: list[dict[str, object]] = []
+        reference_guard: Optional[np.ndarray] = None
         try:
             if not manager.find_window():
                 raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
@@ -1005,6 +1054,16 @@ class RenewalApp:
                         continue
                     last_sequence = packet.sequence_id
                     last_timestamp = packet.captured_at
+                    recent_guard_frames.append(packet.image.copy())
+                    recent_packets.append(
+                        {
+                            "sequence_id": int(packet.sequence_id),
+                            "captured_at": float(packet.captured_at),
+                            "shape": list(packet.image.shape),
+                        }
+                    )
+                    del recent_guard_frames[:-50]
+                    del recent_packets[:-50]
                     return packet
                 return None
 
@@ -1054,7 +1113,7 @@ class RenewalApp:
                 opening_number = opening + 1
                 if opening > 0:
                     self.status_var.set(
-                        f"v8 1080p 보정 {opening_number}/"
+                        f"v9 우측 가격 보정 {opening_number}/"
                         f"{RENEWAL_CALIBRATION_OPENINGS} · 팝업 닫힘 확인"
                     )
                     self.root.update_idletasks()
@@ -1064,7 +1123,7 @@ class RenewalApp:
                     clicker.click_client(action)
 
                 self.status_var.set(
-                    f"v8 1080p 보정 {opening_number}/"
+                    f"v9 우측 가격 보정 {opening_number}/"
                     f"{RENEWAL_CALIBRATION_OPENINGS} · "
                     "안정된 팝업 확인 중"
                 )
@@ -1157,6 +1216,26 @@ class RenewalApp:
                     f"{last_edge_delta:.3f}"
                 )
             return sessions, closed_samples
+        except Exception as exc:
+            diagnostic_frames = list(recent_guard_frames)
+            if reference_guard is not None and reference_guard.size:
+                diagnostic_frames.insert(0, reference_guard)
+            _save_calibration_diagnostic(
+                self.side_var.get(),
+                "calibration_capture_failed",
+                diagnostic_frames,
+                price_box,
+                {
+                    "phase": "capture",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "completed_openings": len(sessions),
+                    "expected_size": list(expected_size),
+                    "price_box": list(price_box),
+                    "recent_packets": recent_packets,
+                },
+            )
+            raise
         finally:
             manager.stop_capture()
 
@@ -1264,7 +1343,13 @@ class RenewalApp:
             frame_height, frame_width = frame.shape[:2]
             x1, y1, x2, y2 = selection.to_pixels(frame_width, frame_height)
             selected_price = frame[y1:y2, x1:x2]
-            validation = validate_price_region(selected_price)
+            validation = validate_limit_price_selection(
+                selected_price,
+                selection,
+                self.side_var.get(),
+                frame_width,
+                frame_height,
+            )
             if not validation.valid:
                 self.status_var.set("가격영역 거부 · 숫자 한 줄만 다시 선택")
                 messagebox.showerror(
@@ -1281,6 +1366,8 @@ class RenewalApp:
                 frame_width,
                 frame_height,
             )
+            samples: list[list[np.ndarray]] = []
+            closed_samples: list[np.ndarray] = []
             self.status_var.set("팝업 안전 보정 중 · 창을 그대로 두세요")
             self.root.update_idletasks()
             try:
@@ -1296,6 +1383,26 @@ class RenewalApp:
                     closed_samples,
                 )
             except Exception as exc:
+                captured_guards = [
+                    sample
+                    for opening_samples in samples
+                    for sample in opening_samples
+                ]
+                captured_guards.extend(closed_samples)
+                _save_calibration_diagnostic(
+                    self.side_var.get(),
+                    "calibration_validation_failed",
+                    captured_guards,
+                    price_box,
+                    {
+                        "phase": "validation",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "completed_openings": len(samples),
+                        "price_box": list(price_box),
+                        "frame_size": [frame_width, frame_height],
+                    },
+                )
                 self.log(
                     f"[안전 보정 실패] {type(exc).__name__}: {exc}"
                 )
@@ -1410,7 +1517,7 @@ class RenewalApp:
         available_ram = _available_ram_gb()
         self.status_var.set("갱신매크로 시작")
         self.log(
-            f"[시작 v8] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
+            f"[시작 v9] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
@@ -1536,16 +1643,552 @@ class RenewalApp:
         self.root.destroy()
 
 
-def main() -> None:
+def _startup_selftest() -> int:
+    """Build the complete local UI and exit without license or game input."""
+
+    root: Optional[tk.Tk] = None
+    app: Optional[RenewalApp] = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        app = RenewalApp(root, "local-startup-selftest")
+        root.update_idletasks()
+        root.update()
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+    finally:
+        if app is not None:
+            try:
+                app.on_close()
+            except Exception:
+                pass
+        elif root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def _headless_calibrate_existing(side_name: str) -> int:
+    """Calibrate an existing right-side ROI using open/ESC only.
+
+    This local diagnostic path deliberately has no access to the limit-price or
+    final-order click coordinates.  A failed or ambiguous capture leaves the
+    existing profile untouched.
+    """
+
+    report_path = app_dir() / "renewal_headless_calibration.json"
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "side": side_name,
+        "started_at_unix": time.time(),
+        "passed": False,
+    }
+    manager: Optional[InactiveManager] = None
+    clicker: Optional[_FastClicker] = None
+    popup_may_be_open = False
+    corpus_frames: list[tuple[str, np.ndarray]] = []
+    packet_metadata: list[dict[str, object]] = []
+    recent_guard_frames: list[np.ndarray] = []
+    capture_metrics: list[dict[str, object]] = []
+    diagnostic_price_box: Optional[tuple[int, int, int, int]] = None
+    try:
+        if side_name not in ("buy", "sell"):
+            raise ValueError("구매 또는 판매만 보정할 수 있습니다.")
+        profile = load_renewal_profile()
+        side = profile.side(side_name)
+        if side.action_point is None or side.price_rect is None:
+            raise RuntimeError("기존 창 열기 좌표와 가격영역이 필요합니다.")
+
+        manager = InactiveManager(WINDOW_TITLE, logger=lambda _message: None)
+        if not manager.find_window():
+            raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
+        full_frame = manager.capture_client_area(window_validated=True)
+        if full_frame is None:
+            raise RuntimeError("첫 WGC 프레임을 받지 못했습니다.")
+        frame_height, frame_width = full_frame.shape[:2]
+        if (frame_width, frame_height) != (1928, 1048):
+            raise RuntimeError(
+                f"WGC 크기가 {frame_width}x{frame_height}입니다. "
+                "1928x1048에서만 v9 자동 보정을 실행합니다."
+            )
+
+        price_rect = side.price_rect
+        x1, y1, x2, y2 = price_rect.to_pixels(frame_width, frame_height)
+        existing_price = (
+            decode_gray_png(side.baseline_png)
+            if side.baseline_png
+            else full_frame[y1:y2, x1:x2]
+        )
+        selection_validation = validate_limit_price_selection(
+            existing_price,
+            price_rect,
+            side_name,
+            frame_width,
+            frame_height,
+        )
+        if not selection_validation.valid:
+            raise RuntimeError(selection_validation.message)
+
+        guard_rect = build_guard_rect(
+            price_rect,
+            frame_width,
+            frame_height,
+        )
+        price_box = price_box_in_guard(
+            price_rect,
+            guard_rect,
+            frame_width,
+            frame_height,
+        )
+        diagnostic_price_box = price_box
+        gx1, gy1, gx2, gy2 = guard_rect.to_pixels(
+            frame_width,
+            frame_height,
+        )
+        initial_closed_guard = full_frame[gy1:gy2, gx1:gx2].copy()
+        initial_closed_luma = float(np.mean(initial_closed_guard))
+
+        engine = manager.capture_engine
+        if engine is None or not hasattr(engine, "get_latest_frame_packet"):
+            raise RuntimeError("WGC 고유 프레임 API를 사용할 수 없습니다.")
+        clicker = _FastClicker(manager, frame_width, frame_height)
+        action = clicker.resolve(side.action_point)
+        last_sequence = -1
+        last_timestamp = float("-inf")
+
+        def flush() -> None:
+            nonlocal last_sequence, last_timestamp
+            packet = engine.get_latest_frame_packet(timeout=0.0)
+            if packet is not None:
+                last_sequence = max(last_sequence, int(packet.sequence_id))
+                last_timestamp = max(last_timestamp, float(packet.captured_at))
+
+        def next_full(deadline: float) -> Optional[np.ndarray]:
+            nonlocal last_sequence, last_timestamp
+            while time.monotonic() < deadline:
+                packet = engine.get_latest_frame_packet(timeout=0.10)
+                if packet is None:
+                    if engine.closed_event.is_set():
+                        raise RuntimeError("WGC 세션이 보정 중 종료되었습니다.")
+                    continue
+                if (
+                    int(packet.sequence_id) <= last_sequence
+                    or float(packet.captured_at) <= last_timestamp
+                ):
+                    continue
+                last_sequence = int(packet.sequence_id)
+                last_timestamp = float(packet.captured_at)
+                packet_metadata.append(
+                    {
+                        "sequence_id": last_sequence,
+                        "captured_at": last_timestamp,
+                    }
+                )
+                del packet_metadata[:-200]
+                if packet.image.shape != full_frame.shape:
+                    continue
+                return packet.image
+            return None
+
+        def capture_closed(
+            guard_detector: RenewalModalGuard,
+            opening_number: int,
+        ) -> list[np.ndarray]:
+            deadline = time.monotonic() + CALIBRATION_CLOSE_TIMEOUT_SECONDS
+            stable: list[np.ndarray] = []
+            while time.monotonic() < deadline:
+                frame = next_full(deadline)
+                if frame is None:
+                    break
+                guard = frame[gy1:gy2, gx1:gx2].copy()
+                if guard_detector.register(guard, 0.0, 0.0).valid:
+                    stable.clear()
+                    continue
+                if stable:
+                    delta = float(
+                        cv2.mean(cv2.absdiff(stable[-1], guard))[0]
+                    )
+                    if delta > CALIBRATION_STABLE_FRAME_DELTA:
+                        stable.clear()
+                stable.append(guard)
+                if len(stable) >= 4:
+                    return stable[-4:]
+            raise RuntimeError(
+                f"{opening_number}번째 ESC 뒤 닫힘 화면 4프레임을 확인하지 못했습니다."
+            )
+
+        sessions: list[list[np.ndarray]] = []
+        closed_samples: list[np.ndarray] = []
+        guard_detector: Optional[RenewalModalGuard] = None
+        flush()
+        for opening in range(RENEWAL_CALIBRATION_OPENINGS):
+            opening_number = opening + 1
+            clicker.click_client(action)
+            popup_may_be_open = True
+            deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
+            session: list[np.ndarray] = []
+            previous_pair = None
+            while (
+                len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                and time.monotonic() < deadline
+            ):
+                frame = next_full(deadline)
+                if frame is None:
+                    break
+                raw_guard = frame[gy1:gy2, gx1:gx2].copy()
+                recent_guard_frames.append(raw_guard.copy())
+                del recent_guard_frames[:-50]
+                metric: dict[str, object] = {
+                    "opening": opening_number,
+                    "guard_luma": float(np.mean(raw_guard)),
+                    "guard_valid": False,
+                    "price_valid": False,
+                }
+                if guard_detector is None:
+                    if float(np.mean(raw_guard)) < max(
+                        150.0,
+                        initial_closed_luma + 50.0,
+                    ):
+                        capture_metrics.append(metric)
+                        del capture_metrics[:-200]
+                        session.clear()
+                        previous_pair = None
+                        continue
+                    aligned_guard = raw_guard
+                    metric["guard_valid"] = True
+                else:
+                    registration = guard_detector.register(
+                        raw_guard,
+                        0.0,
+                        0.0,
+                    )
+                    if not registration.valid:
+                        metric.update(
+                            {
+                                "guard_luma_delta": registration.luma_delta,
+                                "guard_edge_delta": registration.edge_delta,
+                            }
+                        )
+                        capture_metrics.append(metric)
+                        del capture_metrics[:-200]
+                        session.clear()
+                        previous_pair = None
+                        continue
+                    aligned_guard = registration.aligned
+                    metric.update(
+                        {
+                            "guard_valid": True,
+                            "guard_shift": [
+                                registration.shift_x,
+                                registration.shift_y,
+                            ],
+                            "guard_luma_delta": registration.luma_delta,
+                            "guard_edge_delta": registration.edge_delta,
+                        }
+                    )
+
+                price = crop_price_from_guard(aligned_guard, price_box)
+                price_validation = validate_limit_price_selection(
+                    price,
+                    price_rect,
+                    side_name,
+                    frame_width,
+                    frame_height,
+                )
+                if not price_validation.valid:
+                    metric["price_message"] = price_validation.message
+                    capture_metrics.append(metric)
+                    del capture_metrics[:-200]
+                    session.clear()
+                    previous_pair = None
+                    continue
+                metric["price_valid"] = True
+                pair = RenewalChangeDetector.prepare_pair(price)
+                if previous_pair is None:
+                    session[:] = [raw_guard]
+                    metric["pair_stability"] = None
+                elif (
+                    RenewalChangeDetector.pair_stability(previous_pair, pair)
+                    <= 0.030
+                ):
+                    metric["pair_stability"] = (
+                        RenewalChangeDetector.pair_stability(
+                            previous_pair,
+                            pair,
+                        )
+                    )
+                    session.append(raw_guard)
+                else:
+                    metric["pair_stability"] = (
+                        RenewalChangeDetector.pair_stability(
+                            previous_pair,
+                            pair,
+                        )
+                    )
+                    session[:] = [raw_guard]
+                previous_pair = pair
+                capture_metrics.append(metric)
+                del capture_metrics[:-200]
+
+            if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
+                raise RuntimeError(
+                    f"{opening_number}번째 팝업에서 완성된 동일 가격 "
+                    "4프레임을 확인하지 못했습니다."
+                )
+            sessions.append(session[-4:])
+            if guard_detector is None:
+                first_guard = np.median(
+                    np.stack(session[-4:]),
+                    axis=0,
+                ).astype(np.uint8)
+                guard_detector = RenewalModalGuard(
+                    first_guard,
+                    price_box,
+                    shift_limit=4,
+                )
+
+            for index, guard in enumerate(session[-4:], start=1):
+                corpus_frames.append(
+                    (f"open_{opening_number}_{index}", guard.copy())
+                )
+            clicker.press_escape()
+            closed_samples = capture_closed(
+                guard_detector,
+                opening_number,
+            )
+            popup_may_be_open = False
+            for index, guard in enumerate(closed_samples, start=1):
+                corpus_frames.append(
+                    (f"closed_{opening_number}_{index}", guard.copy())
+                )
+            flush()
+
+        calibration = build_calibration_result(
+            sessions,
+            price_box,
+            closed_samples,
+        )
+        side.price_rect = price_rect
+        side.guard_rect = guard_rect
+        side.baseline_png = encode_gray_png(calibration.baseline)
+        side.guard_png = encode_gray_png(calibration.guard)
+        side.closed_guard_png = encode_gray_png(calibration.closed_guard)
+        side.noise_global = calibration.noise_global
+        side.noise_slice = calibration.noise_slice
+        side.guard_luma_noise = calibration.guard_luma_noise
+        side.guard_edge_noise = calibration.guard_edge_noise
+        side.closed_guard_luma_noise = calibration.closed_guard_luma_noise
+        side.closed_guard_edge_noise = calibration.closed_guard_edge_noise
+        side.unchanged_limit = calibration.unchanged_limit
+        side.stability_limit = calibration.stability_limit
+        side.registration_shift_limit = calibration.registration_shift_limit
+        side.calibration_openings = calibration.calibration_openings
+        side.calibration_version = RENEWAL_CALIBRATION_VERSION
+        side.calibrated_frame_width = frame_width
+        side.calibrated_frame_height = frame_height
+        saved_profile = save_renewal_profile(profile)
+
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        corpus_root = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        )
+        corpus_dir = (
+            corpus_root
+            / "mAuto"
+            / "renewal_corpus"
+            / f"{time.strftime('%Y%m%d_%H%M%S')}_{side_name}_v9"
+        )
+        corpus_dir.mkdir(parents=True, exist_ok=False)
+        for name, guard in corpus_frames:
+            cv2.imwrite(str(corpus_dir / f"{name}.png"), guard)
+        (corpus_dir / "packets.json").write_text(
+            json.dumps(packet_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        report.update(
+            {
+                "passed": True,
+                "profile": str(saved_profile),
+                "corpus": str(corpus_dir),
+                "frame_size": [frame_width, frame_height],
+                "openings": len(sessions),
+                "open_frames": sum(len(session) for session in sessions),
+                "closed_frames": len(closed_samples),
+                "noise_global": calibration.noise_global,
+                "noise_slice": calibration.noise_slice,
+                "unchanged_limit": calibration.unchanged_limit,
+                "stability_limit": calibration.stability_limit,
+            }
+        )
+        return 0
+    except Exception as exc:
+        if diagnostic_price_box is not None:
+            _save_calibration_diagnostic(
+                side_name,
+                "headless_calibration_failed",
+                recent_guard_frames,
+                diagnostic_price_box,
+                {
+                    "phase": "headless_existing_roi",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "packets": packet_metadata,
+                    "capture_metrics": capture_metrics,
+                },
+            )
+        report.update(
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "packets_seen": len(packet_metadata),
+                "capture_metrics": capture_metrics,
+            }
+        )
+        return 1
+    finally:
+        if popup_may_be_open and clicker is not None:
+            try:
+                clicker.press_escape()
+            except Exception:
+                pass
+        if manager is not None:
+            manager.stop_capture()
+        report["finished_at_unix"] = time.time()
+        temporary = report_path.with_suffix(".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(report_path)
+        except Exception:
+            pass
+
+
+def _startup_selftest_repeat(count: int) -> int:
+    """Run the exact frozen artifact repeatedly and persist an auditable result."""
+
+    count = min(1000, max(1, int(count)))
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--startup-selftest"]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), "--startup-selftest"]
+    creation_flags = (
+        int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if os.name == "nt"
+        else 0
+    )
+    child_environment = dict(os.environ)
+    # PyInstaller 6.9+ otherwise treats the same executable as a worker and
+    # reuses the parent's extraction directory.  The gate must exercise a
+    # completely independent onefile bootstrap on every iteration.
+    child_environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    child_environment["PYINSTALLER_STRICT_UNPACK_MODE"] = "1"
+    elapsed_ms: list[float] = []
+    return_codes: list[int] = []
+    failures: list[dict[str, object]] = []
+    started_at = time.time()
+    for iteration in range(1, count + 1):
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10.0,
+                check=False,
+                creationflags=creation_flags,
+                env=child_environment,
+            )
+            return_code = int(completed.returncode)
+        except subprocess.TimeoutExpired:
+            return_code = -1
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        elapsed_ms.append(duration_ms)
+        return_codes.append(return_code)
+        if return_code != 0:
+            failures.append(
+                {
+                    "iteration": iteration,
+                    "return_code": return_code,
+                    "elapsed_ms": duration_ms,
+                }
+            )
+
+    ordered = sorted(elapsed_ms)
+
+    def percentile(percent: float) -> float:
+        if not ordered:
+            return 0.0
+        position = (len(ordered) - 1) * percent
+        lower = int(position)
+        upper = min(len(ordered) - 1, lower + 1)
+        fraction = position - lower
+        return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+    report = {
+        "schema_version": 1,
+        "artifact": str(Path(sys.executable).resolve()),
+        "started_at_unix": started_at,
+        "finished_at_unix": time.time(),
+        "requested_runs": count,
+        "completed_runs": len(return_codes),
+        "failures": failures,
+        "return_codes": return_codes,
+        "timing_ms": {
+            "minimum": min(elapsed_ms, default=0.0),
+            "median": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "maximum": max(elapsed_ms, default=0.0),
+        },
+        "passed": (
+            len(return_codes) == count
+            and not failures
+            and percentile(0.95) <= 3000.0
+            and max(elapsed_ms, default=0.0) <= 5000.0
+        ),
+    }
+    target = app_dir() / "renewal_startup_selftest.json"
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return 0 if bool(report["passed"]) else 1
+
+
+def main() -> int:
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
+    if "--startup-selftest" in sys.argv[1:]:
+        return _startup_selftest()
+    for argument in sys.argv[1:]:
+        if argument.startswith("--headless-calibrate-existing="):
+            return _headless_calibrate_existing(argument.split("=", 1)[1])
+        if argument.startswith("--startup-selftest-repeat="):
+            try:
+                repeat = int(argument.split("=", 1)[1])
+            except ValueError:
+                return 2
+            return _startup_selftest_repeat(repeat)
+
     root = tk.Tk()
     RenewalLicenseDialog(root, app_dir())
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -184,7 +184,7 @@ def _run(
     manager = _FakeManager(engine)
     with ExitStack() as stack:
         # 회귀 테스트가 사용자의 실제 진단 보관함을 채우거나 오래된 자료를
-        # 최근 20건 정리 정책으로 삭제하지 않도록 저장 I/O를 차단합니다.
+        # 최근 50건 정리 정책으로 삭제하지 않도록 저장 I/O를 차단합니다.
         stack.enter_context(
             patch.object(
                 renewal,
@@ -240,25 +240,86 @@ class RenewalSafetyTests(unittest.TestCase):
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
 
-    def test_v7_profile_requires_v8_size_safe_recalibration(self) -> None:
+    def test_v8_profile_requires_v9_right_limit_price_recalibration(self) -> None:
         legacy = self.profile.to_dict()
-        legacy["version"] = 7
-        legacy["buy"]["calibration_version"] = 3
+        legacy["version"] = 8
+        legacy["buy"]["calibration_version"] = 4
         legacy["buy"].pop("calibrated_frame_width")
         legacy["buy"].pop("calibrated_frame_height")
         loaded = renewal.RenewalProfile.from_dict(legacy)
-        self.assertIn("v8 1080p 가격영역 재설정", loaded.missing("buy"))
+        self.assertIn("v9 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v8_profile_round_trip_keeps_alignment_and_frame_size(self) -> None:
+    def test_v9_profile_round_trip_keeps_alignment_and_frame_size(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 8)
+        self.assertEqual(loaded.to_dict()["version"], 9)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
         self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
+
+    def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
+        buy_rect = renewal.NormalizedRect(0.7128, 0.4042, 0.7904, 0.4424)
+        sell_rect = renewal.NormalizedRect(0.7128, 0.3660, 0.7904, 0.4042)
+        self.assertTrue(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                buy_rect,
+                "buy",
+                1928,
+                1048,
+            ).valid
+        )
+        self.assertTrue(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                sell_rect,
+                "sell",
+                1928,
+                1048,
+            ).valid
+        )
+
+        amount_input = renewal.NormalizedRect(0.610, 0.485, 0.765, 0.555)
+        wrong_side_row = renewal.NormalizedRect(0.7128, 0.3660, 0.7904, 0.4042)
+        self.assertFalse(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                amount_input,
+                "buy",
+                1928,
+                1048,
+            ).valid
+        )
+        self.assertFalse(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                wrong_side_row,
+                "buy",
+                1928,
+                1048,
+            ).valid
+        )
+        self.assertFalse(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                buy_rect,
+                "sell",
+                1928,
+                1048,
+            ).valid
+        )
+        self.assertFalse(
+            renewal.validate_limit_price_selection(
+                self.base_price,
+                buy_rect,
+                "buy",
+                2568,
+                1408,
+            ).valid
+        )
 
     def test_two_line_price_region_is_rejected(self) -> None:
         two_lines = np.full((70, 120), 238, dtype=np.uint8)
@@ -379,7 +440,7 @@ class RenewalSafetyTests(unittest.TestCase):
             guard_detector.register(wrong_popup, 0.0, 0.0).valid
         )
 
-    def test_five_independent_openings_build_v8_calibration(self) -> None:
+    def test_five_independent_openings_build_v9_calibration(self) -> None:
         sessions = [
             [
                 renewal._translate_image(self.guard, shift_x, 0)
@@ -405,7 +466,7 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
 
-    def test_v8_calibration_still_rejects_a_real_price_change(self) -> None:
+    def test_v9_calibration_still_rejects_a_real_price_change(self) -> None:
         sessions = [
             [self.guard.copy() for _ in range(4)]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
@@ -425,7 +486,7 @@ class RenewalSafetyTests(unittest.TestCase):
                 closed_samples,
             )
 
-    def test_v8_calibration_rejects_indistinguishable_closed_screen(self) -> None:
+    def test_v9_calibration_rejects_indistinguishable_closed_screen(self) -> None:
         sessions = [
             [self.guard.copy() for _ in range(4)]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)

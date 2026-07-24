@@ -33,8 +33,8 @@ cv2.setNumThreads(1)
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 8
-RENEWAL_CALIBRATION_VERSION = 4
+RENEWAL_PROFILE_VERSION = 9
+RENEWAL_CALIBRATION_VERSION = 5
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
 
@@ -361,7 +361,7 @@ class RenewalProfile:
             or side_profile.calibration_version < RENEWAL_CALIBRATION_VERSION
             or side_profile.calibrated_frame_size() is None
         ):
-            missing.append("v8 1080p 가격영역 재설정")
+            missing.append("v9 우측 상한가/하한가 재설정")
         if side_profile.limit_point is None:
             missing.append("상한가 위치" if side == "buy" else "하한가 위치")
         return missing
@@ -534,6 +534,62 @@ def validate_price_region(image: np.ndarray) -> PriceRegionValidation:
             1,
         )
     return PriceRegionValidation(True, "가격 숫자 한 줄 확인 완료", 1)
+
+
+def validate_limit_price_selection(
+    image: np.ndarray,
+    rect: NormalizedRect,
+    side: str,
+    frame_width: int,
+    frame_height: int,
+) -> PriceRegionValidation:
+    """Accept only the right-side upper/lower limit-price row at 1080p WGC."""
+
+    row_validation = validate_price_region(image)
+    if not row_validation.valid:
+        return row_validation
+    if (int(frame_width), int(frame_height)) != (1928, 1048):
+        return PriceRegionValidation(
+            False,
+            "v9 우측 가격 보정은 WGC 1928x1048에서만 저장할 수 있습니다.",
+            row_validation.band_count,
+        )
+    if side not in ("buy", "sell"):
+        return PriceRegionValidation(
+            False,
+            "구매 또는 판매 구분을 먼저 선택하세요.",
+            row_validation.band_count,
+        )
+
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    center_x = (rect.left + rect.right) * 0.5
+    center_y = (rect.top + rect.bottom) * 0.5
+    expected_y = (
+        0.410 <= center_y <= 0.455
+        if side == "buy"
+        else 0.365 <= center_y <= 0.405
+    )
+    if not (
+        0.700 <= center_x <= 0.835
+        and expected_y
+        and 0.025 <= width <= 0.180
+        and 0.015 <= height <= 0.070
+    ):
+        target = "우측 상한가" if side == "buy" else "우측 하한가"
+        return PriceRegionValidation(
+            False,
+            f"{target} 숫자 한 줄만 선택하세요. 금액 입력칸, 라벨, "
+            "상·하한가 두 줄은 저장할 수 없습니다.",
+            row_validation.band_count,
+        )
+    return PriceRegionValidation(
+        True,
+        "우측 상한가 숫자 확인 완료"
+        if side == "buy"
+        else "우측 하한가 숫자 확인 완료",
+        1,
+    )
 
 
 def build_guard_rect(
@@ -1307,7 +1363,7 @@ def build_calibration_result(
     if any(sample is None or sample.shape != shape for sample in guard_samples):
         raise ValueError("보정 프레임의 크기가 서로 다릅니다.")
     if closed_samples is None or len(closed_samples) < 4:
-        raise ValueError("v8 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
+        raise ValueError("v9 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
     closed_samples = closed_samples[:4]
     if any(
         sample is None or sample.shape != shape
@@ -1514,7 +1570,7 @@ def save_renewal_diagnostic(
 ) -> None:
     """차단 또는 주문 판정의 직전 프레임을 제한적으로 저장합니다.
 
-    정상 유지 반복에서는 파일을 만들지 않으며 최근 20건만 남깁니다. 진단 저장 실패는
+    정상 유지 반복에서는 파일을 만들지 않으며 최근 50건만 남깁니다. 진단 저장 실패는
     주문 안전성이나 실행 흐름에 영향을 주지 않습니다.
     """
     try:
@@ -1557,7 +1613,7 @@ def save_renewal_diagnostic(
             (path for path in diagnostic_root.iterdir() if path.is_dir()),
             key=lambda path: path.name,
         )
-        for old_dir in event_dirs[:-20]:
+        for old_dir in event_dirs[:-50]:
             for child in old_dir.iterdir():
                 if child.is_file():
                     child.unlink(missing_ok=True)
@@ -1659,7 +1715,7 @@ class FastRenewalRunner:
             raise RuntimeError(
                 "게임 창 크기가 안전 보정과 다릅니다. "
                 f"현재 {frame_width}x{frame_height}, 보정 {expected_text}. "
-                "현재 크기에서 v8 가격영역을 다시 설정하세요."
+                "현재 크기에서 v9 우측 가격영역을 다시 설정하세요."
             )
         engine = self.manager.capture_engine
         if engine is None:
@@ -1727,7 +1783,7 @@ class FastRenewalRunner:
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v8] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v9] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
@@ -1941,7 +1997,7 @@ class FastRenewalRunner:
 
             if decision is PriceState.CHANGED and last_result is not None:
                 if armed_openings < required_arm_openings:
-                    self.status("기준 가격 불일치 · v8 가격영역 재설정 필요")
+                    self.status("기준 가격 불일치 · v9 우측 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
                         "주문 없이 정지합니다."
@@ -1971,7 +2027,7 @@ class FastRenewalRunner:
                 if self.monitor_only:
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
-                        f"[무주문 측정 v8] {cycle_count}회에서 변경 확정, "
+                        f"[무주문 측정 v9] {cycle_count}회에서 변경 확정, "
                         f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
                     )
                     save_renewal_diagnostic(
@@ -2005,7 +2061,7 @@ class FastRenewalRunner:
                 clicker.click_prepared(confirm_click)
                 elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
                 self.log(
-                    f"[갱신 완료 v8] {cycle_count}회 확인, "
+                    f"[갱신 완료 v9] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -2044,7 +2100,7 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v8] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v9] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
                 if not close_modal():
                     self.status("닫힘 준비 화면 미확인 · 안전 정지")
@@ -2085,7 +2141,7 @@ class FastRenewalRunner:
                     else 0
                 )
                 self.log(
-                    f"[갱신 v8] {cycle_count}회 확인 중 · "
+                    f"[갱신 v9] {cycle_count}회 확인 중 · "
                     f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
                     f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
                     f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "
