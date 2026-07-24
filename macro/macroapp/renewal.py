@@ -1272,6 +1272,21 @@ def build_calibration_result(
     price_box: tuple[int, int, int, int],
     closed_samples: Optional[list[np.ndarray]] = None,
 ) -> RenewalCalibrationResult:
+    def is_safe_calibration_match(
+        classification: PriceClassification,
+    ) -> bool:
+        # Runtime remains fail-closed: gray-zone frames never authorize an
+        # order.  During calibration, however, a complete glyph row that is
+        # below the real-change thresholds is useful as a same-price noise
+        # sample instead of making all five openings impossible to save.
+        return (
+            classification.state is PriceState.UNCHANGED
+            or (
+                classification.state is PriceState.AMBIGUOUS
+                and classification.reason == "gray_zone"
+            )
+        )
+
     if len(guard_sessions) < RENEWAL_CALIBRATION_OPENINGS:
         raise ValueError(
             f"안전 보정에는 서로 다른 팝업 {RENEWAL_CALIBRATION_OPENINGS}회가 필요합니다."
@@ -1325,18 +1340,62 @@ def build_calibration_result(
             max(abs(registration.shift_x), abs(registration.shift_y))
         )
 
-    reference_classifier = RenewalPriceClassifier(
-        reference_price,
-        unchanged_limit=0.035,
-        stability_limit=0.015,
-    )
+    price_candidates = [
+        crop_price_from_guard(guard_sample, price_box)
+        for guard_sample in aligned_guards
+    ]
+    # The first WGC frame after a popup transition can be a valid but noisier
+    # anti-aliased render.  Pick the medoid-like candidate that agrees with the
+    # most complete same-price rows instead of making that first frame the
+    # permanent calibration authority.
+    reference_classifier: Optional[RenewalPriceClassifier] = None
+    reference_price = price_candidates[0]
+    best_reference_key: Optional[tuple[int, float, int]] = None
+    for candidate_index, candidate in enumerate(price_candidates):
+        try:
+            candidate_classifier = RenewalPriceClassifier(
+                candidate,
+                unchanged_limit=0.035,
+                stability_limit=0.015,
+            )
+        except ValueError:
+            continue
+        unsafe_count = 0
+        total_score = 0.0
+        for other in price_candidates:
+            candidate_match = candidate_classifier.classify(other)
+            if not is_safe_calibration_match(candidate_match):
+                unsafe_count += 1
+            total_score += float(candidate_match.global_score)
+        candidate_key = (unsafe_count, total_score, candidate_index)
+        if best_reference_key is None or candidate_key < best_reference_key:
+            best_reference_key = candidate_key
+            reference_classifier = candidate_classifier
+            reference_price = candidate
+    if reference_classifier is None:
+        raise ValueError(
+            "완전하게 표시된 상한가/하한가 숫자 한 줄을 찾지 못했습니다. "
+            "우측 가격 숫자만 조금 넓게 다시 선택하세요."
+        )
+
     aligned_prices: list[np.ndarray] = []
-    for guard_sample in aligned_guards:
+    for sample_index, guard_sample in enumerate(aligned_guards):
         price = crop_price_from_guard(guard_sample, price_box)
         classification = reference_classifier.classify(price)
-        if classification.state is not PriceState.UNCHANGED:
+        if not is_safe_calibration_match(classification):
+            opening_number = (
+                sample_index // RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+            ) + 1
+            frame_number = (
+                sample_index % RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+            ) + 1
             raise ValueError(
-                "보정 중 가격이 바뀌거나 글자가 완전히 표시되지 않았습니다. 다시 설정하세요."
+                f"보정 {opening_number}/"
+                f"{RENEWAL_CALIBRATION_OPENINGS}의 {frame_number}번째 "
+                "프레임에서 우측 가격 숫자 구조가 달라졌습니다. "
+                f"(판정 {classification.reason}, 전역 "
+                f"{classification.global_score:.4f}, 한 자리 "
+                f"{classification.slice_score:.4f})"
             )
         aligned_prices.append(classification.aligned)
 
@@ -1366,12 +1425,23 @@ def build_calibration_result(
     closed_luma_scores: list[float] = []
     closed_edge_scores: list[float] = []
     previous: Optional[PriceClassification] = None
-    for sample in aligned_guards:
+    for sample_index, sample in enumerate(aligned_guards):
         price = crop_price_from_guard(sample, price_box)
         classification = classifier.classify(price)
-        if classification.state is not PriceState.UNCHANGED:
+        if not is_safe_calibration_match(classification):
+            opening_number = (
+                sample_index // RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+            ) + 1
+            frame_number = (
+                sample_index % RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+            ) + 1
             raise ValueError(
-                "독립 팝업 사이의 기준 가격이 일치하지 않습니다. 다시 설정하세요."
+                f"독립 팝업 {opening_number}/"
+                f"{RENEWAL_CALIBRATION_OPENINGS}의 {frame_number}번째 "
+                "우측 가격이 기준과 일치하지 않습니다. "
+                f"(판정 {classification.reason}, 전역 "
+                f"{classification.global_score:.4f}, 한 자리 "
+                f"{classification.slice_score:.4f})"
             )
         luma_score, edge_score = guard_detector.metrics(sample)
         global_scores.append(classification.global_score)

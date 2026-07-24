@@ -103,20 +103,48 @@ class _Clicker:
         self.click_count += 1
 
 
+class _Detector:
+    @staticmethod
+    def prepare_pair(image):
+        return image.copy(), image.copy()
+
+    @staticmethod
+    def pair_stability(first, second):
+        return 0.0 if np.array_equal(first[0], second[0]) else 1.0
+
+
 class RenewalCalibrationCaptureTests(unittest.TestCase):
     def test_five_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.ones((height, width), dtype=np.uint8)
         closed = np.zeros((height, width), dtype=np.uint8)
         stale = np.ones((height + 1, width), dtype=np.uint8)
+        transition = np.full((height, width), 2, dtype=np.uint8)
+        transition[0, 0] = 1
 
         frames = [opened.copy()]
-        frames.extend([stale.copy(), opened.copy(), opened.copy(), opened.copy(), opened.copy()])
+        frames.extend(
+            [
+                stale.copy(),
+                transition.copy(),
+                opened.copy(),
+                opened.copy(),
+                opened.copy(),
+                opened.copy(),
+            ]
+        )
         for _ in range(4):
             frames.extend(closed.copy() for _ in range(4))
             frames.append(closed.copy())
             frames.extend(
-                [stale.copy(), opened.copy(), opened.copy(), opened.copy(), opened.copy()]
+                [
+                    stale.copy(),
+                    transition.copy(),
+                    opened.copy(),
+                    opened.copy(),
+                    opened.copy(),
+                    opened.copy(),
+                ]
             )
 
         manager = _Manager(frames, opened)
@@ -135,6 +163,16 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 return_value=manager,
             ),
             mock.patch.object(renewal_macro, "RenewalModalGuard", _Guard),
+            mock.patch.object(
+                renewal_macro,
+                "RenewalChangeDetector",
+                _Detector,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "validate_price_region",
+                return_value=SimpleNamespace(valid=True),
+            ),
             mock.patch.object(renewal_macro, "_FastClicker", _Clicker),
         ):
             sessions, closed_samples = renewal_macro.RenewalApp._capture_guard_samples(
@@ -153,6 +191,13 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         self.assertTrue(manager.stopped)
         self.assertTrue(
             any("5/5 팝업 확인" in line for line in app.log_messages)
+        )
+        popup_logs = [
+            line for line in app.log_messages if "팝업 확인" in line
+        ]
+        self.assertEqual(len(popup_logs), 5)
+        self.assertTrue(
+            all("가격 전환 1장" in line for line in popup_logs)
         )
 
 

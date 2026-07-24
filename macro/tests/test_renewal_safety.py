@@ -405,6 +405,26 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
 
+    def test_v8_calibration_still_rejects_a_real_price_change(self) -> None:
+        sessions = [
+            [self.guard.copy() for _ in range(4)]
+            for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
+        ]
+        sessions[-1] = [self.changed_guard.copy() for _ in range(4)]
+        closed_samples = [
+            np.zeros_like(self.guard)
+            for _ in range(4)
+        ]
+        with self.assertRaisesRegex(
+            ValueError,
+            "숫자 구조가 달라졌습니다|기준과 일치하지 않습니다",
+        ):
+            renewal.build_calibration_result(
+                sessions,
+                self.price_box,
+                closed_samples,
+            )
+
     def test_v8_calibration_rejects_indistinguishable_closed_screen(self) -> None:
         sessions = [
             [self.guard.copy() for _ in range(4)]

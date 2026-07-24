@@ -40,10 +40,12 @@ from macroapp.renewal import (
     FastRenewalRunner,
     NormalizedPoint,
     NormalizedRect,
+    RenewalChangeDetector,
     RenewalModalGuard,
     _FastClicker,
     build_calibration_result,
     build_guard_rect,
+    crop_price_from_guard,
     encode_gray_png,
     load_renewal_profile,
     price_box_in_guard,
@@ -1071,8 +1073,11 @@ class RenewalApp:
                 deadline = time.monotonic() + CALIBRATION_OPEN_TIMEOUT_SECONDS
                 invalid_count = 0
                 wrong_shape_count = 0
+                incomplete_price_count = 0
+                unstable_price_count = 0
                 last_luma_delta = 255.0
                 last_edge_delta = 1.0
+                previous_price_pair = None
                 while (
                     len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING
                     and time.monotonic() < deadline
@@ -1084,6 +1089,7 @@ class RenewalApp:
                     if sample.shape != reference_guard.shape:
                         wrong_shape_count += 1
                         session.clear()
+                        previous_price_pair = None
                         continue
                     registration = provisional_guard.register(sample, 0.0, 0.0)
                     last_luma_delta = registration.luma_delta
@@ -1091,8 +1097,33 @@ class RenewalApp:
                     if not registration.valid:
                         invalid_count += 1
                         session.clear()
+                        previous_price_pair = None
                         continue
-                    session.append(sample.copy())
+                    price = crop_price_from_guard(
+                        registration.aligned,
+                        price_box,
+                    )
+                    price_validation = validate_price_region(price)
+                    if not price_validation.valid:
+                        incomplete_price_count += 1
+                        session.clear()
+                        previous_price_pair = None
+                        continue
+                    price_pair = RenewalChangeDetector.prepare_pair(price)
+                    if previous_price_pair is None:
+                        session[:] = [sample.copy()]
+                    elif (
+                        RenewalChangeDetector.pair_stability(
+                            previous_price_pair,
+                            price_pair,
+                        )
+                        <= 0.030
+                    ):
+                        session.append(sample.copy())
+                    else:
+                        unstable_price_count += 1
+                        session[:] = [sample.copy()]
+                    previous_price_pair = price_pair
                 if len(session) < RENEWAL_CALIBRATION_FRAMES_PER_OPENING:
                     if opening == 0:
                         hint = (
@@ -1108,7 +1139,9 @@ class RenewalApp:
                         f"{opening_number}번째 팝업이 5초 안에 안정되지 "
                         f"않았습니다. {hint} "
                         f"(불일치 {invalid_count}장, 다른 크기 "
-                        f"{wrong_shape_count}장, 밝기 차이 "
+                        f"{wrong_shape_count}장, 미완성 가격 "
+                        f"{incomplete_price_count}장, 가격 전환 "
+                        f"{unstable_price_count}장, 밝기 차이 "
                         f"{last_luma_delta:.2f}, 구조 차이 "
                         f"{last_edge_delta:.3f})"
                     )
@@ -1117,7 +1150,9 @@ class RenewalApp:
                     f"[안전 보정] {opening_number}/"
                     f"{RENEWAL_CALIBRATION_OPENINGS} 팝업 확인 "
                     f"· 불일치 {invalid_count}장 · 다른 크기 "
-                    f"{wrong_shape_count}장 · 마지막 밝기 "
+                    f"{wrong_shape_count}장 · 미완성 가격 "
+                    f"{incomplete_price_count}장 · 가격 전환 "
+                    f"{unstable_price_count}장 · 마지막 밝기 "
                     f"{last_luma_delta:.2f} · 구조 "
                     f"{last_edge_delta:.3f}"
                 )
