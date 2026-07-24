@@ -154,15 +154,31 @@ def _fit_game_window_to_wgc(
         TARGET_WGC_SIZE,
     )
     snapshot = resize_window_no_activate(hwnd, target_outer_size)
+    original_snapshot = snapshot
     try:
-        after_frame = _measure_stable_wgc_frame(hwnd, logger)
-        after_size = (int(after_frame.shape[1]), int(after_frame.shape[0]))
-        if after_size != TARGET_WGC_SIZE:
-            raise RuntimeError(
-                f"Stable WGC is {after_size[0]}x{after_size[1]} after fitting; "
-                f"expected {TARGET_WGC_SIZE[0]}x{TARGET_WGC_SIZE[1]}."
+        for correction in range(3):
+            after_frame = _measure_stable_wgc_frame(hwnd, logger)
+            after_size = (int(after_frame.shape[1]), int(after_frame.shape[0]))
+            if after_size == TARGET_WGC_SIZE:
+                return snapshot, before_size, after_size
+            if correction >= 2:
+                break
+            corrected_outer_size = target_outer_size_for_wgc(
+                snapshot.resized,
+                after_size,
+                TARGET_WGC_SIZE,
             )
-        return snapshot, before_size, after_size
+            corrected = resize_window_no_activate(hwnd, corrected_outer_size)
+            snapshot = WindowResizeSnapshot(
+                int(hwnd),
+                original_snapshot.original,
+                corrected.resized,
+                original_snapshot.original_was_maximized,
+            )
+        raise RuntimeError(
+            f"Stable WGC is {after_size[0]}x{after_size[1]} after fitting; "
+            f"expected {TARGET_WGC_SIZE[0]}x{TARGET_WGC_SIZE[1]}."
+        )
     except Exception:
         restore_window_no_activate(snapshot)
         raise

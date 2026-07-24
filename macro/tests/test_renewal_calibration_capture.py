@@ -147,6 +147,13 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             100,
             current_outer,
             promoted_outer,
+            True,
+        )
+        corrected_outer = WindowRect(0, 0, 1944, 1064)
+        corrected_snapshot = renewal_macro.WindowResizeSnapshot(
+            100,
+            promoted_outer,
+            corrected_outer,
         )
         fallback = np.zeros((1040, 1920), dtype=np.uint8)
         preferred = np.zeros((1048, 1928), dtype=np.uint8)
@@ -159,21 +166,29 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             mock.patch.object(
                 renewal_macro,
                 "_measure_stable_wgc_frame",
-                side_effect=(fallback, preferred),
+                side_effect=(fallback, fallback, preferred),
             ),
             mock.patch.object(
                 renewal_macro,
                 "resize_window_no_activate",
-                return_value=promoted_snapshot,
+                side_effect=(promoted_snapshot, corrected_snapshot),
             ) as resize,
         ):
             result, before_size, after_size = (
                 renewal_macro._fit_game_window_to_wgc(100)
             )
-        self.assertEqual(result, promoted_snapshot)
+        self.assertEqual(result.original, current_outer)
+        self.assertEqual(result.resized, corrected_outer)
+        self.assertTrue(result.original_was_maximized)
         self.assertEqual(before_size, (1920, 1040))
         self.assertEqual(after_size, (1928, 1048))
-        resize.assert_called_once_with(100, (1936, 1056))
+        self.assertEqual(
+            resize.call_args_list,
+            [
+                mock.call(100, (1936, 1056)),
+                mock.call(100, (1944, 1064)),
+            ],
+        )
 
         unsupported_outer = WindowRect(0, 0, 1608, 908)
         resized_outer = WindowRect(0, 0, 1936, 1056)
@@ -224,7 +239,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             mock.patch.object(
                 renewal_macro,
                 "_measure_stable_wgc_frame",
-                side_effect=(before, wrong_after),
+                side_effect=(before, wrong_after, wrong_after, wrong_after),
             ),
             mock.patch.object(
                 renewal_macro,
