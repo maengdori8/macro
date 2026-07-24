@@ -717,6 +717,25 @@ def price_box_in_guard(
     )
 
 
+def dynamic_limit_price_boxes(
+    price_box: tuple[int, int, int, int],
+    side: str,
+    frame_height: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Return both changing right-side price rows for popup registration."""
+
+    if side not in ("buy", "sell"):
+        raise ValueError("side must be buy or sell")
+    x1, y1, x2, y2 = (int(value) for value in price_box)
+    row_offset = max(y2 - y1 + 2, int(round(int(frame_height) * 0.038)))
+    sibling = (
+        (x1, y1 - row_offset, x2, y2 - row_offset)
+        if side == "buy"
+        else (x1, y1 + row_offset, x2, y2 + row_offset)
+    )
+    return (price_box, sibling)
+
+
 def crop_price_from_guard(
     guard_image: np.ndarray,
     price_box: tuple[int, int, int, int],
@@ -1509,6 +1528,9 @@ class RenewalModalGuard:
         baseline: np.ndarray,
         price_box: tuple[int, int, int, int],
         shift_limit: int = 4,
+        dynamic_boxes: Optional[
+            tuple[tuple[int, int, int, int], ...]
+        ] = None,
     ):
         if baseline is None or baseline.size == 0:
             raise ValueError("팝업 가드 기준 이미지가 비어 있습니다.")
@@ -1518,12 +1540,25 @@ class RenewalModalGuard:
         self.shift_limit = min(4, max(1, int(shift_limit)))
         self._last_shift = (0, 0)
         self.mask = np.full(self.baseline.shape, 255, dtype=np.uint8)
-        x1, y1, x2, y2 = price_box
+        boxes = tuple(dynamic_boxes or (price_box,))
+        if price_box not in boxes:
+            boxes = (price_box, *boxes)
+        x1 = min(int(box[0]) for box in boxes)
+        y1 = min(int(box[1]) for box in boxes)
+        x2 = max(int(box[2]) for box in boxes)
+        y2 = max(int(box[3]) for box in boxes)
         margin = 4
-        self.mask[
-            max(0, y1 - margin) : min(self.mask.shape[0], y2 + margin),
-            max(0, x1 - margin) : min(self.mask.shape[1], x2 + margin),
-        ] = 0
+        for box_left, box_top, box_right, box_bottom in boxes:
+            self.mask[
+                max(0, int(box_top) - margin) : min(
+                    self.mask.shape[0],
+                    int(box_bottom) + margin,
+                ),
+                max(0, int(box_left) - margin) : min(
+                    self.mask.shape[1],
+                    int(box_right) + margin,
+                ),
+            ] = 0
         # Registration exposes synthetic fill pixels along the crop boundary.
         # They are not popup evidence, so exclude the entire possible shift rim.
         rim = self.shift_limit + 1
@@ -1889,6 +1924,9 @@ def build_calibration_result(
     guard_sessions: list[list[np.ndarray]],
     price_box: tuple[int, int, int, int],
     closed_samples: Optional[list[np.ndarray]] = None,
+    dynamic_boxes: Optional[
+        tuple[tuple[int, int, int, int], ...]
+    ] = None,
 ) -> RenewalCalibrationResult:
     def is_safe_calibration_match(
         classification: PriceClassification,
@@ -1944,6 +1982,7 @@ def build_calibration_result(
         reference_guard,
         price_box,
         shift_limit=4,
+        dynamic_boxes=dynamic_boxes,
     )
     aligned_guards: list[np.ndarray] = []
     guard_shifts: list[int] = []
@@ -2028,12 +2067,18 @@ def build_calibration_result(
         unchanged_limit=0.040,
         stability_limit=0.030,
     )
-    guard_detector = RenewalModalGuard(guard, price_box, shift_limit=4)
+    guard_detector = RenewalModalGuard(
+        guard,
+        price_box,
+        shift_limit=4,
+        dynamic_boxes=dynamic_boxes,
+    )
     closed_guard = np.median(np.stack(closed_samples), axis=0).astype(np.uint8)
     closed_guard_detector = RenewalModalGuard(
         closed_guard,
         price_box,
         shift_limit=4,
+        dynamic_boxes=dynamic_boxes,
     )
     global_scores: list[float] = []
     slice_scores: list[float] = []
@@ -2310,6 +2355,11 @@ class FastRenewalRunner:
             frame_width,
             frame_height,
         )
+        dynamic_boxes = dynamic_limit_price_boxes(
+            price_box,
+            self.side_name,
+            frame_height,
+        )
         classifier = RenewalPriceClassifier(
             baseline,
             side_profile.unchanged_limit,
@@ -2319,11 +2369,13 @@ class FastRenewalRunner:
             guard_baseline,
             price_box,
             shift_limit=side_profile.registration_shift_limit,
+            dynamic_boxes=dynamic_boxes,
         )
         ready_guard = RenewalModalGuard(
             closed_guard_baseline,
             price_box,
             shift_limit=side_profile.registration_shift_limit,
+            dynamic_boxes=dynamic_boxes,
         )
         guard_region = side_profile.guard_rect.to_pixels(frame_width, frame_height)
 

@@ -69,7 +69,13 @@ class _Manager:
 
 
 class _Guard:
-    def __init__(self, baseline, price_box, shift_limit=4):
+    def __init__(
+        self,
+        baseline,
+        price_box,
+        shift_limit=4,
+        dynamic_boxes=None,
+    ):
         self.shape = baseline.shape
 
     def register(self, image, luma_noise, edge_noise):
@@ -263,6 +269,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         manager = _Manager(frames, opened)
         app = SimpleNamespace(
             window_title_var=_Value("FC ONLINE"),
+            side_var=_Value("buy"),
             status_var=_Value(),
             root=_Root(),
             log_messages=[],

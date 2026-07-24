@@ -426,6 +426,49 @@ class RenewalSafetyTests(unittest.TestCase):
                     renewal.PriceState.CHANGED,
                 )
 
+    def test_guard_registration_ignores_both_live_limit_price_rows(self) -> None:
+        target = _price("769", 150, 40)
+        sibling_before = _price("629", 150, 40)
+        sibling_after = _price("630", 150, 40)
+        price_box = (96, 40, 246, 80)
+        baseline_guard = np.full((120, 341), 251, dtype=np.uint8)
+        baseline_guard[0:40, 96:246] = sibling_before
+        baseline_guard[40:80, 96:246] = target
+        cv2.line(baseline_guard, (20, 100), (300, 100), 190, 1)
+        changed_sibling_guard = baseline_guard.copy()
+        changed_sibling_guard[0:40, 96:246] = sibling_after
+        dynamic_boxes = renewal.dynamic_limit_price_boxes(
+            price_box,
+            "buy",
+            1040,
+        )
+        guard_detector = renewal.RenewalModalGuard(
+            baseline_guard,
+            price_box,
+            shift_limit=4,
+            dynamic_boxes=dynamic_boxes,
+        )
+        for shift_x, shift_y in ((0, 0), (-4, -4), (4, 4)):
+            with self.subTest(shift_x=shift_x, shift_y=shift_y):
+                registration = guard_detector.register(
+                    renewal._translate_image(
+                        changed_sibling_guard,
+                        shift_x,
+                        shift_y,
+                    ),
+                    0.0,
+                    0.0,
+                )
+                self.assertTrue(registration.valid)
+                current = renewal.crop_price_from_guard(
+                    registration.aligned,
+                    price_box,
+                )
+                self.assertLess(
+                    float(cv2.mean(cv2.absdiff(current, target))[0]),
+                    0.01,
+                )
+
     def test_guard_alignment_noise_never_hides_whole_popup_shift(self) -> None:
         for brightness in (0, 12):
             guard_detector = renewal.RenewalModalGuard(

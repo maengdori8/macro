@@ -56,6 +56,7 @@ from macroapp.renewal import (
     build_guard_rect,
     crop_price_from_guard,
     decode_gray_png,
+    dynamic_limit_price_boxes,
     encode_gray_png,
     is_supported_renewal_wgc_size,
     load_renewal_profile,
@@ -1101,10 +1102,16 @@ class RenewalApp:
                     )
             gx1, gy1, gx2, gy2 = guard_rect.to_pixels(frame_width, frame_height)
             reference_guard = full_frame[gy1:gy2, gx1:gx2].copy()
+            dynamic_boxes = dynamic_limit_price_boxes(
+                price_box,
+                self.side_var.get(),
+                frame_height,
+            )
             provisional_guard = RenewalModalGuard(
                 reference_guard,
                 price_box,
                 shift_limit=4,
+                dynamic_boxes=dynamic_boxes,
             )
             engine = manager.capture_engine
             if engine is None:
@@ -1469,6 +1476,11 @@ class RenewalApp:
                     samples,
                     price_box,
                     closed_samples,
+                    dynamic_limit_price_boxes(
+                        price_box,
+                        self.side_var.get(),
+                        frame_height,
+                    ),
                 )
             except Exception as exc:
                 captured_guards = [
@@ -1897,6 +1909,11 @@ def _headless_calibrate_existing(side_name: str) -> int:
             frame_width,
             frame_height,
         )
+        dynamic_boxes = dynamic_limit_price_boxes(
+            price_box,
+            side_name,
+            frame_height,
+        )
         diagnostic_price_box = price_box
         gx1, gy1, gx2, gy2 = guard_rect.to_pixels(
             frame_width,
@@ -2102,6 +2119,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
                     first_guard,
                     price_box,
                     shift_limit=4,
+                    dynamic_boxes=dynamic_boxes,
                 )
 
             for index, guard in enumerate(session[-4:], start=1):
@@ -2124,6 +2142,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
             sessions,
             price_box,
             closed_samples,
+            dynamic_boxes,
         )
         side.price_rect = price_rect
         side.guard_rect = guard_rect
