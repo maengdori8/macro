@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import argparse
 import time
 from pathlib import Path
 from typing import Iterable
@@ -19,8 +20,10 @@ import psutil
 
 from macroapp.renewal import (
     PriceState,
+    RenewalModalGuard,
     RenewalPriceClassifier,
     _translate_image,
+    crop_price_from_guard,
 )
 
 
@@ -125,6 +128,39 @@ def _changed_corpus(changed: np.ndarray) -> list[np.ndarray]:
     ]
 
 
+def _guard(price: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    guard = np.full((120, 342), 224, dtype=np.uint8)
+    cv2.rectangle(guard, (1, 1), (340, 118), 90, 1)
+    cv2.putText(
+        guard,
+        "LIMIT PRICE",
+        (12, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        70,
+        1,
+        cv2.LINE_AA,
+    )
+    price_box = (96, 40, 246, 80)
+    x1, y1, x2, y2 = price_box
+    guard[y1:y2, x1:x2] = price
+    return guard, price_box
+
+
+def _guard_corpus(
+    prices: list[np.ndarray],
+    base_guard: np.ndarray,
+    price_box: tuple[int, int, int, int],
+) -> list[np.ndarray]:
+    x1, y1, x2, y2 = price_box
+    result: list[np.ndarray] = []
+    for price in prices:
+        candidate = base_guard.copy()
+        candidate[y1:y2, x1:x2] = price
+        result.append(candidate)
+    return result
+
+
 def _write_report(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -165,7 +201,27 @@ def run_verification_soak(
         raise RuntimeError("soak unchanged corpus is not stable")
     if not _all_state(classifier, changed_corpus, PriceState.CHANGED):
         raise RuntimeError("soak changed corpus is not detectable")
-
+    base_guard, price_box = _guard(baseline)
+    modal_guard = RenewalModalGuard(
+        base_guard,
+        price_box,
+        shift_limit=4,
+    )
+    same_guard_corpus = _guard_corpus(
+        same_corpus,
+        base_guard,
+        price_box,
+    )
+    changed_guard_corpus = _guard_corpus(
+        changed_corpus,
+        base_guard,
+        price_box,
+    )
+    popup_shifts = tuple(
+        (dx, dy)
+        for dy in range(-4, 5)
+        for dx in range(-4, 5)
+    )
     process = psutil.Process()
     logical_cpus = max(1, int(psutil.cpu_count(logical=True) or 1))
     started = time.perf_counter()
@@ -178,6 +234,7 @@ def run_verification_soak(
     start_memory = process.memory_info()
     frame_intervals = _Histogram(0.05, 100.0)
     classify_latency = _Histogram(0.01, 10.0)
+    guard_latency = _Histogram(0.01, 25.0)
     cpu_percent = _Histogram(0.01, 100.0)
     working_set_mb = _Histogram(0.05, 512.0)
     private_mb = _Histogram(0.05, 512.0)
@@ -185,10 +242,13 @@ def run_verification_soak(
     unchanged_frames = 0
     changed_frames = 0
     false_changes = 0
+    false_order_candidates = 0
+    guard_rejections = 0
     changed_misses = 0
     changed_pair_mismatches = 0
     stable_changed_detections = 0
     previous_changed = None
+    previous_unexpected_change = None
     busy_seconds_total = 0.0
     busy_seconds_since_sample = 0.0
     changed_pair_period = max(120, int(round(target_hz * 10.0)))
@@ -211,12 +271,15 @@ def run_verification_soak(
             "unchanged_frames": unchanged_frames,
             "changed_frames": changed_frames,
             "false_changes": false_changes,
+            "false_order_candidates": false_order_candidates,
+            "guard_rejections": guard_rejections,
             "changed_misses": changed_misses,
             "changed_pair_mismatches": changed_pair_mismatches,
             "stable_changed_detections": stable_changed_detections,
             "input_calls": 0,
             "frame_interval_ms": frame_intervals.summary(),
             "classify_ms": classify_latency.summary(),
+            "guard_ms": guard_latency.summary(),
             "cpu_total_percent": cpu_percent.summary(),
             "working_set_mb": working_set_mb.summary(),
             "private_mb": private_mb.summary(),
@@ -240,6 +303,8 @@ def run_verification_soak(
         passed = bool(
             finished
             and false_changes == 0
+            and false_order_candidates == 0
+            and guard_rejections == 0
             and changed_misses == 0
             and changed_pair_mismatches == 0
             and stable_changed_detections > 0
@@ -269,12 +334,42 @@ def run_verification_soak(
         frame_index = frames
         pair_offset = frame_index % changed_pair_period
         is_changed = pair_offset in (0, 1)
+        popup_shift_index = (
+            frame_index // 2
+        ) % len(popup_shifts)
+        popup_dx, popup_dy = popup_shifts[popup_shift_index]
         if is_changed:
-            candidate = changed_corpus[
-                (frame_index // changed_pair_period) % len(changed_corpus)
-            ]
+            corpus_index = (
+                frame_index // changed_pair_period
+            ) % len(changed_corpus)
+            guard_frame = _translate_image(
+                changed_guard_corpus[corpus_index],
+                popup_dx,
+                popup_dy,
+            )
         else:
-            candidate = same_corpus[frame_index % len(same_corpus)]
+            # Keep every unchanged render for two distinct frames.  This
+            # exercises the exact confirmation path that could otherwise
+            # turn two identical false CHANGED results into a real order.
+            corpus_index = (frame_index // 2) % len(same_corpus)
+            guard_frame = _translate_image(
+                same_guard_corpus[corpus_index],
+                popup_dx,
+                popup_dy,
+            )
+        guard_started = time.perf_counter()
+        registration = modal_guard.register(guard_frame, 0.0, 0.0)
+        guard_latency.add(
+            (time.perf_counter() - guard_started) * 1000.0
+        )
+        if not registration.valid:
+            guard_rejections += 1
+            candidate = baseline
+        else:
+            candidate = crop_price_from_guard(
+                registration.aligned,
+                price_box,
+            )
         classify_started = time.perf_counter()
         result = classifier.classify(candidate)
         classify_latency.add(
@@ -282,6 +377,7 @@ def run_verification_soak(
         )
         if is_changed:
             changed_frames += 1
+            previous_unexpected_change = None
             if result.state is not PriceState.CHANGED:
                 changed_misses += 1
                 previous_changed = None
@@ -300,6 +396,19 @@ def run_verification_soak(
             previous_changed = None
             if result.state is PriceState.CHANGED:
                 false_changes += 1
+                if (
+                    previous_unexpected_change is not None
+                    and classifier.same_candidate(
+                        previous_unexpected_change,
+                        result,
+                    )
+                ):
+                    false_order_candidates += 1
+                    previous_unexpected_change = None
+                else:
+                    previous_unexpected_change = result
+            else:
+                previous_unexpected_change = None
         frame_busy_seconds = time.perf_counter() - frame_work_started
         busy_seconds_total += frame_busy_seconds
         busy_seconds_since_sample += frame_busy_seconds
@@ -326,3 +435,22 @@ def run_verification_soak(
     report = build_report(finished=True)
     _write_report(report_path, report)
     return 0 if bool(report["passed"]) else 1
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the local renewal safety endurance verifier.",
+    )
+    parser.add_argument("--seconds", type=float, required=True)
+    parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--hz", type=float, default=120.0)
+    arguments = parser.parse_args()
+    return run_verification_soak(
+        arguments.seconds,
+        arguments.report,
+        target_hz=arguments.hz,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

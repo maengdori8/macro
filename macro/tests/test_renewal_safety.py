@@ -391,6 +391,7 @@ class RenewalSafetyTests(unittest.TestCase):
                     0.0,
                 )
                 self.assertTrue(registration.valid)
+                self.assertEqual(registration.shift_x, -shift_x)
                 current = renewal.crop_price_from_guard(
                     registration.aligned,
                     self.price_box,
@@ -406,6 +407,7 @@ class RenewalSafetyTests(unittest.TestCase):
                     0.0,
                 )
                 self.assertTrue(registration.valid)
+                self.assertEqual(registration.shift_x, -shift_x)
                 current = renewal.crop_price_from_guard(
                     registration.aligned,
                     self.price_box,
@@ -414,6 +416,44 @@ class RenewalSafetyTests(unittest.TestCase):
                     classifier.classify(current).state,
                     renewal.PriceState.CHANGED,
                 )
+
+    def test_guard_alignment_noise_never_hides_whole_popup_shift(self) -> None:
+        for brightness in (0, 12):
+            guard_detector = renewal.RenewalModalGuard(
+                self.guard,
+                self.price_box,
+                shift_limit=4,
+            )
+            for shift_y in range(-4, 5):
+                for shift_x in range(-4, 5):
+                    with self.subTest(
+                        brightness=brightness,
+                        shift_x=shift_x,
+                        shift_y=shift_y,
+                    ):
+                        shifted = renewal._translate_image(
+                            self.guard,
+                            shift_x,
+                            shift_y,
+                        )
+                        shifted = np.clip(
+                            shifted.astype(np.int16) + brightness,
+                            0,
+                            255,
+                        ).astype(np.uint8)
+                        registration = guard_detector.register(
+                            shifted,
+                            10.0,
+                            0.001,
+                        )
+                        self.assertTrue(registration.valid)
+                        self.assertEqual(
+                            (
+                                registration.shift_x,
+                                registration.shift_y,
+                            ),
+                            (-shift_x, -shift_y),
+                        )
 
     def test_incomplete_brightness_and_wrong_popup_never_become_changes(self) -> None:
         classifier = renewal.RenewalPriceClassifier(

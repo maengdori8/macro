@@ -1444,6 +1444,7 @@ class RenewalModalGuard:
             baseline = cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY)
         self.baseline = baseline.copy()
         self.shift_limit = min(4, max(1, int(shift_limit)))
+        self._last_shift = (0, 0)
         self.mask = np.full(self.baseline.shape, 255, dtype=np.uint8)
         x1, y1, x2, y2 = price_box
         margin = 4
@@ -1466,6 +1467,114 @@ class RenewalModalGuard:
         )
         self.baseline_dilated = cv2.dilate(
             self.baseline_edges, self._DILATE_KERNEL
+        )
+        self._baseline_float = self.baseline.astype(np.float32)
+        unit_shift_scores = [
+            self._registration_luma(
+                _translate_image(self.baseline, dx, dy)
+            )
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        ]
+        # A direct/cached match must remain well below the weakest visible
+        # one-pixel translation of this exact guard.  This prevents measured
+        # brightness noise from ever widening the shortcut enough to swallow
+        # real popup movement.
+        self._direct_spatial_limit = max(
+            0.20,
+            min(1.50, min(unit_shift_scores) * 0.45),
+        )
+        self._registration_templates: list[
+            tuple[int, int, int, int, np.ndarray]
+        ] = []
+        static_margin = self.shift_limit + 4
+        height, width = self.baseline.shape
+        candidate_rects = (
+            (
+                rim,
+                rim,
+                width - rim,
+                max(rim + 8, y1 - static_margin),
+            ),
+            (
+                rim,
+                min(height - rim - 8, y2 + static_margin),
+                width - rim,
+                height - rim,
+            ),
+            (
+                rim,
+                rim,
+                max(rim + 8, x1 - static_margin),
+                height - rim,
+            ),
+            (
+                min(width - rim - 8, x2 + static_margin),
+                rim,
+                width - rim,
+                height - rim,
+            ),
+        )
+        full_edges = cv2.Canny(
+            cv2.GaussianBlur(self.baseline, (3, 3), 0),
+            40,
+            120,
+        )
+        for left, top, right, bottom in candidate_rects:
+            if (
+                left < self.shift_limit
+                or top < self.shift_limit
+                or right + self.shift_limit > width
+                or bottom + self.shift_limit > height
+                or right - left < 8
+                or bottom - top < 8
+            ):
+                continue
+            template = full_edges[top:bottom, left:right]
+            if cv2.countNonZero(template) < 8:
+                continue
+            self._registration_templates.append(
+                (left, top, right, bottom, template)
+            )
+
+    def _registration_luma(self, gray: np.ndarray) -> float:
+        """Return spatial error after removing a uniform brightness offset."""
+        difference = gray.astype(np.float32) - self._baseline_float
+        brightness_offset = float(cv2.mean(difference, mask=self.mask)[0])
+        spatial_difference = np.abs(difference - brightness_offset)
+        return float(cv2.mean(spatial_difference, mask=self.mask)[0])
+
+    def _template_shift(
+        self,
+        candidate_edges: np.ndarray,
+    ) -> Optional[tuple[int, int]]:
+        if not self._registration_templates:
+            return None
+        combined: Optional[np.ndarray] = None
+        limit = self.shift_limit
+        for left, top, right, bottom, template in (
+            self._registration_templates
+        ):
+            search = candidate_edges[
+                top - limit : bottom + limit,
+                left - limit : right + limit,
+            ]
+            scores = cv2.matchTemplate(
+                search,
+                template,
+                cv2.TM_SQDIFF_NORMED,
+            )
+            if not np.all(np.isfinite(scores)):
+                return None
+            if combined is None:
+                combined = scores
+            else:
+                combined = cv2.add(combined, scores)
+        if combined is None:
+            return None
+        minimum_location = cv2.minMaxLoc(combined)[2]
+        return (
+            limit - int(minimum_location[0]),
+            limit - int(minimum_location[1]),
         )
 
     def metrics(self, image: np.ndarray) -> tuple[float, float]:
@@ -1522,11 +1631,18 @@ class RenewalModalGuard:
             return GuardRegistration(False, gray, 0, 0, 255.0, 1.0)
         luma_limit = max(12.0, luma_noise * 4.0 + 2.0)
         edge_limit = max(0.10, edge_noise * 4.0 + 0.02)
+        registered_edge_limit = max(0.20, edge_limit)
 
         # 대부분의 정상 프레임은 이동이 없습니다. 먼저 0px을 검사해 81개 정렬
         # 후보 탐색을 피하고, 불일치일 때만 ±shift_limit 정밀 탐색으로 내려갑니다.
         direct_luma, direct_edge = self.metrics(gray)
-        if direct_luma <= luma_limit and direct_edge <= edge_limit:
+        direct_spatial = self._registration_luma(gray)
+        if (
+            direct_spatial <= self._direct_spatial_limit
+            and direct_luma <= luma_limit
+            and direct_edge <= registered_edge_limit
+        ):
+            self._last_shift = (0, 0)
             return GuardRegistration(
                 True,
                 gray,
@@ -1535,6 +1651,29 @@ class RenewalModalGuard:
                 direct_luma,
                 direct_edge,
             )
+
+        cached_dx, cached_dy = self._last_shift
+        if cached_dx != 0 or cached_dy != 0:
+            cached_aligned = _translate_image(
+                gray,
+                cached_dx,
+                cached_dy,
+            )
+            cached_luma, cached_edge = self.metrics(cached_aligned)
+            cached_spatial = self._registration_luma(cached_aligned)
+            if (
+                cached_spatial <= self._direct_spatial_limit
+                and cached_luma <= luma_limit
+                and cached_edge <= registered_edge_limit
+            ):
+                return GuardRegistration(
+                    True,
+                    cached_aligned,
+                    cached_dx,
+                    cached_dy,
+                    cached_luma,
+                    cached_edge,
+                )
 
         candidate_edges = cv2.Canny(
             cv2.GaussianBlur(gray, (3, 3), 0),
@@ -1545,14 +1684,46 @@ class RenewalModalGuard:
             candidate_edges,
             self._DILATE_KERNEL,
         )
-        # Edge overlap alone can prefer a diagonal near-match when the whole popup
-        # moved horizontally.  Choose the registration by guard luminance first,
-        # then use edge structure only as the tie breaker.  This preserves the
-        # exact inverse translation for ±4 px reopen jitter.
-        best: Optional[tuple[float, float, int, int, int]] = None
+        template_shift = self._template_shift(candidate_edges)
+        if template_shift is not None:
+            template_dx, template_dy = template_shift
+            template_aligned = _translate_image(
+                gray,
+                template_dx,
+                template_dy,
+            )
+            template_spatial = self._registration_luma(
+                template_aligned
+            )
+            template_luma, template_edge = self.metrics(
+                template_aligned
+            )
+            if (
+                template_spatial <= self._direct_spatial_limit
+                and template_luma <= luma_limit
+                and template_edge <= registered_edge_limit
+            ):
+                self._last_shift = (template_dx, template_dy)
+                return GuardRegistration(
+                    True,
+                    template_aligned,
+                    template_dx,
+                    template_dy,
+                    template_luma,
+                    template_edge,
+                )
+        # Edge overlap alone can prefer a diagonal near-match when the whole
+        # popup moved horizontally.  Choose by brightness-normalized spatial
+        # error first, then raw luminance and edge structure.  This preserves
+        # the exact inverse translation through reopen jitter and uniform
+        # brightness changes.
+        best: Optional[
+            tuple[float, float, float, int, int, int]
+        ] = None
         for dy in range(-self.shift_limit, self.shift_limit + 1):
             for dx in range(-self.shift_limit, self.shift_limit + 1):
                 shifted_gray = _translate_image(gray, dx, dy)
+                shifted_spatial = self._registration_luma(shifted_gray)
                 absolute = cv2.absdiff(self.baseline, shifted_gray)
                 shifted_luma = float(cv2.mean(absolute, mask=self.mask)[0])
                 shifted_edges = cv2.bitwise_and(
@@ -1582,6 +1753,7 @@ class RenewalModalGuard:
                     / float(union_count)
                 )
                 candidate = (
+                    shifted_spatial,
                     shifted_luma,
                     shifted_edge,
                     abs(dx) + abs(dy),
@@ -1591,16 +1763,23 @@ class RenewalModalGuard:
                 if best is None or candidate < best:
                     best = candidate
         assert best is not None
-        _luma, _edge, _distance, dx, dy = best
+        _spatial, _luma, _edge, _distance, dx, dy = best
         aligned = _translate_image(gray, dx, dy)
+        aligned_spatial = self._registration_luma(aligned)
         luma_delta, edge_delta = self.metrics(aligned)
         # Registration discards a narrow border, so a valid ±4 px translation
         # naturally has more unmatched edge pixels than a zero-shift frame.
         # Luminance still remains strict and prevents a different popup from
         # passing this relaxed registered-edge ceiling.
-        registered_edge_limit = max(0.20, edge_limit)
+        valid = (
+            aligned_spatial <= self._direct_spatial_limit
+            and luma_delta <= luma_limit
+            and edge_delta <= registered_edge_limit
+        )
+        if valid:
+            self._last_shift = (dx, dy)
         return GuardRegistration(
-            luma_delta <= luma_limit and edge_delta <= registered_edge_limit,
+            valid,
             aligned,
             dx,
             dy,
