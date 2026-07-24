@@ -513,6 +513,30 @@ class RenewalSafetyTests(unittest.TestCase):
                             (-shift_x, -shift_y),
                         )
 
+    def test_guard_rejects_closed_screen_without_exhaustive_shift_sweep(
+        self,
+    ) -> None:
+        guard_detector = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            shift_limit=4,
+        )
+        closed_screen = np.zeros_like(self.guard)
+        with patch.object(
+            renewal,
+            "_translate_image",
+            wraps=renewal._translate_image,
+        ) as translate:
+            registration = guard_detector.register(
+                closed_screen,
+                0.0,
+                0.0,
+            )
+        self.assertFalse(registration.valid)
+        # Neither template alignment nor the 9x9 fallback may run for a
+        # screen whose luminance is plainly not this popup.
+        self.assertEqual(translate.call_count, 0)
+
     def test_guard_accepts_only_structure_matched_smooth_illumination_drift(
         self,
     ) -> None:
@@ -784,6 +808,22 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
+
+    def test_three_incomplete_popup_attempts_stop_without_order(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[[]],
+        )
+        completed = _run(
+            self.profile,
+            engine,
+            monitor_only=True,
+        )
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)] * 3)
+        self.assertEqual(engine.escapes, 3)
+        self.assertEqual(engine.mode, "closed")
 
     def test_recorded_false_orders_replay_as_unchanged(self) -> None:
         diagnostic_root = (

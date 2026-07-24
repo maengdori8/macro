@@ -1856,6 +1856,7 @@ def _headless_monitor_existing(
     logs: list[str] = []
     statuses: list[str] = []
     cleanup_escape_sent = False
+    original_priority = _enable_safe_process_priority()
     started = time.perf_counter()
     try:
         if side_name not in ("buy", "sell"):
@@ -1885,20 +1886,37 @@ def _headless_monitor_existing(
         telemetry = dict(runner.telemetry)
         order_inputs = int(telemetry.get("order_clicks", 0))
         armed_openings = int(telemetry.get("armed_openings", 0))
+        confirmed_openings = int(
+            telemetry.get("confirmed_openings", 0)
+        )
+        max_open_failures = int(
+            telemetry.get("max_consecutive_open_failures", 0)
+        )
         initial_mismatch = bool(telemetry.get("initial_mismatch", False))
+        minimum_confirmed_openings = min(
+            1000,
+            max(2, int(duration * 1.5)),
+        )
+        monitor_detected = bool(telemetry.get("monitor_detected", False))
         passed = bool(
             order_inputs == 0
             and armed_openings >= 2
             and not initial_mismatch
+            and max_open_failures < 3
+            and (
+                monitor_detected
+                or confirmed_openings >= minimum_confirmed_openings
+            )
         )
         report.update(
             {
                 "passed": passed,
                 "order_inputs": order_inputs,
+                "minimum_confirmed_openings": minimum_confirmed_openings,
                 "telemetry": telemetry,
                 "stopped_by": (
                     "price_change_detected"
-                    if telemetry.get("monitor_detected")
+                    if monitor_detected
                     else (
                         "initial_price_mismatch"
                         if initial_mismatch
@@ -1969,6 +1987,7 @@ def _headless_monitor_existing(
             temporary.replace(report_path)
         except Exception:
             pass
+        _restore_process_priority(original_priority)
 
 
 def _headless_calibrate_existing(side_name: str) -> int:

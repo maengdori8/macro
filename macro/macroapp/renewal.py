@@ -1483,8 +1483,12 @@ class RenewalPriceClassifier:
                 int(round(prepared_dy * gray.shape[0] / self.detector._SIZE[1])),
             ),
         )
-        aligned = _translate_image(gray, dx, dy)
-        aligned_pair = self.detector.prepare_pair_reusable(aligned)
+        if dx == 0 and dy == 0:
+            aligned = gray
+            aligned_pair = pair
+        else:
+            aligned = _translate_image(gray, dx, dy)
+            aligned_pair = self.detector.prepare_pair_reusable(aligned)
         global_score, slice_score = self.detector.analyze_pair(aligned_pair)
         return (
             aligned,
@@ -1866,16 +1870,11 @@ class RenewalModalGuard:
             limit - int(minimum_location[1]),
         )
 
-    def metrics(self, image: np.ndarray) -> tuple[float, float]:
-        if image is None or image.size == 0:
-            return 255.0, 1.0
-        gray = image
-        if gray.ndim == 3:
-            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-        if gray.shape != self.baseline.shape:
-            return 255.0, 1.0
+    def _luma_delta(self, gray: np.ndarray) -> float:
         absolute = cv2.absdiff(self.baseline, gray)
-        luma_delta = float(cv2.mean(absolute, mask=self.mask)[0])
+        return float(cv2.mean(absolute, mask=self.mask)[0])
+
+    def _edge_delta(self, gray: np.ndarray) -> float:
         edges = cv2.bitwise_and(
             cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 40, 120),
             self.mask,
@@ -1896,7 +1895,17 @@ class RenewalModalGuard:
             if union_count <= 0
             else float(cv2.countNonZero(difference)) / float(union_count)
         )
-        return luma_delta, edge_delta
+        return edge_delta
+
+    def metrics(self, image: np.ndarray) -> tuple[float, float]:
+        if image is None or image.size == 0:
+            return 255.0, 1.0
+        gray = image
+        if gray.ndim == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        if gray.shape != self.baseline.shape:
+            return 255.0, 1.0
+        return self._luma_delta(gray), self._edge_delta(gray)
 
     def register(
         self,
@@ -1922,9 +1931,24 @@ class RenewalModalGuard:
         edge_limit = max(0.10, edge_noise * 4.0 + 0.02)
         registered_edge_limit = max(0.20, edge_limit)
 
+        # The two live price rows are excluded from this metric.  A guard
+        # this far from the calibrated popup is the closed/list screen or a
+        # different modal, not a legal +/-4 px movement.  Reject it before
+        # Canny, float registration, template matching, and the 9x9 fallback.
+        direct_luma = self._luma_delta(gray)
+        if direct_luma > max(96.0, luma_limit * 5.0):
+            return GuardRegistration(
+                False,
+                gray,
+                0,
+                0,
+                direct_luma,
+                1.0,
+            )
+
         # 대부분의 정상 프레임은 이동이 없습니다. 먼저 0px을 검사해 81개 정렬
         # 후보 탐색을 피하고, 불일치일 때만 ±shift_limit 정밀 탐색으로 내려갑니다.
-        direct_luma, direct_edge = self.metrics(gray)
+        direct_edge = self._edge_delta(gray)
         direct_spatial = self._registration_luma(gray)
         if (
             self._spatial_match(
@@ -2515,6 +2539,12 @@ class FastRenewalRunner:
         self.monitor_only = bool(monitor_only)
         self.telemetry: dict[str, object] = {
             "cycle_count": 0,
+            "popup_openings": 0,
+            "confirmed_openings": 0,
+            "unchanged_openings": 0,
+            "open_failures": 0,
+            "consecutive_open_failures": 0,
+            "max_consecutive_open_failures": 0,
             "armed_openings": 0,
             "ambiguous_count": 0,
             "monitor_detected": False,
@@ -2623,6 +2653,7 @@ class FastRenewalRunner:
         armed_openings = 0
         order_latched = False
         cycle_count = 0
+        consecutive_open_failures = 0
         last_sequence_id = -1
         last_captured_at = float("-inf")
         frame_intervals: deque[float] = deque(maxlen=240)
@@ -2862,6 +2893,9 @@ class FastRenewalRunner:
                         (time.perf_counter() - action_started) * 1000.0
                     )
                     open_recorded = True
+                    self.telemetry["popup_openings"] = (
+                        int(self.telemetry["popup_openings"]) + 1
+                    )
                 price = crop_price_from_guard(registration.aligned, price_box)
                 classify_started = time.perf_counter()
                 result = classifier.classify(price)
@@ -2913,6 +2947,38 @@ class FastRenewalRunner:
                     close_modal(allow_stopped=True)
                 update_performance_telemetry()
                 return False
+
+            if decision is None and not ambiguous:
+                consecutive_open_failures += 1
+                self.telemetry["open_failures"] = (
+                    int(self.telemetry["open_failures"]) + 1
+                )
+                self.telemetry["consecutive_open_failures"] = (
+                    consecutive_open_failures
+                )
+                self.telemetry["max_consecutive_open_failures"] = max(
+                    int(self.telemetry["max_consecutive_open_failures"]),
+                    consecutive_open_failures,
+                )
+                if not close_modal():
+                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
+                    return False
+                if consecutive_open_failures >= 3:
+                    self.status("팝업 3회 연속 미개방 · 안전 정지")
+                    self.log(
+                        "[안전 차단 v9] 완성된 가격 팝업을 3회 연속 "
+                        "확인하지 못해 주문 없이 정지합니다."
+                    )
+                    update_performance_telemetry()
+                    return False
+                continue
+
+            consecutive_open_failures = 0
+            self.telemetry["consecutive_open_failures"] = 0
+            if decision is not None:
+                self.telemetry["confirmed_openings"] = (
+                    int(self.telemetry["confirmed_openings"]) + 1
+                )
 
             if ambiguous and last_result is not None:
                 self.telemetry["ambiguous_count"] = (
@@ -3071,6 +3137,9 @@ class FastRenewalRunner:
                 return True
 
             if decision is PriceState.UNCHANGED:
+                self.telemetry["unchanged_openings"] = (
+                    int(self.telemetry["unchanged_openings"]) + 1
+                )
                 if armed_openings < required_arm_openings:
                     armed_openings += 1
                     self.telemetry["armed_openings"] = armed_openings
