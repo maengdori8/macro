@@ -133,7 +133,11 @@ class TurboSessionTests(unittest.TestCase):
     def test_resize_and_restore_keep_window_inactive(self) -> None:
         original = turbo.WindowRect(-4, -4, 2564, 1404)
         resized = turbo.WindowRect(-4, -4, 1924, 1044)
-        fake_user32 = SimpleNamespace(SetWindowPos=Mock(return_value=True))
+        fake_user32 = SimpleNamespace(
+            IsZoomed=Mock(return_value=False),
+            SetWindowPos=Mock(return_value=True),
+            ShowWindowAsync=Mock(return_value=True),
+        )
         with (
             patch.object(turbo, "_user32", fake_user32),
             patch.object(
@@ -166,6 +170,55 @@ class TurboSessionTests(unittest.TestCase):
             restored = turbo.restore_window_no_activate(snapshot)
         self.assertEqual((restored.width, restored.height), (2568, 1408))
         restore_flags = fake_user32.SetWindowPos.call_args.args[-1]
+        self.assertTrue(restore_flags & turbo._SWP_NOACTIVATE)
+
+    def test_maximized_window_is_restored_without_activation_before_resize(
+        self,
+    ) -> None:
+        original = turbo.WindowRect(-4, -4, 1924, 1044)
+        resized = turbo.WindowRect(-4, -4, 1932, 1052)
+        fake_user32 = SimpleNamespace(
+            IsZoomed=Mock(side_effect=(True, False, False)),
+            SetWindowPos=Mock(return_value=True),
+            ShowWindowAsync=Mock(return_value=True),
+        )
+        with (
+            patch.object(turbo, "_user32", fake_user32),
+            patch.object(
+                turbo,
+                "_get_window_rect",
+                side_effect=(original, resized),
+            ),
+        ):
+            snapshot = turbo.resize_window_no_activate(99, (1936, 1056))
+        self.assertTrue(snapshot.original_was_maximized)
+        fake_user32.ShowWindowAsync.assert_called_once_with(
+            99,
+            turbo._SW_SHOWNOACTIVATE,
+        )
+        resize_flags = fake_user32.SetWindowPos.call_args.args[-1]
+        self.assertTrue(resize_flags & turbo._SWP_NOACTIVATE)
+
+        restore_user32 = SimpleNamespace(
+            IsZoomed=Mock(side_effect=(False, True, True)),
+            SetWindowPos=Mock(return_value=True),
+            ShowWindowAsync=Mock(return_value=True),
+        )
+        with (
+            patch.object(turbo, "_user32", restore_user32),
+            patch.object(
+                turbo,
+                "_get_window_rect",
+                side_effect=(resized, original),
+            ),
+        ):
+            restored = turbo.restore_window_no_activate(snapshot)
+        self.assertEqual(restored, original)
+        restore_user32.ShowWindowAsync.assert_called_once_with(
+            99,
+            turbo._SW_SHOWMAXIMIZED,
+        )
+        restore_flags = restore_user32.SetWindowPos.call_args.args[-1]
         self.assertTrue(restore_flags & turbo._SWP_NOACTIVATE)
 
     def test_target_outer_size_uses_measured_wgc_difference(self) -> None:

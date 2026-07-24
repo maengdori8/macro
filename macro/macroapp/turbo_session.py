@@ -29,6 +29,8 @@ _PROCESS_VM_READ = 0x0010
 _PROCESS_QUERY_INFORMATION = 0x0400
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WM_CLOSE = 0x0010
+_SW_SHOWMAXIMIZED = 3
+_SW_SHOWNOACTIVATE = 4
 _SWP_NOZORDER = 0x0004
 _SWP_NOACTIVATE = 0x0010
 _SWP_FRAMECHANGED = 0x0020
@@ -184,6 +186,7 @@ class WindowResizeSnapshot:
     hwnd: int
     original: WindowRect
     resized: WindowRect
+    original_was_maximized: bool = False
 
 
 class _FILETIME(ctypes.Structure):
@@ -290,6 +293,8 @@ if os.name == "nt":
     ]
     _user32.IsWindow.argtypes = [wintypes.HWND]
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.IsZoomed.argtypes = [wintypes.HWND]
+    _user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.GetWindowThreadProcessId.argtypes = [
         wintypes.HWND,
         ctypes.POINTER(wintypes.DWORD),
@@ -750,9 +755,19 @@ def resize_window_no_activate(
     """창을 활성화하거나 Z 순서를 바꾸지 않고 목표 외곽 크기로 조정합니다."""
 
     original = _get_window_rect(hwnd)
+    original_was_maximized = bool(_user32.IsZoomed(int(hwnd)))
     width, height = (int(target_size[0]), int(target_size[1]))
     if width < 640 or height < 480:
         raise ValueError("터보 창 크기가 너무 작습니다.")
+    if original_was_maximized:
+        # SetWindowPos cannot resize a maximized FC window.  This restores the
+        # normal placement without activating the game or changing Z order.
+        _user32.ShowWindowAsync(int(hwnd), _SW_SHOWNOACTIVATE)
+        deadline = time.monotonic() + 1.0
+        while bool(_user32.IsZoomed(int(hwnd))) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if bool(_user32.IsZoomed(int(hwnd))):
+            raise RuntimeError("FC ONLINE maximized window could not be restored.")
     if not _user32.SetWindowPos(
         int(hwnd),
         0,
@@ -775,11 +790,18 @@ def resize_window_no_activate(
             original.height,
             _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
         )
+        if original_was_maximized:
+            _user32.ShowWindowAsync(int(hwnd), _SW_SHOWMAXIMIZED)
         raise RuntimeError(
             f"FC ONLINE이 목표 크기를 적용하지 않았습니다: "
             f"{resized.width}x{resized.height}"
         )
-    return WindowResizeSnapshot(int(hwnd), original, resized)
+    return WindowResizeSnapshot(
+        int(hwnd),
+        original,
+        resized,
+        original_was_maximized,
+    )
 
 
 def restore_window_no_activate(snapshot: WindowResizeSnapshot) -> WindowRect:
@@ -797,6 +819,16 @@ def restore_window_no_activate(snapshot: WindowResizeSnapshot) -> WindowRect:
         _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
     ):
         raise RuntimeError("FC ONLINE 원래 창 크기 복원이 거부되었습니다.")
+    if snapshot.original_was_maximized:
+        _user32.ShowWindowAsync(int(snapshot.hwnd), _SW_SHOWMAXIMIZED)
+        deadline = time.monotonic() + 1.0
+        while (
+            not bool(_user32.IsZoomed(int(snapshot.hwnd)))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        if not bool(_user32.IsZoomed(int(snapshot.hwnd))):
+            raise RuntimeError("FC ONLINE maximized state could not be restored.")
     restored = _get_window_rect(snapshot.hwnd)
     if (
         abs(restored.left - original.left) > 2
