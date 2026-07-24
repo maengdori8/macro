@@ -1971,7 +1971,16 @@ def build_calibration_result(
     ):
         raise ValueError("닫힌 화면 보정 프레임의 크기가 서로 다릅니다.")
 
-    reference_guard = guard_samples[0]
+    # The capture phase admits a popup only after four complete, same-price
+    # frames and registers later openings against their median.  Use that same
+    # robust first-opening reference here; a single transition-adjacent frame
+    # must not become the permanent spatial authority.
+    reference_guard = np.median(
+        np.stack(
+            guard_sessions[0][:RENEWAL_CALIBRATION_FRAMES_PER_OPENING]
+        ),
+        axis=0,
+    ).astype(np.uint8)
     reference_price = crop_price_from_guard(reference_guard, price_box)
     validation = validate_price_region(reference_price)
     if not validation.valid:

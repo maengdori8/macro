@@ -2247,10 +2247,20 @@ def _headless_calibrate_existing(side_name: str) -> int:
         return 0
     except Exception as exc:
         if diagnostic_price_box is not None:
+            accepted_open_guards = [
+                guard
+                for name, guard in corpus_frames
+                if name.startswith("open_")
+            ]
+            diagnostic_guards = (
+                accepted_open_guards + recent_guard_frames[-2:]
+                if accepted_open_guards
+                else recent_guard_frames
+            )
             _save_calibration_diagnostic(
                 side_name,
                 "headless_calibration_failed",
-                recent_guard_frames,
+                diagnostic_guards,
                 diagnostic_price_box,
                 {
                     "phase": "headless_existing_roi",
