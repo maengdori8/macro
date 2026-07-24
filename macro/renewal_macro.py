@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
 import queue
 import sys
@@ -48,6 +49,22 @@ from macroapp.renewal import (
     price_box_in_guard,
     save_renewal_profile,
     validate_price_region,
+)
+from macroapp.turbo_session import (
+    MIN_AVAILABLE_RAM_GB,
+    TARGET_AVAILABLE_RAM_GB,
+    TARGET_FREE_VRAM_GB,
+    TARGET_WGC_SIZE,
+    TurboCandidate,
+    WindowResizeSnapshot,
+    close_selected_gracefully,
+    force_close_remaining,
+    get_window_rect,
+    group_candidates,
+    measure_pressure,
+    resize_window_no_activate,
+    restore_window_no_activate,
+    scan_processes,
 )
 from macroapp.window import InactiveManager
 
@@ -271,7 +288,12 @@ class RenewalApp:
         self.closing = False
         self._starting = False
         self._capture_buttons: list[tk.Button] = []
+        self._turbo_buttons: list[tk.Button] = []
+        self._turbo_checkboxes: list[tk.Checkbutton] = []
         self._original_priority_class = _enable_safe_process_priority()
+        self._turbo_candidates: tuple[TurboCandidate, ...] = ()
+        self._turbo_vars: dict[str, tk.BooleanVar] = {}
+        self._turbo_window_snapshot: Optional[WindowResizeSnapshot] = None
 
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         self.side_var = tk.StringVar(value="buy")
@@ -281,6 +303,7 @@ class RenewalApp:
         self.status_var = tk.StringVar(value="좌표 설정 후 F8")
         self.clock_var = tk.StringVar(value="--:--:--")
         self.setting_status_var = tk.StringVar(value="")
+        self.turbo_status_var = tk.StringVar(value="터보 상태 확인 중")
 
         self._log_file = None
         try:
@@ -295,8 +318,8 @@ class RenewalApp:
             pass
 
         self.root.title(f"mAuto 갱신매크로 {APP_VERSION}")
-        self.root.geometry("760x650+120+70")
-        self.root.minsize(720, 610)
+        self.root.geometry("820x930+120+20")
+        self.root.minsize(760, 850)
         self.root.resizable(True, True)
         self.root.configure(bg=self.COLORS["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -498,6 +521,55 @@ class RenewalApp:
         self.monitor_checkbox.pack(anchor=tk.W, pady=(8, 0))
         self._on_speed_changed(str(self.speed_var.get()))
 
+        turbo_panel = self._panel(body, "4. 16GB 터보 세션")
+        turbo_panel.pack(fill=tk.X, pady=(0, 10))
+        turbo_controls = tk.Frame(turbo_panel, bg=c["panel"])
+        turbo_controls.pack(fill=tk.X, pady=(0, 7))
+        refresh_button = self._button(
+            turbo_controls,
+            "앱·메모리 검사",
+            self._refresh_turbo_session,
+            small=True,
+        )
+        refresh_button.pack(side=tk.LEFT, padx=(0, 7))
+        close_button = self._button(
+            turbo_controls,
+            "선택 앱 종료",
+            self._close_selected_turbo_apps,
+            small=True,
+        )
+        close_button.pack(side=tk.LEFT, padx=(0, 7))
+        resize_button = self._button(
+            turbo_controls,
+            "1080p 창 맞춤",
+            self._resize_game_window,
+            small=True,
+        )
+        resize_button.pack(side=tk.LEFT, padx=(0, 7))
+        restore_button = self._button(
+            turbo_controls,
+            "원래 크기 복원",
+            self._restore_game_window,
+            small=True,
+        )
+        restore_button.pack(side=tk.LEFT)
+        self._turbo_buttons.extend(
+            (refresh_button, close_button, resize_button, restore_button)
+        )
+
+        self.turbo_apps_frame = tk.Frame(turbo_panel, bg=c["panel"])
+        self.turbo_apps_frame.pack(fill=tk.X)
+        tk.Label(
+            turbo_panel,
+            textvariable=self.turbo_status_var,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8),
+        ).pack(fill=tk.X, pady=(7, 0))
+        self._refresh_turbo_session()
+
         status_panel = self._panel(body, "상태")
         status_panel.pack(fill=tk.X, pady=(0, 10))
         tk.Label(
@@ -530,6 +602,7 @@ class RenewalApp:
             and side.closed_guard_png
             and side.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
             and side.calibration_version >= RENEWAL_CALIBRATION_VERSION
+            and side.calibrated_frame_size() is not None
         )
         self.setting_status_var.set(
             "공통: 가격이 그대로면 ESC 후 다시 열기\n"
@@ -563,6 +636,287 @@ class RenewalApp:
                 f"{required_frames}프레임 · 애매하면 주문 금지"
             )
         self.speed_status_var.set(text)
+
+    def _refresh_turbo_session(self) -> None:
+        """종료 허용 앱과 시스템 압박을 한 번만 읽어 UI에 표시합니다."""
+
+        previous = {
+            key: bool(variable.get())
+            for key, variable in self._turbo_vars.items()
+        }
+        try:
+            processes = scan_processes()
+            candidates = group_candidates(processes)
+            pressure = measure_pressure(processes)
+        except Exception as exc:
+            self._turbo_candidates = ()
+            self.turbo_status_var.set(f"터보 검사 실패: {exc}")
+            return
+
+        self._turbo_candidates = candidates
+        for child in self.turbo_apps_frame.winfo_children():
+            child.destroy()
+        self._turbo_vars = {}
+        self._turbo_checkboxes = []
+        for index, candidate in enumerate(candidates):
+            variable = tk.BooleanVar(
+                value=previous.get(candidate.key, True)
+            )
+            self._turbo_vars[candidate.key] = variable
+            text = (
+                f"{candidate.label} "
+                f"{candidate.working_set_mb:.0f}MB/{candidate.process_count}개"
+            )
+            checkbox = tk.Checkbutton(
+                self.turbo_apps_frame,
+                text=text,
+                variable=variable,
+                bg=self.COLORS["panel"],
+                fg=self.COLORS["text"],
+                activebackground=self.COLORS["panel"],
+                activeforeground=self.COLORS["text"],
+                selectcolor=self.COLORS["input"],
+                highlightthickness=0,
+                font=self._font(8, bold=True),
+            )
+            checkbox.grid(
+                row=index // 2,
+                column=index % 2,
+                sticky=tk.W,
+                padx=(0, 20),
+                pady=1,
+            )
+            self._turbo_checkboxes.append(checkbox)
+        if not candidates:
+            tk.Label(
+                self.turbo_apps_frame,
+                text="종료 가능한 백그라운드 앱 없음",
+                bg=self.COLORS["panel"],
+                fg=self.COLORS["ok"],
+                font=self._font(8, bold=True),
+            ).pack(anchor=tk.W)
+
+        ram_text = (
+            f"RAM 여유 {pressure.available_ram_gb:.1f}GB"
+            if pressure.available_ram_gb is not None
+            else "RAM 측정 불가"
+        )
+        pagefile_text = (
+            f"페이지파일 사용 {pressure.pagefile_used_gb:.1f}GB"
+            if pressure.pagefile_used_gb is not None
+            else "페이지파일 측정 불가"
+        )
+        vram_text = (
+            f"VRAM 여유 {pressure.free_vram_gb:.1f}/"
+            f"{pressure.total_vram_gb:.1f}GB"
+            if (
+                pressure.free_vram_gb is not None
+                and pressure.total_vram_gb is not None
+            )
+            else "VRAM 측정 불가"
+        )
+        overlay_text = (
+            " · NVIDIA Overlay 켜짐(수동 비활성 권장)"
+            if pressure.nvidia_overlay_running
+            else ""
+        )
+        selected_mb = sum(
+            candidate.working_set_mb
+            for candidate in candidates
+            if self._turbo_vars[candidate.key].get()
+        )
+        self.turbo_status_var.set(
+            f"{ram_text} · {pagefile_text} · {vram_text}{overlay_text}\n"
+            f"선택 앱 현재 점유 {selected_mb:.0f}MB · "
+            f"목표 RAM {TARGET_AVAILABLE_RAM_GB:.0f}GB+/VRAM "
+            f"{TARGET_FREE_VRAM_GB:.0f}GB+ · WGC "
+            f"{TARGET_WGC_SIZE[0]}x{TARGET_WGC_SIZE[1]}"
+        )
+
+    def _selected_turbo_keys(self) -> set[str]:
+        return {
+            key
+            for key, variable in self._turbo_vars.items()
+            if bool(variable.get())
+        }
+
+    def _close_selected_turbo_apps(self) -> bool:
+        """선택 앱을 정상 종료하고 남은 동일 PID는 재확인 뒤 종료합니다."""
+
+        selected_keys = self._selected_turbo_keys()
+        selected = tuple(
+            candidate
+            for candidate in self._turbo_candidates
+            if candidate.key in selected_keys
+        )
+        if not selected:
+            self.status_var.set("종료할 터보 앱 없음")
+            return True
+        lines = [
+            f"• {candidate.label}: {candidate.working_set_mb:.0f}MB "
+            f"({candidate.process_count}개)"
+            for candidate in selected
+        ]
+        if not messagebox.askokcancel(
+            "선택 앱 종료",
+            "아래 앱을 정상 종료합니다. 저장하지 않은 작업을 먼저 확인하세요.\n\n"
+            + "\n".join(lines)
+            + "\n\nFC ONLINE·안티치트·Windows·매크로는 건드리지 않습니다.",
+            parent=self.root,
+            default=messagebox.CANCEL,
+        ):
+            return False
+
+        self.status_var.set("선택 앱 정상 종료 중")
+        self.root.update_idletasks()
+        result = close_selected_gracefully(
+            self._turbo_candidates,
+            selected_keys,
+            timeout_seconds=2.0,
+        )
+        closed_count = len(result.closed)
+        remaining = result.remaining
+        if remaining:
+            remaining_pids = len(remaining)
+            if messagebox.askyesno(
+                "종료되지 않은 앱",
+                f"정상 종료 후에도 선택 앱 프로세스 {remaining_pids}개가 남았습니다.\n"
+                "같은 PID와 생성 시각을 다시 확인한 뒤 강제 종료할까요?\n\n"
+                "저장하지 않은 브라우저 입력 내용은 사라질 수 있습니다.",
+                parent=self.root,
+                default=messagebox.NO,
+            ):
+                forced = force_close_remaining(remaining)
+                closed_count += len(forced.closed)
+                remaining = forced.remaining
+
+        self._refresh_turbo_session()
+        if remaining:
+            self.status_var.set(
+                f"터보 앱 {closed_count}개 종료 · {len(remaining)}개 남음"
+            )
+        else:
+            self.status_var.set(f"터보 앱 {closed_count}개 종료 완료")
+        return True
+
+    def _find_game_hwnd(self) -> Optional[int]:
+        manager = InactiveManager(
+            self.window_title_var.get().strip(),
+            logger=self.log,
+        )
+        if not manager.find_window() or manager.hwnd is None:
+            self.status_var.set("FC ONLINE 창을 찾지 못함")
+            return None
+        return int(manager.hwnd)
+
+    def _invalidate_size_calibration(self) -> None:
+        for side in (self.profile.buy, self.profile.sell):
+            side.calibration_openings = 0
+            side.calibration_version = 0
+            side.calibrated_frame_width = 0
+            side.calibrated_frame_height = 0
+        self._save_settings()
+        self._refresh_status()
+
+    def _resize_game_window(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.status_var.set("실행 중에는 창 크기 변경 불가")
+            return
+        hwnd = self._find_game_hwnd()
+        if hwnd is None:
+            return
+        try:
+            current = get_window_rect(hwnd)
+            if (current.width, current.height) == TARGET_WGC_SIZE:
+                self.status_var.set(
+                    f"이미 1080p 터보 크기 {current.width}x{current.height}"
+                )
+                return
+            snapshot = resize_window_no_activate(hwnd, TARGET_WGC_SIZE)
+        except Exception as exc:
+            messagebox.showerror(
+                "1080p 창 맞춤 실패",
+                str(exc),
+                parent=self.root,
+            )
+            self.status_var.set("1080p 창 맞춤 실패")
+            return
+        self._turbo_window_snapshot = snapshot
+        self._invalidate_size_calibration()
+        self.status_var.set(
+            f"FC 창 {snapshot.original.width}x{snapshot.original.height} → "
+            f"{snapshot.resized.width}x{snapshot.resized.height} · "
+            "구매/판매 가격영역 재설정 필요"
+        )
+
+    def _restore_game_window(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.status_var.set("실행 중에는 창 크기 복원 불가")
+            return
+        snapshot = self._turbo_window_snapshot
+        if snapshot is None:
+            self.status_var.set("이번 세션에 저장된 원래 창 크기 없음")
+            return
+        try:
+            restored = restore_window_no_activate(snapshot)
+        except Exception as exc:
+            messagebox.showerror(
+                "원래 크기 복원 실패",
+                str(exc),
+                parent=self.root,
+            )
+            self.status_var.set("원래 창 크기 복원 실패")
+            return
+        self._turbo_window_snapshot = None
+        self._invalidate_size_calibration()
+        self.status_var.set(
+            f"FC 창 {restored.width}x{restored.height} 복원 · "
+            "구매/판매 가격영역 재설정 필요"
+        )
+
+    def _confirm_turbo_pressure(self) -> bool:
+        """시작 직전 압박이 목표보다 높으면 사용자가 명시적으로 결정합니다."""
+
+        try:
+            processes = scan_processes()
+            pressure = measure_pressure(processes)
+        except Exception:
+            return True
+        warnings: list[str] = []
+        if (
+            pressure.available_ram_gb is not None
+            and pressure.available_ram_gb < TARGET_AVAILABLE_RAM_GB
+        ):
+            level = (
+                "매우 부족"
+                if pressure.available_ram_gb < MIN_AVAILABLE_RAM_GB
+                else "목표 미달"
+            )
+            warnings.append(
+                f"RAM 여유 {pressure.available_ram_gb:.1f}GB ({level}, "
+                f"목표 {TARGET_AVAILABLE_RAM_GB:.0f}GB)"
+            )
+        if (
+            pressure.free_vram_gb is not None
+            and pressure.free_vram_gb < TARGET_FREE_VRAM_GB
+        ):
+            warnings.append(
+                f"VRAM 여유 {pressure.free_vram_gb:.1f}GB "
+                f"(목표 {TARGET_FREE_VRAM_GB:.0f}GB)"
+            )
+        if pressure.nvidia_overlay_running:
+            warnings.append("NVIDIA Overlay 실행 중")
+        if not warnings:
+            return True
+        return bool(
+            messagebox.askyesno(
+                "터보 목표 미달",
+                "\n".join(f"• {warning}" for warning in warnings)
+                + "\n\n이 상태에서도 갱신을 시작할까요?",
+                parent=self.root,
+                default=messagebox.NO,
+            )
+        )
 
     def _capture_frame(self) -> Optional[np.ndarray]:
         manager = InactiveManager(self.window_title_var.get().strip(), logger=self.log)
@@ -685,7 +1039,7 @@ class RenewalApp:
                     flush()
 
                 self.status_var.set(
-                    f"v7 120Hz 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
+                    f"v8 1080p 보정 {opening + 1}/{RENEWAL_CALIBRATION_OPENINGS} · "
                     "창을 조작하지 마세요"
                 )
                 self.root.update_idletasks()
@@ -884,6 +1238,8 @@ class RenewalApp:
             side.registration_shift_limit = calibration.registration_shift_limit
             side.calibration_openings = calibration.calibration_openings
             side.calibration_version = RENEWAL_CALIBRATION_VERSION
+            side.calibrated_frame_width = frame_width
+            side.calibrated_frame_height = frame_height
         elif isinstance(selection, NormalizedPoint):
             if item == "action":
                 side.action_point = selection
@@ -916,7 +1272,8 @@ class RenewalApp:
             self.status_var.set("라이센스 확인 중")
             threading.Thread(target=self._verify_then_start, daemon=True).start()
         else:
-            self._start_worker()
+            if self._prepare_turbo_start():
+                self._start_worker()
 
     def _verify_then_start(self) -> None:
         try:
@@ -935,9 +1292,23 @@ class RenewalApp:
             self.status_var.set("라이센스 만료")
             self._set_running(False)
             return
-        self._start_worker()
+        self._set_running(False)
+        if self._prepare_turbo_start():
+            self._start_worker()
+
+    def _prepare_turbo_start(self) -> bool:
+        self._refresh_turbo_session()
+        if self._selected_turbo_keys() and self._turbo_candidates:
+            if not self._close_selected_turbo_apps():
+                self.status_var.set("터보 앱 종료 취소")
+                return False
+        if not self._confirm_turbo_pressure():
+            self.status_var.set("터보 목표 미달 · 시작 취소")
+            return False
+        return True
 
     def _start_worker(self) -> None:
+        gc.collect()
         self.stop_event.clear()
         self._set_running(True)
         side = self.side_var.get()
@@ -945,7 +1316,7 @@ class RenewalApp:
         available_ram = _available_ram_gb()
         self.status_var.set("갱신매크로 시작")
         self.log(
-            f"[시작 v7] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
+            f"[시작 v8] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
@@ -1016,6 +1387,10 @@ class RenewalApp:
         self.monitor_checkbox.configure(
             state=tk.DISABLED if running else tk.NORMAL
         )
+        for button in self._turbo_buttons:
+            button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        for checkbox in self._turbo_checkboxes:
+            checkbox.configure(state=tk.DISABLED if running else tk.NORMAL)
 
     def _poll_queue(self) -> None:
         while True:

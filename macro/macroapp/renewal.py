@@ -8,6 +8,7 @@ OCR 대신 사용자가 지정한 가격 숫자 영역의 에지 변화만 비�
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import os
 import time
@@ -32,8 +33,8 @@ cv2.setNumThreads(1)
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 7
-RENEWAL_CALIBRATION_VERSION = 3
+RENEWAL_PROFILE_VERSION = 8
+RENEWAL_CALIBRATION_VERSION = 4
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
 
@@ -198,6 +199,16 @@ class RenewalSideProfile:
     registration_shift_limit: int = 4
     calibration_openings: int = 0
     calibration_version: int = 0
+    calibrated_frame_width: int = 0
+    calibrated_frame_height: int = 0
+
+    def calibrated_frame_size(self) -> Optional[tuple[int, int]]:
+        if self.calibrated_frame_width <= 0 or self.calibrated_frame_height <= 0:
+            return None
+        return self.calibrated_frame_width, self.calibrated_frame_height
+
+    def matches_frame_size(self, width: int, height: int) -> bool:
+        return self.calibrated_frame_size() == (int(width), int(height))
 
     def complete(self) -> bool:
         return bool(
@@ -211,6 +222,7 @@ class RenewalSideProfile:
             and self.closed_guard_png
             and self.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
             and self.calibration_version >= RENEWAL_CALIBRATION_VERSION
+            and self.calibrated_frame_size() is not None
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -236,6 +248,8 @@ class RenewalSideProfile:
             "registration_shift_limit": int(self.registration_shift_limit),
             "calibration_openings": int(self.calibration_openings),
             "calibration_version": int(self.calibration_version),
+            "calibrated_frame_width": int(self.calibrated_frame_width),
+            "calibrated_frame_height": int(self.calibrated_frame_height),
         }
 
     @classmethod
@@ -288,8 +302,16 @@ class RenewalSideProfile:
             side.calibration_version = max(
                 0, int(value.get("calibration_version", 0))
             )
+            side.calibrated_frame_width = max(
+                0, int(value.get("calibrated_frame_width", 0))
+            )
+            side.calibrated_frame_height = max(
+                0, int(value.get("calibrated_frame_height", 0))
+            )
         except (TypeError, ValueError):
             side.calibration_version = 0
+            side.calibrated_frame_width = 0
+            side.calibrated_frame_height = 0
         return side
 
 
@@ -337,8 +359,9 @@ class RenewalProfile:
             or not side_profile.closed_guard_png
             or side_profile.calibration_openings < RENEWAL_CALIBRATION_OPENINGS
             or side_profile.calibration_version < RENEWAL_CALIBRATION_VERSION
+            or side_profile.calibrated_frame_size() is None
         ):
-            missing.append("v7 120Hz 가격영역 재설정")
+            missing.append("v8 1080p 가격영역 재설정")
         if side_profile.limit_point is None:
             missing.append("상한가 위치" if side == "buy" else "하한가 위치")
         return missing
@@ -1269,7 +1292,7 @@ def build_calibration_result(
     if any(sample is None or sample.shape != shape for sample in guard_samples):
         raise ValueError("보정 프레임의 크기가 서로 다릅니다.")
     if closed_samples is None or len(closed_samples) < 4:
-        raise ValueError("v7 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
+        raise ValueError("v8 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
     closed_samples = closed_samples[:4]
     if any(
         sample is None or sample.shape != shape
@@ -1555,13 +1578,27 @@ class FastRenewalRunner:
         if full_frame is None:
             raise RuntimeError("FC ONLINE 첫 화면을 캡처하지 못했습니다.")
         frame_height, frame_width = full_frame.shape[:2]
+        side_profile = self.profile.side(self.side_name)
+        calibrated_size = side_profile.calibrated_frame_size()
+        if calibrated_size != (frame_width, frame_height):
+            expected_text = (
+                f"{calibrated_size[0]}x{calibrated_size[1]}"
+                if calibrated_size is not None
+                else "미설정"
+            )
+            raise RuntimeError(
+                "게임 창 크기가 안전 보정과 다릅니다. "
+                f"현재 {frame_width}x{frame_height}, 보정 {expected_text}. "
+                "현재 크기에서 v8 가격영역을 다시 설정하세요."
+            )
         engine = self.manager.capture_engine
         if engine is None:
             raise RuntimeError("WGC 캡처 엔진이 시작되지 않았습니다.")
         if not hasattr(engine, "get_latest_frame_packet"):
             raise RuntimeError("WGC 프레임 순번 API가 없는 구버전 캡처 엔진입니다.")
+        del full_frame
+        gc.collect()
 
-        side_profile = self.profile.side(self.side_name)
         assert side_profile.action_point is not None
         assert side_profile.confirm_point is not None
         assert side_profile.price_rect is not None
@@ -1620,7 +1657,7 @@ class FastRenewalRunner:
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v7] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v8] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
@@ -1834,7 +1871,7 @@ class FastRenewalRunner:
 
             if decision is PriceState.CHANGED and last_result is not None:
                 if armed_openings < required_arm_openings:
-                    self.status("기준 가격 불일치 · v7 가격영역 재설정 필요")
+                    self.status("기준 가격 불일치 · v8 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
                         "주문 없이 정지합니다."
@@ -1864,7 +1901,7 @@ class FastRenewalRunner:
                 if self.monitor_only:
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
-                        f"[무주문 측정 v7] {cycle_count}회에서 변경 확정, "
+                        f"[무주문 측정 v8] {cycle_count}회에서 변경 확정, "
                         f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
                     )
                     save_renewal_diagnostic(
@@ -1898,7 +1935,7 @@ class FastRenewalRunner:
                 clicker.click_prepared(confirm_click)
                 elapsed_ms = (time.perf_counter() - detected_at) * 1000.0
                 self.log(
-                    f"[갱신 완료 v7] {cycle_count}회 확인, "
+                    f"[갱신 완료 v8] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -1937,7 +1974,7 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v7] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v8] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
                 if not close_modal():
                     self.status("닫힘 준비 화면 미확인 · 안전 정지")
@@ -1978,7 +2015,7 @@ class FastRenewalRunner:
                     else 0
                 )
                 self.log(
-                    f"[갱신 v7] {cycle_count}회 확인 중 · "
+                    f"[갱신 v8] {cycle_count}회 확인 중 · "
                     f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
                     f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
                     f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "

@@ -167,6 +167,8 @@ def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
         registration_shift_limit=4,
         calibration_openings=renewal.RENEWAL_CALIBRATION_OPENINGS,
         calibration_version=renewal.RENEWAL_CALIBRATION_VERSION,
+        calibrated_frame_width=200,
+        calibrated_frame_height=100,
     )
     profile = renewal.RenewalProfile(buy=side)
     profile.apply_speed_level(10)
@@ -238,24 +240,25 @@ class RenewalSafetyTests(unittest.TestCase):
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
 
-    def test_v6_profile_requires_v7_safe_price_recalibration(self) -> None:
+    def test_v7_profile_requires_v8_size_safe_recalibration(self) -> None:
         legacy = self.profile.to_dict()
-        legacy["version"] = 6
-        legacy["buy"]["calibration_version"] = 2
-        legacy["buy"].pop("closed_guard_png")
-        legacy["buy"].pop("calibration_openings")
+        legacy["version"] = 7
+        legacy["buy"]["calibration_version"] = 3
+        legacy["buy"].pop("calibrated_frame_width")
+        legacy["buy"].pop("calibrated_frame_height")
         loaded = renewal.RenewalProfile.from_dict(legacy)
-        self.assertIn("v7 120Hz 가격영역 재설정", loaded.missing("buy"))
+        self.assertIn("v8 1080p 가격영역 재설정", loaded.missing("buy"))
 
-    def test_v7_profile_round_trip_keeps_alignment_limits(self) -> None:
+    def test_v8_profile_round_trip_keeps_alignment_and_frame_size(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 7)
+        self.assertEqual(loaded.to_dict()["version"], 8)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
+        self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
 
     def test_two_line_price_region_is_rejected(self) -> None:
         two_lines = np.full((70, 120), 238, dtype=np.uint8)
@@ -376,7 +379,7 @@ class RenewalSafetyTests(unittest.TestCase):
             guard_detector.register(wrong_popup, 0.0, 0.0).valid
         )
 
-    def test_five_independent_openings_build_v7_calibration(self) -> None:
+    def test_five_independent_openings_build_v8_calibration(self) -> None:
         sessions = [
             [
                 renewal._translate_image(self.guard, shift_x, 0)
@@ -402,7 +405,7 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
 
-    def test_v7_calibration_rejects_indistinguishable_closed_screen(self) -> None:
+    def test_v8_calibration_rejects_indistinguishable_closed_screen(self) -> None:
         sessions = [
             [self.guard.copy() for _ in range(4)]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
@@ -510,6 +513,15 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
+
+    def test_frame_size_mismatch_stops_before_first_click(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
+        self.profile.buy.calibrated_frame_width = 1928
+        self.profile.buy.calibrated_frame_height = 1048
+        with self.assertRaisesRegex(RuntimeError, "게임 창 크기"):
+            _run(self.profile, engine)
+        self.assertEqual(engine.clicks, [])
 
     def test_next_open_is_blocked_until_exact_ready_guard_returns(self) -> None:
         stop_event = threading.Event()

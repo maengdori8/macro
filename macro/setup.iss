@@ -5,7 +5,7 @@
 
 [Setup]
 AppName=Macro
-AppVersion=1.0.31
+AppVersion=1.0.32
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
