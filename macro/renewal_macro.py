@@ -823,6 +823,7 @@ class RenewalApp:
             side.price_rect
             and side.guard_rect
             and side.baseline_png
+            and side.baseline_variants_png
             and side.guard_png
             and side.closed_guard_png
             and side.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
@@ -1036,6 +1037,7 @@ class RenewalApp:
 
     def _invalidate_size_calibration(self) -> None:
         for side in (self.profile.buy, self.profile.sell):
+            side.baseline_variants_png = []
             side.calibration_openings = 0
             side.calibration_version = 0
             side.calibrated_frame_width = 0
@@ -1636,6 +1638,10 @@ class RenewalApp:
             side.price_rect = selection
             side.guard_rect = guard_rect
             side.baseline_png = encode_gray_png(calibration.baseline)
+            side.baseline_variants_png = [
+                encode_gray_png(variant)
+                for variant in calibration.baseline_variants
+            ]
             side.guard_png = encode_gray_png(calibration.guard)
             side.closed_guard_png = encode_gray_png(calibration.closed_guard)
             side.noise_global = calibration.noise_global
@@ -2482,6 +2488,10 @@ def _headless_calibrate_existing(side_name: str) -> int:
         side.price_rect = price_rect
         side.guard_rect = guard_rect
         side.baseline_png = encode_gray_png(calibration.baseline)
+        side.baseline_variants_png = [
+            encode_gray_png(variant)
+            for variant in calibration.baseline_variants
+        ]
         side.guard_png = encode_gray_png(calibration.guard)
         side.closed_guard_png = encode_gray_png(calibration.closed_guard)
         side.noise_global = calibration.noise_global

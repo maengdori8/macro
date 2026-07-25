@@ -13,7 +13,7 @@ import json
 import os
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
@@ -48,9 +48,11 @@ if hasattr(cv2, "ipp"):
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 RENEWAL_PROFILE_VERSION = 9
-RENEWAL_CALIBRATION_VERSION = 5
+RENEWAL_CALIBRATION_VERSION = 6
 RENEWAL_CALIBRATION_OPENINGS = 5
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
+RENEWAL_MAX_BASELINE_VARIANTS = 8
+RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT = 0.005
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
@@ -280,6 +282,7 @@ class RenewalSideProfile:
     guard_rect: Optional[NormalizedRect] = None
     limit_point: Optional[NormalizedPoint] = None
     baseline_png: str = ""
+    baseline_variants_png: list[str] = field(default_factory=list)
     guard_png: str = ""
     closed_guard_png: str = ""
     noise_global: float = 0.0
@@ -312,6 +315,7 @@ class RenewalSideProfile:
             and self.guard_rect
             and self.limit_point
             and self.baseline_png
+            and self.baseline_variants_png
             and self.guard_png
             and self.closed_guard_png
             and self.calibration_openings >= RENEWAL_CALIBRATION_OPENINGS
@@ -329,6 +333,7 @@ class RenewalSideProfile:
             "guard_rect": self.guard_rect.to_dict() if self.guard_rect else None,
             "limit_point": self.limit_point.to_dict() if self.limit_point else None,
             "baseline_png": self.baseline_png,
+            "baseline_variants_png": list(self.baseline_variants_png),
             "guard_png": self.guard_png,
             "closed_guard_png": self.closed_guard_png,
             "noise_global": float(self.noise_global),
@@ -357,6 +362,15 @@ class RenewalSideProfile:
             guard_rect=NormalizedRect.from_dict(value.get("guard_rect")),
             limit_point=NormalizedPoint.from_dict(value.get("limit_point")),
             baseline_png=str(value.get("baseline_png") or ""),
+            baseline_variants_png=[
+                str(encoded)
+                for encoded in (
+                    value.get("baseline_variants_png")
+                    if isinstance(value.get("baseline_variants_png"), list)
+                    else []
+                )[:RENEWAL_MAX_BASELINE_VARIANTS]
+                if isinstance(encoded, str) and encoded
+            ],
             guard_png=str(value.get("guard_png") or ""),
             closed_guard_png=str(value.get("closed_guard_png") or ""),
         )
@@ -449,6 +463,7 @@ class RenewalProfile:
             side_profile.price_rect is None
             or side_profile.guard_rect is None
             or not side_profile.baseline_png
+            or not side_profile.baseline_variants_png
             or not side_profile.guard_png
             or not side_profile.closed_guard_png
             or side_profile.calibration_openings < RENEWAL_CALIBRATION_OPENINGS
@@ -1621,7 +1636,6 @@ class RenewalPriceClassifier:
         current_right = cx + current_width
         baseline_bottom = by + baseline_height
         current_bottom = cy + current_height
-        left_dx = bx - cx
         right_dx = baseline_right - current_right
         top_dy = by - cy
         bottom_dy = baseline_bottom - current_bottom
@@ -2016,6 +2030,83 @@ class RenewalPriceClassifier:
             RenewalChangeDetector.pair_stability(first.pair, second.pair)
             <= self.stability_limit
         )
+
+
+class RenewalCalibratedPriceClassifier:
+    """Use only calibration-observed render phases to resolve a gray zone."""
+
+    _VARIANT_REASONS = frozenset(
+        {
+            "global_glyph_resampling",
+            "native_glyph_gray_zone",
+        }
+    )
+
+    def __init__(
+        self,
+        baseline: np.ndarray,
+        variants: list[np.ndarray],
+        unchanged_limit: float,
+        stability_limit: float,
+    ):
+        self.primary = RenewalPriceClassifier(
+            baseline,
+            unchanged_limit,
+            stability_limit,
+        )
+        self.variants: list[RenewalPriceClassifier] = []
+        unique: list[np.ndarray] = [self.primary.baseline]
+        for image in variants[:RENEWAL_MAX_BASELINE_VARIANTS]:
+            gray = image
+            if gray is None or gray.size == 0:
+                raise ValueError("A calibrated price render variant is empty.")
+            if gray.ndim == 3:
+                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+            if gray.shape != self.primary.baseline.shape:
+                raise ValueError(
+                    "A calibrated price render variant has the wrong size."
+                )
+            if any(np.array_equal(gray, known) for known in unique):
+                continue
+            variant = RenewalPriceClassifier(
+                gray,
+                unchanged_limit,
+                stability_limit,
+            )
+            unique.append(variant.baseline)
+            self.variants.append(variant)
+
+    @property
+    def stability_limit(self) -> float:
+        return self.primary.stability_limit
+
+    def classify(self, image: np.ndarray) -> PriceClassification:
+        result = self.primary.classify(image)
+        if (
+            result.state is not PriceState.AMBIGUOUS
+            or result.reason not in self._VARIANT_REASONS
+        ):
+            return result
+        for variant in self.variants:
+            alternate = variant.classify(image)
+            if (
+                alternate.state is PriceState.UNCHANGED
+                and alternate.geometry_valid
+                and alternate.global_score
+                <= RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT
+            ):
+                return replace(
+                    alternate,
+                    reason="calibrated_render_variant",
+                )
+        return result
+
+    def same_candidate(
+        self,
+        first: PriceClassification,
+        second: PriceClassification,
+    ) -> bool:
+        return self.primary.same_candidate(first, second)
 
 
 @dataclass(frozen=True)
@@ -2581,6 +2672,7 @@ class RenewalModalGuard:
 @dataclass(frozen=True)
 class RenewalCalibrationResult:
     baseline: np.ndarray
+    baseline_variants: tuple[np.ndarray, ...]
     guard: np.ndarray
     closed_guard: np.ndarray
     noise_global: float
@@ -2606,17 +2698,11 @@ def build_calibration_result(
     def is_safe_calibration_match(
         classification: PriceClassification,
     ) -> bool:
-        # Runtime remains fail-closed: gray-zone frames never authorize an
-        # order.  During calibration, however, a complete glyph row that is
-        # below the real-change thresholds is useful as a same-price noise
-        # sample instead of making all five openings impossible to save.
-        return (
-            classification.state is PriceState.UNCHANGED
-            or (
-                classification.state is PriceState.AMBIGUOUS
-                and classification.reason == "gray_zone"
-            )
-        )
+        # Calibration establishes the only render variants that may later
+        # resolve a runtime gray zone.  Therefore an ambiguous frame must not
+        # be admitted here: it could be a real price change and would turn
+        # into a false equality if persisted as a baseline variant.
+        return classification.state is PriceState.UNCHANGED
 
     if len(guard_sessions) < RENEWAL_CALIBRATION_OPENINGS:
         raise ValueError(
@@ -2771,6 +2857,7 @@ def build_calibration_result(
     edge_scores: list[float] = []
     closed_luma_scores: list[float] = []
     closed_edge_scores: list[float] = []
+    variant_eligible_prices: list[np.ndarray] = []
     previous: Optional[PriceClassification] = None
     for sample_index, sample in enumerate(aligned_guards):
         price = crop_price_from_guard(sample, price_box)
@@ -2793,6 +2880,12 @@ def build_calibration_result(
         luma_score, edge_score = guard_detector.metrics(sample)
         global_scores.append(classification.global_score)
         slice_scores.append(classification.slice_score)
+        if (
+            classification.reason == "aligned_same_price"
+            and classification.global_score
+            <= RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT
+        ):
+            variant_eligible_prices.append(classification.aligned.copy())
         if previous is not None:
             pair_scores.append(
                 RenewalChangeDetector.pair_stability(
@@ -2831,9 +2924,17 @@ def build_calibration_result(
     # Runtime must tolerate a later reopen moving farther than the five
     # calibration openings.  The safety plan fixes the guard search at ±4 px.
     registration_shift_limit = 4
+    baseline_variants: list[np.ndarray] = [baseline.copy()]
+    for price in variant_eligible_prices:
+        if any(np.array_equal(price, known) for known in baseline_variants):
+            continue
+        baseline_variants.append(price.copy())
+        if len(baseline_variants) >= RENEWAL_MAX_BASELINE_VARIANTS:
+            break
 
     return RenewalCalibrationResult(
         baseline=baseline.copy(),
+        baseline_variants=tuple(baseline_variants),
         guard=guard,
         closed_guard=closed_guard,
         noise_global=max(global_scores),
@@ -3069,8 +3170,12 @@ class FastRenewalRunner:
             self.side_name,
             frame_height,
         )
-        classifier = RenewalPriceClassifier(
+        classifier = RenewalCalibratedPriceClassifier(
             baseline,
+            [
+                decode_gray_png(encoded)
+                for encoded in side_profile.baseline_variants_png
+            ],
             side_profile.unchanged_limit,
             side_profile.stability_limit,
         )

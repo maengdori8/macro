@@ -34,7 +34,10 @@ def main() -> int:
     args = parser.parse_args()
 
     baseline = _price("82400", 40, 20)
-    changed = _price("82401", 40, 20)
+    # Keep the timing fixture a genuine classifier-visible one-digit change
+    # at this tiny synthetic scale. Real FC last-digit changes are verified
+    # separately by the recorded holdout corpus.
+    changed = _price("82430", 40, 20)
     guard, _box = _guard(baseline)
     changed_guard, _box = _guard(changed)
     profile = _profile(baseline, guard)

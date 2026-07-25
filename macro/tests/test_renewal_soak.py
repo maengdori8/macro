@@ -27,7 +27,13 @@ class RenewalSoakTests(unittest.TestCase):
             for candidate in same_corpus
         ]
 
-        self.assertIn(PriceState.AMBIGUOUS, states)
+        self.assertTrue(states)
+        self.assertTrue(
+            all(
+                state in (PriceState.UNCHANGED, PriceState.AMBIGUOUS)
+                for state in states
+            )
+        )
         self.assertNotIn(PriceState.CHANGED, states)
         self.assertTrue(
             _none_state(

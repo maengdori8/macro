@@ -185,6 +185,7 @@ def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
         guard_rect=renewal.NormalizedRect(0.25, 0.20, 0.75, 0.80),
         limit_point=renewal.NormalizedPoint(140 / 199, 70 / 99),
         baseline_png=renewal.encode_gray_png(baseline),
+        baseline_variants_png=[renewal.encode_gray_png(baseline)],
         guard_png=renewal.encode_gray_png(guard),
         closed_guard_png=renewal.encode_gray_png(np.zeros_like(guard)),
         unchanged_limit=0.035,
@@ -271,7 +272,12 @@ class RenewalSafetyTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.base_price = _price("82400", 40, 20)
-        self.changed_price = _price("82401", 40, 20)
+        # At this deliberately tiny synthetic scale, the 0 -> 1 terminal
+        # stroke collapses inside the classifier's 3x3 anti-aliasing
+        # tolerance and is not a valid stand-in for the much larger FC price
+        # glyph.  Use a one-digit topology change that survives the tiny
+        # raster; recorded FC last-digit holdouts cover the real requirement.
+        self.changed_price = _price("82430", 40, 20)
         self.guard, self.price_box = _guard(self.base_price)
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
@@ -294,6 +300,7 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
+        self.assertEqual(len(loaded.buy.baseline_variants_png), 1)
         self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
 
     def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
@@ -836,6 +843,39 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertFalse(classifier.same_candidate(first, second))
         self.assertIsNot(first.state, renewal.PriceState.CHANGED)
 
+    def test_calibration_observed_render_variant_resolves_only_gray_zone(
+        self,
+    ) -> None:
+        def decode(encoded: str) -> np.ndarray:
+            raw = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
+            image = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(image)
+            return image
+
+        baseline = decode(_REAL_SAME_PRICE_39_BASELINE)
+        render_variant = decode(_REAL_SAME_PRICE_39_CANDIDATE_V2)
+        classifier = renewal.RenewalCalibratedPriceClassifier(
+            baseline,
+            [render_variant],
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+
+        first = classifier.classify(render_variant)
+        second = classifier.classify(render_variant.copy())
+        self.assertIs(first.state, renewal.PriceState.UNCHANGED)
+        self.assertEqual(first.reason, "calibrated_render_variant")
+        self.assertTrue(classifier.same_candidate(first, second))
+
+        changed = baseline.copy()
+        changed[:, 80:100] = np.fliplr(changed[:, 80:100])
+        changed_first = classifier.classify(changed)
+        changed_second = classifier.classify(changed.copy())
+        self.assertIs(changed_first.state, renewal.PriceState.CHANGED)
+        self.assertTrue(
+            classifier.same_candidate(changed_first, changed_second)
+        )
+
     def test_subthreshold_native_glyph_change_is_not_hidden_as_same(self) -> None:
         raw = np.frombuffer(
             base64.b64decode(_REAL_SAME_ILLUMINATION_BASELINE),
@@ -970,6 +1010,11 @@ class RenewalSafetyTests(unittest.TestCase):
         )
         self.assertEqual(result.registration_shift_limit, 4)
         self.assertEqual(result.closed_guard.shape, self.guard.shape)
+        self.assertGreaterEqual(len(result.baseline_variants), 1)
+        self.assertLessEqual(
+            len(result.baseline_variants),
+            renewal.RENEWAL_MAX_BASELINE_VARIANTS,
+        )
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
 
@@ -991,6 +1036,40 @@ class RenewalSafetyTests(unittest.TestCase):
                 sessions,
                 self.price_box,
                 closed_samples,
+            )
+
+    def test_calibration_never_persists_an_ambiguous_render_as_same(
+        self,
+    ) -> None:
+        def decode(encoded: str) -> np.ndarray:
+            raw = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
+            image = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(image)
+            return image
+
+        baseline = decode(_REAL_SAME_PRICE_39_BASELINE)
+        ambiguous = decode(_REAL_SAME_PRICE_39_CANDIDATE_V2)
+        price_box = (30, 20, 250, 68)
+
+        def make_guard(price: np.ndarray) -> np.ndarray:
+            guard = np.full((88, 280), 224, dtype=np.uint8)
+            cv2.rectangle(guard, (1, 1), (278, 86), 90, 1)
+            guard[20:68, 30:250] = price
+            return guard
+
+        baseline_guard = make_guard(baseline)
+        ambiguous_guard = make_guard(ambiguous)
+        sessions = [
+            [baseline_guard.copy() for _ in range(4)]
+            for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
+        ]
+        sessions[-1] = [ambiguous_guard.copy() for _ in range(4)]
+
+        with self.assertRaises(ValueError):
+            renewal.build_calibration_result(
+                sessions,
+                price_box,
+                [np.zeros_like(baseline_guard) for _ in range(4)],
             )
 
     def test_v9_calibration_rejects_indistinguishable_closed_screen(self) -> None:

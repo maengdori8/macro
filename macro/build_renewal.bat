@@ -5,7 +5,7 @@ cd /d "%~dp0"
 echo [1/3] Checking renewal source...
 python -m compileall -q macroapp renewal_macro.py
 if errorlevel 1 goto :failed
-python -c "import cv2,numpy; assert cv2.__version__ == '4.12.0'; assert numpy.__version__ == '2.2.6'"
+python -c "import cv2,numpy,PIL,win32api,win32gui,windows_capture; assert cv2.__version__ == '5.0.0'; assert numpy.__version__ == '2.2.6'"
 if errorlevel 1 (
   echo Local renewal dependencies do not match requirements-renewal-local.txt.
   goto :failed
