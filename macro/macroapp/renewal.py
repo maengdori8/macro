@@ -47,10 +47,10 @@ if hasattr(cv2, "ipp"):
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 9
-RENEWAL_CALIBRATION_VERSION = 6
-RENEWAL_CALIBRATION_OPENINGS = 5
-RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
+RENEWAL_PROFILE_VERSION = 10
+RENEWAL_CALIBRATION_VERSION = 7
+RENEWAL_CALIBRATION_OPENINGS = 8
+RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 3
 RENEWAL_MAX_BASELINE_VARIANTS = 8
 RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT = 0.005
 # This is only a fail-closed deadline. A completed popup is consumed
@@ -438,6 +438,7 @@ class RenewalProfile:
     closed_streak: int = 1
     slice_threshold: float = 0.29
     modal_max_score: float = 0.75
+    target_minute: int = 20
 
     def side(self, side: str) -> RenewalSideProfile:
         return self.buy if side == "buy" else self.sell
@@ -470,7 +471,7 @@ class RenewalProfile:
             or side_profile.calibration_version < RENEWAL_CALIBRATION_VERSION
             or side_profile.calibrated_frame_size() is None
         ):
-            missing.append("v9 우측 상한가/하한가 재설정")
+            missing.append("v10 우측 상한가/하한가 재설정")
         if side_profile.limit_point is None:
             missing.append("상한가 위치" if side == "buy" else "하한가 위치")
         return missing
@@ -493,6 +494,7 @@ class RenewalProfile:
             "closed_streak": int(self.closed_streak),
             "slice_threshold": float(self.slice_threshold),
             "modal_max_score": float(self.modal_max_score),
+            "target_minute": int(self.target_minute),
         }
 
     @classmethod
@@ -521,6 +523,9 @@ class RenewalProfile:
             profile.apply_speed_level(speed_level)
             profile.modal_max_score = min(
                 0.95, max(0.10, float(value.get("modal_max_score", 0.75)))
+            )
+            profile.target_minute = min(
+                59, max(0, int(value.get("target_minute", 20)))
             )
         except (TypeError, ValueError):
             pass
@@ -660,7 +665,7 @@ def validate_limit_price_selection(
     if not is_supported_renewal_wgc_size(frame_width, frame_height):
         return PriceRegionValidation(
             False,
-            "v9 우측 가격 보정은 검증된 1080p 안정 WGC 크기에서만 저장할 수 있습니다.",
+            "v10 우측 가격 보정은 검증된 1080p 안정 WGC 크기에서만 저장할 수 있습니다.",
             row_validation.band_count,
         )
     if side not in ("buy", "sell"):
@@ -694,6 +699,25 @@ def validate_limit_price_selection(
         if side == "buy"
         else "우측 하한가 숫자 확인 완료",
         1,
+    )
+
+
+def expand_price_rect_for_recognition(
+    price_rect: NormalizedRect,
+    frame_width: int,
+    frame_height: int,
+    *,
+    pad_x: int = 12,
+    pad_y: int = 5,
+) -> NormalizedRect:
+    """가격 글자가 재래스터링돼도 잘리지 않도록 작은 안전 여백을 붙입니다."""
+
+    x1, y1, x2, y2 = price_rect.to_pixels(frame_width, frame_height)
+    return NormalizedRect(
+        max(0, x1 - max(0, int(pad_x))) / frame_width,
+        max(0, y1 - max(0, int(pad_y))) / frame_height,
+        min(frame_width, x2 + max(0, int(pad_x))) / frame_width,
+        min(frame_height, y2 + max(0, int(pad_y))) / frame_height,
     )
 
 
@@ -1073,7 +1097,7 @@ class PriceClassification:
 class RenewalPriceClassifier:
     """정수 픽셀 정렬 후 가격을 유지/변경/판정 불가로 분류합니다."""
 
-    _LOCAL_SHIFT_LIMIT = 2
+    _LOCAL_SHIFT_LIMIT = 4
     # Native-resolution glyph evidence complements the resized Canny score.
     # Captured same-price WGC reopen jitter tops out below 0.003 after the
     # safer of raw/aligned registration, while the closest captured
@@ -1236,11 +1260,35 @@ class RenewalPriceClassifier:
             <= self.baseline_intensity_range * 1.35
         )
 
-    def _boundary_clear(self, image: np.ndarray) -> bool:
-        return self._border_contrast(image) <= max(
-            18.0,
-            self.baseline_border_contrast + 8.0,
+    @classmethod
+    def _complete_glyph_row(cls, image: np.ndarray) -> bool:
+        """배경 밝기 대신 실제 글자 마스크가 ROI 안에서 완성됐는지 확인합니다.
+
+        FC의 같은 가격도 팝업을 다시 열면 ROI 테두리 배경이 1~2 단계
+        재래스터링됩니다. 그 차이를 글자 잘림으로 취급하면 완성된 가격을
+        거부하므로, 어두운 획의 실제 경계와 행 높이만 검사합니다.
+        """
+
+        mask = cls._local_glyph_mask(image)
+        count = int(cv2.countNonZero(mask))
+        if count < 64:
+            return False
+        points = cv2.findNonZero(mask)
+        if points is None:
+            return False
+        x, y, width, height = cv2.boundingRect(points)
+        image_height, image_width = image.shape[:2]
+        return bool(
+            x >= 1
+            and y >= 1
+            and x + width <= image_width - 1
+            and y + height <= image_height - 1
+            and height >= max(4, int(round(image_height * 0.25)))
+            and height <= int(round(image_height * 0.90))
         )
+
+    def _boundary_clear(self, image: np.ndarray) -> bool:
+        return self._complete_glyph_row(image)
 
     @staticmethod
     def _registration_edges(image: np.ndarray) -> np.ndarray:
@@ -1826,6 +1874,19 @@ class RenewalPriceClassifier:
         boundary_valid = bool(
             alignment_valid and self._boundary_clear(aligned)
         )
+        prepared_geometry_valid = self._prepared_geometry_matches(pair)
+        if (
+            not prepared_geometry_valid
+            and (dx != 0 or dy != 0)
+            and gray_for_cache is not None
+            and self._complete_glyph_row(gray_for_cache)
+        ):
+            raw_structure_pair = RenewalChangeDetector.prepare_pair(
+                gray_for_cache
+            )
+            prepared_geometry_valid = self._prepared_geometry_matches(
+                raw_structure_pair
+            )
         full_structure_valid = False
         if (
             boundary_valid
@@ -1833,8 +1894,8 @@ class RenewalPriceClassifier:
         ):
             full_structure_valid = bool(
                 self._render_contrast_valid(aligned)
-                and self._geometry_matches_edges(structural_edges)
-                and self._prepared_geometry_matches(pair)
+                and self._complete_glyph_row(aligned)
+                and prepared_geometry_valid
                 and self._projection_integrity_edges(structural_edges)
             )
         if not alignment_valid:
@@ -2082,13 +2143,12 @@ class RenewalCalibratedPriceClassifier:
 
     def classify(self, image: np.ndarray) -> PriceClassification:
         result = self.primary.classify(image)
-        if (
-            result.state is not PriceState.AMBIGUOUS
-            or result.reason not in self._VARIANT_REASONS
-        ):
+        if result.state is PriceState.UNCHANGED or not self.variants:
             return result
+        alternate_results: list[PriceClassification] = []
         for variant in self.variants:
             alternate = variant.classify(image)
+            alternate_results.append(alternate)
             if (
                 alternate.state is PriceState.UNCHANGED
                 and alternate.geometry_valid
@@ -2099,6 +2159,16 @@ class RenewalCalibratedPriceClassifier:
                     alternate,
                     reason="calibrated_render_variant",
                 )
+        if result.state is PriceState.CHANGED and any(
+            alternate.state is not PriceState.CHANGED
+            or not alternate.geometry_valid
+            for alternate in alternate_results
+        ):
+            return replace(
+                result,
+                state=PriceState.AMBIGUOUS,
+                reason="baseline_variant_disagreement",
+            )
         return result
 
     def same_candidate(
@@ -2724,7 +2794,7 @@ def build_calibration_result(
     if any(sample is None or sample.shape != shape for sample in guard_samples):
         raise ValueError("보정 프레임의 크기가 서로 다릅니다.")
     if closed_samples is None or len(closed_samples) < 4:
-        raise ValueError("v9 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
+        raise ValueError("v10 보정에는 팝업이 완전히 닫힌 새 WGC 프레임 4장이 필요합니다.")
     closed_samples = closed_samples[:4]
     if any(
         sample is None or sample.shape != shape
@@ -3065,6 +3135,10 @@ class _FastClicker:
         input_message.send_key_to_window(self.hwnd, vk_escape, press_delay=0.0)
 
 
+class RenewalCaptureRestart(RuntimeError):
+    """안전한 목록 상태에서 WGC/HWND를 다시 연결해야 함을 나타냅니다."""
+
+
 class FastRenewalRunner:
     """구매/판매 창을 열고 가격 변경 시 제한가와 같은 버튼을 즉시 클릭합니다."""
 
@@ -3077,6 +3151,8 @@ class FastRenewalRunner:
         logger: LogCallback,
         status: StatusCallback,
         monitor_only: bool = False,
+        active_until: Optional[float] = None,
+        time_valid: Optional[Callable[[], bool]] = None,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -3087,6 +3163,10 @@ class FastRenewalRunner:
         self.log = logger
         self.status = status
         self.monitor_only = bool(monitor_only)
+        self.active_until = (
+            None if active_until is None else float(active_until)
+        )
+        self.time_valid = time_valid
         self.telemetry: dict[str, object] = {
             "cycle_count": 0,
             "popup_openings": 0,
@@ -3103,25 +3183,89 @@ class FastRenewalRunner:
             "popup_may_be_open": False,
             "current_popup_escape_sent": False,
             "startup_popup_recovered": False,
+            "capture_restarts": 0,
+            "schedule_expired": False,
         }
 
     def _wait(self, seconds: float) -> bool:
         return bool(self.stop_event.wait(max(0.0, seconds)))
 
+    def _schedule_deadline_active(self) -> bool:
+        return bool(
+            self.active_until is None
+            or time.monotonic() < self.active_until
+        )
+
+    def _time_source_valid(self) -> bool:
+        return bool(
+            self.time_valid is None
+            or bool(self.time_valid())
+        )
+
+    def _time_window_active(self) -> bool:
+        return bool(
+            self._schedule_deadline_active()
+            and self._time_source_valid()
+        )
+
     def run(self) -> bool:
+        """복구 가능한 WGC/화면 실패는 시간창이 끝날 때까지 다시 연결합니다."""
+
+        while (
+            not self.stop_event.is_set()
+            and self._schedule_deadline_active()
+        ):
+            if not self._time_source_valid():
+                self.status("네이버 시간 재동기화 대기 · 주문 입력 없음")
+                if self._wait(0.05):
+                    return False
+                continue
+            try:
+                completed = self._run_capture_session()
+                if (
+                    not completed
+                    and not self.stop_event.is_set()
+                    and self._schedule_deadline_active()
+                    and not self._time_source_valid()
+                ):
+                    continue
+                return completed
+            except RenewalCaptureRestart as exc:
+                self.telemetry["capture_restarts"] = (
+                    int(self.telemetry["capture_restarts"]) + 1
+                )
+                self.status("화면 복구 중 · 주문 입력 없음")
+                self.log(
+                    "[복구 v10] "
+                    f"{exc} · WGC/HWND 재연결 "
+                    f"{self.telemetry['capture_restarts']}회"
+                )
+                try:
+                    self.manager.stop_capture()
+                except Exception:
+                    pass
+                if self._wait(0.05):
+                    return False
+        if not self._schedule_deadline_active():
+            self.telemetry["schedule_expired"] = True
+            self.status("네이버 시간창 종료 · 주문 없이 정지")
+            self.log("[시간창 v10] 허용 시간이 끝나 입력 없이 정지합니다.")
+        return False
+
+    def _run_capture_session(self) -> bool:
         """정렬된 3상태 판정과 고유 WGC 프레임만 사용해 한 번 주문합니다."""
         missing = self.profile.missing(self.side_name)
         if missing:
             raise RuntimeError("갱신 설정이 필요합니다: " + ", ".join(missing))
         if not self.manager.find_window():
-            raise RuntimeError("FC ONLINE 창을 찾지 못했습니다.")
+            raise RenewalCaptureRestart("FC ONLINE 창을 찾지 못했습니다.")
 
         side_profile = self.profile.side(self.side_name)
         calibrated_size = side_profile.calibrated_frame_size()
         self.status("WGC 연결 중")
         full_frame = self.manager.capture_client_area(window_validated=True)
         if full_frame is None:
-            raise RuntimeError("FC ONLINE 첫 화면을 캡처하지 못했습니다.")
+            raise RenewalCaptureRestart("FC ONLINE 첫 화면을 캡처하지 못했습니다.")
         frame_height, frame_width = full_frame.shape[:2]
         if calibrated_size != (frame_width, frame_height):
             full_frame = wait_for_stable_wgc_frame(
@@ -3138,7 +3282,7 @@ class FastRenewalRunner:
             raise RuntimeError(
                 "게임 창 크기가 안전 보정과 다릅니다. "
                 f"현재 {frame_width}x{frame_height}, 보정 {expected_text}. "
-                "현재 크기에서 v9 우측 가격영역을 다시 설정하세요."
+                "현재 크기에서 v10 우측 가격영역을 다시 설정하세요."
             )
         engine = self.manager.capture_engine
         if engine is None:
@@ -3219,7 +3363,7 @@ class FastRenewalRunner:
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v9] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v10] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
@@ -3278,6 +3422,8 @@ class FastRenewalRunner:
         ) -> Optional[CapturedFrame]:
             nonlocal last_sequence_id, last_captured_at
             while allow_stopped or not self.stop_event.is_set():
+                if not allow_stopped and not self._time_window_active():
+                    return None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -3286,7 +3432,9 @@ class FastRenewalRunner:
                 )
                 if packet is None:
                     if engine.closed_event.is_set():
-                        raise RuntimeError("WGC 캡처 세션이 종료되었습니다.")
+                        raise RenewalCaptureRestart(
+                            "WGC 캡처 세션이 종료되었습니다."
+                        )
                     continue
                 if (
                     packet.sequence_id <= last_sequence_id
@@ -3423,22 +3571,27 @@ class FastRenewalRunner:
             self.telemetry["current_popup_escape_sent"] = False
             self.status("열린 팝업 확인 · 안전하게 닫는 중")
             if not close_modal():
-                raise RuntimeError(
+                raise RenewalCaptureRestart(
                     "열린 팝업에 ESC를 보냈지만 목록 화면 복귀를 확인하지 "
                     "못했습니다."
                 )
             self.telemetry["startup_popup_recovered"] = True
             self.status("열린 팝업 정리 완료 · 목록 감시 시작")
         elif start_state != "ready":
-            raise RuntimeError(
+            raise RenewalCaptureRestart(
                 "보정된 목록 화면이나 구매/판매 팝업을 확인하지 못했습니다. "
-                "보정한 선수의 목록 화면에서 다시 시작하세요."
+                "입력 없이 다시 확인합니다."
             )
 
-        while not self.stop_event.is_set():
+        while (
+            not self.stop_event.is_set()
+            and self._time_window_active()
+        ):
             cycle_count += 1
             self.telemetry["cycle_count"] = cycle_count
             action_started = time.perf_counter()
+            if not self._time_window_active():
+                break
             clicker.click_prepared(action_click)
             self.telemetry["popup_may_be_open"] = True
             self.telemetry["current_popup_escape_sent"] = False
@@ -3454,6 +3607,7 @@ class FastRenewalRunner:
                 return False
 
             last_result: Optional[PriceClassification] = None
+            last_ambiguous_result: Optional[PriceClassification] = None
             stable_count = 0
             raw_prices: list[np.ndarray] = []
             aligned_prices: list[np.ndarray] = []
@@ -3505,9 +3659,9 @@ class FastRenewalRunner:
                 classify_latencies.append(
                     (time.perf_counter() - classify_started) * 1000.0
                 )
-                raw_prices.append(price)
-                aligned_prices.append(result.aligned)
-                raw_guards.append(packet.image)
+                raw_prices.append(price.copy())
+                aligned_prices.append(result.aligned.copy())
+                raw_guards.append(packet.image.copy())
                 sequence_ids.append(packet.sequence_id)
                 capture_timestamps.append(packet.captured_at)
                 guard_shifts.append(
@@ -3522,8 +3676,10 @@ class FastRenewalRunner:
 
                 if result.state is PriceState.AMBIGUOUS:
                     ambiguous = True
+                    last_ambiguous_result = result
                     last_result = result
-                    break
+                    stable_count = 0
+                    continue
 
                 if (
                     last_result is not None
@@ -3543,6 +3699,7 @@ class FastRenewalRunner:
                 if stable_count < required_frames:
                     continue
                 decision = result.state
+                ambiguous = False
                 break
 
             if self.stop_event.is_set():
@@ -3553,6 +3710,18 @@ class FastRenewalRunner:
                     )
                 update_performance_telemetry()
                 return False
+
+            if not self._time_window_active():
+                if bool(self.telemetry["popup_may_be_open"]):
+                    close_modal(allow_stopped=True)
+                update_performance_telemetry()
+                if not self._schedule_deadline_active():
+                    self.telemetry["schedule_expired"] = True
+                    self.status("네이버 시간창 종료 · 주문 없이 정지")
+                    return False
+                raise RenewalCaptureRestart(
+                    "네이버 시간 정보가 오래되거나 시계 점프가 감지됐습니다."
+                )
 
             if decision is None and not ambiguous:
                 consecutive_open_failures += 1
@@ -3567,16 +3736,18 @@ class FastRenewalRunner:
                     consecutive_open_failures,
                 )
                 if not close_modal():
-                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
-                    return False
-                if consecutive_open_failures >= 3:
-                    self.status("팝업 3회 연속 미개방 · 안전 정지")
-                    self.log(
-                        "[안전 차단 v9] 완성된 가격 팝업을 3회 연속 "
-                        "확인하지 못해 주문 없이 정지합니다."
+                    raise RenewalCaptureRestart(
+                        "ESC 뒤 목록 준비 화면을 확인하지 못했습니다."
                     )
+                if consecutive_open_failures == 3:
+                    self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")
+                    self.log(
+                        "[복구 v10] 완성된 가격 팝업을 3회 연속 "
+                        "확인하지 못했지만 주문 없이 계속 시도합니다."
+                    )
+                if consecutive_open_failures >= 10:
                     update_performance_telemetry()
-                    return False
+                    raise RenewalCaptureRestart("팝업 확인 10회 연속 실패")
                 continue
 
             consecutive_open_failures = 0
@@ -3586,7 +3757,11 @@ class FastRenewalRunner:
                     int(self.telemetry["confirmed_openings"]) + 1
                 )
 
-            if ambiguous and last_result is not None:
+            if (
+                decision is None
+                and ambiguous
+                and last_ambiguous_result is not None
+            ):
                 self.telemetry["ambiguous_count"] = (
                     int(self.telemetry["ambiguous_count"]) + 1
                 )
@@ -3597,13 +3772,13 @@ class FastRenewalRunner:
                     baseline,
                     raw_prices,
                     {
-                        "state": last_result.state.value,
-                        "reason": last_result.reason,
-                        "global_score": last_result.global_score,
-                        "slice_score": last_result.slice_score,
+                        "state": last_ambiguous_result.state.value,
+                        "reason": last_ambiguous_result.reason,
+                        "global_score": last_ambiguous_result.global_score,
+                        "slice_score": last_ambiguous_result.slice_score,
                         "price_shift": [
-                            last_result.shift_x,
-                            last_result.shift_y,
+                            last_ambiguous_result.shift_x,
+                            last_ambiguous_result.shift_y,
                         ],
                         "guard_shifts": guard_shifts,
                         "sequence_ids": sequence_ids,
@@ -3614,14 +3789,15 @@ class FastRenewalRunner:
                     guard_frames=raw_guards,
                 )
                 if not close_modal():
-                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
-                    return False
+                    raise RenewalCaptureRestart(
+                        "애매한 팝업을 닫은 뒤 목록 화면 미확인"
+                    )
                 continue
 
             if decision is PriceState.CHANGED and last_result is not None:
                 if armed_openings < required_arm_openings:
                     self.telemetry["initial_mismatch"] = True
-                    self.status("기준 가격 불일치 · v9 우측 가격영역 재설정 필요")
+                    self.status("기준 가격 불일치 · v10 우측 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
                         "주문 없이 정지합니다."
@@ -3654,7 +3830,7 @@ class FastRenewalRunner:
                     self.telemetry["monitor_detected"] = True
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
-                        f"[무주문 측정 v9] {cycle_count}회에서 변경 확정, "
+                        f"[무주문 측정 v10] {cycle_count}회에서 변경 확정, "
                         f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
                     )
                     save_renewal_diagnostic(
@@ -3680,6 +3856,16 @@ class FastRenewalRunner:
 
                 if order_latched:
                     return True
+                if not self._time_window_active():
+                    close_modal(allow_stopped=True)
+                    update_performance_telemetry()
+                    if not self._schedule_deadline_active():
+                        self.telemetry["schedule_expired"] = True
+                        self.status("네이버 시간창 종료 · 주문 차단")
+                        return False
+                    raise RenewalCaptureRestart(
+                        "주문 직전 네이버 시간 정보가 무효화됐습니다."
+                    )
                 order_latched = True
                 detected_at = time.perf_counter()
                 self.status(
@@ -3706,7 +3892,7 @@ class FastRenewalRunner:
                     * 1000.0
                 )
                 self.log(
-                    f"[갱신 완료 v9] {cycle_count}회 확인, "
+                    f"[갱신 완료 v10] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -3754,16 +3940,18 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v9] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v10] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
                 if not close_modal():
-                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
-                    return False
+                    raise RenewalCaptureRestart(
+                        "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
+                    )
             else:
                 # 팝업이 완전히 열리지 않았거나 고유 프레임이 부족한 사이클입니다.
                 if not close_modal():
-                    self.status("닫힘 준비 화면 미확인 · 안전 정지")
-                    return False
+                    raise RenewalCaptureRestart(
+                        "불완전 팝업을 닫은 뒤 목록 화면 미확인"
+                    )
 
             if cycle_count % 100 == 0:
                 update_performance_telemetry()
@@ -3796,7 +3984,7 @@ class FastRenewalRunner:
                     else 0
                 )
                 self.log(
-                    f"[갱신 v9] {cycle_count}회 확인 중 · "
+                    f"[갱신 v10] {cycle_count}회 확인 중 · "
                     f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
                     f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
                     f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "

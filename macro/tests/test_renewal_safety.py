@@ -282,26 +282,27 @@ class RenewalSafetyTests(unittest.TestCase):
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
 
-    def test_v8_profile_requires_v9_right_limit_price_recalibration(self) -> None:
+    def test_v9_profile_requires_v10_right_limit_price_recalibration(self) -> None:
         legacy = self.profile.to_dict()
         legacy["version"] = 8
         legacy["buy"]["calibration_version"] = 4
         legacy["buy"].pop("calibrated_frame_width")
         legacy["buy"].pop("calibrated_frame_height")
         loaded = renewal.RenewalProfile.from_dict(legacy)
-        self.assertIn("v9 우측 상한가/하한가 재설정", loaded.missing("buy"))
+        self.assertIn("v10 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v9_profile_round_trip_keeps_alignment_and_frame_size(self) -> None:
+    def test_v10_profile_round_trip_keeps_alignment_frame_and_schedule(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 9)
+        self.assertEqual(loaded.to_dict()["version"], 10)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
         self.assertEqual(len(loaded.buy.baseline_variants_png), 1)
         self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
+        self.assertEqual(loaded.target_minute, 20)
 
     def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
         buy_rect = renewal.NormalizedRect(0.6810, 0.4113, 0.7951, 0.4571)
@@ -987,13 +988,14 @@ class RenewalSafetyTests(unittest.TestCase):
                     and classifier.same_candidate(first, second)
                 )
 
-    def test_five_independent_openings_build_v9_calibration(self) -> None:
+    def test_eight_independent_openings_build_v10_calibration(self) -> None:
+        shifts = (0, 1, -1, 2, -2, 1, -1, 0)
         sessions = [
             [
                 renewal._translate_image(self.guard, shift_x, 0)
                 for _ in range(renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING)
             ]
-            for shift_x in (0, 1, -1, 2, -2)
+            for shift_x in shifts
         ]
         closed_samples = [
             np.zeros_like(self.guard)
@@ -1018,12 +1020,20 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(result.unchanged_limit, 0.035)
         self.assertLessEqual(result.unchanged_limit, 0.040)
 
-    def test_v9_calibration_still_rejects_a_real_price_change(self) -> None:
+    def test_v10_calibration_still_rejects_a_real_price_change(self) -> None:
         sessions = [
-            [self.guard.copy() for _ in range(4)]
+            [
+                self.guard.copy()
+                for _ in range(
+                    renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                )
+            ]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
         ]
-        sessions[-1] = [self.changed_guard.copy() for _ in range(4)]
+        sessions[-1] = [
+            self.changed_guard.copy()
+            for _ in range(renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING)
+        ]
         closed_samples = [
             np.zeros_like(self.guard)
             for _ in range(4)
@@ -1060,10 +1070,18 @@ class RenewalSafetyTests(unittest.TestCase):
         baseline_guard = make_guard(baseline)
         ambiguous_guard = make_guard(ambiguous)
         sessions = [
-            [baseline_guard.copy() for _ in range(4)]
+            [
+                baseline_guard.copy()
+                for _ in range(
+                    renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                )
+            ]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
         ]
-        sessions[-1] = [ambiguous_guard.copy() for _ in range(4)]
+        sessions[-1] = [
+            ambiguous_guard.copy()
+            for _ in range(renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING)
+        ]
 
         with self.assertRaises(ValueError):
             renewal.build_calibration_result(
@@ -1072,9 +1090,14 @@ class RenewalSafetyTests(unittest.TestCase):
                 [np.zeros_like(baseline_guard) for _ in range(4)],
             )
 
-    def test_v9_calibration_rejects_indistinguishable_closed_screen(self) -> None:
+    def test_v10_calibration_rejects_indistinguishable_closed_screen(self) -> None:
         sessions = [
-            [self.guard.copy() for _ in range(4)]
+            [
+                self.guard.copy()
+                for _ in range(
+                    renewal.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                )
+            ]
             for _ in range(renewal.RENEWAL_CALIBRATION_OPENINGS)
         ]
         with self.assertRaisesRegex(ValueError, "구분되지 않습니다"):
@@ -1094,11 +1117,127 @@ class RenewalSafetyTests(unittest.TestCase):
             [],
         )
 
-    def test_three_incomplete_popup_attempts_stop_without_order(self) -> None:
+    def test_expired_schedule_never_sends_game_input(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(stop_event, repeat_guard=self.guard)
+        manager = _FakeManager(engine)
+        runner = renewal.FastRenewalRunner(
+            manager=manager,
+            profile=self.profile,
+            side="buy",
+            stop_event=stop_event,
+            logger=lambda _message: None,
+            status=lambda _message: None,
+            active_until=time.monotonic() - 0.001,
+            time_valid=lambda: True,
+        )
+        self.assertFalse(runner.run())
+        self.assertEqual(engine.clicks, [])
+        self.assertEqual(engine.escapes, 0)
+        self.assertTrue(runner.telemetry["schedule_expired"])
+
+    def test_stale_naver_time_pauses_without_game_input(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(stop_event, repeat_guard=self.guard)
+        manager = _FakeManager(engine)
+        checks = 0
+
+        def time_valid() -> bool:
+            nonlocal checks
+            checks += 1
+            if checks >= 3:
+                stop_event.set()
+            return False
+
+        runner = renewal.FastRenewalRunner(
+            manager=manager,
+            profile=self.profile,
+            side="buy",
+            stop_event=stop_event,
+            logger=lambda _message: None,
+            status=lambda _message: None,
+            active_until=time.monotonic() + 2.0,
+            time_valid=time_valid,
+        )
+        self.assertFalse(runner.run())
+        self.assertGreaterEqual(checks, 3)
+        self.assertEqual(engine.clicks, [])
+        self.assertEqual(engine.escapes, 0)
+        self.assertFalse(runner.telemetry["schedule_expired"])
+
+    def test_ambiguous_transition_does_not_close_before_stable_change(self) -> None:
+        incomplete = self.guard.copy()
+        x1, y1, x2, y2 = self.price_box
+        incomplete[y1:y2, x1:x2] = 224
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard, self.guard],
+                [self.guard, self.guard],
+                [incomplete, self.changed_guard, self.changed_guard],
+            ],
+        )
+        manager = _FakeManager(engine)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    renewal,
+                    "save_renewal_diagnostic",
+                    lambda *_args, **_kwargs: None,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    renewal.input_message,
+                    "prepare_mouse_click",
+                    lambda hwnd, x, y: SimpleNamespace(
+                        hwnd=hwnd,
+                        x=x,
+                        y=y,
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    renewal.input_message,
+                    "post_prepared_mouse_click",
+                    side_effect=lambda click: engine.on_click(
+                        click.hwnd,
+                        click.x,
+                        click.y,
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    renewal.input_message,
+                    "send_key_to_window",
+                    side_effect=engine.on_escape,
+                )
+            )
+            runner = renewal.FastRenewalRunner(
+                manager=manager,
+                profile=self.profile,
+                side="buy",
+                stop_event=stop_event,
+                logger=lambda _message: None,
+                status=lambda _message: None,
+                monitor_only=True,
+            )
+            self.assertFalse(runner.run())
+        self.assertTrue(runner.telemetry["monitor_detected"])
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_incomplete_popups_continue_until_external_stop_without_order(self) -> None:
         stop_event = threading.Event()
         engine = _FakeEngine(
             stop_event,
             cycles=[[]],
+            stop_after_closes=5,
         )
         completed = _run(
             self.profile,
@@ -1106,8 +1245,8 @@ class RenewalSafetyTests(unittest.TestCase):
             monitor_only=True,
         )
         self.assertFalse(completed)
-        self.assertEqual(engine.clicks, [(20, 10)] * 3)
-        self.assertEqual(engine.escapes, 3)
+        self.assertEqual(engine.clicks, [(20, 10)] * 5)
+        self.assertEqual(engine.escapes, 5)
         self.assertEqual(engine.mode, "closed")
 
     def test_recorded_false_orders_replay_as_unchanged(self) -> None:
@@ -1160,6 +1299,34 @@ class RenewalSafetyTests(unittest.TestCase):
                 )
                 replayed += 1
         self.assertGreaterEqual(replayed, 1)
+
+    def test_recorded_135jo_border_rerasterization_is_unchanged(self) -> None:
+        event_dir = (
+            Path.home()
+            / "AppData"
+            / "Local"
+            / "mAuto"
+            / "renewal_diagnostics"
+            / "20260725_184758_051058800_buy_ambiguous"
+        )
+        if not event_dir.is_dir():
+            self.skipTest("local 135조 regression fixture is unavailable")
+        baseline = cv2.imread(
+            str(event_dir / "baseline.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        candidate = cv2.imread(
+            str(event_dir / "candidate_1.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        classifier = renewal.RenewalPriceClassifier(
+            baseline,
+            unchanged_limit=0.040,
+            stability_limit=0.030,
+        )
+        result = classifier.classify(candidate)
+        self.assertIs(result.state, renewal.PriceState.UNCHANGED)
+        self.assertTrue(result.geometry_valid)
 
     def test_initial_mismatch_never_orders(self) -> None:
         stop_event = threading.Event()

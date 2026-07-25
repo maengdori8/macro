@@ -398,7 +398,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 renewal_macro._fit_game_window_to_wgc(100)
         restore.assert_called_once_with(snapshot)
 
-    def test_five_openings_accept_new_stable_frames_and_skip_stale_size(self):
+    def test_eight_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.full((height, width), 251, dtype=np.uint8)
         opened[0, 0] = 1
@@ -409,28 +409,24 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         transition[0, 0] = 1
 
         frames = [opened.copy()]
+        frames.extend([stale.copy(), transition.copy()])
         frames.extend(
-            [
-                stale.copy(),
-                transition.copy(),
-                opened.copy(),
-                opened.copy(),
-                opened.copy(),
-                opened.copy(),
-            ]
+            opened.copy()
+            for _ in range(
+                renewal_macro.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+            )
         )
-        for _ in range(4):
+        for _ in range(
+            renewal_macro.RENEWAL_CALIBRATION_OPENINGS - 1
+        ):
             frames.extend(closed.copy() for _ in range(4))
             frames.append(closed.copy())
+            frames.extend([stale.copy(), transition.copy()])
             frames.extend(
-                [
-                    stale.copy(),
-                    transition.copy(),
-                    opened.copy(),
-                    opened.copy(),
-                    opened.copy(),
-                    opened.copy(),
-                ]
+                opened.copy()
+                for _ in range(
+                    renewal_macro.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                )
             )
 
         manager = _Manager(frames, opened)
@@ -470,19 +466,37 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 (width, height),
             )
 
-        self.assertEqual(len(sessions), 5)
-        self.assertTrue(all(len(session) == 4 for session in sessions))
+        self.assertEqual(
+            len(sessions),
+            renewal_macro.RENEWAL_CALIBRATION_OPENINGS,
+        )
+        self.assertTrue(
+            all(
+                len(session)
+                == renewal_macro.RENEWAL_CALIBRATION_FRAMES_PER_OPENING
+                for session in sessions
+            )
+        )
         self.assertEqual(len(closed_samples), 4)
-        self.assertEqual(_Clicker.instance.escape_count, 4)
-        self.assertEqual(_Clicker.instance.click_count, 4)
+        self.assertEqual(
+            _Clicker.instance.escape_count,
+            renewal_macro.RENEWAL_CALIBRATION_OPENINGS - 1,
+        )
+        self.assertEqual(
+            _Clicker.instance.click_count,
+            renewal_macro.RENEWAL_CALIBRATION_OPENINGS - 1,
+        )
         self.assertTrue(manager.stopped)
         self.assertTrue(
-            any("5/5 팝업 확인" in line for line in app.log_messages)
+            any("8/8 팝업 확인" in line for line in app.log_messages)
         )
         popup_logs = [
             line for line in app.log_messages if "팝업 확인" in line
         ]
-        self.assertEqual(len(popup_logs), 5)
+        self.assertEqual(
+            len(popup_logs),
+            renewal_macro.RENEWAL_CALIBRATION_OPENINGS,
+        )
         self.assertTrue(
             all("불일치 1장" in line for line in popup_logs)
         )
