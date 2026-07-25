@@ -137,7 +137,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            (1313, 472, 1533, 520),
+            (1313, 431, 1533, 479),
         )
 
     def test_headless_price_rect_keeps_already_wide_horizontal_selection(self):
@@ -157,15 +157,15 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
 
         self.assertEqual(
             expanded.to_pixels(1928, 1048),
-            (1303, 472, 1533, 520),
+            (1303, 431, 1533, 479),
         )
 
     def test_headless_price_rect_is_idempotent_after_expansion(self):
         original = NormalizedRect(
             1313 / 1928,
-            472 / 1048,
+            431 / 1048,
             1533 / 1928,
-            520 / 1048,
+            479 / 1048,
         )
 
         expanded = renewal_macro._expand_headless_price_rect(
@@ -231,6 +231,24 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             renewal_macro.CALIBRATION_POPUP_WHITE_RATIO,
         )
         self.assertTrue(opaque_valid)
+
+        # A real opaque buy guard contains a long price and the gray edge of
+        # the amount input.  Its 72% white background is complete even though
+        # the full-crop mean is only about 216.
+        dense_opaque = np.full((100, 100), 251, dtype=np.uint8)
+        dense_opaque[:, 72:] = 125
+        dense_luma, dense_white_ratio, dense_valid = (
+            renewal_macro._calibration_popup_opacity(dense_opaque)
+        )
+        self.assertGreaterEqual(
+            dense_luma,
+            renewal_macro.CALIBRATION_POPUP_LUMA_FLOOR,
+        )
+        self.assertGreaterEqual(
+            dense_white_ratio,
+            renewal_macro.CALIBRATION_POPUP_WHITE_RATIO,
+        )
+        self.assertTrue(dense_valid)
 
     def test_calibration_guard_stability_rejects_crossfade_frames(self):
         early = np.full((40, 80), 223, dtype=np.uint8)

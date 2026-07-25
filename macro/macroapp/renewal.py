@@ -54,6 +54,11 @@ RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 4
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
+# A stop can race an action click: ESC may be processed while the list is
+# still visible, and the delayed popup can then appear roughly 0.5 s later.
+# Cleanup alone observes through this measured window; normal cycles retain
+# their immediate ready-frame path.
+RENEWAL_POPUP_CLEANUP_GRACE_SECONDS = 0.65
 SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
     {
         (1928, 1048),
@@ -654,11 +659,7 @@ def validate_limit_price_selection(
     height = rect.bottom - rect.top
     center_x = (rect.left + rect.right) * 0.5
     center_y = (rect.top + rect.bottom) * 0.5
-    expected_y = (
-        0.458 <= center_y <= 0.490
-        if side == "buy"
-        else 0.418 <= center_y <= 0.450
-    )
+    expected_y = 0.418 <= center_y <= 0.450
     if not (
         0.700 <= center_x <= 0.835
         and expected_y
@@ -1074,6 +1075,14 @@ class RenewalPriceClassifier:
     _GLYPH_RECT_SAME_LIMIT = 0.001
     _GLYPH_RECT_CHANGE_LIMIT = 0.002
     _GLYPH_RECT_KERNEL = np.ones((3, 3), dtype=np.uint8)
+    # A fully rendered popup can briefly re-rasterize every stroke at a
+    # different sub-pixel phase.  That produces a large exact XOR even
+    # though every native glyph pixel remains within two pixels of the same
+    # topology.  It is neither proof of equality nor proof of a price
+    # change, so route this signature to the fail-closed gray zone.
+    _GLYPH_RESAMPLE_KERNEL = np.ones((5, 5), dtype=np.uint8)
+    _GLYPH_RESAMPLE_LOCAL_LIMIT = 0.001
+    _GLYPH_RESAMPLE_EXACT_FLOOR = 0.150
 
     def __init__(
         self,
@@ -1135,6 +1144,15 @@ class RenewalPriceClassifier:
         )
         self._baseline_local_glyph_rect_dilated_inverse = cv2.bitwise_not(
             self.baseline_local_glyph_rect_dilated
+        )
+        self.baseline_local_glyph_resample_dilated = cv2.dilate(
+            self.baseline_local_glyph_mask,
+            self._GLYPH_RESAMPLE_KERNEL,
+        )
+        self._baseline_local_glyph_resample_dilated_inverse = (
+            cv2.bitwise_not(
+                self.baseline_local_glyph_resample_dilated
+            )
         )
         glyph_shape = self.baseline.shape
         self._glyph_background_work = np.empty(glyph_shape, dtype=np.uint8)
@@ -1230,8 +1248,17 @@ class RenewalPriceClassifier:
     def _glyph_difference_evidence_after_illumination(
         self,
         image: np.ndarray,
-    ) -> tuple[Optional[float], Optional[float]]:
-        """Return cross- and square-tolerant native glyph differences."""
+    ) -> tuple[
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        Optional[float],
+    ]:
+        """Return coherent native-glyph difference evidence.
+
+        The values are cross-3x3, square-3x3, square-5x5, and exact XOR
+        ratios, all measured from the same illumination-normalized masks.
+        """
 
         cv2.blur(
             image,
@@ -1252,12 +1279,12 @@ class RenewalPriceClassifier:
         current_mask = self._glyph_mask_work
         current_count = int(cv2.countNonZero(current_mask))
         if current_count < 64:
-            return None, None
+            return None, None, None, None
         population_ratio = (
             float(current_count) / float(self.baseline_local_glyph_count)
         )
         if not 0.85 <= population_ratio <= 1.18:
-            return None, None
+            return None, None, None, None
         kernel = RenewalChangeDetector._DILATE_KERNEL
         cv2.dilate(current_mask, kernel, self._glyph_dilated_work)
         cv2.bitwise_not(
@@ -1286,8 +1313,17 @@ class RenewalPriceClassifier:
         )
         union_count = int(cv2.countNonZero(self._glyph_union_work))
         if union_count <= 0:
-            return None, None
+            return None, None, None, None
         cross_difference = (
+            float(cv2.countNonZero(self._glyph_difference_work))
+            / float(union_count)
+        )
+        cv2.bitwise_xor(
+            self.baseline_local_glyph_mask,
+            current_mask,
+            self._glyph_difference_work,
+        )
+        exact_difference = (
             float(cv2.countNonZero(self._glyph_difference_work))
             / float(union_count)
         )
@@ -1322,7 +1358,40 @@ class RenewalPriceClassifier:
             float(cv2.countNonZero(self._glyph_difference_work))
             / float(union_count)
         )
-        return cross_difference, rectangular_difference
+        cv2.dilate(
+            current_mask,
+            self._GLYPH_RESAMPLE_KERNEL,
+            self._glyph_dilated_work,
+        )
+        cv2.bitwise_not(
+            self._glyph_dilated_work,
+            self._glyph_inverse_work,
+        )
+        cv2.bitwise_and(
+            self.baseline_local_glyph_mask,
+            self._glyph_inverse_work,
+            self._glyph_first_diff_work,
+        )
+        cv2.bitwise_and(
+            current_mask,
+            self._baseline_local_glyph_resample_dilated_inverse,
+            self._glyph_second_diff_work,
+        )
+        cv2.bitwise_or(
+            self._glyph_first_diff_work,
+            self._glyph_second_diff_work,
+            self._glyph_difference_work,
+        )
+        resample_local_difference = (
+            float(cv2.countNonZero(self._glyph_difference_work))
+            / float(union_count)
+        )
+        return (
+            cross_difference,
+            rectangular_difference,
+            resample_local_difference,
+            exact_difference,
+        )
 
     def _glyph_difference_after_illumination(
         self,
@@ -1765,23 +1834,33 @@ class RenewalPriceClassifier:
 
         glyph_difference: Optional[float] = None
         rectangular_glyph_difference: Optional[float] = None
+        glyph_evidence: list[tuple[float, float, float, float]] = []
         if geometry_valid and global_score >= self._GLYPH_ANALYSIS_FLOOR:
             # A residual right-anchor shift can be one pixel worse than the
             # raw ROI for the same glyph. The smaller native difference is
             # the safe choice because either registration can veto an order.
             differences: list[float] = []
             rectangular_differences: list[float] = []
+            aligned_evidence = (
+                self._glyph_difference_evidence_after_illumination(
+                    aligned,
+                )
+            )
             (
                 aligned_difference,
                 aligned_rectangular_difference,
-            ) = self._glyph_difference_evidence_after_illumination(
-                aligned,
-            )
+                _aligned_resample_difference,
+                _aligned_exact_difference,
+            ) = aligned_evidence
             if aligned_difference is not None:
                 differences.append(aligned_difference)
             if aligned_rectangular_difference is not None:
                 rectangular_differences.append(
                     aligned_rectangular_difference
+                )
+            if all(value is not None for value in aligned_evidence):
+                glyph_evidence.append(
+                    tuple(float(value) for value in aligned_evidence)
                 )
             if (
                 (dx != 0 or dy != 0)
@@ -1790,17 +1869,26 @@ class RenewalPriceClassifier:
                 and self._boundary_clear(gray_for_cache)
                 and self._render_contrast_valid(gray_for_cache)
             ):
+                raw_evidence = (
+                    self._glyph_difference_evidence_after_illumination(
+                        gray_for_cache
+                    )
+                )
                 (
                     raw_difference,
                     raw_rectangular_difference,
-                ) = self._glyph_difference_evidence_after_illumination(
-                    gray_for_cache
-                )
+                    _raw_resample_difference,
+                    _raw_exact_difference,
+                ) = raw_evidence
                 if raw_difference is not None:
                     differences.append(raw_difference)
                 if raw_rectangular_difference is not None:
                     rectangular_differences.append(
                         raw_rectangular_difference
+                    )
+                if all(value is not None for value in raw_evidence):
+                    glyph_evidence.append(
+                        tuple(float(value) for value in raw_evidence)
                     )
             if differences:
                 glyph_difference = min(differences)
@@ -1825,6 +1913,19 @@ class RenewalPriceClassifier:
             and rectangular_glyph_difference
             >= self._GLYPH_RECT_CHANGE_LIMIT
         )
+        best_glyph_evidence = (
+            min(glyph_evidence, key=lambda item: (item[1], item[0]))
+            if glyph_evidence
+            else None
+        )
+        global_resampling_gray_zone = bool(
+            best_glyph_evidence is not None
+            and global_score <= self.unchanged_limit
+            and best_glyph_evidence[2]
+            <= self._GLYPH_RESAMPLE_LOCAL_LIMIT
+            and best_glyph_evidence[3]
+            >= self._GLYPH_RESAMPLE_EXACT_FLOOR
+        )
         native_structure_change = bool(
             glyph_difference is not None
             and global_score >= self._GLYPH_CHANGE_GLOBAL_FLOOR
@@ -1837,6 +1938,9 @@ class RenewalPriceClassifier:
         elif illumination_same:
             state = PriceState.UNCHANGED
             reason = "illumination_normalized_same_glyph"
+        elif global_resampling_gray_zone:
+            state = PriceState.AMBIGUOUS
+            reason = "global_glyph_resampling"
         elif native_structure_change:
             state = PriceState.CHANGED
             reason = "native_glyph_structure_change"
@@ -3057,7 +3161,11 @@ class FastRenewalRunner:
                     return "modal"
             return "unknown"
 
-        def close_modal(*, allow_stopped: bool = False) -> bool:
+        def close_modal(
+            *,
+            allow_stopped: bool = False,
+            pending_open_started: Optional[float] = None,
+        ) -> bool:
             self.telemetry["current_popup_escape_sent"] = True
             clicker.press_escape()
             closing_started = time.perf_counter()
@@ -3067,11 +3175,51 @@ class FastRenewalRunner:
                 # duration timer fires.  Aborting here can leave the popup
                 # open and make the next run fail its initial state check.
                 time.sleep(settle_seconds)
-            ready = wait_until_ready(
-                time.monotonic() + 0.75,
-                not_before=closing_started,
-                allow_stopped=True,
-            )
+            if allow_stopped and pending_open_started is not None:
+                # Do not accept the first ready frame as final.  If the stop
+                # raced the open click, that frame can precede a delayed modal
+                # by hundreds of milliseconds.  Observe through the measured
+                # open window and close any modal that arrives later.
+                cleanup_deadline = max(
+                    time.monotonic() + 0.10,
+                    pending_open_started
+                    + RENEWAL_POPUP_CLEANUP_GRACE_SECONDS,
+                )
+                ready_streak = 0
+                last_escape = closing_started
+                while time.monotonic() < cleanup_deadline:
+                    packet = next_guard_packet(
+                        cleanup_deadline,
+                        not_before=closing_started,
+                        allow_stopped=True,
+                    )
+                    if packet is None:
+                        break
+                    if modal_guard.register(
+                        packet.image,
+                        side_profile.guard_luma_noise,
+                        side_profile.guard_edge_noise,
+                    ).valid:
+                        ready_streak = 0
+                        if time.perf_counter() - last_escape >= 0.050:
+                            clicker.press_escape()
+                            last_escape = time.perf_counter()
+                        continue
+                    if ready_guard.register(
+                        packet.image,
+                        side_profile.closed_guard_luma_noise,
+                        side_profile.closed_guard_edge_noise,
+                    ).valid:
+                        ready_streak += 1
+                    else:
+                        ready_streak = 0
+                ready = ready_streak >= 2
+            else:
+                ready = wait_until_ready(
+                    time.monotonic() + 0.75,
+                    not_before=closing_started,
+                    allow_stopped=True,
+                )
             if ready:
                 self.telemetry["popup_may_be_open"] = False
                 close_latencies.append(
@@ -3109,7 +3257,10 @@ class FastRenewalRunner:
             if self.profile.open_settle_ms > 0 and self._wait(
                 self.profile.open_settle_ms / 1000.0
             ):
-                close_modal(allow_stopped=True)
+                close_modal(
+                    allow_stopped=True,
+                    pending_open_started=opening_not_before,
+                )
                 update_performance_telemetry()
                 return False
 
@@ -3207,7 +3358,10 @@ class FastRenewalRunner:
 
             if self.stop_event.is_set():
                 if bool(self.telemetry["popup_may_be_open"]):
-                    close_modal(allow_stopped=True)
+                    close_modal(
+                        allow_stopped=True,
+                        pending_open_started=opening_not_before,
+                    )
                 update_performance_telemetry()
                 return False
 

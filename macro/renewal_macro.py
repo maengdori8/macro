@@ -91,7 +91,7 @@ from macroapp.window import InactiveManager
 ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 CALIBRATION_CLOSE_TIMEOUT_SECONDS = 3.0
 CALIBRATION_OPEN_TIMEOUT_SECONDS = 5.0
-CALIBRATION_POPUP_LUMA_FLOOR = 220.0
+CALIBRATION_POPUP_LUMA_FLOOR = 210.0
 CALIBRATION_POPUP_WHITE_FLOOR = 250
 CALIBRATION_POPUP_WHITE_RATIO = 0.70
 CALIBRATION_PRICE_TARGET_HEIGHT = 48
@@ -136,7 +136,10 @@ def _expand_headless_price_rect(
         max(x2, int(round(frame_width * CALIBRATION_PRICE_RIGHT_X))),
     )
     target_left = max(0, target_right - target_width)
-    target_center_y = 0.4733 if side_name == "buy" else 0.4342
+    # FC uses different buy/sell modal layouts.  At 1928x1048 the buy upper
+    # limit and sell lower limit both occupy the 431:479 row.  The buy row
+    # below this range is the amount input, not the upper-limit label.
+    target_center_y = 0.4342
     target_top = int(
         round(
             frame_height * target_center_y
