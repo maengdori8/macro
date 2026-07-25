@@ -2049,6 +2049,9 @@ class RenewalModalGuard:
         self.baseline = baseline.copy()
         self.shift_limit = min(4, max(1, int(shift_limit)))
         self._last_shift = (0, 0)
+        self._last_candidate: Optional[np.ndarray] = None
+        self._last_candidate_noise: Optional[tuple[float, float]] = None
+        self._last_registration: Optional[GuardRegistration] = None
         self.mask = np.full(self.baseline.shape, 255, dtype=np.uint8)
         boxes = tuple(dynamic_boxes or (price_box,))
         if price_box not in boxes:
@@ -2182,23 +2185,31 @@ class RenewalModalGuard:
         residual = np.abs(difference - illumination)
         return float(cv2.mean(residual, mask=self.mask)[0])
 
-    def _spatial_match(
+    def _spatial_precheck(
         self,
         gray: np.ndarray,
         raw_spatial: float,
         luma_delta: float,
-        edge_delta: float,
     ) -> bool:
         if raw_spatial <= self._direct_spatial_limit:
             return True
+        return bool(
+            luma_delta <= 10.0
+            and self._local_registration_luma(gray)
+            <= self._local_spatial_limit
+        )
+
+    def _spatial_edge_match(
+        self,
+        raw_spatial: float,
+        edge_delta: float,
+    ) -> bool:
         # A smooth white-popup render drift is allowed only when the static
         # edge structure is virtually exact.  Position shifts and a different
         # popup therefore cannot enter through this illumination-only path.
         return bool(
-            luma_delta <= 10.0
-            and edge_delta <= 0.03
-            and self._local_registration_luma(gray)
-            <= self._local_spatial_limit
+            raw_spatial <= self._direct_spatial_limit
+            or edge_delta <= 0.03
         )
 
     def _template_shift(
@@ -2272,6 +2283,17 @@ class RenewalModalGuard:
             return 255.0, 1.0
         return self._luma_delta(gray), self._edge_delta(gray)
 
+    def _remember_registration(
+        self,
+        gray: np.ndarray,
+        noise_key: tuple[float, float],
+        registration: GuardRegistration,
+    ) -> GuardRegistration:
+        self._last_candidate = gray.copy()
+        self._last_candidate_noise = noise_key
+        self._last_registration = registration
+        return registration
+
     def register(
         self,
         image: np.ndarray,
@@ -2292,6 +2314,14 @@ class RenewalModalGuard:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         if gray.shape != self.baseline.shape:
             return GuardRegistration(False, gray, 0, 0, 255.0, 1.0)
+        noise_key = (float(luma_noise), float(edge_noise))
+        if (
+            self._last_candidate_noise == noise_key
+            and self._last_candidate is not None
+            and self._last_registration is not None
+            and np.array_equal(gray, self._last_candidate)
+        ):
+            return self._last_registration
         luma_limit = max(12.0, luma_noise * 4.0 + 2.0)
         edge_limit = max(0.10, edge_noise * 4.0 + 0.02)
         registered_edge_limit = max(0.20, edge_limit)
@@ -2302,38 +2332,51 @@ class RenewalModalGuard:
         # Canny, float registration, template matching, and the 9x9 fallback.
         direct_luma = self._luma_delta(gray)
         if direct_luma > max(96.0, luma_limit * 5.0):
-            return GuardRegistration(
-                False,
+            return self._remember_registration(
                 gray,
-                0,
-                0,
-                direct_luma,
-                1.0,
+                noise_key,
+                GuardRegistration(
+                    False,
+                    gray,
+                    0,
+                    0,
+                    direct_luma,
+                    1.0,
+                ),
             )
 
         # 대부분의 정상 프레임은 이동이 없습니다. 먼저 0px을 검사해 81개 정렬
         # 후보 탐색을 피하고, 불일치일 때만 ±shift_limit 정밀 탐색으로 내려갑니다.
-        direct_edge = self._edge_delta(gray)
         direct_spatial = self._registration_luma(gray)
         if (
-            self._spatial_match(
+            direct_luma <= luma_limit
+            and self._spatial_precheck(
                 gray,
                 direct_spatial,
                 direct_luma,
-                direct_edge,
             )
-            and direct_luma <= luma_limit
-            and direct_edge <= registered_edge_limit
         ):
-            self._last_shift = (0, 0)
-            return GuardRegistration(
-                True,
-                gray,
-                0,
-                0,
-                direct_luma,
-                direct_edge,
-            )
+            direct_edge = self._edge_delta(gray)
+            if (
+                self._spatial_edge_match(
+                    direct_spatial,
+                    direct_edge,
+                )
+                and direct_edge <= registered_edge_limit
+            ):
+                self._last_shift = (0, 0)
+                return self._remember_registration(
+                    gray,
+                    noise_key,
+                    GuardRegistration(
+                        True,
+                        gray,
+                        0,
+                        0,
+                        direct_luma,
+                        direct_edge,
+                    ),
+                )
 
         cached_dx, cached_dy = self._last_shift
         if cached_dx != 0 or cached_dy != 0:
@@ -2342,26 +2385,36 @@ class RenewalModalGuard:
                 cached_dx,
                 cached_dy,
             )
-            cached_luma, cached_edge = self.metrics(cached_aligned)
+            cached_luma = self._luma_delta(cached_aligned)
             cached_spatial = self._registration_luma(cached_aligned)
             if (
-                self._spatial_match(
+                cached_luma <= luma_limit
+                and self._spatial_precheck(
                     cached_aligned,
                     cached_spatial,
                     cached_luma,
-                    cached_edge,
                 )
-                and cached_luma <= luma_limit
-                and cached_edge <= registered_edge_limit
             ):
-                return GuardRegistration(
-                    True,
-                    cached_aligned,
-                    cached_dx,
-                    cached_dy,
-                    cached_luma,
-                    cached_edge,
-                )
+                cached_edge = self._edge_delta(cached_aligned)
+                if (
+                    self._spatial_edge_match(
+                        cached_spatial,
+                        cached_edge,
+                    )
+                    and cached_edge <= registered_edge_limit
+                ):
+                    return self._remember_registration(
+                        gray,
+                        noise_key,
+                        GuardRegistration(
+                            True,
+                            cached_aligned,
+                            cached_dx,
+                            cached_dy,
+                            cached_luma,
+                            cached_edge,
+                        ),
+                    )
 
         candidate_edges = cv2.Canny(
             cv2.GaussianBlur(gray, (3, 3), 0),
@@ -2383,28 +2436,55 @@ class RenewalModalGuard:
             template_spatial = self._registration_luma(
                 template_aligned
             )
-            template_luma, template_edge = self.metrics(
-                template_aligned
-            )
+            template_luma = self._luma_delta(template_aligned)
+            template_edge = 1.0
             if (
-                self._spatial_match(
+                template_luma <= luma_limit
+                and self._spatial_precheck(
                     template_aligned,
                     template_spatial,
                     template_luma,
-                    template_edge,
                 )
-                and template_luma <= luma_limit
-                and template_edge <= registered_edge_limit
             ):
-                self._last_shift = (template_dx, template_dy)
-                return GuardRegistration(
-                    True,
+                template_edge = self._edge_delta(template_aligned)
+                if (
+                    self._spatial_edge_match(
+                        template_spatial,
+                        template_edge,
+                    )
+                    and template_edge <= registered_edge_limit
+                ):
+                    self._last_shift = (template_dx, template_dy)
+                    return self._remember_registration(
+                        gray,
+                        noise_key,
+                        GuardRegistration(
+                            True,
+                            template_aligned,
+                            template_dx,
+                            template_dy,
+                            template_luma,
+                            template_edge,
+                        ),
+                    )
+            # Static popup templates found a concrete alignment, but the
+            # aligned frame still failed the full luma/edge/structure guard.
+            # This is an incomplete popup transition or a different modal.
+            # Searching every other +/-4 px position cannot turn it into
+            # trustworthy popup evidence; it only burns a full frame budget.
+            # Fail closed and let the next fresh WGC frame retry.
+            return self._remember_registration(
+                gray,
+                noise_key,
+                GuardRegistration(
+                    False,
                     template_aligned,
                     template_dx,
                     template_dy,
                     template_luma,
                     template_edge,
-                )
+                ),
+            )
         # Edge overlap alone can prefer a diagonal near-match when the whole
         # popup moved horizontally.  Choose by brightness-normalized spatial
         # error first, then raw luminance and edge structure.  This preserves
@@ -2465,24 +2545,28 @@ class RenewalModalGuard:
         # Luminance still remains strict and prevents a different popup from
         # passing this relaxed registered-edge ceiling.
         valid = (
-            self._spatial_match(
+            self._spatial_precheck(
                 aligned,
                 aligned_spatial,
                 luma_delta,
-                edge_delta,
             )
+            and self._spatial_edge_match(aligned_spatial, edge_delta)
             and luma_delta <= luma_limit
             and edge_delta <= registered_edge_limit
         )
         if valid:
             self._last_shift = (dx, dy)
-        return GuardRegistration(
-            valid,
-            aligned,
-            dx,
-            dy,
-            luma_delta,
-            edge_delta,
+        return self._remember_registration(
+            gray,
+            noise_key,
+            GuardRegistration(
+                valid,
+                aligned,
+                dx,
+                dy,
+                luma_delta,
+                edge_delta,
+            ),
         )
 
     def matches(

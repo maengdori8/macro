@@ -562,6 +562,78 @@ class RenewalSafetyTests(unittest.TestCase):
         # screen whose luminance is plainly not this popup.
         self.assertEqual(translate.call_count, 0)
 
+    def test_guard_rejects_incomplete_template_match_without_shift_sweep(
+        self,
+    ) -> None:
+        guard_detector = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            shift_limit=4,
+        )
+        # Close enough to bypass the coarse closed-screen luma rejection, but
+        # structurally incomplete and therefore never valid popup evidence.
+        incomplete = np.clip(
+            self.guard.astype(np.float32) * 0.65,
+            0,
+            255,
+        ).astype(np.uint8)
+        with (
+            patch.object(
+                guard_detector,
+                "_template_shift",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                renewal,
+                "_translate_image",
+                wraps=renewal._translate_image,
+            ) as translate,
+            patch.object(
+                guard_detector,
+                "_edge_delta",
+                wraps=guard_detector._edge_delta,
+            ) as edge_delta,
+        ):
+            registration = guard_detector.register(
+                incomplete,
+                0.0,
+                0.0,
+            )
+        self.assertFalse(registration.valid)
+        # One translation validates the template's proposed location.  The
+        # old 9x9 fallback would add 81 more translations on every transition
+        # frame even though no alignment could make it a completed popup.
+        self.assertEqual(translate.call_count, 1)
+        # Luma and local structure already prove this popup is incomplete, so
+        # expensive Canny edge extraction must not run at all.
+        self.assertEqual(edge_delta.call_count, 0)
+
+    def test_guard_reuses_exact_fresh_frame_pixels_without_reprocessing(
+        self,
+    ) -> None:
+        guard_detector = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            shift_limit=4,
+        )
+        shifted = renewal._translate_image(self.guard, 3, -2)
+        with patch.object(
+            guard_detector,
+            "_edge_delta",
+            wraps=guard_detector._edge_delta,
+        ) as edge_delta:
+            first = guard_detector.register(shifted, 0.0, 0.0)
+            calls_after_first = edge_delta.call_count
+            second = guard_detector.register(
+                shifted.copy(),
+                0.0,
+                0.0,
+            )
+        self.assertTrue(first.valid)
+        self.assertIs(first, second)
+        self.assertGreater(calls_after_first, 0)
+        self.assertEqual(edge_delta.call_count, calls_after_first)
+
     def test_guard_accepts_only_structure_matched_smooth_illumination_drift(
         self,
     ) -> None:
