@@ -552,6 +552,31 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         )
         self.assertTrue(summary["within_limit"])
 
+    def test_headless_monitor_separates_safe_reselection_recovery(self):
+        summary = renewal_macro._headless_open_failure_summary(
+            {
+                "confirmed_openings": 100,
+                "open_failures": 50,
+                "recovered_open_failures": 50,
+            }
+        )
+        self.assertEqual(summary["recovered_open_failures"], 50)
+        self.assertEqual(summary["unrecovered_open_failures"], 0)
+        self.assertEqual(summary["open_failure_rate"], 0.0)
+        self.assertGreater(summary["raw_open_failure_rate"], 0.3)
+        self.assertTrue(summary["within_limit"])
+
+    def test_headless_monitor_still_rejects_unrecovered_failure(self):
+        summary = renewal_macro._headless_open_failure_summary(
+            {
+                "confirmed_openings": 100,
+                "open_failures": 50,
+                "recovered_open_failures": 49,
+            }
+        )
+        self.assertEqual(summary["unrecovered_open_failures"], 1)
+        self.assertFalse(summary["within_limit"])
+
     def test_finished_checkpoint_keeps_the_resources_used_for_pass(self):
         accepted = {
             "within_limits": True,

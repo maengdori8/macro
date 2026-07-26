@@ -98,6 +98,9 @@ class _FakeEngine:
         self.open_packet_counts: list[int] = []
         self.mode = "closed"
         self.closed_guard = np.zeros((60, 100), dtype=np.uint8)
+        self.full_frame = np.full((100, 200), 128, dtype=np.uint8)
+        self.target_selected = True
+        self.action_disabled = False
         self.sequence_id = 0
         self.runner_telemetry: dict[str, object] = {}
 
@@ -111,7 +114,9 @@ class _FakeEngine:
     def get_latest_frame_packet(self, timeout: float = 0.0):
         if timeout <= 0:
             return None
-        if self.mode == "closed":
+        if self.capture_region is None:
+            frame = self.render_full_frame()
+        elif self.mode == "closed":
             frame = self.closed_guard.copy()
             if (
                 self.stop_after_closes is not None
@@ -134,9 +139,26 @@ class _FakeEngine:
         self.sequence_id += 1
         return CapturedFrame(frame.copy(), self.sequence_id, time.perf_counter())
 
+    def render_full_frame(self) -> np.ndarray:
+        frame = self.full_frame.copy()
+        guard = self.closed_guard
+        if self.mode == "open" and self.open_frames:
+            guard = self.open_frames[
+                min(self.open_index, len(self.open_frames) - 1)
+            ]
+        if guard.shape == (60, 100):
+            frame[20:80, 100:200] = guard
+        if self.action_disabled:
+            frame[7:14, 8:33] = 40
+        if not self.target_selected:
+            frame[28:33, 29:72] = 40
+        return frame
+
     def on_click(self, _hwnd: int, x: int, y: int) -> None:
         self.clicks.append((x, y))
         if (x, y) == (20, 10):
+            if self.action_disabled:
+                return
             self.cycle_index += 1
             self.mode = "open"
             self.open_index = 0
@@ -149,6 +171,12 @@ class _FakeEngine:
             else:
                 index = min(self.cycle_index, len(self.cycles) - 1)
                 self.open_frames = self.cycles[index]
+        elif (x, y) == (50, 40):
+            self.target_selected = False
+            self.action_disabled = False
+        elif (x, y) == (50, 30):
+            self.target_selected = True
+            self.action_disabled = False
 
     def on_escape(self, *_args, **_kwargs) -> None:
         self.escapes += 1
@@ -165,7 +193,7 @@ class _FakeManager:
         return True
 
     def capture_client_area(self, *, window_validated: bool = False):
-        return np.full((100, 200), 128, dtype=np.uint8)
+        return self.engine.render_full_frame()
 
     def wgc_to_client(self, x: int, y: int):
         return x, y
@@ -211,24 +239,104 @@ class _SizeReportingEngine(_FakeEngine):
         return self.frame_size
 
 
+class _DisabledActionRecoveryEngine(_FakeEngine):
+    """First action click turns gray; row reselection restores it."""
+
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        guard: np.ndarray,
+        *,
+        alternate_click_works: bool = True,
+        target_click_works: bool = True,
+    ):
+        super().__init__(
+            stop_event,
+            repeat_guard=guard,
+            stop_after_closes=1,
+        )
+        self.disable_first_action = True
+        self.alternate_click_works = alternate_click_works
+        self.target_click_works = target_click_works
+
+    def on_click(self, hwnd: int, x: int, y: int) -> None:
+        if (x, y) == (20, 10) and self.disable_first_action:
+            self.clicks.append((x, y))
+            self.disable_first_action = False
+            self.action_disabled = True
+            self.mode = "closed"
+            return
+        if (x, y) == (50, 40) and not self.alternate_click_works:
+            self.clicks.append((x, y))
+            return
+        if (x, y) == (50, 30) and not self.target_click_works:
+            self.clicks.append((x, y))
+            return
+        super().on_click(hwnd, x, y)
+
+
+class _DroppedActionEngine(_FakeEngine):
+    """Leaves the exact ready state visible after each action click."""
+
+    def __init__(self, stop_event: threading.Event, stop_after_actions: int):
+        super().__init__(stop_event, cycles=[[]])
+        self.stop_after_actions = stop_after_actions
+        self.action_count = 0
+        self.stop_on_guard_restore = False
+
+    def on_click(self, _hwnd: int, x: int, y: int) -> None:
+        self.clicks.append((x, y))
+        if (x, y) != (20, 10):
+            return
+        self.action_count += 1
+        self.mode = "closed"
+        if self.action_count >= self.stop_after_actions:
+            self.stop_on_guard_restore = True
+
+    def set_capture_region(self, region) -> None:
+        previous = self.capture_region
+        super().set_capture_region(region)
+        if (
+            self.stop_on_guard_restore
+            and previous is None
+            and region is not None
+        ):
+            self.stop_event.set()
+
+
 def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
     full_frame = np.full((100, 200), 128, dtype=np.uint8)
+    full_frame[20:80, 100:200] = np.zeros_like(guard)
     action_point = renewal.NormalizedPoint(20 / 199, 10 / 99)
+    reselect_target_point = renewal.NormalizedPoint(50 / 199, 30 / 99)
+    reselect_alternate_point = renewal.NormalizedPoint(50 / 199, 40 / 99)
     action_ready_rect = renewal.build_action_ready_rect(
         action_point,
         200,
         100,
     )
+    reselect_target_rect = renewal.build_reselect_target_rect(
+        reselect_target_point,
+        200,
+        100,
+    )
     x1, y1, x2, y2 = action_ready_rect.to_pixels(200, 100)
+    tx1, ty1, tx2, ty2 = reselect_target_rect.to_pixels(200, 100)
     side = renewal.RenewalSideProfile(
         action_point=action_point,
         action_ready_rect=action_ready_rect,
         action_ready_png=renewal.encode_gray_png(
             full_frame[y1:y2, x1:x2]
         ),
+        reselect_target_point=reselect_target_point,
+        reselect_alternate_point=reselect_alternate_point,
+        reselect_target_rect=reselect_target_rect,
+        reselect_target_png=renewal.encode_gray_png(
+            full_frame[ty1:ty2, tx1:tx2]
+        ),
         confirm_point=renewal.NormalizedPoint(180 / 199, 80 / 99),
-        price_rect=renewal.NormalizedRect(0.40, 0.40, 0.60, 0.60),
-        guard_rect=renewal.NormalizedRect(0.25, 0.20, 0.75, 0.80),
+        price_rect=renewal.NormalizedRect(0.65, 0.40, 0.85, 0.60),
+        guard_rect=renewal.NormalizedRect(0.50, 0.20, 1.00, 0.80),
         limit_point=renewal.NormalizedPoint(140 / 199, 70 / 99),
         baseline_png=renewal.encode_gray_png(baseline),
         baseline_variants_png=[renewal.encode_gray_png(baseline)],
@@ -590,16 +698,20 @@ class RenewalSafetyTests(unittest.TestCase):
         loaded = renewal.RenewalProfile.from_dict(legacy)
         self.assertIn("v10 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v13_profile_round_trip_keeps_action_anchor_and_schedule(self) -> None:
+    def test_v14_profile_round_trip_keeps_reselect_anchors_and_schedule(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         self.profile.fast_probe_interval = 6
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 13)
+        self.assertEqual(loaded.to_dict()["version"], 14)
         self.assertTrue(loaded.buy.complete())
         self.assertIsNotNone(loaded.buy.action_ready_rect)
         self.assertTrue(loaded.buy.action_ready_png)
+        self.assertIsNotNone(loaded.buy.reselect_target_point)
+        self.assertIsNotNone(loaded.buy.reselect_alternate_point)
+        self.assertIsNotNone(loaded.buy.reselect_target_rect)
+        self.assertTrue(loaded.buy.reselect_target_png)
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
         self.assertEqual(len(loaded.buy.baseline_variants_png), 1)
@@ -607,6 +719,36 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(loaded.target_minute, 20)
         self.assertTrue(loaded.first_frame_fast_exit)
         self.assertEqual(loaded.fast_probe_interval, 6)
+
+    def test_v13_profile_requires_v14_reselect_recovery(self) -> None:
+        legacy = self.profile.to_dict()
+        legacy["version"] = 13
+        for key in (
+            "reselect_target_point",
+            "reselect_alternate_point",
+            "reselect_target_rect",
+            "reselect_target_png",
+        ):
+            legacy["buy"].pop(key)
+        loaded = renewal.RenewalProfile.from_dict(legacy)
+        self.assertIn(
+            "v14 target/alternate player reselect recovery",
+            loaded.missing("buy"),
+        )
+
+    def test_reselect_points_must_be_separate_and_inside_player_list(
+        self,
+    ) -> None:
+        target = renewal.NormalizedPoint(0.25, 0.30)
+        alternate = renewal.NormalizedPoint(0.25, 0.40)
+        self.assertTrue(renewal.valid_reselect_points(target, alternate))
+        self.assertFalse(renewal.valid_reselect_points(target, target))
+        self.assertFalse(
+            renewal.valid_reselect_points(
+                target,
+                renewal.NormalizedPoint(0.80, 0.40),
+            )
+        )
 
     def test_proven_top_left_dwm_extension_reuses_calibrated_pixels(self) -> None:
         side = self.profile.buy
@@ -1831,19 +1973,23 @@ class RenewalSafetyTests(unittest.TestCase):
 
     def test_incomplete_popups_continue_until_external_stop_without_order(self) -> None:
         stop_event = threading.Event()
-        engine = _FakeEngine(
+        engine = _DroppedActionEngine(
             stop_event,
-            cycles=[[]],
-            stop_after_closes=5,
+            stop_after_actions=5,
         )
-        completed = _run(
-            self.profile,
-            engine,
-            monitor_only=True,
-        )
+        with patch.object(
+            renewal,
+            "RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+            )
         self.assertFalse(completed)
         self.assertEqual(engine.clicks, [(20, 10)] * 5)
-        self.assertEqual(engine.escapes, 5)
+        self.assertEqual(engine.escapes, 0)
         self.assertEqual(engine.mode, "closed")
 
     def test_recorded_false_orders_replay_as_unchanged(self) -> None:
@@ -2094,26 +2240,125 @@ class RenewalSafetyTests(unittest.TestCase):
             _run(self.profile, engine)
         self.assertEqual(engine.clicks, [])
 
-    def test_wrong_or_disabled_action_context_stops_before_first_click(
+    def test_startup_gray_action_reselects_before_first_open(
         self,
     ) -> None:
         stop_event = threading.Event()
-        engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
-        wrong_screen = np.full((100, 200), 128, dtype=np.uint8)
-        action_rect = self.profile.buy.action_ready_rect
-        self.assertIsNotNone(action_rect)
-        x1, y1, x2, y2 = action_rect.to_pixels(200, 100)
-        wrong_screen[y1:y2, x1:x2] = 40
+        engine = _FakeEngine(
+            stop_event,
+            repeat_guard=self.guard,
+            stop_after_closes=1,
+        )
+        engine.action_disabled = True
 
-        with patch.object(
-            _FakeManager,
-            "capture_client_area",
-            return_value=wrong_screen,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "활성 버튼"):
-                _run(self.profile, engine)
+        completed = _run(
+            self.profile,
+            engine,
+            monitor_only=True,
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual(
+            engine.clicks,
+            [(50, 40), (50, 30), (20, 10)],
+        )
+        self.assertEqual(
+            engine.runner_telemetry["reselection_successes"],
+            1,
+        )
+
+    def test_wrong_target_row_stops_before_first_click(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
+        engine.target_selected = False
+
+        with self.assertRaisesRegex(RuntimeError, "활성 버튼"):
+            _run(self.profile, engine)
 
         self.assertEqual(engine.clicks, [])
+
+    def test_gray_action_reselects_other_then_target_without_order(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DisabledActionRecoveryEngine(
+            stop_event,
+            self.guard,
+        )
+
+        completed = _run(
+            self.profile,
+            engine,
+            monitor_only=True,
+            continuous_monitor=True,
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual(
+            engine.clicks,
+            [
+                (20, 10),
+                (50, 40),
+                (50, 30),
+                (20, 10),
+            ],
+        )
+        self.assertEqual(engine.escapes, 1)
+        telemetry = engine.runner_telemetry
+        self.assertEqual(telemetry["runtime_disabled_action_detections"], 1)
+        self.assertEqual(telemetry["reselection_attempts"], 1)
+        self.assertEqual(telemetry["reselection_successes"], 1)
+        self.assertEqual(telemetry["recovered_open_failures"], 1)
+        self.assertEqual(telemetry["reselection_failures"], 0)
+        self.assertEqual(telemetry["reselection_clicks"], 2)
+        self.assertEqual(telemetry["order_clicks"], 0)
+
+    def test_gray_action_does_not_return_to_target_without_alt_evidence(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DisabledActionRecoveryEngine(
+            stop_event,
+            self.guard,
+            alternate_click_works=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "추가 입력 없이 정지"):
+            _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                continuous_monitor=True,
+            )
+
+        self.assertEqual(engine.clicks, [(20, 10), (50, 40)])
+        self.assertEqual(engine.escapes, 0)
+        self.assertTrue(engine.action_disabled)
+
+    def test_gray_action_target_restore_failure_stops_without_open_retry(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DisabledActionRecoveryEngine(
+            stop_event,
+            self.guard,
+            target_click_works=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "추가 입력 없이 정지"):
+            _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                continuous_monitor=True,
+            )
+
+        self.assertEqual(
+            engine.clicks,
+            [(20, 10), (50, 40), (50, 30)],
+        )
+        self.assertEqual(engine.escapes, 0)
+        self.assertFalse(engine.target_selected)
 
     def test_exact_initial_size_still_waits_for_wgc_settle(self) -> None:
         stop_event = threading.Event()

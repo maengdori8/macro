@@ -47,7 +47,7 @@ if hasattr(cv2, "ipp"):
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 13
+RENEWAL_PROFILE_VERSION = 14
 RENEWAL_CALIBRATION_VERSION = 8
 RENEWAL_CALIBRATION_OPENINGS = 8
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 3
@@ -110,6 +110,15 @@ RENEWAL_SERVER_PRESSURE_FAILURE_LIMIT = 2
 # Cleanup alone observes through this measured window; normal cycles retain
 # their immediate ready-frame path.
 RENEWAL_POPUP_CLEANUP_GRACE_SECONDS = 0.65
+# A failed popup open can leave FC's action button disabled even though the
+# selected-player list remains visible.  Recovery is allowed only after two
+# fresh full WGC frames prove the calibrated target row and closed price table
+# are still present.  The alternate row must then be observed before the
+# calibrated target row is selected again.
+RENEWAL_RESELECT_VERIFY_FRAMES = 2
+RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS = 0.65
+RENEWAL_RESELECT_LIST_BOUNDS = (0.14, 0.18, 0.46, 0.90)
+RENEWAL_RESELECT_MIN_POINT_DISTANCE = 0.025
 SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
     {
         (1928, 1048),
@@ -430,6 +439,55 @@ def build_action_ready_rect(
     )
 
 
+def build_reselect_target_rect(
+    target_point: NormalizedPoint,
+    _frame_width: int,
+    _frame_height: int,
+) -> NormalizedRect:
+    """Return a compact anchor around the selected target-player row."""
+
+    half_width = 0.105
+    half_height = 0.024
+    return NormalizedRect(
+        max(0.0, float(target_point.x) - half_width),
+        max(0.0, float(target_point.y) - half_height),
+        min(1.0, float(target_point.x) + half_width),
+        min(1.0, float(target_point.y) + half_height),
+    )
+
+
+def valid_reselect_point(point: Optional[NormalizedPoint]) -> bool:
+    """Return whether a point is safely inside FC's left player-list pane."""
+
+    if point is None:
+        return False
+    left, top, right, bottom = RENEWAL_RESELECT_LIST_BOUNDS
+    return bool(
+        left <= float(point.x) <= right
+        and top <= float(point.y) <= bottom
+    )
+
+
+def valid_reselect_points(
+    target_point: Optional[NormalizedPoint],
+    alternate_point: Optional[NormalizedPoint],
+) -> bool:
+    """Accept only two separated points inside FC's left player-list pane."""
+
+    if not (
+        valid_reselect_point(target_point)
+        and valid_reselect_point(alternate_point)
+    ):
+        return False
+    assert target_point is not None
+    assert alternate_point is not None
+    distance = (
+        (float(target_point.x) - float(alternate_point.x)) ** 2
+        + (float(target_point.y) - float(alternate_point.y)) ** 2
+    ) ** 0.5
+    return bool(distance >= RENEWAL_RESELECT_MIN_POINT_DISTANCE)
+
+
 @dataclass
 class RenewalSideProfile:
     # 목록 화면에서 가격 창을 여는 구매/판매 버튼.
@@ -438,6 +496,12 @@ class RenewalSideProfile:
     # Require a second closed-screen anchor around an enabled action button.
     action_ready_rect: Optional[NormalizedRect] = None
     action_ready_png: str = ""
+    # When FC temporarily disables the action button, select a different
+    # visible player row and then return to this calibrated target row.
+    reselect_target_point: Optional[NormalizedPoint] = None
+    reselect_alternate_point: Optional[NormalizedPoint] = None
+    reselect_target_rect: Optional[NormalizedRect] = None
+    reselect_target_png: str = ""
     # 열린 가격 창 안에서 실제 주문을 넣는 최종 구매/판매 버튼.
     confirm_point: Optional[NormalizedPoint] = None
     price_rect: Optional[NormalizedRect] = None
@@ -474,6 +538,12 @@ class RenewalSideProfile:
             self.action_point
             and self.action_ready_rect
             and self.action_ready_png
+            and valid_reselect_points(
+                self.reselect_target_point,
+                self.reselect_alternate_point,
+            )
+            and self.reselect_target_rect
+            and self.reselect_target_png
             and self.confirm_point
             and self.price_rect
             and self.guard_rect
@@ -496,6 +566,22 @@ class RenewalSideProfile:
                 else None
             ),
             "action_ready_png": self.action_ready_png,
+            "reselect_target_point": (
+                self.reselect_target_point.to_dict()
+                if self.reselect_target_point
+                else None
+            ),
+            "reselect_alternate_point": (
+                self.reselect_alternate_point.to_dict()
+                if self.reselect_alternate_point
+                else None
+            ),
+            "reselect_target_rect": (
+                self.reselect_target_rect.to_dict()
+                if self.reselect_target_rect
+                else None
+            ),
+            "reselect_target_png": self.reselect_target_png,
             "confirm_point": (
                 self.confirm_point.to_dict() if self.confirm_point else None
             ),
@@ -531,6 +617,18 @@ class RenewalSideProfile:
                 value.get("action_ready_rect")
             ),
             action_ready_png=str(value.get("action_ready_png") or ""),
+            reselect_target_point=NormalizedPoint.from_dict(
+                value.get("reselect_target_point")
+            ),
+            reselect_alternate_point=NormalizedPoint.from_dict(
+                value.get("reselect_alternate_point")
+            ),
+            reselect_target_rect=NormalizedRect.from_dict(
+                value.get("reselect_target_rect")
+            ),
+            reselect_target_png=str(
+                value.get("reselect_target_png") or ""
+            ),
             confirm_point=NormalizedPoint.from_dict(value.get("confirm_point")),
             price_rect=NormalizedRect.from_dict(value.get("price_rect")),
             guard_rect=NormalizedRect.from_dict(value.get("guard_rect")),
@@ -639,6 +737,17 @@ class RenewalProfile:
             or not side_profile.action_ready_png
         ):
             missing.append("v13 active purchase/sale button anchor")
+        if (
+            not valid_reselect_points(
+                side_profile.reselect_target_point,
+                side_profile.reselect_alternate_point,
+            )
+            or side_profile.reselect_target_rect is None
+            or not side_profile.reselect_target_png
+        ):
+            missing.append(
+                "v14 target/alternate player reselect recovery"
+            )
         if side_profile.confirm_point is None:
             missing.append("창 안 최종 구매/판매 버튼 위치")
         if (
@@ -783,17 +892,21 @@ class ActionReadyValidation:
     reason: str
 
 
-def validate_action_ready_frame(
+def _validate_calibrated_anchor(
     full_frame: np.ndarray,
     side_profile: RenewalSideProfile,
+    rect: Optional[NormalizedRect],
+    encoded_baseline: str,
+    *,
+    luma_limit: float,
+    edge_limit: float,
+    preserve_uniform_fill: bool,
 ) -> ActionReadyValidation:
-    """Fail closed unless the calibrated enabled action button is present."""
-
     if (
         full_frame is None
         or full_frame.size == 0
-        or side_profile.action_ready_rect is None
-        or not side_profile.action_ready_png
+        or rect is None
+        or not encoded_baseline
     ):
         return ActionReadyValidation(False, float("inf"), 1.0, "missing_anchor")
     calibrated_size = side_profile.calibrated_frame_size()
@@ -807,12 +920,12 @@ def validate_action_ready_frame(
     ):
         return ActionReadyValidation(False, float("inf"), 1.0, "frame_shape")
     try:
-        x1, y1, x2, y2 = side_profile.action_ready_rect.to_pixels(
+        x1, y1, x2, y2 = rect.to_pixels(
             content_width,
             content_height,
         )
         candidate = full_frame[y1:y2, x1:x2]
-        baseline = decode_gray_png(side_profile.action_ready_png)
+        baseline = decode_gray_png(encoded_baseline)
     except (TypeError, ValueError):
         return ActionReadyValidation(False, float("inf"), 1.0, "decode")
     if candidate.shape != baseline.shape or candidate.size < 64:
@@ -824,9 +937,11 @@ def validate_action_ready_frame(
     spatial_luma_delta = float(
         np.mean(np.abs(difference - illumination_offset))
     )
-    # The enabled orange/blue button becoming a disabled gray button is
-    # largely a uniform fill change. Do not normalize that evidence away.
-    luma_delta = max(raw_luma_delta, spatial_luma_delta)
+    luma_delta = (
+        max(raw_luma_delta, spatial_luma_delta)
+        if preserve_uniform_fill
+        else spatial_luma_delta
+    )
 
     baseline_edges = cv2.Canny(
         cv2.GaussianBlur(baseline, (3, 3), 0),
@@ -861,13 +976,48 @@ def validate_action_ready_frame(
         )
         / edge_count
     )
-
-    valid = bool(luma_delta <= 2.50 and edge_delta <= 0.080)
+    valid = bool(luma_delta <= luma_limit and edge_delta <= edge_limit)
     return ActionReadyValidation(
         valid,
         luma_delta,
         edge_delta,
         "match" if valid else "context_mismatch",
+    )
+
+
+def validate_action_ready_frame(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+) -> ActionReadyValidation:
+    """Fail closed unless the calibrated enabled action button is present."""
+
+    # The enabled orange/blue button becoming a disabled gray button is
+    # largely a uniform fill change. Do not normalize that evidence away.
+    return _validate_calibrated_anchor(
+        full_frame,
+        side_profile,
+        side_profile.action_ready_rect,
+        side_profile.action_ready_png,
+        luma_limit=2.50,
+        edge_limit=0.080,
+        preserve_uniform_fill=True,
+    )
+
+
+def validate_reselect_target_frame(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+) -> ActionReadyValidation:
+    """Fail closed unless the calibrated selected target row is visible."""
+
+    return _validate_calibrated_anchor(
+        full_frame,
+        side_profile,
+        side_profile.reselect_target_rect,
+        side_profile.reselect_target_png,
+        luma_limit=4.00,
+        edge_limit=0.120,
+        preserve_uniform_fill=True,
     )
 
 
@@ -4143,6 +4293,13 @@ class FastRenewalRunner:
             "action_context_rejections": 0,
             "action_context_luma": 0.0,
             "action_context_edge": 0.0,
+            "runtime_disabled_action_detections": 0,
+            "reselection_attempts": 0,
+            "reselection_successes": 0,
+            "recovered_open_failures": 0,
+            "reselection_failures": 0,
+            "reselection_clicks": 0,
+            "reselection_unsafe_rejections": 0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -4269,24 +4426,6 @@ class FastRenewalRunner:
                 f"(luma {layout.evidence_luma:.3f}, "
                 f"edge {layout.evidence_edge:.4f})"
             )
-        action_ready = validate_action_ready_frame(
-            full_frame,
-            side_profile,
-        )
-        self.telemetry["action_context_luma"] = action_ready.luma_delta
-        self.telemetry["action_context_edge"] = action_ready.edge_delta
-        if not action_ready.valid:
-            self.telemetry["action_context_rejections"] = (
-                int(self.telemetry["action_context_rejections"]) + 1
-            )
-            raise RuntimeError(
-                "구매/판매 준비 화면 또는 활성 버튼이 안전 보정과 다릅니다. "
-                "게임 입력 없이 차단했습니다. 올바른 탭에서 활성 버튼을 "
-                "다시 설정하고 가격 안전 보정을 진행하세요. "
-                f"(luma {action_ready.luma_delta:.3f}, "
-                f"edge {action_ready.edge_delta:.4f}, "
-                f"{action_ready.reason})"
-            )
         engine = self.manager.capture_engine
         if engine is None:
             raise RuntimeError("WGC 캡처 엔진이 시작되지 않았습니다.")
@@ -4296,6 +4435,8 @@ class FastRenewalRunner:
         gc.collect()
 
         assert side_profile.action_point is not None
+        assert side_profile.reselect_target_point is not None
+        assert side_profile.reselect_alternate_point is not None
         assert side_profile.confirm_point is not None
         assert side_profile.price_rect is not None
         assert side_profile.guard_rect is not None
@@ -4346,9 +4487,19 @@ class FastRenewalRunner:
 
         clicker = _FastClicker(self.manager, frame_width, frame_height)
         action = clicker.resolve(side_profile.action_point)
+        reselect_target = clicker.resolve(
+            side_profile.reselect_target_point
+        )
+        reselect_alternate = clicker.resolve(
+            side_profile.reselect_alternate_point
+        )
         confirm = clicker.resolve(side_profile.confirm_point)
         limit_price = clicker.resolve(side_profile.limit_point)
         action_click = clicker.prepare_client(action)
+        reselect_target_click = clicker.prepare_client(reselect_target)
+        reselect_alternate_click = clicker.prepare_client(
+            reselect_alternate
+        )
         confirm_click = clicker.prepare_client(confirm)
         limit_click = clicker.prepare_client(limit_price)
         expected_capture_size = (
@@ -4724,6 +4875,167 @@ class FastRenewalRunner:
                 )
             return ready
 
+        def observe_full_state(
+            deadline: float,
+            *,
+            not_before: float = float("-inf"),
+        ) -> str:
+            """Classify two fresh full frames without sending FC input."""
+
+            stable_state = ""
+            stable_count = 0
+            while (
+                not self.stop_event.is_set()
+                and self._time_window_active()
+            ):
+                packet = next_guard_packet(
+                    deadline,
+                    not_before=not_before,
+                )
+                if packet is None:
+                    return "unknown"
+                frame = packet.image
+                if (
+                    frame.ndim != 2
+                    or frame.shape[1] < frame_width
+                    or frame.shape[0] < frame_height
+                ):
+                    stable_state = ""
+                    stable_count = 0
+                    continue
+                content = frame[:frame_height, :frame_width]
+                gx1, gy1, gx2, gy2 = guard_region
+                guard = content[gy1:gy2, gx1:gx2]
+                modal_valid = modal_guard.register(
+                    guard,
+                    side_profile.guard_luma_noise,
+                    side_profile.guard_edge_noise,
+                ).valid
+                ready_valid = ready_guard.register(
+                    guard,
+                    side_profile.closed_guard_luma_noise,
+                    side_profile.closed_guard_edge_noise,
+                ).valid
+                action_validation = validate_action_ready_frame(
+                    content,
+                    side_profile,
+                )
+                self.telemetry["action_context_luma"] = (
+                    action_validation.luma_delta
+                )
+                self.telemetry["action_context_edge"] = (
+                    action_validation.edge_delta
+                )
+                target_validation = validate_reselect_target_frame(
+                    content,
+                    side_profile,
+                )
+                if modal_valid:
+                    state = "modal"
+                elif ready_valid and target_validation.valid:
+                    state = (
+                        "ready_enabled"
+                        if action_validation.valid
+                        else "ready_disabled"
+                    )
+                elif not target_validation.valid:
+                    state = "target_left"
+                else:
+                    state = "unknown"
+                if state == stable_state:
+                    stable_count += 1
+                else:
+                    stable_state = state
+                    stable_count = 1
+                if (
+                    state != "unknown"
+                    and stable_count >= RENEWAL_RESELECT_VERIFY_FRAMES
+                ):
+                    return state
+            return "unknown"
+
+        def recover_disabled_action() -> str:
+            """Recover only a proven gray action button on the target row.
+
+            Returns one of ready_enabled, recovered, modal, or unsafe.  The
+            guard-only capture region is always restored before returning.
+            """
+
+            state = "unknown"
+            try:
+                engine.set_capture_region(None)
+                state = observe_full_state(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS
+                )
+                if state == "ready_enabled":
+                    self.telemetry["popup_may_be_open"] = False
+                    return "ready_enabled"
+                if state == "modal":
+                    return "modal"
+                if state != "ready_disabled":
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
+
+                self.telemetry["runtime_disabled_action_detections"] = (
+                    int(
+                        self.telemetry[
+                            "runtime_disabled_action_detections"
+                        ]
+                    )
+                    + 1
+                )
+                self.telemetry["reselection_attempts"] = (
+                    int(self.telemetry["reselection_attempts"]) + 1
+                )
+                self.telemetry["popup_may_be_open"] = False
+
+                alternate_started = time.perf_counter()
+                clicker.click_prepared(reselect_alternate_click)
+                self.telemetry["reselection_clicks"] = (
+                    int(self.telemetry["reselection_clicks"]) + 1
+                )
+                alternate_state = observe_full_state(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                    not_before=alternate_started,
+                )
+                if alternate_state != "target_left":
+                    self.telemetry["reselection_failures"] = (
+                        int(self.telemetry["reselection_failures"]) + 1
+                    )
+                    return "unsafe"
+
+                target_started = time.perf_counter()
+                clicker.click_prepared(reselect_target_click)
+                self.telemetry["reselection_clicks"] = (
+                    int(self.telemetry["reselection_clicks"]) + 1
+                )
+                target_state = observe_full_state(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                    not_before=target_started,
+                )
+                if target_state != "ready_enabled":
+                    self.telemetry["reselection_failures"] = (
+                        int(self.telemetry["reselection_failures"]) + 1
+                    )
+                    return "unsafe"
+
+                self.telemetry["reselection_successes"] = (
+                    int(self.telemetry["reselection_successes"]) + 1
+                )
+                return "recovered"
+            finally:
+                engine.set_capture_region(guard_region)
+
         self.status("목록 준비 화면 확인 중")
         start_state = detect_start_state(time.monotonic() + 1.0)
         if start_state == "modal":
@@ -4741,6 +5053,24 @@ class FastRenewalRunner:
             raise RenewalCaptureRestart(
                 "보정된 목록 화면이나 구매/판매 팝업을 확인하지 못했습니다. "
                 "입력 없이 다시 확인합니다."
+            )
+
+        if self.stop_event.is_set():
+            update_performance_telemetry()
+            return False
+
+        startup_action_state = recover_disabled_action()
+        if self.stop_event.is_set():
+            update_performance_telemetry()
+            return False
+        if startup_action_state not in ("ready_enabled", "recovered"):
+            self.telemetry["action_context_rejections"] = (
+                int(self.telemetry["action_context_rejections"]) + 1
+            )
+            raise RuntimeError(
+                "구매/판매 준비 화면의 활성 버튼·감시 선수 행·닫힌 "
+                "가격표를 함께 확인하지 못했습니다. 주문 입력은 "
+                "차단됐습니다."
             )
 
         while (
@@ -5013,10 +5343,45 @@ class FastRenewalRunner:
                     int(self.telemetry["max_consecutive_open_failures"]),
                     consecutive_open_failures,
                 )
-                if not close_modal():
+                recovery_state = recover_disabled_action()
+                if recovery_state == "recovered":
+                    self.telemetry["recovered_open_failures"] = (
+                        int(self.telemetry["recovered_open_failures"]) + 1
+                    )
+                    consecutive_open_failures = 0
+                    self.telemetry["consecutive_open_failures"] = 0
+                    self.status(
+                        "회색 버튼 복구 완료 · 다른 선수→감시 선수 왕복"
+                    )
+                    self.log(
+                        "[선수 재선택 v14] 비활성 버튼을 확인해 "
+                        "다른 선수→감시 선수를 왕복했고 활성 버튼·"
+                        "목표 행·닫힌 가격표를 2프레임 확인했습니다."
+                    )
+                    if pace_completed_cycle(
+                        action_started,
+                        open_failed=False,
+                    ):
+                        return False
+                    continue
+                if recovery_state == "unsafe":
+                    update_performance_telemetry()
+                    raise RuntimeError(
+                        "회색 버튼 복구 화면을 안전하게 확인하지 못했습니다. "
+                        "추가 입력 없이 정지합니다."
+                    )
+                if (
+                    recovery_state == "modal"
+                    and not close_modal()
+                ):
                     raise RenewalCaptureRestart(
                         "ESC 뒤 목록 준비 화면을 확인하지 못했습니다."
                     )
+                if recovery_state == "ready_enabled":
+                    # The click was dropped while the exact target list state
+                    # remained visible. Sending ESC here would close the
+                    # transfer market, so retry only after adaptive pacing.
+                    self.telemetry["popup_may_be_open"] = False
                 if pace_completed_cycle(
                     action_started,
                     open_failed=True,

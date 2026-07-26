@@ -55,6 +55,7 @@ from macroapp.renewal import (
     RenewalModalGuard,
     _FastClicker,
     build_action_ready_rect,
+    build_reselect_target_rect,
     build_calibration_result,
     build_guard_rect,
     crop_price_from_guard,
@@ -70,6 +71,9 @@ from macroapp.renewal import (
     save_renewal_diagnostic,
     validate_limit_price_selection,
     validate_action_ready_frame,
+    validate_reselect_target_frame,
+    valid_reselect_point,
+    valid_reselect_points,
     validate_price_region,
     wait_for_stable_wgc_frame,
 )
@@ -127,8 +131,18 @@ def _headless_open_failure_summary(
 ) -> dict[str, object]:
     confirmed = max(0, int(telemetry.get("confirmed_openings", 0)))
     failures = max(0, int(telemetry.get("open_failures", 0)))
+    recovered = min(
+        failures,
+        max(0, int(telemetry.get("recovered_open_failures", 0))),
+    )
+    unrecovered = failures - recovered
     attempts = confirmed + failures
     failure_rate = (
+        float(unrecovered) / float(attempts)
+        if attempts > 0
+        else 0.0
+    )
+    raw_failure_rate = (
         float(failures) / float(attempts)
         if attempts > 0
         else 0.0
@@ -136,8 +150,11 @@ def _headless_open_failure_summary(
     return {
         "confirmed_openings": confirmed,
         "open_failures": failures,
+        "recovered_open_failures": recovered,
+        "unrecovered_open_failures": unrecovered,
         "open_attempts": attempts,
         "open_failure_rate": failure_rate,
+        "raw_open_failure_rate": raw_failure_rate,
         "open_failure_rate_limit": (
             HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT
         ),
@@ -799,6 +816,28 @@ class RenewalApp:
             button.pack(side=tk.LEFT, padx=(0, 7))
             self._capture_buttons.append(button)
 
+        recovery_row = tk.Frame(calibration_panel, bg=c["panel"])
+        recovery_row.pack(fill=tk.X, pady=(7, 0))
+        tk.Label(
+            recovery_row,
+            text="회색 버튼 자동복구:",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(9, bold=True),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        for text, item in (
+            ("감시할 선수 행", "reselect_target"),
+            ("복구용 다른 선수 행", "reselect_alternate"),
+        ):
+            button = self._button(
+                recovery_row,
+                text,
+                lambda selected=item: self.calibrate(selected),
+                small=True,
+            )
+            button.pack(side=tk.LEFT, padx=(0, 7))
+            self._capture_buttons.append(button)
+
         self._refresh_status()
         tk.Label(
             calibration_panel,
@@ -1008,9 +1047,18 @@ class RenewalApp:
             and side.calibration_version >= RENEWAL_CALIBRATION_VERSION
             and side.calibrated_frame_size() is not None
         )
+        safe_reselect = (
+            valid_reselect_points(
+                side.reselect_target_point,
+                side.reselect_alternate_point,
+            )
+            and side.reselect_target_rect
+            and side.reselect_target_png
+        )
         self.setting_status_var.set(
-            "공통: 가격이 그대로면 ESC 후 다시 열기\n"
+            "공통: 가격이 그대로면 ESC 후 다시 열기 · 회색 버튼은 선수 왕복 복구\n"
             f"{side_name}: 열기 {mark(side.action_point)} / "
+            f"선수복구 {mark(safe_reselect)} / "
             f"안전 가격영역 {mark(safe_price)} / "
             f"{limit_name} {mark(side.limit_point)} / "
             f"최종 버튼 {mark(side.confirm_point)}"
@@ -1778,6 +1826,14 @@ class RenewalApp:
         side_name = "구매" if self.side_var.get() == "buy" else "판매"
         instruction = {
             "action": f"목록 화면에서 가격 창을 여는 '{side_name}' 버튼 가운데를 클릭하세요.",
+            "reselect_target": (
+                "현재 선택되어 흰색으로 강조된 감시 대상 선수 행에서 "
+                "선수 이름 가운데를 클릭하세요."
+            ),
+            "reselect_alternate": (
+                "회색 구매/판매 버튼을 복구할 때 잠깐 선택할 "
+                "다른 선수 행의 선수 이름 가운데를 클릭하세요."
+            ),
             "price": f"{side_name} 창에서 감시할 가격 숫자 부분만 좁게 드래그하세요.",
             "limit": f"{side_name} 창에서 {'상한가' if self.side_var.get() == 'buy' else '하한가'} 항목 가운데를 클릭하세요.",
             "confirm": f"열린 {side_name} 창 하단의 최종 '{side_name}' 버튼 가운데를 클릭하세요.",
@@ -1964,6 +2020,71 @@ class RenewalApp:
                 # Price calibration must subsequently prove that this enabled
                 # button really opens the intended popup.
                 side.calibration_version = 0
+            elif item == "reselect_target":
+                if not valid_reselect_point(selection):
+                    self.status_var.set(
+                        "감시 선수 행 거부 · 왼쪽 선수 목록 안에서 다시 선택"
+                    )
+                    messagebox.showerror(
+                        "선수 행을 다시 선택하세요",
+                        "감시 선수 행은 왼쪽 선수 목록의 선수 이름 가운데여야 합니다.",
+                        parent=self.root,
+                    )
+                    return
+                if (
+                    side.reselect_alternate_point is not None
+                    and not valid_reselect_points(
+                        selection,
+                        side.reselect_alternate_point,
+                    )
+                ):
+                    self.status_var.set(
+                        "선수 행 간격 부족 · 서로 다른 행을 선택"
+                    )
+                    return
+                frame_height, frame_width = frame.shape[:2]
+                target_rect = build_reselect_target_rect(
+                    selection,
+                    frame_width,
+                    frame_height,
+                )
+                x1, y1, x2, y2 = target_rect.to_pixels(
+                    frame_width,
+                    frame_height,
+                )
+                target_anchor = frame[y1:y2, x1:x2].copy()
+                if target_anchor.size < 64:
+                    self.status_var.set("감시 선수 행 앵커 저장 실패")
+                    return
+                side.reselect_target_point = selection
+                side.reselect_target_rect = target_rect
+                side.reselect_target_png = encode_gray_png(target_anchor)
+                # A different target row necessarily has a different closed
+                # price table, so its price calibration must be captured again.
+                side.calibration_version = 0
+            elif item == "reselect_alternate":
+                if not valid_reselect_point(selection):
+                    self.status_var.set(
+                        "복구용 선수 행 거부 · 왼쪽 선수 목록 안에서 다시 선택"
+                    )
+                    messagebox.showerror(
+                        "선수 행을 다시 선택하세요",
+                        "복구용 선수 행은 왼쪽 선수 목록의 다른 선수 이름 가운데여야 합니다.",
+                        parent=self.root,
+                    )
+                    return
+                if (
+                    side.reselect_target_point is None
+                    or not valid_reselect_points(
+                        side.reselect_target_point,
+                        selection,
+                    )
+                ):
+                    self.status_var.set(
+                        "먼저 감시 선수 행을 설정하고 서로 다른 행을 선택"
+                    )
+                    return
+                side.reselect_alternate_point = selection
             elif item == "limit":
                 side.limit_point = selection
             elif item == "confirm":
@@ -2805,6 +2926,23 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 f"(luma={action_ready.luma_delta:.3f}, "
                 f"edge={action_ready.edge_delta:.4f}, "
                 f"reason={action_ready.reason})"
+            )
+        if not valid_reselect_points(
+            side.reselect_target_point,
+            side.reselect_alternate_point,
+        ):
+            raise RuntimeError(
+                "Target and alternate player rows are not calibrated. "
+                "Select two different visible player rows in the GUI."
+            )
+        target_ready = validate_reselect_target_frame(full_frame, side)
+        if not target_ready.valid:
+            raise RuntimeError(
+                "The calibrated target player row is not selected. "
+                "Return to the target row before headless price calibration. "
+                f"(luma={target_ready.luma_delta:.3f}, "
+                f"edge={target_ready.edge_delta:.4f}, "
+                f"reason={target_ready.reason})"
             )
 
         original_price_rect = side.price_rect
