@@ -322,7 +322,7 @@ class RenewalSafetyTests(unittest.TestCase):
         fixture_path = (
             Path(__file__).parent
             / "fixtures"
-            / "renewal_sustained_open_failure_870s.json"
+            / "renewal_sustained_open_failure_390s.json"
         )
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
         natural_cycle = float(
@@ -332,18 +332,28 @@ class RenewalSafetyTests(unittest.TestCase):
         for _ in range(240):
             pacer.record_success(natural_cycle)
 
-        pacer.record_failure()
+        first_recovery = pacer.record_failure()
         self.assertGreaterEqual(
             pacer.floor_seconds,
             natural_cycle
             + renewal.RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS,
+        )
+        self.assertGreaterEqual(
+            first_recovery,
+            renewal.RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS,
         )
         self.assertGreater(
             pacer.delay_seconds(natural_cycle),
             0.0,
         )
 
-        for _ in range(int(fixture["open_failures"]) - 1):
+        second_recovery = pacer.record_failure()
+        self.assertGreaterEqual(
+            second_recovery,
+            first_recovery
+            + renewal.RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS,
+        )
+        for _ in range(int(fixture["open_failures"]) - 2):
             pacer.record_failure()
         self.assertEqual(
             pacer.increases,
@@ -369,7 +379,7 @@ class RenewalSafetyTests(unittest.TestCase):
     def test_disabled_adaptive_pacer_never_delays(self) -> None:
         pacer = renewal.RenewalAdaptiveCyclePacer(enabled=False)
         pacer.record_success(0.340)
-        pacer.record_failure()
+        self.assertEqual(pacer.record_failure(), 0.0)
         self.assertEqual(pacer.floor_seconds, 0.0)
         self.assertEqual(pacer.delay_seconds(0.0), 0.0)
 

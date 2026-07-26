@@ -82,12 +82,15 @@ RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
 # adding a fixed cycle floor wastes frames on machines where FC closes sooner.
 # Blocking waits for fresh WGC frames keep this from becoming a CPU spin loop.
 RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.0
-RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.035
-RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.020
+RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.070
+RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.050
 RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS = 0.005
-RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES = 600
+RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES = 3600
 RENEWAL_ADAPTIVE_PACING_FALLBACK_CYCLE_SECONDS = 0.340
-RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS = 0.550
+RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS = 0.800
+RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS = 3.0
+RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS = 2.0
+RENEWAL_ADAPTIVE_RECOVERY_MAX_SECONDS = 15.0
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain
@@ -126,6 +129,7 @@ class RenewalAdaptiveCyclePacer:
         self.increases = 0
         self.decreases = 0
         self.successes_since_failure = 0
+        self.failure_level = 0
         self._successful_cycles: deque[float] = deque(maxlen=240)
 
     def record_success(self, cycle_seconds: float) -> None:
@@ -146,11 +150,12 @@ class RenewalAdaptiveCyclePacer:
                 - RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS,
             )
             self.successes_since_failure = 0
+            self.failure_level = max(0, self.failure_level - 1)
             self.decreases += 1
 
-    def record_failure(self) -> None:
+    def record_failure(self) -> float:
         if not self.enabled:
-            return
+            return 0.0
         baseline = (
             float(np.median(self._successful_cycles))
             if self._successful_cycles
@@ -172,6 +177,13 @@ class RenewalAdaptiveCyclePacer:
         )
         self.successes_since_failure = 0
         self.increases += 1
+        self.failure_level += 1
+        return min(
+            RENEWAL_ADAPTIVE_RECOVERY_MAX_SECONDS,
+            RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS
+            + (self.failure_level - 1)
+            * RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS,
+        )
 
     def delay_seconds(self, elapsed_seconds: float) -> float:
         if not self.enabled:
@@ -3966,6 +3978,9 @@ class FastRenewalRunner:
             "adaptive_pacing_increases": 0,
             "adaptive_pacing_decreases": 0,
             "adaptive_successes_since_failure": 0,
+            "adaptive_failure_level": 0,
+            "adaptive_recovery_waits": 0,
+            "adaptive_recovery_total_ms": 0.0,
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
         }
@@ -4285,6 +4300,9 @@ class FastRenewalRunner:
             self.telemetry["adaptive_successes_since_failure"] = (
                 adaptive_pacer.successes_since_failure
             )
+            self.telemetry["adaptive_failure_level"] = (
+                adaptive_pacer.failure_level
+            )
 
         def pace_completed_cycle(
             action_started: float,
@@ -4292,12 +4310,17 @@ class FastRenewalRunner:
             open_failed: bool,
         ) -> bool:
             cycle_elapsed = time.perf_counter() - action_started
+            recovery_delay = 0.0
             if open_failed:
-                adaptive_pacer.record_failure()
+                recovery_delay = adaptive_pacer.record_failure()
             else:
                 adaptive_pacer.record_success(cycle_elapsed)
             update_adaptive_pacing_telemetry()
-            pacing_delay = adaptive_pacer.delay_seconds(cycle_elapsed)
+            pacing_delay = (
+                recovery_delay
+                if open_failed
+                else adaptive_pacer.delay_seconds(cycle_elapsed)
+            )
             if pacing_delay > 0.0:
                 self.telemetry["pacing_waits"] = (
                     int(self.telemetry["pacing_waits"]) + 1
@@ -4306,6 +4329,23 @@ class FastRenewalRunner:
                     float(self.telemetry["pacing_total_ms"])
                     + pacing_delay * 1000.0
                 )
+                if open_failed:
+                    self.telemetry["adaptive_recovery_waits"] = (
+                        int(
+                            self.telemetry[
+                                "adaptive_recovery_waits"
+                            ]
+                        )
+                        + 1
+                    )
+                    self.telemetry["adaptive_recovery_total_ms"] = (
+                        float(
+                            self.telemetry[
+                                "adaptive_recovery_total_ms"
+                            ]
+                        )
+                        + pacing_delay * 1000.0
+                    )
                 if self._wait(pacing_delay):
                     cycle_latencies.append(
                         (time.perf_counter() - action_started) * 1000.0

@@ -473,23 +473,32 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
     def test_headless_monitor_rejects_recorded_sustained_open_failures(
         self,
     ):
-        fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "renewal_sustained_open_failure_870s.json"
-        )
-        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        summary = renewal_macro._headless_open_failure_summary(
-            {
-                "confirmed_openings": fixture["confirmed_openings"],
-                "open_failures": fixture["open_failures"],
-            }
-        )
-        self.assertFalse(summary["within_limit"])
-        self.assertGreater(
-            summary["open_failure_rate"],
-            summary["open_failure_rate_limit"],
-        )
+        for fixture_name in (
+            "renewal_sustained_open_failure_870s.json",
+            "renewal_sustained_open_failure_390s.json",
+        ):
+            with self.subTest(fixture=fixture_name):
+                fixture_path = (
+                    Path(__file__).parent
+                    / "fixtures"
+                    / fixture_name
+                )
+                fixture = json.loads(
+                    fixture_path.read_text(encoding="utf-8")
+                )
+                summary = renewal_macro._headless_open_failure_summary(
+                    {
+                        "confirmed_openings": (
+                            fixture["confirmed_openings"]
+                        ),
+                        "open_failures": fixture["open_failures"],
+                    }
+                )
+                self.assertFalse(summary["within_limit"])
+                self.assertGreater(
+                    summary["open_failure_rate"],
+                    summary["open_failure_rate_limit"],
+                )
 
     def test_headless_monitor_accepts_rare_recovered_open_failure(self):
         summary = renewal_macro._headless_open_failure_summary(

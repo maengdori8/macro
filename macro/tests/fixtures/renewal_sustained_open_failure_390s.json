@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "source_commit": "ec166cd3be725993016920b15801f8bfcbad9220",
+  "elapsed_seconds": 390.1776772000594,
+  "cycle_count": 944,
+  "confirmed_openings": 866,
+  "open_failures": 77,
+  "max_consecutive_open_failures": 2,
+  "natural_success_cycle_seconds": 0.340,
+  "old_max_cycle_seconds": 0.550,
+  "old_pacing_waits": 63,
+  "old_pacing_total_ms": 12395.396200395191,
+  "order_inputs": 0,
+  "monitor_detected": false,
+  "frame_size_changes": 0,
+  "checkpoints": [
+    {
+      "elapsed_seconds": 270.1336777000688,
+      "cycle_count": 791,
+      "open_failures": 0
+    },
+    {
+      "elapsed_seconds": 330.15736499999184,
+      "cycle_count": 871,
+      "open_failures": 37
+    },
+    {
+      "elapsed_seconds": 390.1776772000594,
+      "cycle_count": 944,
+      "open_failures": 77
+    }
+  ]
+}
