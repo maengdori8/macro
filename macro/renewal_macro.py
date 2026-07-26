@@ -2358,11 +2358,20 @@ def _headless_monitor_existing(
             cpu_values = [
                 float(resource_samples[-1]["cpu_system_percent"])
             ]
+        # PyInstaller extraction, WGC startup and the first OpenCV buffers are
+        # one-time initialization costs, not long-session memory growth.  Use
+        # the first post-startup checkpoint as the soak baseline.  A short
+        # preflight still has its final sample as a conservative baseline.
+        stable_samples = (
+            resource_samples[1:]
+            if len(resource_samples) > 1
+            else resource_samples
+        )
         rss_values = [
-            float(sample["rss_mb"]) for sample in resource_samples
+            float(sample["rss_mb"]) for sample in stable_samples
         ]
         private_values = [
-            float(sample["private_mb"]) for sample in resource_samples
+            float(sample["private_mb"]) for sample in stable_samples
         ]
         cpu_average = float(np.mean(cpu_values))
         cpu_p95 = float(np.percentile(cpu_values, 95))
@@ -2388,10 +2397,14 @@ def _headless_monitor_existing(
             "cpu_p95_limit_percent": (
                 HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT
             ),
+            "startup_rss_mb": float(resource_samples[0]["rss_mb"]),
             "rss_start_mb": rss_values[0],
             "rss_peak_mb": max(rss_values),
             "rss_growth_mb": rss_growth,
             "rss_growth_limit_mb": HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB,
+            "startup_private_mb": float(
+                resource_samples[0]["private_mb"]
+            ),
             "private_start_mb": private_values[0],
             "private_peak_mb": max(private_values),
             "private_growth_mb": private_growth,
