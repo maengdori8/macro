@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -294,6 +295,78 @@ class RenewalSafetyTests(unittest.TestCase):
         self.changed_guard, _ = _guard(self.changed_price)
         self.profile = _profile(self.base_price, self.guard)
 
+    def test_transition_guard_accepts_only_closed_to_popup_corridor(self) -> None:
+        dynamic_boxes = renewal.dynamic_limit_price_boxes(
+            self.price_box,
+            "buy",
+            100,
+        )
+        opened = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            dynamic_boxes=dynamic_boxes,
+        )
+        closed_image = np.zeros_like(self.guard)
+        closed = renewal.RenewalModalGuard(
+            closed_image,
+            self.price_box,
+            dynamic_boxes=dynamic_boxes,
+        )
+        gate = renewal.RenewalTransitionGuard(opened, closed)
+        transition = cv2.addWeighted(
+            self.guard,
+            0.80,
+            closed_image,
+            0.20,
+            0.0,
+        )
+        unrelated = np.full_like(self.guard, 20)
+        unrelated[:, self.guard.shape[1] // 2 :] = 240
+
+        self.assertFalse(
+            gate.register(closed_image, closed_valid=True).valid
+        )
+        accepted = gate.register(transition)
+        self.assertTrue(accepted.valid)
+        self.assertGreater(accepted.progress, 0.70)
+        self.assertLess(accepted.residual_ratio, 0.10)
+        self.assertFalse(gate.register(unrelated).valid)
+
+    def test_transition_commit_gate_blocks_early_shifted_change(self) -> None:
+        classifier = renewal.RenewalPriceClassifier(
+            self.base_price,
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        unchanged = classifier.classify(self.base_price.copy())
+        changed = classifier.classify(self.changed_price.copy())
+        early_changed = replace(changed, shift_x=-12, shift_y=2)
+        committed_changed = replace(changed, shift_x=-5, shift_y=1)
+
+        self.assertIs(
+            renewal.gate_transition_classification(
+                unchanged,
+                renewal.RENEWAL_TRANSITION_UNCHANGED_MIN_PROGRESS,
+            ).state,
+            renewal.PriceState.UNCHANGED,
+        )
+        blocked = renewal.gate_transition_classification(
+            early_changed,
+            0.82,
+        )
+        self.assertIs(blocked.state, renewal.PriceState.AMBIGUOUS)
+        self.assertEqual(
+            blocked.reason,
+            "transition_change_not_committed",
+        )
+        self.assertIs(
+            renewal.gate_transition_classification(
+                committed_changed,
+                renewal.RENEWAL_TRANSITION_CHANGE_MIN_PROGRESS,
+            ).state,
+            renewal.PriceState.CHANGED,
+        )
+
     def test_v9_profile_requires_v10_right_limit_price_recalibration(self) -> None:
         legacy = self.profile.to_dict()
         legacy["version"] = 8
@@ -303,13 +376,13 @@ class RenewalSafetyTests(unittest.TestCase):
         loaded = renewal.RenewalProfile.from_dict(legacy)
         self.assertIn("v10 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v11_profile_round_trip_keeps_fast_exit_and_schedule(self) -> None:
+    def test_v12_profile_round_trip_keeps_transition_path_and_schedule(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         self.profile.fast_probe_interval = 6
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 11)
+        self.assertEqual(loaded.to_dict()["version"], 12)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
@@ -920,6 +993,85 @@ class RenewalSafetyTests(unittest.TestCase):
             classifier.same_candidate(changed_first, changed_second)
         )
 
+    def test_transition_variant_consensus_requires_two_calibrated_matches(
+        self,
+    ) -> None:
+        raw = np.frombuffer(
+            base64.b64decode(_REAL_SAME_ILLUMINATION_BASELINE),
+            dtype=np.uint8,
+        )
+        image = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(image)
+        pair = (
+            np.zeros_like(image),
+            np.zeros_like(image),
+        )
+
+        def result(
+            state: renewal.PriceState,
+            reason: str,
+            score: float,
+        ) -> renewal.PriceClassification:
+            return renewal.PriceClassification(
+                state,
+                image,
+                pair,
+                score,
+                0.30,
+                -7,
+                1,
+                True,
+                reason,
+            )
+
+        changed = result(
+            renewal.PriceState.CHANGED,
+            "stable_glyph_change",
+            0.22,
+        )
+        same_a = result(
+            renewal.PriceState.UNCHANGED,
+            "illumination_normalized_same_glyph",
+            0.21,
+        )
+        same_b = result(
+            renewal.PriceState.UNCHANGED,
+            "illumination_normalized_same_glyph",
+            0.20,
+        )
+        classifier = renewal.RenewalCalibratedPriceClassifier(
+            image,
+            [],
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        classifier.primary = SimpleNamespace(
+            classify=lambda _image: changed,
+            stability_limit=0.015,
+        )
+        classifier.variants = [
+            SimpleNamespace(
+                classify=lambda _image: same_a,
+                transition_same_glyph=lambda _image: True,
+            ),
+            SimpleNamespace(
+                classify=lambda _image: same_b,
+                transition_same_glyph=lambda _image: True,
+            ),
+            SimpleNamespace(
+                classify=lambda _image: changed,
+                transition_same_glyph=lambda _image: False,
+            ),
+        ]
+
+        settled = classifier.classify(image)
+        transition = classifier.classify_transition(image)
+
+        self.assertIs(settled.state, renewal.PriceState.AMBIGUOUS)
+        self.assertEqual(settled.reason, "baseline_variant_disagreement")
+        self.assertIs(transition.state, renewal.PriceState.UNCHANGED)
+        self.assertEqual(transition.reason, "transition_variant_consensus")
+
     def test_subthreshold_native_glyph_change_is_not_hidden_as_same(self) -> None:
         raw = np.frombuffer(
             base64.b64decode(_REAL_SAME_ILLUMINATION_BASELINE),
@@ -1275,30 +1427,33 @@ class RenewalSafetyTests(unittest.TestCase):
             [],
         )
 
-    def test_first_strong_unchanged_frame_exits_immediately_after_arming(
+    def test_transition_price_exits_on_second_unique_frame_after_arming(
         self,
     ) -> None:
         stop_event = threading.Event()
-        shifted_guard = renewal._translate_image(self.guard, 3, 0)
+        transition_guard = cv2.addWeighted(
+            self.guard,
+            0.80,
+            np.zeros_like(self.guard),
+            0.20,
+            0.0,
+        )
         engine = _FakeEngine(
             stop_event,
-            repeat_guard=shifted_guard,
+            repeat_guard=transition_guard,
             stop_after_closes=7,
         )
 
         self.assertFalse(_run(self.profile, engine, monitor_only=True))
 
-        # The first two independent popups and every fourth eligible popup
-        # are full precision probes.  All other unchanged popups close on
-        # their first fully aligned WGC frame.
-        self.assertGreaterEqual(engine.open_packet_counts[0], 4)
-        self.assertGreaterEqual(engine.open_packet_counts[1], 4)
-        self.assertEqual(engine.open_packet_counts[2:5], [1, 1, 1])
-        self.assertGreaterEqual(engine.open_packet_counts[5], 4)
-        self.assertEqual(engine.open_packet_counts[6], 1)
-        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 4)
-        self.assertEqual(engine.runner_telemetry["precision_probe_count"], 3)
-        self.assertEqual(engine.runner_telemetry["fast_exit_max_streak"], 3)
+        # Every popup uses two unique frames, but both are consumed while the
+        # popup is still transitioning instead of waiting for the opaque
+        # modal.  The first two openings arm the order path.
+        self.assertEqual(engine.open_packet_counts, [2] * 7)
+        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 5)
+        self.assertEqual(engine.runner_telemetry["precision_probe_count"], 0)
+        self.assertEqual(engine.runner_telemetry["transition_exit_count"], 7)
+        self.assertEqual(engine.runner_telemetry["fast_exit_max_streak"], 5)
         self.assertLess(
             float(engine.runner_telemetry["fast_exit_input_p95_ms"]),
             2.0,
@@ -1308,24 +1463,39 @@ class RenewalSafetyTests(unittest.TestCase):
             [],
         )
 
-    def test_precision_probe_catches_change_after_same_first_frame(self) -> None:
+    def test_transition_lookahead_catches_change_after_same_first_frame(self) -> None:
         stop_event = threading.Event()
+        transition_same = cv2.addWeighted(
+            self.guard,
+            0.80,
+            np.zeros_like(self.guard),
+            0.20,
+            0.0,
+        )
+        transition_changed = cv2.addWeighted(
+            self.changed_guard,
+            0.95,
+            np.zeros_like(self.changed_guard),
+            0.05,
+            0.0,
+        )
         engine = _FakeEngine(
             stop_event,
             cycles=[
-                [self.guard] * 4,
-                [self.guard] * 4,
-                [self.guard],
-                [self.guard],
-                [self.guard],
-                [self.guard, self.changed_guard, self.changed_guard],
+                [transition_same, transition_same],
+                [transition_same, transition_same],
+                [
+                    transition_same,
+                    transition_changed,
+                    transition_changed,
+                ],
             ],
         )
 
         self.assertFalse(_run(self.profile, engine, monitor_only=True))
         self.assertTrue(engine.runner_telemetry["monitor_detected"])
-        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 3)
-        self.assertGreaterEqual(engine.open_packet_counts[-1], 3)
+        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 0)
+        self.assertEqual(engine.open_packet_counts[-1], 3)
         self.assertEqual(
             [point for point in engine.clicks if point != (20, 10)],
             [],
@@ -1657,9 +1827,16 @@ class RenewalSafetyTests(unittest.TestCase):
 
     def test_unchanged_10000_cycles_has_zero_orders(self) -> None:
         stop_event = threading.Event()
+        transition_guard = cv2.addWeighted(
+            self.guard,
+            0.80,
+            np.zeros_like(self.guard),
+            0.20,
+            0.0,
+        )
         engine = _FakeEngine(
             stop_event,
-            repeat_guard=self.guard,
+            repeat_guard=transition_guard,
             stop_after_closes=10_000,
         )
         completed = _run(self.profile, engine)
@@ -1667,14 +1844,17 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(engine.escapes, 10_000)
         self.assertEqual(
             engine.runner_telemetry["fast_exit_count"],
-            7_499,
+            9_998,
         )
         self.assertEqual(
             engine.runner_telemetry["precision_probe_count"],
-            2_501,
+            0,
         )
-        self.assertEqual(sum(engine.open_packet_counts), 17_503)
-        self.assertLess(sum(engine.open_packet_counts), 20_000)
+        self.assertEqual(
+            engine.runner_telemetry["transition_exit_count"],
+            10_000,
+        )
+        self.assertEqual(sum(engine.open_packet_counts), 20_000)
         self.assertEqual(
             [point for point in engine.clicks if point != (20, 10)],
             [],

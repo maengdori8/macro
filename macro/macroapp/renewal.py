@@ -47,7 +47,7 @@ if hasattr(cv2, "ipp"):
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 11
+RENEWAL_PROFILE_VERSION = 12
 RENEWAL_CALIBRATION_VERSION = 7
 RENEWAL_CALIBRATION_OPENINGS = 8
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 3
@@ -56,6 +56,24 @@ RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT = 0.005
 RENEWAL_FAST_UNCHANGED_GLOBAL_LIMIT = 0.005
 RENEWAL_FAST_PROBE_INTERVAL = 4
 RENEWAL_FULL_PROBE_UNCHANGED_FRAMES = 4
+# The FC popup's first complete price row is rendered roughly 60-80 ms after
+# the click, while the static white popup guard does not settle for another
+# 120-180 ms.  During that early render the right-aligned price can be up to
+# about ten native WGC pixels to the right of its final position.
+RENEWAL_TRANSITION_PRICE_SHIFT_LIMIT = 12
+RENEWAL_TRANSITION_MIN_PROGRESS = 0.035
+RENEWAL_TRANSITION_MAX_PROGRESS = 1.20
+RENEWAL_TRANSITION_MAX_RESIDUAL_RATIO = 0.35
+RENEWAL_TRANSITION_ENDPOINT_RATIO = 1.40
+# Equality is safe slightly before the popup settles because each frame must
+# independently match the calibrated baseline.  A changed glyph needs a later
+# render phase and a smaller residual position shift: recorded same-price FC
+# transitions briefly look "changed" at progress 0.77-0.89 and -7..-12 px,
+# then resolve to the exact baseline.  These commit gates turn those frames
+# into AMBIGUOUS instead of an order.
+RENEWAL_TRANSITION_UNCHANGED_MIN_PROGRESS = 0.75
+RENEWAL_TRANSITION_CHANGE_MIN_PROGRESS = 0.90
+RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
@@ -1119,7 +1137,7 @@ class PriceClassification:
 class RenewalPriceClassifier:
     """정수 픽셀 정렬 후 가격을 유지/변경/판정 불가로 분류합니다."""
 
-    _LOCAL_SHIFT_LIMIT = 4
+    _LOCAL_SHIFT_LIMIT = RENEWAL_TRANSITION_PRICE_SHIFT_LIMIT
     # Native-resolution glyph evidence complements the resized Canny score.
     # Captured same-price WGC reopen jitter tops out below 0.003 after the
     # safer of raw/aligned registration, while the closest captured
@@ -1612,6 +1630,16 @@ class RenewalPriceClassifier:
         return bool(
             difference is not None
             and difference <= self._GLYPH_SAME_LIMIT
+        )
+
+    def transition_same_glyph(self, image: np.ndarray) -> bool:
+        """Cheap independent equality proof for an already aligned row."""
+
+        return bool(
+            self._render_contrast_valid(image)
+            and self._boundary_clear(image)
+            and self._suffix_anchor_matches(image)
+            and self._same_glyph_after_illumination(image)
         )
 
     @staticmethod
@@ -2283,10 +2311,30 @@ class RenewalCalibratedPriceClassifier:
     def stability_limit(self) -> float:
         return self.primary.stability_limit
 
-    def classify(self, image: np.ndarray) -> PriceClassification:
+    def _classify(
+        self,
+        image: np.ndarray,
+        *,
+        transition_consensus: bool,
+    ) -> PriceClassification:
         result = self.primary.classify(image)
         if result.state is PriceState.UNCHANGED or not self.variants:
             return result
+        if transition_consensus and result.geometry_valid:
+            transition_matches = 0
+            for variant in self.variants:
+                if variant.transition_same_glyph(result.aligned):
+                    transition_matches += 1
+                    if transition_matches >= 2:
+                        # The candidate is already aligned once by the
+                        # primary baseline. Comparing its native glyph mask
+                        # with calibrated variants avoids repeating
+                        # resize/Canny/registration for every variant.
+                        return replace(
+                            result,
+                            state=PriceState.UNCHANGED,
+                            reason="transition_variant_consensus",
+                        )
         alternate_results: list[PriceClassification] = []
         for variant in self.variants:
             alternate = variant.classify(image)
@@ -2301,6 +2349,11 @@ class RenewalCalibratedPriceClassifier:
                     alternate,
                     reason="calibrated_render_variant",
                 )
+        # A moving popup can resample the same glyph differently from every
+        # fully-open calibration image.  One variant match is insufficient:
+        # require two independently calibrated renders to identify the exact
+        # glyph structure.  This path is enabled only for the in-flight popup;
+        # the normal settled classifier keeps its stricter score threshold.
         if result.state is PriceState.CHANGED and any(
             alternate.state is not PriceState.CHANGED
             or not alternate.geometry_valid
@@ -2313,11 +2366,34 @@ class RenewalCalibratedPriceClassifier:
             )
         return result
 
+    def classify(self, image: np.ndarray) -> PriceClassification:
+        return self._classify(image, transition_consensus=False)
+
+    def classify_transition(
+        self,
+        image: np.ndarray,
+    ) -> PriceClassification:
+        """Classify an admitted popup-transition row using variant consensus."""
+
+        return self._classify(image, transition_consensus=True)
+
     def same_candidate(
         self,
         first: PriceClassification,
         second: PriceClassification,
     ) -> bool:
+        # Each UNCHANGED result independently proves equivalence to one of
+        # the calibrated baseline renders.  The early popup moves two pixels
+        # between consecutive 120 Hz frames, so comparing those two moving
+        # edge maps to each other would unnecessarily wait for the animation
+        # to stop even though both already identify the exact baseline price.
+        if (
+            first.state is PriceState.UNCHANGED
+            and second.state is PriceState.UNCHANGED
+            and first.geometry_valid
+            and second.geometry_valid
+        ):
+            return True
         return self.primary.same_candidate(first, second)
 
     @staticmethod
@@ -2343,6 +2419,38 @@ class RenewalCalibratedPriceClassifier:
                 == "illumination_normalized_same_glyph"
             )
         )
+
+
+def gate_transition_classification(
+    classification: PriceClassification,
+    progress: float,
+) -> PriceClassification:
+    """Fail closed until an early price result reaches its safe render phase."""
+
+    if (
+        classification.state is PriceState.UNCHANGED
+        and float(progress) < RENEWAL_TRANSITION_UNCHANGED_MIN_PROGRESS
+    ):
+        return replace(
+            classification,
+            state=PriceState.AMBIGUOUS,
+            reason="transition_equality_not_committed",
+        )
+    if (
+        classification.state is PriceState.CHANGED
+        and (
+            float(progress) < RENEWAL_TRANSITION_CHANGE_MIN_PROGRESS
+            or abs(classification.shift_x)
+            > RENEWAL_TRANSITION_CHANGE_MAX_SHIFT
+            or abs(classification.shift_y) > 2
+        )
+    ):
+        return replace(
+            classification,
+            state=PriceState.AMBIGUOUS,
+            reason="transition_change_not_committed",
+        )
+    return classification
 
 
 @dataclass(frozen=True)
@@ -2906,6 +3014,210 @@ class RenewalModalGuard:
 
 
 @dataclass(frozen=True)
+class TransitionRegistration:
+    """Evidence that a frame lies on the calibrated closed-to-popup path."""
+
+    valid: bool
+    progress: float
+    residual_ratio: float
+    open_luma_delta: float
+    closed_luma_delta: float
+    open_edge_delta: float
+    closed_edge_delta: float
+
+
+class RenewalTransitionGuard:
+    """Admit only an in-flight frame between the calibrated list and popup.
+
+    The order decision still comes exclusively from the price classifier.
+    This guard only lets that classifier see the early, partially transparent
+    popup frame instead of waiting for the final white background.  A frame
+    must lie close to the measured closed->open pixel trajectory, have moved
+    away from the exact list screen, and remain inside both calibrated
+    endpoint distances.
+    """
+
+    _ANALYSIS_SIZE = (96, 40)
+
+    def __init__(
+        self,
+        open_guard: RenewalModalGuard,
+        closed_guard: RenewalModalGuard,
+    ):
+        if open_guard.baseline.shape != closed_guard.baseline.shape:
+            raise ValueError("열림/닫힘 전환 가드 크기가 서로 다릅니다.")
+        if open_guard.mask.shape != closed_guard.mask.shape:
+            raise ValueError("열림/닫힘 전환 마스크 크기가 서로 다릅니다.")
+
+        self.open_guard = open_guard
+        self.closed_guard = closed_guard
+        combined_mask = cv2.bitwise_and(
+            open_guard.mask,
+            closed_guard.mask,
+        )
+        small_mask = cv2.resize(
+            combined_mask,
+            self._ANALYSIS_SIZE,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        self._mask = small_mask > 0
+        if int(np.count_nonzero(self._mask)) < 128:
+            raise ValueError("전환 가드의 정적 배경이 너무 작습니다.")
+
+        self._open = cv2.resize(
+            open_guard.baseline,
+            self._ANALYSIS_SIZE,
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+        self._closed = cv2.resize(
+            closed_guard.baseline,
+            self._ANALYSIS_SIZE,
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+        self._direction = self._open - self._closed
+        direction_values = self._direction[self._mask]
+        self._direction_energy = float(
+            np.dot(direction_values, direction_values)
+        )
+        if self._direction_energy < 256.0:
+            raise ValueError(
+                "열린 팝업과 닫힌 목록의 전환 차이가 너무 작습니다."
+            )
+
+        open_to_closed_luma, open_to_closed_edge = (
+            open_guard.metrics(closed_guard.baseline)
+        )
+        closed_to_open_luma, closed_to_open_edge = (
+            closed_guard.metrics(open_guard.baseline)
+        )
+        self._luma_span = max(
+            1.0,
+            float(open_to_closed_luma),
+            float(closed_to_open_luma),
+        )
+        self._edge_span = max(
+            0.01,
+            float(open_to_closed_edge),
+            float(closed_to_open_edge),
+        )
+
+    def register(
+        self,
+        image: np.ndarray,
+        *,
+        closed_valid: bool = False,
+        open_valid: bool = False,
+    ) -> TransitionRegistration:
+        invalid = TransitionRegistration(
+            False,
+            0.0,
+            float("inf"),
+            255.0,
+            255.0,
+            1.0,
+            1.0,
+        )
+        if (
+            image is None
+            or image.size == 0
+            or image.shape[:2] != self.open_guard.baseline.shape
+        ):
+            return invalid
+        gray = image
+        if gray.ndim == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+        # Luma projection is the cheap hot-path gate.  Canny edge metrics are
+        # deferred until the frame is already inside the calibrated
+        # closed-to-open corridor; closed/list frames therefore do no edge
+        # work while the runner waits for the popup.
+        open_luma = self.open_guard._luma_delta(gray)
+        closed_luma = self.closed_guard._luma_delta(gray)
+        if closed_valid:
+            return replace(
+                invalid,
+                open_luma_delta=open_luma,
+                closed_luma_delta=closed_luma,
+            )
+        if open_valid:
+            return TransitionRegistration(
+                True,
+                1.0,
+                0.0,
+                open_luma,
+                closed_luma,
+                0.0,
+                0.0,
+            )
+
+        small = cv2.resize(
+            gray,
+            self._ANALYSIS_SIZE,
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+        displacement = small - self._closed
+        displacement_values = displacement[self._mask]
+        direction_values = self._direction[self._mask]
+        progress = float(
+            np.dot(displacement_values, direction_values)
+            / self._direction_energy
+        )
+        predicted = progress * direction_values
+        residual = displacement_values - predicted
+        residual_ratio = float(
+            np.sqrt(float(np.dot(residual, residual)))
+            / np.sqrt(self._direction_energy)
+        )
+
+        departure_floor = max(
+            2.0,
+            self._luma_span * RENEWAL_TRANSITION_MIN_PROGRESS,
+        )
+        endpoint_luma_limit = (
+            self._luma_span * RENEWAL_TRANSITION_ENDPOINT_RATIO + 4.0
+        )
+        luma_valid = bool(
+            RENEWAL_TRANSITION_MIN_PROGRESS
+            <= progress
+            <= RENEWAL_TRANSITION_MAX_PROGRESS
+            and residual_ratio <= RENEWAL_TRANSITION_MAX_RESIDUAL_RATIO
+            and closed_luma >= departure_floor
+            and open_luma <= endpoint_luma_limit
+            and closed_luma <= endpoint_luma_limit
+        )
+        if not luma_valid:
+            return TransitionRegistration(
+                False,
+                progress,
+                residual_ratio,
+                open_luma,
+                closed_luma,
+                1.0,
+                1.0,
+            )
+
+        open_edge = self.open_guard._edge_delta(gray)
+        closed_edge = self.closed_guard._edge_delta(gray)
+        endpoint_edge_limit = min(
+            1.0,
+            self._edge_span * RENEWAL_TRANSITION_ENDPOINT_RATIO + 0.08,
+        )
+        valid = bool(
+            open_edge <= endpoint_edge_limit
+            and closed_edge <= endpoint_edge_limit
+        )
+        return TransitionRegistration(
+            valid,
+            progress,
+            residual_ratio,
+            open_luma,
+            closed_luma,
+            open_edge,
+            closed_edge,
+        )
+
+
+@dataclass(frozen=True)
 class RenewalCalibrationResult:
     baseline: np.ndarray
     baseline_variants: tuple[np.ndarray, ...]
@@ -3355,6 +3667,12 @@ class FastRenewalRunner:
             "precision_probe_count": 0,
             "fast_exit_max_streak": 0,
             "fast_exit_input_p95_ms": 0.0,
+            "transition_candidate_frames": 0,
+            "transition_confirmed_openings": 0,
+            "transition_exit_count": 0,
+            "transition_input_p95_ms": 0.0,
+            "first_price_p50_ms": 0.0,
+            "first_price_p95_ms": 0.0,
             "cycle_p50_ms": 0.0,
             "cycle_p95_ms": 0.0,
         }
@@ -3408,7 +3726,7 @@ class FastRenewalRunner:
                 )
                 self.status("화면 복구 중 · 주문 입력 없음")
                 self.log(
-                    "[복구 v11] "
+                    "[복구 v12] "
                     f"{exc} · WGC/HWND 재연결 "
                     f"{self.telemetry['capture_restarts']}회"
                 )
@@ -3421,7 +3739,7 @@ class FastRenewalRunner:
         if not self._schedule_deadline_active():
             self.telemetry["schedule_expired"] = True
             self.status("네이버 시간창 종료 · 주문 없이 정지")
-            self.log("[시간창 v11] 허용 시간이 끝나 입력 없이 정지합니다.")
+            self.log("[시간창 v12] 허용 시간이 끝나 입력 없이 정지합니다.")
         return False
 
     def _run_capture_session(self) -> bool:
@@ -3507,6 +3825,10 @@ class FastRenewalRunner:
             shift_limit=side_profile.registration_shift_limit,
             dynamic_boxes=dynamic_boxes,
         )
+        transition_guard = RenewalTransitionGuard(
+            modal_guard,
+            ready_guard,
+        )
         guard_region = side_profile.guard_rect.to_pixels(frame_width, frame_height)
 
         clicker = _FastClicker(self.manager, frame_width, frame_height)
@@ -3520,16 +3842,11 @@ class FastRenewalRunner:
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
-        fast_mode_enabled = bool(
+        transition_mode_enabled = bool(
             self.profile.first_frame_fast_exit
             and self.profile.speed_level == 10
         )
-        fast_probe_interval = max(
-            2,
-            int(self.profile.fast_probe_interval),
-        )
         armed_openings = 0
-        fast_eligible_cycles = 0
         fast_exit_streak = 0
         order_latched = False
         cycle_count = 0
@@ -3538,20 +3855,22 @@ class FastRenewalRunner:
         last_captured_at = float("-inf")
         frame_intervals: deque[float] = deque(maxlen=240)
         open_latencies: deque[float] = deque(maxlen=120)
+        first_price_latencies: deque[float] = deque(maxlen=240)
         close_latencies: deque[float] = deque(maxlen=120)
         classify_latencies: deque[float] = deque(maxlen=240)
         fast_exit_input_latencies: deque[float] = deque(maxlen=240)
+        transition_input_latencies: deque[float] = deque(maxlen=240)
         cycle_latencies: deque[float] = deque(maxlen=240)
         cycle_window_started = time.perf_counter()
         run_started = cycle_window_started
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v11] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v12] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
-            f"첫 프레임 ESC {'ON' if fast_mode_enabled else 'OFF'}, "
-            f"{fast_probe_interval}회마다 정밀 확인, "
+            f"전환 가격 2프레임 {'ON' if transition_mode_enabled else 'OFF'}, "
+            "완성 팝업 대기 없음, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
 
@@ -3582,6 +3901,14 @@ class FastRenewalRunner:
                     ),
                     "open_p50_ms": percentile(open_latencies, 50),
                     "open_p95_ms": percentile(open_latencies, 95),
+                    "first_price_p50_ms": percentile(
+                        first_price_latencies,
+                        50,
+                    ),
+                    "first_price_p95_ms": percentile(
+                        first_price_latencies,
+                        95,
+                    ),
                     "close_p50_ms": percentile(close_latencies, 50),
                     "close_p95_ms": percentile(close_latencies, 95),
                     "classify_p95_ms": percentile(
@@ -3594,6 +3921,10 @@ class FastRenewalRunner:
                     ),
                     "fast_exit_input_p95_ms": percentile(
                         fast_exit_input_latencies,
+                        95,
+                    ),
+                    "transition_input_p95_ms": percentile(
+                        transition_input_latencies,
                         95,
                     ),
                     "cycle_p50_ms": percentile(cycle_latencies, 50),
@@ -3695,6 +4026,7 @@ class FastRenewalRunner:
             allow_stopped: bool = False,
             pending_open_started: Optional[float] = None,
             fast_decision_started: Optional[float] = None,
+            transition_decision_started: Optional[float] = None,
         ) -> bool:
             self.telemetry["current_popup_escape_sent"] = True
             clicker.press_escape()
@@ -3703,6 +4035,14 @@ class FastRenewalRunner:
                     (
                         time.perf_counter()
                         - float(fast_decision_started)
+                    )
+                    * 1000.0
+                )
+            if transition_decision_started is not None:
+                transition_input_latencies.append(
+                    (
+                        time.perf_counter()
+                        - float(transition_decision_started)
                     )
                     * 1000.0
                 )
@@ -3790,21 +4130,6 @@ class FastRenewalRunner:
         ):
             cycle_count += 1
             self.telemetry["cycle_count"] = cycle_count
-            fast_exit_allowed = False
-            precision_probe = armed_openings < required_arm_openings
-            if (
-                fast_mode_enabled
-                and armed_openings >= required_arm_openings
-            ):
-                fast_eligible_cycles += 1
-                precision_probe = (
-                    fast_eligible_cycles % fast_probe_interval == 0
-                )
-                fast_exit_allowed = not precision_probe
-            if precision_probe:
-                self.telemetry["precision_probe_count"] = (
-                    int(self.telemetry["precision_probe_count"]) + 1
-                )
             action_started = time.perf_counter()
             if not self._time_window_active():
                 break
@@ -3835,8 +4160,12 @@ class FastRenewalRunner:
             decision: Optional[PriceState] = None
             fast_exit = False
             fast_decision_started: Optional[float] = None
-            classified_frames = 0
+            transition_decision_started: Optional[float] = None
+            confirmed_from_transition = False
+            candidate_phases: list[str] = []
+            transition_progress: list[float] = []
             open_recorded = False
+            first_price_recorded = False
             deadline = (
                 time.monotonic() + RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS
             )
@@ -3848,21 +4177,55 @@ class FastRenewalRunner:
                 )
                 if packet is None:
                     break
-                registration = modal_guard.register(
-                    packet.image,
-                    side_profile.guard_luma_noise,
-                    side_profile.guard_edge_noise,
-                )
-                if not registration.valid:
-                    last_result = None
-                    stable_count = 0
-                    raw_prices.clear()
-                    aligned_prices.clear()
-                    raw_guards.clear()
-                    sequence_ids.clear()
-                    capture_timestamps.clear()
-                    guard_shifts.clear()
-                    continue
+                phase = "settled"
+                aligned_guard = packet.image
+                guard_shift = (0, 0)
+                phase_progress = 1.0
+                transition_registration: Optional[
+                    TransitionRegistration
+                ] = None
+                if transition_mode_enabled:
+                    transition_registration = transition_guard.register(
+                        packet.image,
+                    )
+                if (
+                    transition_registration is not None
+                    and transition_registration.valid
+                ):
+                    phase = "transition"
+                    phase_progress = transition_registration.progress
+                    self.telemetry["transition_candidate_frames"] = (
+                        int(
+                            self.telemetry[
+                                "transition_candidate_frames"
+                            ]
+                        )
+                        + 1
+                    )
+                else:
+                    registration = modal_guard.register(
+                        packet.image,
+                        side_profile.guard_luma_noise,
+                        side_profile.guard_edge_noise,
+                    )
+                    if registration.valid:
+                        aligned_guard = registration.aligned
+                        guard_shift = (
+                            registration.shift_x,
+                            registration.shift_y,
+                        )
+                    else:
+                        last_result = None
+                        stable_count = 0
+                        raw_prices.clear()
+                        aligned_prices.clear()
+                        raw_guards.clear()
+                        sequence_ids.clear()
+                        capture_timestamps.clear()
+                        guard_shifts.clear()
+                        candidate_phases.clear()
+                        transition_progress.clear()
+                        continue
 
                 if not open_recorded:
                     open_latencies.append(
@@ -3872,27 +4235,48 @@ class FastRenewalRunner:
                     self.telemetry["popup_openings"] = (
                         int(self.telemetry["popup_openings"]) + 1
                     )
-                price = crop_price_from_guard(registration.aligned, price_box)
+                price = crop_price_from_guard(aligned_guard, price_box)
                 classify_started = time.perf_counter()
-                result = classifier.classify(price)
-                classified_frames += 1
+                result = (
+                    classifier.classify_transition(price)
+                    if phase == "transition"
+                    else classifier.classify(price)
+                )
+                if phase == "transition":
+                    result = gate_transition_classification(
+                        result,
+                        phase_progress,
+                    )
                 classify_latencies.append(
                     (time.perf_counter() - classify_started) * 1000.0
                 )
+                if (
+                    not first_price_recorded
+                    and result.state is not PriceState.AMBIGUOUS
+                    and result.geometry_valid
+                ):
+                    first_price_latencies.append(
+                        (time.perf_counter() - action_started) * 1000.0
+                    )
+                    first_price_recorded = True
                 raw_prices.append(price.copy())
                 aligned_prices.append(result.aligned.copy())
                 raw_guards.append(packet.image.copy())
                 sequence_ids.append(packet.sequence_id)
                 capture_timestamps.append(packet.captured_at)
-                guard_shifts.append(
-                    (registration.shift_x, registration.shift_y)
-                )
+                guard_shifts.append(guard_shift)
+                candidate_phases.append(phase)
+                transition_progress.append(phase_progress)
                 raw_prices[:] = raw_prices[-required_frames:]
                 aligned_prices[:] = aligned_prices[-required_frames:]
                 raw_guards[:] = raw_guards[-required_frames:]
                 sequence_ids[:] = sequence_ids[-required_frames:]
                 capture_timestamps[:] = capture_timestamps[-required_frames:]
                 guard_shifts[:] = guard_shifts[-required_frames:]
+                candidate_phases[:] = candidate_phases[-required_frames:]
+                transition_progress[:] = transition_progress[
+                    -required_frames:
+                ]
 
                 if result.state is PriceState.AMBIGUOUS:
                     ambiguous = True
@@ -3900,17 +4284,6 @@ class FastRenewalRunner:
                     last_result = result
                     stable_count = 0
                     continue
-
-                if (
-                    classified_frames == 1
-                    and fast_exit_allowed
-                    and classifier.fast_unchanged(result)
-                ):
-                    decision = PriceState.UNCHANGED
-                    fast_exit = True
-                    fast_decision_started = packet.captured_at
-                    ambiguous = False
-                    break
 
                 if (
                     last_result is not None
@@ -3925,20 +4298,34 @@ class FastRenewalRunner:
                     sequence_ids[:] = sequence_ids[-1:]
                     capture_timestamps[:] = capture_timestamps[-1:]
                     guard_shifts[:] = guard_shifts[-1:]
+                    candidate_phases[:] = candidate_phases[-1:]
+                    transition_progress[:] = transition_progress[-1:]
                 last_result = result
 
-                decision_frames = required_frames
-                if (
-                    result.state is PriceState.UNCHANGED
-                    and precision_probe
-                ):
-                    decision_frames = max(
-                        decision_frames,
-                        RENEWAL_FULL_PROBE_UNCHANGED_FRAMES,
-                    )
-                if stable_count < decision_frames:
+                if stable_count < required_frames:
                     continue
                 decision = result.state
+                confirmed_from_transition = any(
+                    item == "transition"
+                    for item in candidate_phases
+                )
+                if confirmed_from_transition:
+                    transition_decision_started = packet.captured_at
+                    self.telemetry["transition_confirmed_openings"] = (
+                        int(
+                            self.telemetry[
+                                "transition_confirmed_openings"
+                            ]
+                        )
+                        + 1
+                    )
+                fast_exit = bool(
+                    decision is PriceState.UNCHANGED
+                    and confirmed_from_transition
+                    and armed_openings >= required_arm_openings
+                )
+                if fast_exit:
+                    fast_decision_started = packet.captured_at
                 ambiguous = False
                 break
 
@@ -3982,7 +4369,7 @@ class FastRenewalRunner:
                 if consecutive_open_failures == 3:
                     self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")
                     self.log(
-                        "[복구 v11] 완성된 가격 팝업을 3회 연속 "
+                        "[복구 v12] 완성된 가격 팝업을 3회 연속 "
                         "확인하지 못했지만 주문 없이 계속 시도합니다."
                     )
                 if consecutive_open_failures >= 10:
@@ -4022,6 +4409,8 @@ class FastRenewalRunner:
                             last_ambiguous_result.shift_y,
                         ],
                         "guard_shifts": guard_shifts,
+                        "candidate_phases": candidate_phases,
+                        "transition_progress": transition_progress,
                         "sequence_ids": sequence_ids,
                         "capture_timestamps": capture_timestamps,
                         "cycle": cycle_count,
@@ -4039,7 +4428,7 @@ class FastRenewalRunner:
                 fast_exit_streak = 0
                 if armed_openings < required_arm_openings:
                     self.telemetry["initial_mismatch"] = True
-                    self.status("기준 가격 불일치 · v10 우측 가격영역 재설정 필요")
+                    self.status("기준 가격 불일치 · 우측 가격영역 재설정 필요")
                     self.log(
                         "[안전 차단] 독립 기준 확인 전에 다른 가격이 감지되어 "
                         "주문 없이 정지합니다."
@@ -4057,6 +4446,8 @@ class FastRenewalRunner:
                                 last_result.shift_y,
                             ],
                             "guard_shifts": guard_shifts,
+                            "candidate_phases": candidate_phases,
+                            "transition_progress": transition_progress,
                             "sequence_ids": sequence_ids,
                             "capture_timestamps": capture_timestamps,
                             "cycle": cycle_count,
@@ -4072,7 +4463,7 @@ class FastRenewalRunner:
                     self.telemetry["monitor_detected"] = True
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
-                        f"[무주문 측정 v11] {cycle_count}회에서 변경 확정, "
+                        f"[무주문 측정 v12] {cycle_count}회에서 변경 확정, "
                         f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
                     )
                     save_renewal_diagnostic(
@@ -4086,6 +4477,8 @@ class FastRenewalRunner:
                             "slice_score": last_result.slice_score,
                             "sequence_ids": sequence_ids,
                             "capture_timestamps": capture_timestamps,
+                            "candidate_phases": candidate_phases,
+                            "transition_progress": transition_progress,
                             "cycle": cycle_count,
                             "ordered": False,
                         },
@@ -4133,8 +4526,12 @@ class FastRenewalRunner:
                     )
                     * 1000.0
                 )
+                if confirmed_from_transition:
+                    transition_input_latencies.append(
+                        second_frame_to_input_ms
+                    )
                 self.log(
-                    f"[갱신 완료 v11] {cycle_count}회 확인, "
+                    f"[갱신 완료 v12] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -4155,6 +4552,8 @@ class FastRenewalRunner:
                             last_result.shift_y,
                         ],
                         "guard_shifts": guard_shifts,
+                        "candidate_phases": candidate_phases,
+                        "transition_progress": transition_progress,
                         "sequence_ids": sequence_ids,
                         "capture_timestamps": capture_timestamps,
                         "click_ms": elapsed_ms,
@@ -4174,6 +4573,10 @@ class FastRenewalRunner:
                 self.telemetry["unchanged_openings"] = (
                     int(self.telemetry["unchanged_openings"]) + 1
                 )
+                if confirmed_from_transition:
+                    self.telemetry["transition_exit_count"] = (
+                        int(self.telemetry["transition_exit_count"]) + 1
+                    )
                 if fast_exit:
                     fast_exit_streak += 1
                     self.telemetry["fast_exit_count"] = (
@@ -4183,7 +4586,7 @@ class FastRenewalRunner:
                         int(self.telemetry["fast_exit_max_streak"]),
                         fast_exit_streak,
                     )
-                    self.status("첫 프레임 동일가격 · 즉시 ESC")
+                    self.status("전환 가격 2프레임 동일 · 즉시 ESC")
                 else:
                     fast_exit_streak = 0
                 if armed_openings < required_arm_openings:
@@ -4194,12 +4597,17 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v11] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v12] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
                 if not close_modal(
                     fast_decision_started=(
                         fast_decision_started if fast_exit else None
-                    )
+                    ),
+                    transition_decision_started=(
+                        transition_decision_started
+                        if confirmed_from_transition
+                        else None
+                    ),
                 ):
                     raise RenewalCaptureRestart(
                         "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
@@ -4246,12 +4654,11 @@ class FastRenewalRunner:
                     else 0
                 )
                 self.log(
-                    f"[갱신 v11] {cycle_count}회 확인 중 · "
+                    f"[갱신 v12] {cycle_count}회 확인 중 · "
                     f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
                     f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
                     f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "
-                    f"첫 프레임 ESC {self.telemetry['fast_exit_count']}회 · "
-                    f"정밀 확인 {self.telemetry['precision_probe_count']}회 · "
+                    f"전환 조기 ESC {self.telemetry['transition_exit_count']}회 · "
                     f"최신교체 {replaced}"
                 )
             now = time.perf_counter()
@@ -4267,8 +4674,8 @@ class FastRenewalRunner:
                 )
                 capture_hz = 1000.0 / frame_ms if frame_ms > 0 else 0.0
                 policy = (
-                    "첫 프레임 ESC"
-                    if fast_mode_enabled
+                    "전환 가격 2프레임"
+                    if transition_mode_enabled
                     else f"동일가격 {required_frames}프레임"
                 )
                 self.status(

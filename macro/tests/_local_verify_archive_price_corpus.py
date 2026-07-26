@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from macroapp.renewal import (  # noqa: E402
     PriceState,
+    RenewalCalibratedPriceClassifier,
     RenewalPriceClassifier,
     validate_price_region,
 )
@@ -144,6 +145,48 @@ def verify(archive_dir: Path) -> dict:
                 }
             )
 
+    # The speed-10 transition path can accept equality only when two
+    # independently captured calibration variants match the same native
+    # glyph. Exercise that path against every differently priced archive row
+    # for each price with at least three independent captures.
+    label_groups: dict[str, list[str]] = {}
+    for name, labels in PRICE_LABELS.items():
+        if name in rows:
+            label_groups.setdefault(labels[0], []).append(name)
+    transition_consensus_checks = 0
+    transition_consensus_failures: list[dict[str, object]] = []
+    for baseline_label, names in label_groups.items():
+        if len(names) < 3:
+            continue
+        for baseline_name in names:
+            classifier = RenewalCalibratedPriceClassifier(
+                rows[baseline_name],
+                [
+                    rows[name]
+                    for name in names
+                    if name != baseline_name
+                ],
+                unchanged_limit=0.040,
+                stability_limit=0.030,
+            )
+            for candidate_name, candidate in rows.items():
+                candidate_label = PRICE_LABELS[candidate_name][0]
+                if candidate_label == baseline_label:
+                    continue
+                transition_consensus_checks += 1
+                classified = classifier.classify_transition(candidate)
+                if classified.state is PriceState.UNCHANGED:
+                    transition_consensus_failures.append(
+                        {
+                            "baseline": baseline_name,
+                            "baseline_price": baseline_label,
+                            "candidate": candidate_name,
+                            "candidate_price": candidate_label,
+                            "reason": classified.reason,
+                            "global_score": classified.global_score,
+                        }
+                    )
+
     expected_files = len(PRICE_LABELS)
     pair_count = len(rows) * max(0, len(rows) - 1)
     result = {
@@ -152,6 +195,7 @@ def verify(archive_dir: Path) -> dict:
             and not missing
             and not invalid_regions
             and not failures
+            and not transition_consensus_failures
         ),
         "archive_dir": str(archive_dir),
         "expected_files": expected_files,
@@ -164,6 +208,8 @@ def verify(archive_dir: Path) -> dict:
         "invalid_regions": invalid_regions,
         "failures": failures[:50],
         "failure_count": len(failures),
+        "transition_consensus_checks": transition_consensus_checks,
+        "transition_consensus_failures": transition_consensus_failures[:50],
         "elapsed_seconds": time.perf_counter() - started,
     }
     return result

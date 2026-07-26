@@ -41,6 +41,12 @@ def main() -> int:
     guard, _box = _guard(baseline)
     changed_guard, _box = _guard(changed)
     profile = _profile(baseline, guard)
+    transition_same = np.rint(
+        guard.astype(np.float32) * 0.80
+    ).astype(np.uint8)
+    transition_changed = np.rint(
+        changed_guard.astype(np.float32) * 0.95
+    ).astype(np.uint8)
     second_frame_ms: list[float] = []
     first_frame_ms: list[float] = []
     click_ms: list[float] = []
@@ -52,9 +58,9 @@ def main() -> int:
         engine = _FakeEngine(
             stop_event,
             cycles=[
-                [guard, guard],
-                [guard, guard],
-                [changed_guard, changed_guard],
+                [transition_same, transition_same],
+                [transition_same, transition_same],
+                [transition_changed, transition_changed],
             ],
         )
         ordered: list[dict[str, object]] = []
