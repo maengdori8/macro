@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "source_commit": "70b65fac457642168a091c2c580d15d9cc0de1db",
+  "started_at": "2026-07-27T01:02:51+09:00",
+  "elapsed_seconds": 10.811640699976124,
+  "duration_requested_seconds": 600.0,
+  "cycle_count": 2,
+  "popup_openings": 0,
+  "confirmed_openings": 0,
+  "open_failures": 2,
+  "configured_cycle_floor_seconds": 2.0,
+  "incorrect_reported_cycle_floor_seconds": 0.8,
+  "order_inputs": 0,
+  "order_clicks": 0,
+  "ambiguous_count": 0,
+  "frame_size_changes": 0,
+  "server_pressure_detected": true
+}

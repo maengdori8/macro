@@ -332,6 +332,36 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(disabled.floor_seconds, 0.0)
         self.assertEqual(disabled.delay_seconds(0.0), 0.0)
 
+    def test_failed_open_never_reduces_server_safe_floor(self) -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "renewal_sustained_open_failure_11s.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        pacer = renewal.RenewalAdaptiveCyclePacer(
+            enabled=True,
+            initial_floor_seconds=float(
+                fixture["configured_cycle_floor_seconds"]
+            ),
+        )
+
+        recovery = pacer.record_failure()
+
+        self.assertGreaterEqual(
+            pacer.floor_seconds,
+            float(fixture["configured_cycle_floor_seconds"]),
+        )
+        self.assertNotEqual(
+            pacer.floor_seconds,
+            float(fixture["incorrect_reported_cycle_floor_seconds"]),
+        )
+        self.assertGreaterEqual(
+            recovery,
+            renewal.RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS,
+        )
+        self.assertEqual(int(fixture["order_inputs"]), 0)
+
     def test_server_safe_floor_has_headroom_below_live_rejection_rate(
         self,
     ) -> None:
