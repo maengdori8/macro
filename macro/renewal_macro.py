@@ -115,6 +115,7 @@ HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT = 8.0
 HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
 HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
+HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS = 5.0
 
 
 def _headless_open_failure_summary(
@@ -154,6 +155,21 @@ def _headless_checkpoint_resources(
     if finished and isinstance(finalized, dict):
         return dict(finalized)
     return dict(live_resources)
+
+
+def _headless_resource_sample_due(
+    resource_samples: list[dict[str, float]],
+    elapsed_seconds: float,
+) -> bool:
+    if not resource_samples:
+        return True
+    previous_elapsed = float(
+        resource_samples[-1].get("elapsed_seconds", 0.0)
+    )
+    return (
+        float(elapsed_seconds) - previous_elapsed
+        >= HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS
+    )
 
 
 def _calibration_popup_opacity(
@@ -2360,8 +2376,17 @@ def _headless_monitor_existing(
     logical_cpus = max(1, int(psutil.cpu_count(logical=True) or 1))
     process.cpu_percent(interval=None)
 
-    def sample_resources() -> None:
+    def sample_resources(*, force: bool = False) -> None:
         try:
+            elapsed_seconds = time.perf_counter() - started
+            if (
+                not force
+                and not _headless_resource_sample_due(
+                    resource_samples,
+                    elapsed_seconds,
+                )
+            ):
+                return
             memory = process.memory_info()
             try:
                 private_bytes = int(
@@ -2371,7 +2396,7 @@ def _headless_monitor_existing(
                 private_bytes = int(memory.rss)
             resource_samples.append(
                 {
-                    "elapsed_seconds": time.perf_counter() - started,
+                    "elapsed_seconds": elapsed_seconds,
                     "cpu_system_percent": (
                         float(process.cpu_percent(interval=None))
                         / float(logical_cpus)
@@ -2649,7 +2674,7 @@ def _headless_monitor_existing(
         if manager is not None:
             manager.stop_capture()
         if "resources" not in report:
-            sample_resources()
+            sample_resources(force=True)
             report["resources"] = resource_summary()
         report.update(
             {

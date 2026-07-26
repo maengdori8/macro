@@ -527,6 +527,15 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         )
         self.assertEqual(selected, current)
 
+    def test_resource_sampler_rejects_near_duplicate_final_sample(self):
+        samples = [{"elapsed_seconds": 30.0}]
+        self.assertFalse(
+            renewal_macro._headless_resource_sample_due(samples, 30.1)
+        )
+        self.assertTrue(
+            renewal_macro._headless_resource_sample_due(samples, 35.0)
+        )
+
     def test_eight_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.full((height, width), 251, dtype=np.uint8)
