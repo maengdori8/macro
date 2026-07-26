@@ -77,6 +77,13 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
+# FC accepts the early 2-frame decision faster than it can sustain reopening
+# the same market modal indefinitely. The recorded target runs at roughly
+# 0.45 s/cycle; keeping speed 10 just below that at 0.40 s/cycle preserves
+# its visible speed while avoiding the measured long-session UI throttle.
+# This floor is applied only after an unchanged popup has already closed.
+# A real price change still reaches the order input immediately.
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.40
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain
@@ -94,6 +101,31 @@ SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
 )
 WGC_SIZE_SETTLE_SECONDS = 0.50
 WGC_SIZE_SETTLE_TIMEOUT_SECONDS = 4.0
+
+
+def renewal_sustained_cycle_seconds(speed_level: int) -> float:
+    """Return the unchanged-cycle floor without delaying order approval."""
+
+    return (
+        RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS
+        if int(speed_level) >= 10
+        else 0.0
+    )
+
+
+def renewal_open_failure_backoff_seconds(failure_count: int) -> float:
+    """Bound retries when FC temporarily refuses to open the market modal."""
+
+    failures = max(0, int(failure_count))
+    if failures < 3:
+        return 0.0
+    if failures < 5:
+        return 0.50
+    if failures < 8:
+        return 2.0
+    if failures < 10:
+        return 5.0
+    return 15.0
 
 
 def is_supported_renewal_wgc_size(width: int, height: int) -> bool:
@@ -3752,6 +3784,7 @@ class FastRenewalRunner:
         monitor_only: bool = False,
         active_until: Optional[float] = None,
         time_valid: Optional[Callable[[], bool]] = None,
+        sustained_pacing: bool = True,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -3762,6 +3795,7 @@ class FastRenewalRunner:
         self.log = logger
         self.status = status
         self.monitor_only = bool(monitor_only)
+        self.sustained_pacing = bool(sustained_pacing)
         self.active_until = (
             None if active_until is None else float(active_until)
         )
@@ -3799,6 +3833,10 @@ class FastRenewalRunner:
             "actual_frame_size": [],
             "content_frame_size": [],
             "capture_layout_mode": "",
+            "cycle_floor_ms": 0.0,
+            "pacing_waits": 0,
+            "pacing_total_ms": 0.0,
+            "open_failure_backoff_ms": 0.0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -3989,6 +4027,14 @@ class FastRenewalRunner:
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
+        sustained_cycle_seconds = (
+            renewal_sustained_cycle_seconds(self.profile.speed_level)
+            if self.sustained_pacing
+            else 0.0
+        )
+        self.telemetry["cycle_floor_ms"] = (
+            sustained_cycle_seconds * 1000.0
+        )
         transition_mode_enabled = bool(
             self.profile.first_frame_fast_exit
             and self.profile.speed_level == 10
@@ -4519,6 +4565,19 @@ class FastRenewalRunner:
                         "[복구 v12] 완성된 가격 팝업을 3회 연속 "
                         "확인하지 못했지만 주문 없이 계속 시도합니다."
                     )
+                failure_backoff = renewal_open_failure_backoff_seconds(
+                    consecutive_open_failures
+                )
+                if failure_backoff > 0:
+                    self.telemetry["open_failure_backoff_ms"] = (
+                        float(
+                            self.telemetry["open_failure_backoff_ms"]
+                        )
+                        + failure_backoff * 1000.0
+                    )
+                    if self._wait(failure_backoff):
+                        update_performance_telemetry()
+                        return False
                 if consecutive_open_failures >= 10:
                     update_performance_telemetry()
                     raise RenewalCaptureRestart("팝업 확인 10회 연속 실패")
@@ -4759,6 +4818,28 @@ class FastRenewalRunner:
                     raise RenewalCaptureRestart(
                         "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
                     )
+                cycle_elapsed = time.perf_counter() - action_started
+                pacing_delay = max(
+                    0.0,
+                    sustained_cycle_seconds - cycle_elapsed,
+                )
+                if pacing_delay > 0:
+                    self.telemetry["pacing_waits"] = (
+                        int(self.telemetry["pacing_waits"]) + 1
+                    )
+                    self.telemetry["pacing_total_ms"] = (
+                        float(self.telemetry["pacing_total_ms"])
+                        + pacing_delay * 1000.0
+                    )
+                    if self._wait(pacing_delay):
+                        cycle_latencies.append(
+                            (
+                                time.perf_counter() - action_started
+                            )
+                            * 1000.0
+                        )
+                        update_performance_telemetry()
+                        return False
                 cycle_latencies.append(
                     (time.perf_counter() - action_started) * 1000.0
                 )

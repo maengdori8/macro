@@ -270,6 +270,7 @@ def _run(
             logger=lambda _message: None,
             status=lambda _message: None,
             monitor_only=monitor_only,
+            sustained_pacing=False,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -277,6 +278,28 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
+    def test_speed10_sustains_target_video_rate_without_order_delay(self) -> None:
+        self.assertEqual(
+            renewal.renewal_sustained_cycle_seconds(10),
+            0.40,
+        )
+        self.assertEqual(
+            renewal.renewal_sustained_cycle_seconds(9),
+            0.0,
+        )
+
+    def test_open_failure_backoff_starts_only_after_repeated_failures(
+        self,
+    ) -> None:
+        delays = [
+            renewal.renewal_open_failure_backoff_seconds(value)
+            for value in range(1, 11)
+        ]
+        self.assertEqual(delays[:2], [0.0, 0.0])
+        self.assertEqual(delays[2:4], [0.5, 0.5])
+        self.assertEqual(delays[-1], 15.0)
+        self.assertEqual(delays, sorted(delays))
+
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
             renewal.RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS,
