@@ -2702,11 +2702,13 @@ class RenewalModalGuard:
         absolute = cv2.absdiff(self.baseline, gray)
         return float(cv2.mean(absolute, mask=self.mask)[0])
 
-    def _edge_delta(self, gray: np.ndarray) -> float:
-        edges = cv2.bitwise_and(
-            cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 40, 120),
-            self.mask,
-        )
+    def _edge_delta_from_edges(
+        self,
+        candidate_edges: np.ndarray,
+    ) -> float:
+        """Compare a precomputed candidate edge map with this guard."""
+
+        edges = cv2.bitwise_and(candidate_edges, self.mask)
         dilated = cv2.dilate(edges, self._DILATE_KERNEL)
         difference = cv2.bitwise_or(
             cv2.bitwise_and(
@@ -2724,6 +2726,14 @@ class RenewalModalGuard:
             else float(cv2.countNonZero(difference)) / float(union_count)
         )
         return edge_delta
+
+    def _edge_delta(self, gray: np.ndarray) -> float:
+        candidate_edges = cv2.Canny(
+            cv2.GaussianBlur(gray, (3, 3), 0),
+            40,
+            120,
+        )
+        return self._edge_delta_from_edges(candidate_edges)
 
     def metrics(self, image: np.ndarray) -> tuple[float, float]:
         if image is None or image.size == 0:
@@ -3256,8 +3266,18 @@ class RenewalTransitionGuard:
                 1.0,
             )
 
-        open_edge = self.open_guard._edge_delta(gray)
-        closed_edge = self.closed_guard._edge_delta(gray)
+        # Both endpoint guards inspect the same candidate pixels.  Compute
+        # Gaussian/Canny once and apply each guard's independent mask and
+        # baseline comparison to that shared edge map.
+        candidate_edges = cv2.Canny(
+            cv2.GaussianBlur(gray, (3, 3), 0),
+            40,
+            120,
+        )
+        open_edge = self.open_guard._edge_delta_from_edges(candidate_edges)
+        closed_edge = self.closed_guard._edge_delta_from_edges(
+            candidate_edges
+        )
         endpoint_edge_limit = min(
             1.0,
             self._edge_span * RENEWAL_TRANSITION_ENDPOINT_RATIO + 0.08,
