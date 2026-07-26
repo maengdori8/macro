@@ -370,6 +370,32 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertTrue(accepted.valid)
         self.assertGreater(accepted.progress, 0.70)
         self.assertLess(accepted.residual_ratio, 0.10)
+        work_buffer_ids = (
+            id(gate._small_uint8),
+            id(gate._small_float),
+            id(gate._displacement),
+            id(gate._masked_displacement),
+            id(gate._predicted),
+            id(gate._residual),
+        )
+        repeated = gate.register(transition)
+        self.assertTrue(repeated.valid)
+        self.assertAlmostEqual(repeated.progress, accepted.progress)
+        self.assertAlmostEqual(
+            repeated.residual_ratio,
+            accepted.residual_ratio,
+        )
+        self.assertEqual(
+            work_buffer_ids,
+            (
+                id(gate._small_uint8),
+                id(gate._small_float),
+                id(gate._displacement),
+                id(gate._masked_displacement),
+                id(gate._predicted),
+                id(gate._residual),
+            ),
+        )
         self.assertFalse(gate.register(unrelated).valid)
 
     def test_transition_commit_gate_blocks_early_shifted_change(self) -> None:

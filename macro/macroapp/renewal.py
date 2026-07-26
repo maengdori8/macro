@@ -3092,14 +3092,33 @@ class RenewalTransitionGuard:
             interpolation=cv2.INTER_AREA,
         ).astype(np.float32)
         self._direction = self._open - self._closed
-        direction_values = self._direction[self._mask]
+        self._masked_indices = np.flatnonzero(self._mask.ravel())
+        self._direction_values = self._direction.ravel()[
+            self._masked_indices
+        ].copy()
         self._direction_energy = float(
-            np.dot(direction_values, direction_values)
+            np.dot(self._direction_values, self._direction_values)
         )
         if self._direction_energy < 256.0:
             raise ValueError(
                 "열린 팝업과 닫힌 목록의 전환 차이가 너무 작습니다."
             )
+
+        self._direction_energy_sqrt = float(
+            np.sqrt(self._direction_energy)
+        )
+        analysis_width, analysis_height = self._ANALYSIS_SIZE
+        analysis_shape = (analysis_height, analysis_width)
+        self._small_uint8 = np.empty(analysis_shape, dtype=np.uint8)
+        self._small_float = np.empty(analysis_shape, dtype=np.float32)
+        self._displacement = np.empty(analysis_shape, dtype=np.float32)
+        masked_count = int(self._masked_indices.size)
+        self._masked_displacement = np.empty(
+            masked_count,
+            dtype=np.float32,
+        )
+        self._predicted = np.empty(masked_count, dtype=np.float32)
+        self._residual = np.empty(masked_count, dtype=np.float32)
 
         open_to_closed_luma, open_to_closed_edge = (
             open_guard.metrics(closed_guard.baseline)
@@ -3167,23 +3186,47 @@ class RenewalTransitionGuard:
                 0.0,
             )
 
-        small = cv2.resize(
+        cv2.resize(
             gray,
             self._ANALYSIS_SIZE,
+            dst=self._small_uint8,
             interpolation=cv2.INTER_AREA,
-        ).astype(np.float32)
-        displacement = small - self._closed
-        displacement_values = displacement[self._mask]
-        direction_values = self._direction[self._mask]
+        )
+        np.copyto(
+            self._small_float,
+            self._small_uint8,
+            casting="unsafe",
+        )
+        np.subtract(
+            self._small_float,
+            self._closed,
+            out=self._displacement,
+        )
+        np.take(
+            self._displacement.ravel(),
+            self._masked_indices,
+            out=self._masked_displacement,
+        )
         progress = float(
-            np.dot(displacement_values, direction_values)
+            np.dot(
+                self._masked_displacement,
+                self._direction_values,
+            )
             / self._direction_energy
         )
-        predicted = progress * direction_values
-        residual = displacement_values - predicted
+        np.multiply(
+            self._direction_values,
+            progress,
+            out=self._predicted,
+        )
+        np.subtract(
+            self._masked_displacement,
+            self._predicted,
+            out=self._residual,
+        )
         residual_ratio = float(
-            np.sqrt(float(np.dot(residual, residual)))
-            / np.sqrt(self._direction_energy)
+            np.sqrt(float(np.dot(self._residual, self._residual)))
+            / self._direction_energy_sqrt
         )
 
         departure_floor = max(
