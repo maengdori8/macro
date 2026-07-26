@@ -212,8 +212,20 @@ class _SizeReportingEngine(_FakeEngine):
 
 
 def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
+    full_frame = np.full((100, 200), 128, dtype=np.uint8)
+    action_point = renewal.NormalizedPoint(20 / 199, 10 / 99)
+    action_ready_rect = renewal.build_action_ready_rect(
+        action_point,
+        200,
+        100,
+    )
+    x1, y1, x2, y2 = action_ready_rect.to_pixels(200, 100)
     side = renewal.RenewalSideProfile(
-        action_point=renewal.NormalizedPoint(20 / 199, 10 / 99),
+        action_point=action_point,
+        action_ready_rect=action_ready_rect,
+        action_ready_png=renewal.encode_gray_png(
+            full_frame[y1:y2, x1:x2]
+        ),
         confirm_point=renewal.NormalizedPoint(180 / 199, 80 / 99),
         price_rect=renewal.NormalizedRect(0.40, 0.40, 0.60, 0.60),
         guard_rect=renewal.NormalizedRect(0.25, 0.20, 0.75, 0.80),
@@ -578,14 +590,16 @@ class RenewalSafetyTests(unittest.TestCase):
         loaded = renewal.RenewalProfile.from_dict(legacy)
         self.assertIn("v10 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v12_profile_round_trip_keeps_transition_path_and_schedule(self) -> None:
+    def test_v13_profile_round_trip_keeps_action_anchor_and_schedule(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
         self.profile.fast_probe_interval = 6
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 12)
+        self.assertEqual(loaded.to_dict()["version"], 13)
         self.assertTrue(loaded.buy.complete())
+        self.assertIsNotNone(loaded.buy.action_ready_rect)
+        self.assertTrue(loaded.buy.action_ready_png)
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
         self.assertEqual(len(loaded.buy.baseline_variants_png), 1)
@@ -2078,6 +2092,27 @@ class RenewalSafetyTests(unittest.TestCase):
         self.profile.buy.calibrated_frame_height = 1048
         with self.assertRaisesRegex(RuntimeError, "게임 창 크기"):
             _run(self.profile, engine)
+        self.assertEqual(engine.clicks, [])
+
+    def test_wrong_or_disabled_action_context_stops_before_first_click(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
+        wrong_screen = np.full((100, 200), 128, dtype=np.uint8)
+        action_rect = self.profile.buy.action_ready_rect
+        self.assertIsNotNone(action_rect)
+        x1, y1, x2, y2 = action_rect.to_pixels(200, 100)
+        wrong_screen[y1:y2, x1:x2] = 40
+
+        with patch.object(
+            _FakeManager,
+            "capture_client_area",
+            return_value=wrong_screen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "활성 버튼"):
+                _run(self.profile, engine)
+
         self.assertEqual(engine.clicks, [])
 
     def test_exact_initial_size_still_waits_for_wgc_settle(self) -> None:

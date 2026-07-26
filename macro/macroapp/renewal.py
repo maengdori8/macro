@@ -47,8 +47,8 @@ if hasattr(cv2, "ipp"):
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 12
-RENEWAL_CALIBRATION_VERSION = 7
+RENEWAL_PROFILE_VERSION = 13
+RENEWAL_CALIBRATION_VERSION = 8
 RENEWAL_CALIBRATION_OPENINGS = 8
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 3
 RENEWAL_MAX_BASELINE_VARIANTS = 8
@@ -413,10 +413,31 @@ class NormalizedRect:
         return rect
 
 
+def build_action_ready_rect(
+    action_point: NormalizedPoint,
+    _frame_width: int,
+    _frame_height: int,
+) -> NormalizedRect:
+    """Return a compact closed-screen anchor around the active action button."""
+
+    half_width = 0.060
+    half_height = 0.032
+    return NormalizedRect(
+        max(0.0, float(action_point.x) - half_width),
+        max(0.0, float(action_point.y) - half_height),
+        min(1.0, float(action_point.x) + half_width),
+        min(1.0, float(action_point.y) + half_height),
+    )
+
+
 @dataclass
 class RenewalSideProfile:
     # 목록 화면에서 가격 창을 여는 구매/판매 버튼.
     action_point: Optional[NormalizedPoint] = None
+    # The right-side price table is shared by several transfer-market tabs.
+    # Require a second closed-screen anchor around an enabled action button.
+    action_ready_rect: Optional[NormalizedRect] = None
+    action_ready_png: str = ""
     # 열린 가격 창 안에서 실제 주문을 넣는 최종 구매/판매 버튼.
     confirm_point: Optional[NormalizedPoint] = None
     price_rect: Optional[NormalizedRect] = None
@@ -451,6 +472,8 @@ class RenewalSideProfile:
     def complete(self) -> bool:
         return bool(
             self.action_point
+            and self.action_ready_rect
+            and self.action_ready_png
             and self.confirm_point
             and self.price_rect
             and self.guard_rect
@@ -467,6 +490,12 @@ class RenewalSideProfile:
     def to_dict(self) -> dict[str, object]:
         return {
             "action_point": self.action_point.to_dict() if self.action_point else None,
+            "action_ready_rect": (
+                self.action_ready_rect.to_dict()
+                if self.action_ready_rect
+                else None
+            ),
+            "action_ready_png": self.action_ready_png,
             "confirm_point": (
                 self.confirm_point.to_dict() if self.confirm_point else None
             ),
@@ -498,6 +527,10 @@ class RenewalSideProfile:
             return cls()
         side = cls(
             action_point=NormalizedPoint.from_dict(value.get("action_point")),
+            action_ready_rect=NormalizedRect.from_dict(
+                value.get("action_ready_rect")
+            ),
+            action_ready_png=str(value.get("action_ready_png") or ""),
             confirm_point=NormalizedPoint.from_dict(value.get("confirm_point")),
             price_rect=NormalizedRect.from_dict(value.get("price_rect")),
             guard_rect=NormalizedRect.from_dict(value.get("guard_rect")),
@@ -601,6 +634,11 @@ class RenewalProfile:
         side_profile = self.side(side)
         if side_profile.action_point is None:
             missing.append("창 열기 구매/판매 버튼 위치")
+        if (
+            side_profile.action_ready_rect is None
+            or not side_profile.action_ready_png
+        ):
+            missing.append("v13 active purchase/sale button anchor")
         if side_profile.confirm_point is None:
             missing.append("창 안 최종 구매/판매 버튼 위치")
         if (
@@ -735,6 +773,102 @@ def decode_gray_png(encoded: str) -> np.ndarray:
     if image is None or image.size == 0:
         raise ValueError("저장된 기준 가격 이미지를 읽지 못했습니다.")
     return image
+
+
+@dataclass(frozen=True)
+class ActionReadyValidation:
+    valid: bool
+    luma_delta: float
+    edge_delta: float
+    reason: str
+
+
+def validate_action_ready_frame(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+) -> ActionReadyValidation:
+    """Fail closed unless the calibrated enabled action button is present."""
+
+    if (
+        full_frame is None
+        or full_frame.size == 0
+        or side_profile.action_ready_rect is None
+        or not side_profile.action_ready_png
+    ):
+        return ActionReadyValidation(False, float("inf"), 1.0, "missing_anchor")
+    calibrated_size = side_profile.calibrated_frame_size()
+    if calibrated_size is None:
+        return ActionReadyValidation(False, float("inf"), 1.0, "missing_size")
+    content_width, content_height = calibrated_size
+    if (
+        full_frame.ndim != 2
+        or full_frame.shape[1] < content_width
+        or full_frame.shape[0] < content_height
+    ):
+        return ActionReadyValidation(False, float("inf"), 1.0, "frame_shape")
+    try:
+        x1, y1, x2, y2 = side_profile.action_ready_rect.to_pixels(
+            content_width,
+            content_height,
+        )
+        candidate = full_frame[y1:y2, x1:x2]
+        baseline = decode_gray_png(side_profile.action_ready_png)
+    except (TypeError, ValueError):
+        return ActionReadyValidation(False, float("inf"), 1.0, "decode")
+    if candidate.shape != baseline.shape or candidate.size < 64:
+        return ActionReadyValidation(False, float("inf"), 1.0, "anchor_shape")
+
+    difference = candidate.astype(np.float32) - baseline.astype(np.float32)
+    illumination_offset = float(np.median(difference))
+    raw_luma_delta = float(np.mean(np.abs(difference)))
+    spatial_luma_delta = float(
+        np.mean(np.abs(difference - illumination_offset))
+    )
+    # The enabled orange/blue button becoming a disabled gray button is
+    # largely a uniform fill change. Do not normalize that evidence away.
+    luma_delta = max(raw_luma_delta, spatial_luma_delta)
+
+    baseline_edges = cv2.Canny(
+        cv2.GaussianBlur(baseline, (3, 3), 0),
+        40,
+        120,
+    )
+    candidate_edges = cv2.Canny(
+        cv2.GaussianBlur(candidate, (3, 3), 0),
+        40,
+        120,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    baseline_near = cv2.dilate(baseline_edges, kernel)
+    candidate_near = cv2.dilate(candidate_edges, kernel)
+    baseline_miss = cv2.bitwise_and(
+        baseline_edges,
+        cv2.bitwise_not(candidate_near),
+    )
+    candidate_miss = cv2.bitwise_and(
+        candidate_edges,
+        cv2.bitwise_not(baseline_near),
+    )
+    edge_count = max(
+        64,
+        cv2.countNonZero(baseline_edges)
+        + cv2.countNonZero(candidate_edges),
+    )
+    edge_delta = float(
+        (
+            cv2.countNonZero(baseline_miss)
+            + cv2.countNonZero(candidate_miss)
+        )
+        / edge_count
+    )
+
+    valid = bool(luma_delta <= 2.50 and edge_delta <= 0.080)
+    return ActionReadyValidation(
+        valid,
+        luma_delta,
+        edge_delta,
+        "match" if valid else "context_mismatch",
+    )
 
 
 @dataclass(frozen=True)
@@ -4006,6 +4140,9 @@ class FastRenewalRunner:
             "server_pressure_detected": False,
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
+            "action_context_rejections": 0,
+            "action_context_luma": 0.0,
+            "action_context_edge": 0.0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -4131,6 +4268,24 @@ class FastRenewalRunner:
                 "1920x1040 top-left content view proven by the closed guard. "
                 f"(luma {layout.evidence_luma:.3f}, "
                 f"edge {layout.evidence_edge:.4f})"
+            )
+        action_ready = validate_action_ready_frame(
+            full_frame,
+            side_profile,
+        )
+        self.telemetry["action_context_luma"] = action_ready.luma_delta
+        self.telemetry["action_context_edge"] = action_ready.edge_delta
+        if not action_ready.valid:
+            self.telemetry["action_context_rejections"] = (
+                int(self.telemetry["action_context_rejections"]) + 1
+            )
+            raise RuntimeError(
+                "구매/판매 준비 화면 또는 활성 버튼이 안전 보정과 다릅니다. "
+                "게임 입력 없이 차단했습니다. 올바른 탭에서 활성 버튼을 "
+                "다시 설정하고 가격 안전 보정을 진행하세요. "
+                f"(luma {action_ready.luma_delta:.3f}, "
+                f"edge {action_ready.edge_delta:.4f}, "
+                f"{action_ready.reason})"
             )
         engine = self.manager.capture_engine
         if engine is None:

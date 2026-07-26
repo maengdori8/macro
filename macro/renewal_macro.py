@@ -54,6 +54,7 @@ from macroapp.renewal import (
     RenewalChangeDetector,
     RenewalModalGuard,
     _FastClicker,
+    build_action_ready_rect,
     build_calibration_result,
     build_guard_rect,
     crop_price_from_guard,
@@ -68,6 +69,7 @@ from macroapp.renewal import (
     save_renewal_profile,
     save_renewal_diagnostic,
     validate_limit_price_selection,
+    validate_action_ready_frame,
     validate_price_region,
     wait_for_stable_wgc_frame,
 )
@@ -1943,6 +1945,25 @@ class RenewalApp:
         elif isinstance(selection, NormalizedPoint):
             if item == "action":
                 side.action_point = selection
+                frame_height, frame_width = frame.shape[:2]
+                action_ready_rect = build_action_ready_rect(
+                    selection,
+                    frame_width,
+                    frame_height,
+                )
+                x1, y1, x2, y2 = action_ready_rect.to_pixels(
+                    frame_width,
+                    frame_height,
+                )
+                action_ready = frame[y1:y2, x1:x2].copy()
+                if action_ready.size < 64:
+                    self.status_var.set("활성 버튼 앵커 저장 실패")
+                    return
+                side.action_ready_rect = action_ready_rect
+                side.action_ready_png = encode_gray_png(action_ready)
+                # Price calibration must subsequently prove that this enabled
+                # button really opens the intended popup.
+                side.calibration_version = 0
             elif item == "limit":
                 side.limit_point = selection
             elif item == "confirm":
@@ -2773,6 +2794,17 @@ def _headless_calibrate_existing(side_name: str) -> int:
             raise RuntimeError(
                 f"WGC 크기가 {frame_width}x{frame_height}입니다. "
                 "검증된 1080p 안정 크기에서만 v10 자동 보정을 실행합니다."
+            )
+
+        action_ready = validate_action_ready_frame(full_frame, side)
+        if not action_ready.valid:
+            raise RuntimeError(
+                "Active purchase/sale button anchor is missing or does not "
+                "match. Re-select the enabled action button in the GUI before "
+                "headless price calibration. "
+                f"(luma={action_ready.luma_delta:.3f}, "
+                f"edge={action_ready.edge_delta:.4f}, "
+                f"reason={action_ready.reason})"
             )
 
         original_price_rect = side.price_rect
