@@ -61,15 +61,29 @@ def _build_holdout_classifier(
     RenewalModalGuard,
     RenewalCalibratedPriceClassifier,
 ]:
+    opening_ids = sorted({opening for opening, _ in open_frames})
     training_keys = [
-        (opening, frame)
-        for opening in range(1, 6)
-        for frame in (2, 3, 4)
+        key
+        for key in sorted(open_frames)
+        if key[1] > 1
     ]
-    if any(key not in open_frames for key in training_keys):
+    if (
+        len(opening_ids) < 5
+        or any((opening, 1) not in open_frames for opening in opening_ids)
+        or any(
+            not any(
+                candidate_opening == opening and frame > 1
+                for candidate_opening, frame in training_keys
+            )
+            for opening in opening_ids
+        )
+    ):
         raise ValueError("missing_training_frames")
+    first_opening_training = [
+        key for key in training_keys if key[0] == opening_ids[0]
+    ]
     reference_guard = np.median(
-        np.stack([open_frames[(1, frame)] for frame in (2, 3, 4)]),
+        np.stack([open_frames[key] for key in first_opening_training]),
         axis=0,
     ).astype(np.uint8)
     guard = RenewalModalGuard(
@@ -185,7 +199,9 @@ def audit(corpus_root: Path, expected_frames: int) -> dict[str, object]:
             continue
 
         accepted_sets += 1
-        for opening in range(1, 6):
+        for opening in sorted(
+            {opening for opening, _ in open_frames}
+        ):
             first_frames += 1
             frame = open_frames.get((opening, 1))
             if frame is None:

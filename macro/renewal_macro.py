@@ -166,6 +166,28 @@ def _expand_headless_price_rect(
     )
 
 
+def _calibration_selection_probe(
+    side_profile,
+    closed_screen_crop: np.ndarray,
+) -> np.ndarray:
+    """Use the stored numeric row to validate an expanded popup ROI.
+
+    The list screen does not contain the popup's right-side limit row. After
+    widening an older narrow ROI, the new crop shape intentionally differs
+    from the saved baseline, so shape equality must not decide whether the
+    saved numeric evidence is usable.
+    """
+
+    if side_profile.baseline_png:
+        try:
+            stored = decode_gray_png(side_profile.baseline_png)
+            if validate_price_region(stored).valid:
+                return stored
+        except (TypeError, ValueError):
+            pass
+    return closed_screen_crop
+
+
 def _calibration_guard_delta(
     previous: Optional[np.ndarray],
     current: np.ndarray,
@@ -2446,11 +2468,10 @@ def _headless_calibrate_existing(side_name: str) -> int:
             frame_height,
         )
         x1, y1, x2, y2 = price_rect.to_pixels(frame_width, frame_height)
-        existing_price = full_frame[y1:y2, x1:x2]
-        if side.baseline_png:
-            stored_price = decode_gray_png(side.baseline_png)
-            if stored_price.shape == existing_price.shape:
-                existing_price = stored_price
+        existing_price = _calibration_selection_probe(
+            side,
+            full_frame[y1:y2, x1:x2],
+        )
         selection_validation = validate_limit_price_selection(
             existing_price,
             price_rect,

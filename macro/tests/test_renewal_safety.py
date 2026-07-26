@@ -392,6 +392,83 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertTrue(loaded.first_frame_fast_exit)
         self.assertEqual(loaded.fast_probe_interval, 6)
 
+    def test_proven_top_left_dwm_extension_reuses_calibrated_pixels(self) -> None:
+        side = self.profile.buy
+        side.calibrated_frame_width = 1920
+        side.calibrated_frame_height = 1040
+        side.guard_rect = renewal.NormalizedRect(
+            100 / 1920,
+            100 / 1040,
+            200 / 1920,
+            160 / 1040,
+        )
+        side.price_rect = renewal.NormalizedRect(
+            130 / 1920,
+            120 / 1040,
+            170 / 1920,
+            140 / 1040,
+        )
+        frame = np.zeros((1048, 1928), dtype=np.uint8)
+
+        layout = renewal.resolve_renewal_capture_layout(
+            frame,
+            side,
+            "buy",
+        )
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(
+            (layout.content_width, layout.content_height),
+            (1920, 1040),
+        )
+        self.assertEqual(
+            (layout.actual_width, layout.actual_height),
+            (1928, 1048),
+        )
+        self.assertEqual(layout.mode, "top_left_dwm_extension_8")
+        self.assertEqual((layout.origin_x, layout.origin_y), (0, 0))
+
+    def test_dwm_extension_requires_exact_closed_guard_evidence(self) -> None:
+        side = self.profile.buy
+        side.calibrated_frame_width = 1920
+        side.calibrated_frame_height = 1040
+        side.guard_rect = renewal.NormalizedRect(
+            100 / 1920,
+            100 / 1040,
+            200 / 1920,
+            160 / 1040,
+        )
+        side.price_rect = renewal.NormalizedRect(
+            130 / 1920,
+            120 / 1040,
+            170 / 1920,
+            140 / 1040,
+        )
+        frame = np.zeros((1048, 1928), dtype=np.uint8)
+        frame[100:120, 100:200] = 255
+
+        self.assertIsNone(
+            renewal.resolve_renewal_capture_layout(
+                frame,
+                side,
+                "buy",
+            )
+        )
+
+    def test_dwm_extension_does_not_accept_other_frame_sizes(self) -> None:
+        side = self.profile.buy
+        side.calibrated_frame_width = 1920
+        side.calibrated_frame_height = 1040
+        frame = np.zeros((1050, 1930), dtype=np.uint8)
+
+        self.assertIsNone(
+            renewal.resolve_renewal_capture_layout(
+                frame,
+                side,
+                "buy",
+            )
+        )
+
     def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
         buy_rect = renewal.NormalizedRect(0.6810, 0.4113, 0.7951, 0.4571)
         sell_rect = renewal.NormalizedRect(0.6810, 0.4113, 0.7951, 0.4571)

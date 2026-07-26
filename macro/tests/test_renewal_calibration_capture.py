@@ -8,7 +8,12 @@ from unittest import mock
 import numpy as np
 
 import renewal_macro
-from macroapp.renewal import NormalizedPoint, NormalizedRect
+from macroapp.renewal import (
+    NormalizedPoint,
+    NormalizedRect,
+    RenewalSideProfile,
+    encode_gray_png,
+)
 
 
 class _Value:
@@ -199,6 +204,32 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             expanded.to_pixels(1928, 1048),
             (1313, 431, 1533, 479),
         )
+
+    def test_expanded_calibration_uses_valid_stored_numeric_row(self):
+        stored = np.full((40, 150), 238, dtype=np.uint8)
+        # Reuse the validator fixture font path through OpenCV exposed by the
+        # runtime module; the stored row intentionally differs from the new
+        # 48x220 expanded crop shape.
+        renewal_macro.cv2.putText(
+            stored,
+            "777",
+            (25, 30),
+            renewal_macro.cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            30,
+            2,
+            renewal_macro.cv2.LINE_AA,
+        )
+        side = RenewalSideProfile(baseline_png=encode_gray_png(stored))
+        closed_screen = np.full((48, 220), 90, dtype=np.uint8)
+
+        selected = renewal_macro._calibration_selection_probe(
+            side,
+            closed_screen,
+        )
+
+        self.assertEqual(selected.shape, stored.shape)
+        self.assertTrue(np.array_equal(selected, stored))
 
     def test_calibration_popup_opacity_rejects_stable_crossfade(self):
         faded = np.full((40, 80), 249, dtype=np.uint8)

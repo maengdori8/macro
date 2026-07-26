@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "side": "buy",
+  "frame_width": 1920,
+  "frame_height": 1040,
+  "guard_rect": {
+    "left": 0.6953125,
+    "top": 0.3730769230769231,
+    "right": 0.8421875,
+    "bottom": 0.4855769230769231
+  },
+  "price_rect": {
+    "left": 0.7442708333333333,
+    "top": 0.41057692307692306,
+    "right": 0.7932291666666667,
+    "bottom": 0.4480769230769231
+  },
+  "baseline_image": "renewal_transition_video_1920_buy_baseline.png",
+  "open_frame_indices": [22, 23, 24, 25],
+  "variant_frame_indices": [22, 23, 24, 25, 54, 55, 56, 57],
+  "closed_frame_indices": [0, 1, 26, 27, 28, 29],
+  "unchanged_limit": 0.04,
+  "stability_limit": 0.03,
+  "registration_shift_limit": 4
+}

@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from macroapp.renewal import (  # noqa: E402
+    NormalizedRect,
     PriceState,
     RenewalCalibratedPriceClassifier,
     RenewalModalGuard,
@@ -46,6 +47,11 @@ def main() -> int:
     parser.add_argument("--side", choices=("buy", "sell"), default="buy")
     parser.add_argument("--json", type=Path, required=True)
     parser.add_argument("--minimum-events", type=int, default=10)
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        help="Fixed geometry/endpoints instead of the mutable user profile.",
+    )
     args = parser.parse_args()
 
     profile = load_renewal_profile()
@@ -94,6 +100,141 @@ def main() -> int:
         frame_width,
         frame_height,
     )
+    fixture_path = args.fixture.resolve() if args.fixture else None
+    if fixture_path is not None:
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        if fixture.get("side") != args.side:
+            raise RuntimeError("The transition fixture side does not match.")
+        frame_width = int(fixture["frame_width"])
+        frame_height = int(fixture["frame_height"])
+        guard_rect = NormalizedRect.from_dict(fixture.get("guard_rect"))
+        price_rect = NormalizedRect.from_dict(fixture.get("price_rect"))
+        if guard_rect is None or price_rect is None:
+            raise RuntimeError("The transition fixture rectangles are invalid.")
+        baseline = cv2.imread(
+            str(fixture_path.parent / str(fixture["baseline_image"])),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if baseline is None or baseline.size == 0:
+            raise RuntimeError("The transition fixture baseline is missing.")
+
+        bootstrap = cv2.VideoCapture(str(args.video))
+        requested = {
+            int(index)
+            for index in (
+                list(fixture["open_frame_indices"])
+                + list(
+                    fixture.get(
+                        "variant_frame_indices",
+                        fixture["open_frame_indices"],
+                    )
+                )
+                + list(fixture["closed_frame_indices"])
+            )
+        }
+        selected: dict[int, np.ndarray] = {}
+        bootstrap_index = 0
+        while requested:
+            ok, bootstrap_frame = bootstrap.read()
+            if not ok:
+                break
+            if bootstrap_index in requested:
+                selected[bootstrap_index] = cv2.cvtColor(
+                    bootstrap_frame[:frame_height, :frame_width],
+                    cv2.COLOR_BGR2GRAY,
+                )
+                requested.remove(bootstrap_index)
+            bootstrap_index += 1
+        bootstrap.release()
+        if requested:
+            raise RuntimeError(
+                f"Transition fixture frames are missing: {sorted(requested)}"
+            )
+
+        gx1, gy1, gx2, gy2 = guard_rect.to_pixels(
+            frame_width,
+            frame_height,
+        )
+        open_guards = [
+            selected[int(index)][gy1:gy2, gx1:gx2]
+            for index in fixture["open_frame_indices"]
+        ]
+        variant_guards = [
+            selected[int(index)][gy1:gy2, gx1:gx2]
+            for index in fixture.get(
+                "variant_frame_indices",
+                fixture["open_frame_indices"],
+            )
+        ]
+        closed_guards = [
+            selected[int(index)][gy1:gy2, gx1:gx2]
+            for index in fixture["closed_frame_indices"]
+        ]
+        open_guard = np.median(np.stack(open_guards), axis=0).astype(
+            np.uint8
+        )
+        closed_guard = np.median(np.stack(closed_guards), axis=0).astype(
+            np.uint8
+        )
+        price_box = price_box_in_guard(
+            price_rect,
+            guard_rect,
+            frame_width,
+            frame_height,
+        )
+        dynamic_boxes = dynamic_limit_price_boxes(
+            price_box,
+            args.side,
+            frame_height,
+        )
+        registration_shift_limit = int(
+            fixture["registration_shift_limit"]
+        )
+        opened = RenewalModalGuard(
+            open_guard,
+            price_box,
+            registration_shift_limit,
+            dynamic_boxes,
+        )
+        closed = RenewalModalGuard(
+            closed_guard,
+            price_box,
+            registration_shift_limit,
+            dynamic_boxes,
+        )
+        transition = RenewalTransitionGuard(opened, closed)
+        # Production calibration stores each eligible independent popup
+        # sample after aligning it to the primary baseline.  Reproduce that
+        # path here so the fixed video fixture does not depend on whichever
+        # mutable profile happens to be installed on the machine.
+        fixture_primary = RenewalCalibratedPriceClassifier(
+            baseline,
+            [],
+            float(fixture["unchanged_limit"]),
+            float(fixture["stability_limit"]),
+        )
+        aligned_variants = []
+        for guard in variant_guards:
+            guard_registration = opened.register(guard, 0.0, 0.0)
+            if not guard_registration.valid:
+                raise RuntimeError(
+                    "A transition fixture variant does not match the "
+                    "fully-open popup guard."
+                )
+            aligned_variants.append(
+                fixture_primary.primary.classify(
+                    crop_price_from_guard(
+                        guard_registration.aligned,
+                        price_box,
+                    )
+                ).aligned.copy()
+            )
+        classifier = RenewalCalibratedPriceClassifier(
+            baseline,
+            aligned_variants,
+            float(fixture["unchanged_limit"]),
+            float(fixture["stability_limit"]),
+        )
 
     capture = cv2.VideoCapture(str(args.video))
     fps = float(capture.get(cv2.CAP_PROP_FPS))
@@ -243,6 +384,9 @@ def main() -> int:
     report = {
         "schema_version": 1,
         "video": str(args.video),
+        "fixture": (
+            str(fixture_path) if fixture_path is not None else None
+        ),
         "side": args.side,
         "fps": fps,
         "events": events,

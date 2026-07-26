@@ -3613,6 +3613,127 @@ class _FastClicker:
         input_message.send_key_to_window(self.hwnd, vk_escape, press_delay=0.0)
 
 
+@dataclass(frozen=True)
+class RenewalCaptureLayout:
+    """Safe mapping from the WGC surface to calibrated FC content pixels."""
+
+    actual_width: int
+    actual_height: int
+    content_width: int
+    content_height: int
+    origin_x: int
+    origin_y: int
+    mode: str
+    evidence_luma: float = 0.0
+    evidence_edge: float = 0.0
+
+
+def resolve_renewal_capture_layout(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+    side_name: str,
+) -> Optional[RenewalCaptureLayout]:
+    """Accept an exact frame or a proven 8 px right/bottom DWM extension.
+
+    FC sometimes reports 1928x1048 after a window-style change while the
+    already calibrated 1920x1040 game content remains byte-aligned at (0, 0).
+    The larger surface is accepted only from the closed purchase/sale list
+    screen and only when its static popup guard matches the saved closed guard
+    at the original pixel coordinates. A scaled, shifted, open, or unrelated
+    screen therefore remains fail-closed.
+    """
+
+    if full_frame is None or full_frame.size == 0 or full_frame.ndim != 2:
+        return None
+    calibrated_size = side_profile.calibrated_frame_size()
+    if calibrated_size is None:
+        return None
+    content_width, content_height = calibrated_size
+    actual_height, actual_width = full_frame.shape[:2]
+    if (actual_width, actual_height) == calibrated_size:
+        return RenewalCaptureLayout(
+            actual_width,
+            actual_height,
+            content_width,
+            content_height,
+            0,
+            0,
+            "exact",
+        )
+
+    if (
+        calibrated_size != (1920, 1040)
+        or (actual_width, actual_height) != (1928, 1048)
+        or side_name not in ("buy", "sell")
+        or side_profile.guard_rect is None
+        or side_profile.price_rect is None
+        or not side_profile.closed_guard_png
+    ):
+        return None
+
+    try:
+        x1, y1, x2, y2 = side_profile.guard_rect.to_pixels(
+            content_width,
+            content_height,
+        )
+        candidate = full_frame[y1:y2, x1:x2]
+        baseline = decode_gray_png(side_profile.closed_guard_png)
+        if candidate.shape != baseline.shape:
+            return None
+        price_box = price_box_in_guard(
+            side_profile.price_rect,
+            side_profile.guard_rect,
+            content_width,
+            content_height,
+        )
+        dynamic_boxes = dynamic_limit_price_boxes(
+            price_box,
+            side_name,
+            content_height,
+        )
+        ready_guard = RenewalModalGuard(
+            baseline,
+            price_box,
+            shift_limit=side_profile.registration_shift_limit,
+            dynamic_boxes=dynamic_boxes,
+        )
+        registration = ready_guard.register(
+            candidate,
+            side_profile.closed_guard_luma_noise,
+            side_profile.closed_guard_edge_noise,
+        )
+    except (TypeError, ValueError):
+        return None
+
+    luma_limit = max(
+        1.0,
+        float(side_profile.closed_guard_luma_noise) + 0.5,
+    )
+    edge_limit = max(
+        0.010,
+        float(side_profile.closed_guard_edge_noise) + 0.005,
+    )
+    if not (
+        registration.valid
+        and abs(registration.shift_x) <= 1
+        and abs(registration.shift_y) <= 1
+        and registration.luma_delta <= luma_limit
+        and registration.edge_delta <= edge_limit
+    ):
+        return None
+    return RenewalCaptureLayout(
+        actual_width,
+        actual_height,
+        content_width,
+        content_height,
+        0,
+        0,
+        "top_left_dwm_extension_8",
+        registration.luma_delta,
+        registration.edge_delta,
+    )
+
+
 class RenewalCaptureRestart(RuntimeError):
     """안전한 목록 상태에서 WGC/HWND를 다시 연결해야 함을 나타냅니다."""
 
@@ -3675,6 +3796,9 @@ class FastRenewalRunner:
             "first_price_p95_ms": 0.0,
             "cycle_p50_ms": 0.0,
             "cycle_p95_ms": 0.0,
+            "actual_frame_size": [],
+            "content_frame_size": [],
+            "capture_layout_mode": "",
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -3763,7 +3887,12 @@ class FastRenewalRunner:
                 first_frame=full_frame,
             )
             frame_height, frame_width = full_frame.shape[:2]
-        if calibrated_size != (frame_width, frame_height):
+        layout = resolve_renewal_capture_layout(
+            full_frame,
+            side_profile,
+            self.side_name,
+        )
+        if layout is None:
             expected_text = (
                 f"{calibrated_size[0]}x{calibrated_size[1]}"
                 if calibrated_size is not None
@@ -3773,6 +3902,24 @@ class FastRenewalRunner:
                 "게임 창 크기가 안전 보정과 다릅니다. "
                 f"현재 {frame_width}x{frame_height}, 보정 {expected_text}. "
                 "현재 크기에서 v10 우측 가격영역을 다시 설정하세요."
+            )
+        frame_width = layout.content_width
+        frame_height = layout.content_height
+        self.telemetry["actual_frame_size"] = [
+            layout.actual_width,
+            layout.actual_height,
+        ]
+        self.telemetry["content_frame_size"] = [
+            layout.content_width,
+            layout.content_height,
+        ]
+        self.telemetry["capture_layout_mode"] = layout.mode
+        if layout.mode != "exact":
+            self.log(
+                "[WGC v12] 1928x1048 surface uses a byte-aligned "
+                "1920x1040 top-left content view proven by the closed guard. "
+                f"(luma {layout.evidence_luma:.3f}, "
+                f"edge {layout.evidence_edge:.4f})"
             )
         engine = self.manager.capture_engine
         if engine is None:
