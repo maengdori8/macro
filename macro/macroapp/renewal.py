@@ -77,13 +77,18 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
-# Live runs reached FC's "too many lookup requests" suspension at both
-# 2.9 opens/s and, after 1,040 popup openings in 552.5 s, 1.89 opens/s.
-# This is consistent with a rolling request budget near 1,000 opens/10 min.
-# Keep roughly 14% headroom at 857 opens/10 min.  The changed-price approval
-# remains frame-direct; this floor applies only after an unchanged popup has
-# already been classified and closed.
-RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.700
+# Isolated live runs first reached FC's "too many lookup requests" suspension
+# around 1,000 opens.  After a prior 1,040-open run, a fresh 0.7 s run was
+# rejected after only 530 more opens even with an 18-minute idle gap.  Together
+# those timestamps fit a rolling budget near 1,000 opens/30 min, not 10 min.
+# Use 900 opens/30 min (10% headroom).  Changed-price approval remains
+# frame-direct; this floor applies only after an unchanged popup is classified.
+RENEWAL_SERVER_REQUEST_WINDOW_SECONDS = 30.0 * 60.0
+RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW = 900
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = (
+    RENEWAL_SERVER_REQUEST_WINDOW_SECONDS
+    / RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW
+)
 RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.070
 RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.050
 RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS = 0.005

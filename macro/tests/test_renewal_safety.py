@@ -309,7 +309,7 @@ class RenewalSafetyTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(10),
-            0.700,
+            2.000,
         )
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(9),
@@ -321,13 +321,13 @@ class RenewalSafetyTests(unittest.TestCase):
     ) -> None:
         enabled = renewal.RenewalAdaptiveCyclePacer(
             enabled=True,
-            initial_floor_seconds=0.700,
+            initial_floor_seconds=2.000,
         )
         disabled = renewal.RenewalAdaptiveCyclePacer(
             enabled=False,
-            initial_floor_seconds=0.700,
+            initial_floor_seconds=2.000,
         )
-        self.assertEqual(enabled.floor_seconds, 0.700)
+        self.assertEqual(enabled.floor_seconds, 2.000)
         self.assertGreater(enabled.delay_seconds(0.340), 0.0)
         self.assertEqual(disabled.floor_seconds, 0.0)
         self.assertEqual(disabled.delay_seconds(0.0), 0.0)
@@ -342,18 +342,16 @@ class RenewalSafetyTests(unittest.TestCase):
         )
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
         safe_requests = (
-            600.0 / renewal.renewal_sustained_cycle_seconds(10)
+            renewal.RENEWAL_SERVER_REQUEST_WINDOW_SECONDS
+            / renewal.renewal_sustained_cycle_seconds(10)
         )
-        measured_requests = (
-            float(fixture["measured_cycles_per_second"]) * 600.0
-        )
-        self.assertGreater(
-            measured_requests,
-            float(fixture["popup_openings"]),
+        self.assertEqual(
+            safe_requests,
+            renewal.RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW,
         )
         self.assertLess(
             safe_requests,
-            float(fixture["popup_openings"]) * 0.85,
+            float(fixture["popup_openings"]) * 0.90,
         )
         self.assertEqual(int(fixture["order_inputs"]), 0)
         self.assertTrue(bool(fixture["server_pressure_detected"]))

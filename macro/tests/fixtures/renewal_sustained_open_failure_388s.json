@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "source_commit": "f31fc854edbab805540385eae796061e07eaee79",
+  "elapsed_seconds": 388.0038938000798,
+  "cycle_count": 532,
+  "popup_openings": 530,
+  "confirmed_openings": 530,
+  "open_failures": 2,
+  "ambiguous_count": 0,
+  "old_cycle_floor_seconds": 0.7,
+  "prior_run_popup_openings": 1040,
+  "idle_gap_before_run_seconds": 1118,
+  "inferred_request_window_seconds": 1800,
+  "new_cycle_floor_seconds": 2.0,
+  "new_request_budget_per_window": 900,
+  "order_inputs": 0,
+  "frame_size_changes": 0,
+  "server_pressure_detected": true
+}

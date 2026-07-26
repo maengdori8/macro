@@ -476,7 +476,7 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 600.0,
                 10,
             ),
-            797,
+            279,
         )
         self.assertEqual(
             renewal_macro._headless_minimum_confirmed_openings(
@@ -522,6 +522,26 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                     summary["open_failure_rate"],
                     summary["open_failure_rate_limit"],
                 )
+
+    def test_recorded_server_pressure_is_rejected_below_rate_limit(self):
+        for fixture_name in (
+            "renewal_sustained_open_failure_552s.json",
+            "renewal_sustained_open_failure_388s.json",
+        ):
+            with self.subTest(fixture=fixture_name):
+                fixture_path = (
+                    Path(__file__).parent
+                    / "fixtures"
+                    / fixture_name
+                )
+                fixture = json.loads(
+                    fixture_path.read_text(encoding="utf-8")
+                )
+                self.assertGreaterEqual(int(fixture["open_failures"]), 2)
+                self.assertTrue(
+                    bool(fixture["server_pressure_detected"])
+                )
+                self.assertEqual(int(fixture["order_inputs"]), 0)
 
     def test_headless_monitor_accepts_rare_recovered_open_failure(self):
         summary = renewal_macro._headless_open_failure_summary(
