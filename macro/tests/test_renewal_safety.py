@@ -309,7 +309,7 @@ class RenewalSafetyTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(10),
-            0.500,
+            0.700,
         )
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(9),
@@ -321,16 +321,42 @@ class RenewalSafetyTests(unittest.TestCase):
     ) -> None:
         enabled = renewal.RenewalAdaptiveCyclePacer(
             enabled=True,
-            initial_floor_seconds=0.500,
+            initial_floor_seconds=0.700,
         )
         disabled = renewal.RenewalAdaptiveCyclePacer(
             enabled=False,
-            initial_floor_seconds=0.500,
+            initial_floor_seconds=0.700,
         )
-        self.assertEqual(enabled.floor_seconds, 0.500)
+        self.assertEqual(enabled.floor_seconds, 0.700)
         self.assertGreater(enabled.delay_seconds(0.340), 0.0)
         self.assertEqual(disabled.floor_seconds, 0.0)
         self.assertEqual(disabled.delay_seconds(0.0), 0.0)
+
+    def test_server_safe_floor_has_headroom_below_live_rejection_rate(
+        self,
+    ) -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "renewal_sustained_open_failure_552s.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        safe_requests = (
+            600.0 / renewal.renewal_sustained_cycle_seconds(10)
+        )
+        measured_requests = (
+            float(fixture["measured_cycles_per_second"]) * 600.0
+        )
+        self.assertGreater(
+            measured_requests,
+            float(fixture["popup_openings"]),
+        )
+        self.assertLess(
+            safe_requests,
+            float(fixture["popup_openings"]) * 0.85,
+        )
+        self.assertEqual(int(fixture["order_inputs"]), 0)
+        self.assertTrue(bool(fixture["server_pressure_detected"]))
 
     def test_adaptive_pacer_reacts_to_recorded_open_failure_burst(
         self,
@@ -2298,6 +2324,54 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertIs(second.state, renewal.PriceState.CHANGED)
         self.assertTrue(classifier.same_candidate(first, second))
         self.assertGreater(first.global_score, 0.08)
+
+    def test_live_translucent_868_transition_is_same_price(self) -> None:
+        fixture_dir = Path(__file__).parent / "fixtures"
+        baseline = cv2.imread(
+            str(
+                fixture_dir
+                / "renewal_live_868_transition_baseline.png"
+            ),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        candidate_1 = cv2.imread(
+            str(
+                fixture_dir
+                / "renewal_live_868_transition_candidate_1.png"
+            ),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        candidate_2 = cv2.imread(
+            str(
+                fixture_dir
+                / "renewal_live_868_transition_candidate_2.png"
+            ),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        self.assertIsNotNone(baseline)
+        self.assertIsNotNone(candidate_1)
+        self.assertIsNotNone(candidate_2)
+        classifier = renewal.RenewalCalibratedPriceClassifier(
+            baseline,
+            [baseline],
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        first = renewal.gate_transition_classification(
+            classifier.classify_transition(candidate_1),
+            0.8016185164451599,
+        )
+        second = renewal.gate_transition_classification(
+            classifier.classify_transition(candidate_2),
+            0.8016185164451599,
+        )
+        self.assertIs(first.state, renewal.PriceState.UNCHANGED)
+        self.assertIs(second.state, renewal.PriceState.UNCHANGED)
+        self.assertEqual(
+            first.reason,
+            "illumination_normalized_same_glyph",
+        )
+        self.assertTrue(classifier.same_candidate(first, second))
 
     def test_sell_uses_its_own_open_limit_and_final_coordinates(self) -> None:
         sell = renewal.RenewalSideProfile.from_dict(self.profile.buy.to_dict())

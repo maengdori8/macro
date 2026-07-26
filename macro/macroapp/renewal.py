@@ -77,11 +77,13 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
-# A live 2.9 opens/s run reached FC's "too many lookup requests" suspension
-# after roughly 800 cycles.  Keep the changed-price approval path frame-direct,
-# but cap only completed unchanged cycles at the fastest empirically safe
-# starting rate.  Adaptive recovery can slow it further if FC signals pressure.
-RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.500
+# Live runs reached FC's "too many lookup requests" suspension at both
+# 2.9 opens/s and, after 1,040 popup openings in 552.5 s, 1.89 opens/s.
+# This is consistent with a rolling request budget near 1,000 opens/10 min.
+# Keep roughly 14% headroom at 857 opens/10 min.  The changed-price approval
+# remains frame-direct; this floor applies only after an unchanged popup has
+# already been classified and closed.
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.700
 RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.070
 RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.050
 RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS = 0.005
@@ -1254,11 +1256,11 @@ class RenewalPriceClassifier:
     _GLYPH_SAME_LIMIT = 0.004
     _GLYPH_CHANGE_LIMIT = 0.006
     # A square 3x3 tolerance absorbs diagonal WGC antialiasing that the
-    # cross kernel deliberately preserves.  Recorded same-price 15조 reopen
-    # drift scores 0.000 here, while the closest different-price pair in the
-    # 25-popup FC corpus starts above 0.0029.  Keep a fail-closed gap between
-    # equivalence and change.
-    _GLYPH_RECT_SAME_LIMIT = 0.001
+    # cross kernel deliberately preserves.  A directly recorded translucent
+    # 868조 reopen frame scores 0.001391 here, while the closest
+    # different-price pair in the 25-popup FC corpus starts above 0.0029.
+    # Keep both values on opposite sides of the fail-closed gap.
+    _GLYPH_RECT_SAME_LIMIT = 0.0015
     _GLYPH_RECT_CHANGE_LIMIT = 0.002
     _GLYPH_RECT_KERNEL = np.ones((3, 3), dtype=np.uint8)
     # A fully rendered popup can briefly re-rasterize every stroke at a

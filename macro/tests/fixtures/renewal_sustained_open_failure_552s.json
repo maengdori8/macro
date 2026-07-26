@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "source_commit": "9af09a85b537731c04291b7f1b08b24ad871eba6",
+  "elapsed_seconds": 552.5180860999972,
+  "cycle_count": 1041,
+  "popup_openings": 1040,
+  "confirmed_openings": 1038,
+  "open_failures": 2,
+  "max_consecutive_open_failures": 1,
+  "measured_cycles_per_second": 1.8867439667964707,
+  "old_cycle_floor_seconds": 0.5,
+  "new_cycle_floor_seconds": 0.7,
+  "estimated_old_requests_per_10_minutes": 1132.0463800778824,
+  "estimated_new_requests_per_10_minutes": 857.1428571428571,
+  "order_inputs": 0,
+  "monitor_detected": false,
+  "frame_size_changes": 0,
+  "server_pressure_detected": true
+}
