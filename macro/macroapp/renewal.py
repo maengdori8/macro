@@ -3899,6 +3899,7 @@ class FastRenewalRunner:
         logger: LogCallback,
         status: StatusCallback,
         monitor_only: bool = False,
+        continuous_monitor: bool = False,
         active_until: Optional[float] = None,
         time_valid: Optional[Callable[[], bool]] = None,
         sustained_pacing: bool = True,
@@ -3912,6 +3913,9 @@ class FastRenewalRunner:
         self.log = logger
         self.status = status
         self.monitor_only = bool(monitor_only)
+        self.continuous_monitor = bool(
+            continuous_monitor and self.monitor_only
+        )
         self.sustained_pacing = bool(sustained_pacing)
         self.active_until = (
             None if active_until is None else float(active_until)
@@ -3928,6 +3932,11 @@ class FastRenewalRunner:
             "armed_openings": 0,
             "ambiguous_count": 0,
             "monitor_detected": False,
+            "monitor_change_candidates": 0,
+            "monitor_change_events": 0,
+            "monitor_rebaseline_count": 0,
+            "monitor_candidate_rejections": 0,
+            "monitor_pending_change": False,
             "initial_mismatch": False,
             "order_clicks": 0,
             "popup_may_be_open": False,
@@ -4185,6 +4194,11 @@ class FastRenewalRunner:
         cycle_window_started = time.perf_counter()
         run_started = cycle_window_started
         last_status_update = 0.0
+        monitor_candidate_baseline: Optional[np.ndarray] = None
+        monitor_candidate_classifier: Optional[
+            RenewalCalibratedPriceClassifier
+        ] = None
+        monitor_candidate_cycle = 0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
             f"[갱신 v12] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
@@ -4881,34 +4895,181 @@ class FastRenewalRunner:
                     return False
 
                 if self.monitor_only:
-                    self.telemetry["monitor_detected"] = True
-                    self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
-                    self.log(
-                        f"[무주문 측정 v12] {cycle_count}회에서 변경 확정, "
-                        f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
+                    diagnostic_metrics = {
+                        "state": last_result.state.value,
+                        "global_score": last_result.global_score,
+                        "slice_score": last_result.slice_score,
+                        "sequence_ids": sequence_ids,
+                        "capture_timestamps": capture_timestamps,
+                        "candidate_phases": candidate_phases,
+                        "transition_progress": transition_progress,
+                        "cycle": cycle_count,
+                        "ordered": False,
+                    }
+                    if not self.continuous_monitor:
+                        self.telemetry["monitor_detected"] = True
+                        self.status(
+                            "무주문 측정 · 가격 변경 감지 · 입력 0회"
+                        )
+                        self.log(
+                            f"[무주문 측정 v12] {cycle_count}회에서 변경 확정, "
+                            f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
+                        )
+                        save_renewal_diagnostic(
+                            self.side_name,
+                            "monitor_detected",
+                            baseline,
+                            raw_prices,
+                            diagnostic_metrics,
+                            aligned_frames=aligned_prices,
+                            guard_frames=raw_guards,
+                        )
+                        close_modal()
+                        update_performance_telemetry()
+                        return False
+
+                    pending_results = (
+                        [
+                            monitor_candidate_classifier.classify_transition(
+                                image
+                            )
+                            for image in raw_prices[-required_frames:]
+                        ]
+                        if monitor_candidate_classifier is not None
+                        else []
                     )
-                    save_renewal_diagnostic(
-                        self.side_name,
-                        "monitor_detected",
-                        baseline,
-                        raw_prices,
-                        {
-                            "state": last_result.state.value,
-                            "global_score": last_result.global_score,
-                            "slice_score": last_result.slice_score,
-                            "sequence_ids": sequence_ids,
-                            "capture_timestamps": capture_timestamps,
-                            "candidate_phases": candidate_phases,
-                            "transition_progress": transition_progress,
-                            "cycle": cycle_count,
-                            "ordered": False,
-                        },
-                        aligned_frames=aligned_prices,
-                        guard_frames=raw_guards,
+                    same_pending_change = bool(
+                        len(pending_results) >= required_frames
+                        and all(
+                            result.state is PriceState.UNCHANGED
+                            and result.geometry_valid
+                            for result in pending_results
+                        )
+                        and all(
+                            monitor_candidate_classifier.same_candidate(
+                                pending_results[index - 1],
+                                pending_results[index],
+                            )
+                            for index in range(1, len(pending_results))
+                        )
                     )
-                    close_modal()
-                    update_performance_telemetry()
-                    return False
+                    if same_pending_change:
+                        assert monitor_candidate_baseline is not None
+                        previous_baseline = baseline
+                        baseline = monitor_candidate_baseline
+                        classifier = RenewalCalibratedPriceClassifier(
+                            baseline,
+                            [
+                                result.aligned.copy()
+                                for result in pending_results
+                            ],
+                            side_profile.unchanged_limit,
+                            side_profile.stability_limit,
+                        )
+                        self.telemetry["monitor_change_events"] = (
+                            int(self.telemetry["monitor_change_events"]) + 1
+                        )
+                        self.telemetry["monitor_rebaseline_count"] = (
+                            int(
+                                self.telemetry[
+                                    "monitor_rebaseline_count"
+                                ]
+                            )
+                            + 1
+                        )
+                        self.telemetry["monitor_pending_change"] = False
+                        diagnostic_metrics.update(
+                            {
+                                "first_candidate_cycle": (
+                                    monitor_candidate_cycle
+                                ),
+                                "confirmed_cycle": cycle_count,
+                                "continuous_monitor": True,
+                                "rebaselined": True,
+                            }
+                        )
+                        save_renewal_diagnostic(
+                            self.side_name,
+                            "monitor_rebaseline",
+                            previous_baseline,
+                            raw_prices,
+                            diagnostic_metrics,
+                            aligned_frames=aligned_prices,
+                            guard_frames=raw_guards,
+                        )
+                        self.status(
+                            "무주문 연속 감시 · 새 가격 독립 팝업 2회 확인"
+                        )
+                        self.log(
+                            f"[무주문 연속 v12] 변경 "
+                            f"#{self.telemetry['monitor_change_events']} 확정 · "
+                            f"팝업 {monitor_candidate_cycle}/{cycle_count} · "
+                            "주문 0회 · 메모리 기준만 갱신"
+                        )
+                        monitor_candidate_baseline = None
+                        monitor_candidate_classifier = None
+                        monitor_candidate_cycle = 0
+                    else:
+                        if monitor_candidate_classifier is not None:
+                            self.telemetry[
+                                "monitor_candidate_rejections"
+                            ] = (
+                                int(
+                                    self.telemetry[
+                                        "monitor_candidate_rejections"
+                                    ]
+                                )
+                                + 1
+                            )
+                        monitor_candidate_baseline = (
+                            last_result.aligned.copy()
+                        )
+                        monitor_candidate_classifier = (
+                            RenewalCalibratedPriceClassifier(
+                                monitor_candidate_baseline,
+                                [monitor_candidate_baseline],
+                                side_profile.unchanged_limit,
+                                side_profile.stability_limit,
+                            )
+                        )
+                        monitor_candidate_cycle = cycle_count
+                        self.telemetry["monitor_change_candidates"] = (
+                            int(
+                                self.telemetry[
+                                    "monitor_change_candidates"
+                                ]
+                            )
+                            + 1
+                        )
+                        self.telemetry["monitor_pending_change"] = True
+                        diagnostic_metrics.update(
+                            {
+                                "continuous_monitor": True,
+                                "rebaselined": False,
+                            }
+                        )
+                        save_renewal_diagnostic(
+                            self.side_name,
+                            "monitor_candidate",
+                            baseline,
+                            raw_prices,
+                            diagnostic_metrics,
+                            aligned_frames=aligned_prices,
+                            guard_frames=raw_guards,
+                        )
+                        self.status(
+                            "무주문 연속 감시 · 다음 독립 팝업 확인 대기"
+                        )
+                    if not close_modal():
+                        raise RenewalCaptureRestart(
+                            "무주문 변경 확인 뒤 목록 화면 미확인"
+                        )
+                    if pace_completed_cycle(
+                        action_started,
+                        open_failed=False,
+                    ):
+                        return False
+                    continue
 
                 if order_latched:
                     return True
@@ -4991,6 +5152,22 @@ class FastRenewalRunner:
                 return True
 
             if decision is PriceState.UNCHANGED:
+                if (
+                    self.continuous_monitor
+                    and monitor_candidate_classifier is not None
+                ):
+                    self.telemetry["monitor_candidate_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "monitor_candidate_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    self.telemetry["monitor_pending_change"] = False
+                    monitor_candidate_baseline = None
+                    monitor_candidate_classifier = None
+                    monitor_candidate_cycle = 0
                 self.telemetry["unchanged_openings"] = (
                     int(self.telemetry["unchanged_openings"]) + 1
                 )

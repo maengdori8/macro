@@ -2557,6 +2557,7 @@ def _headless_monitor_existing(
             logs.append,
             statuses.append,
             monitor_only=True,
+            continuous_monitor=True,
         )
         checkpoint_thread = threading.Thread(
             target=checkpoint_worker,
@@ -2586,6 +2587,9 @@ def _headless_monitor_existing(
             max(2, int(duration * 1.5)),
         )
         monitor_detected = bool(telemetry.get("monitor_detected", False))
+        monitor_pending_change = bool(
+            telemetry.get("monitor_pending_change", False)
+        )
         elapsed = time.perf_counter() - started
         duration_completed = bool(
             not monitor_detected
@@ -2598,6 +2602,7 @@ def _headless_monitor_existing(
             order_inputs == 0
             and armed_openings >= 2
             and not initial_mismatch
+            and not monitor_pending_change
             and max_open_failures < 3
             and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings

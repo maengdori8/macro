@@ -240,6 +240,7 @@ def _run(
     engine: _FakeEngine,
     side: str = "buy",
     monitor_only: bool = False,
+    continuous_monitor: bool = False,
     diagnostic_sink=None,
 ) -> bool:
     manager = _FakeManager(engine)
@@ -294,6 +295,7 @@ def _run(
             logger=lambda _message: None,
             status=lambda _message: None,
             monitor_only=monitor_only,
+            continuous_monitor=continuous_monitor,
             sustained_pacing=False,
         )
         completed = runner.run()
@@ -2176,6 +2178,100 @@ class RenewalSafetyTests(unittest.TestCase):
             engine.clicks,
             [(20, 10), (20, 10), (20, 10)],
         )
+
+    def test_continuous_monitor_rebaselines_after_two_independent_popups(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard, self.guard],
+                [self.guard, self.guard],
+                [self.changed_guard, self.changed_guard],
+                [self.changed_guard, self.changed_guard],
+                [self.changed_guard, self.changed_guard],
+            ],
+            stop_after_closes=5,
+        )
+        completed = _run(
+            self.profile,
+            engine,
+            monitor_only=True,
+            continuous_monitor=True,
+        )
+        self.assertFalse(completed)
+        telemetry = engine.runner_telemetry
+        self.assertFalse(telemetry["monitor_detected"])
+        self.assertFalse(telemetry["monitor_pending_change"])
+        self.assertEqual(telemetry["monitor_change_events"], 1)
+        self.assertEqual(telemetry["monitor_rebaseline_count"], 1)
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_continuous_monitor_rejects_one_popup_change_candidate(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard, self.guard],
+                [self.guard, self.guard],
+                [self.changed_guard, self.changed_guard],
+                [self.guard, self.guard],
+            ],
+            stop_after_closes=4,
+        )
+        completed = _run(
+            self.profile,
+            engine,
+            monitor_only=True,
+            continuous_monitor=True,
+        )
+        self.assertFalse(completed)
+        telemetry = engine.runner_telemetry
+        self.assertFalse(telemetry["monitor_pending_change"])
+        self.assertEqual(telemetry["monitor_change_events"], 0)
+        self.assertEqual(telemetry["monitor_candidate_rejections"], 1)
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_live_850_to_868_change_is_stable_across_two_wgc_frames(
+        self,
+    ) -> None:
+        fixture_dir = Path(__file__).parent / "fixtures"
+        baseline = cv2.imread(
+            str(fixture_dir / "renewal_live_850_baseline.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        candidate_1 = cv2.imread(
+            str(fixture_dir / "renewal_live_868_candidate_1.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        candidate_2 = cv2.imread(
+            str(fixture_dir / "renewal_live_868_candidate_2.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        self.assertIsNotNone(baseline)
+        self.assertIsNotNone(candidate_1)
+        self.assertIsNotNone(candidate_2)
+        classifier = renewal.RenewalCalibratedPriceClassifier(
+            baseline,
+            [baseline],
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        first = classifier.classify_transition(candidate_1)
+        second = classifier.classify_transition(candidate_2)
+        self.assertIs(first.state, renewal.PriceState.CHANGED)
+        self.assertIs(second.state, renewal.PriceState.CHANGED)
+        self.assertTrue(classifier.same_candidate(first, second))
+        self.assertGreater(first.global_score, 0.08)
 
     def test_sell_uses_its_own_open_limit_and_final_coordinates(self) -> None:
         sell = renewal.RenewalSideProfile.from_dict(self.profile.buy.to_dict())
