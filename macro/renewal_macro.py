@@ -1333,6 +1333,15 @@ class RenewalApp:
             full_frame = manager.capture_client_area(window_validated=True)
             if full_frame is None:
                 raise RuntimeError("팝업 보정용 WGC 프레임을 받지 못했습니다.")
+            capture_engine = manager.capture_engine
+            if capture_engine is not None and hasattr(
+                capture_engine,
+                "get_frame_size",
+            ):
+                full_frame = _wait_for_stable_wgc_frame(
+                    manager,
+                    first_frame=full_frame,
+                )
             frame_height, frame_width = full_frame.shape[:2]
             if (frame_width, frame_height) != expected_size:
                 full_frame = _wait_for_stable_wgc_frame(

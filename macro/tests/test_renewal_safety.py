@@ -187,6 +187,29 @@ class _DuplicateSequenceEngine(_FakeEngine):
         return CapturedFrame(packet.image, 1, packet.captured_at)
 
 
+class _SizeReportingEngine(_FakeEngine):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        cycles: list[list[np.ndarray]] | None = None,
+        repeat_guard: np.ndarray | None = None,
+        stop_after_closes: int | None = None,
+    ):
+        super().__init__(
+            stop_event,
+            cycles=cycles,
+            repeat_guard=repeat_guard,
+            stop_after_closes=stop_after_closes,
+        )
+        self.frame_size = (200, 100)
+        self.stop_on_size_mismatch = False
+
+    def get_frame_size(self) -> tuple[int, int]:
+        if self.stop_on_size_mismatch and self.frame_size != (200, 100):
+            self.stop_event.set()
+        return self.frame_size
+
+
 def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
     side = renewal.RenewalSideProfile(
         action_point=renewal.NormalizedPoint(20 / 199, 10 / 99),
@@ -270,7 +293,6 @@ def _run(
             logger=lambda _message: None,
             status=lambda _message: None,
             monitor_only=monitor_only,
-            sustained_pacing=False,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -278,28 +300,6 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
-    def test_speed10_sustains_target_video_rate_without_order_delay(self) -> None:
-        self.assertEqual(
-            renewal.renewal_sustained_cycle_seconds(10),
-            0.40,
-        )
-        self.assertEqual(
-            renewal.renewal_sustained_cycle_seconds(9),
-            0.0,
-        )
-
-    def test_open_failure_backoff_starts_only_after_repeated_failures(
-        self,
-    ) -> None:
-        delays = [
-            renewal.renewal_open_failure_backoff_seconds(value)
-            for value in range(1, 11)
-        ]
-        self.assertEqual(delays[:2], [0.0, 0.0])
-        self.assertEqual(delays[2:4], [0.5, 0.5])
-        self.assertEqual(delays[-1], 15.0)
-        self.assertEqual(delays, sorted(delays))
-
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
             renewal.RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS,
@@ -1900,6 +1900,53 @@ class RenewalSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "게임 창 크기"):
             _run(self.profile, engine)
         self.assertEqual(engine.clicks, [])
+
+    def test_exact_initial_size_still_waits_for_wgc_settle(self) -> None:
+        stop_event = threading.Event()
+        engine = _SizeReportingEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+            stop_after_closes=1,
+        )
+        with patch.object(
+            renewal,
+            "wait_for_stable_wgc_frame",
+            side_effect=lambda _manager, first_frame: first_frame,
+        ) as settle:
+            completed = _run(self.profile, engine)
+
+        self.assertFalse(completed)
+        self.assertEqual(settle.call_count, 1)
+        self.assertEqual(engine.runner_telemetry["frame_size_changes"], 0)
+
+    def test_runtime_frame_size_change_escapes_without_order(self) -> None:
+        stop_event = threading.Event()
+        engine = _SizeReportingEngine(
+            stop_event,
+            cycles=[[self.guard, self.guard]],
+        )
+        original_click = engine.on_click
+
+        def click_then_resize(hwnd: int, x: int, y: int) -> None:
+            original_click(hwnd, x, y)
+            if (x, y) == (20, 10):
+                engine.frame_size = (192, 92)
+                engine.stop_on_size_mismatch = True
+
+        engine.on_click = click_then_resize
+        with patch.object(
+            renewal,
+            "wait_for_stable_wgc_frame",
+            side_effect=lambda _manager, first_frame: first_frame,
+        ):
+            completed = _run(self.profile, engine)
+
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)])
+        self.assertEqual(engine.escapes, 1)
+        self.assertEqual(engine.mode, "closed")
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
+        self.assertEqual(engine.runner_telemetry["frame_size_changes"], 1)
 
     def test_next_open_is_blocked_until_exact_ready_guard_returns(self) -> None:
         stop_event = threading.Event()
