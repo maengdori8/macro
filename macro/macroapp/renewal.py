@@ -77,13 +77,11 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
-# FC stopped accepting popup-open inputs after roughly 800 requests inside a
-# five-minute burst.  The reference video averages about 0.47 s per cycle.
-# Keep speed 10 faster than that while leaving measured headroom below FC's
-# sustained input ceiling.  This floor is applied only after an unchanged
-# popup has closed, so a confirmed price change reaches the order input
-# immediately.
-RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.405
+# Speed 10 follows confirmed WGC state transitions directly.  The ready-list
+# confirmation after ESC is already the safe lower bound for the next click;
+# adding a fixed cycle floor wastes frames on machines where FC closes sooner.
+# Blocking waits for fresh WGC frames keep this from becoming a CPU spin loop.
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.0
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain

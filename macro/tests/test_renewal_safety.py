@@ -301,20 +301,16 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
-    def test_speed10_sustained_rate_stays_faster_than_reference_video(
+    def test_speed10_has_no_artificial_cycle_delay(
         self,
     ) -> None:
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(10),
-            0.405,
+            0.0,
         )
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(9),
             0.0,
-        )
-        self.assertGreater(
-            1.0 / renewal.renewal_sustained_cycle_seconds(10),
-            2.14,
         )
 
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
