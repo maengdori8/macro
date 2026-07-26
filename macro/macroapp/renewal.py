@@ -3869,6 +3869,7 @@ class FastRenewalRunner:
             "fast_exit_max_streak": 0,
             "fast_exit_input_p95_ms": 0.0,
             "transition_candidate_frames": 0,
+            "transition_preclassify_skips": 0,
             "transition_confirmed_openings": 0,
             "transition_exit_count": 0,
             "transition_input_p95_ms": 0.0,
@@ -4510,6 +4511,28 @@ class FastRenewalRunner:
                     self.telemetry["popup_openings"] = (
                         int(self.telemetry["popup_openings"]) + 1
                     )
+                if (
+                    phase == "transition"
+                    and phase_progress
+                    < RENEWAL_TRANSITION_UNCHANGED_MIN_PROGRESS
+                ):
+                    # Below this phase the policy necessarily maps every
+                    # possible price result to AMBIGUOUS: equality is not
+                    # committed until 0.75 and a change until 0.90.  Avoid
+                    # spending classifier CPU on a result that cannot affect
+                    # the decision, while still consuming every fresh WGC
+                    # frame so the first eligible frame is handled at once.
+                    self.telemetry["transition_preclassify_skips"] = (
+                        int(
+                            self.telemetry[
+                                "transition_preclassify_skips"
+                            ]
+                        )
+                        + 1
+                    )
+                    last_result = None
+                    stable_count = 0
+                    continue
                 price = crop_price_from_guard(aligned_guard, price_box)
                 classify_started = time.perf_counter()
                 result = (
