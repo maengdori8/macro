@@ -30,6 +30,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import cv2
 import numpy as np
+import psutil
 from PIL import Image, ImageTk
 
 from macroapp.config import WINDOW_TITLE
@@ -107,6 +108,12 @@ CALIBRATION_PRICE_RIGHT_X = 0.795
 CALIBRATION_STABLE_FRAME_DELTA = 1.5
 WGC_SIZE_STABLE_SECONDS = 0.50
 WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
+HEADLESS_MONITOR_MAX_SECONDS = 12.0 * 60.0 * 60.0
+HEADLESS_MONITOR_CHECKPOINT_SECONDS = 30.0
+HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT = 3.0
+HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT = 8.0
+HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
+HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
 
 
 def _calibration_popup_opacity(
@@ -231,6 +238,8 @@ def _measure_stable_wgc_frame(
 def _fit_game_window_to_wgc(
     hwnd: int,
     logger=None,
+    *,
+    allow_supported_fallback: bool = False,
 ) -> tuple[WindowResizeSnapshot, tuple[int, int], tuple[int, int]]:
     """Fit without activation, verify stable WGC size, and roll back on failure."""
 
@@ -243,6 +252,15 @@ def _fit_game_window_to_wgc(
     # left this machine permanently on the fallback and made the documented
     # target impossible to calibrate.
     if before_size == TARGET_WGC_SIZE:
+        return (
+            WindowResizeSnapshot(int(hwnd), original, original),
+            before_size,
+            before_size,
+        )
+    if (
+        allow_supported_fallback
+        and is_supported_renewal_wgc_size(*before_size)
+    ):
         return (
             WindowResizeSnapshot(int(hwnd), original, original),
             before_size,
@@ -2267,30 +2285,176 @@ def _headless_monitor_existing(
     side_name: str,
     duration_seconds: float,
 ) -> int:
-    """Run the real renewal loop with all order inputs permanently disabled."""
+    """Run the real renewal loop with all order inputs permanently disabled.
+
+    The report is checkpointed throughout long sessions so a crash or a true
+    price change leaves actionable evidence instead of an empty ten-hour gap.
+    """
 
     report_path = app_dir() / "renewal_headless_monitor.json"
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "side": side_name,
         "duration_requested_seconds": float(duration_seconds),
         "started_at_unix": time.time(),
+        "updated_at_unix": time.time(),
+        "finished": False,
         "passed": False,
         "order_inputs": 0,
+        "pid": os.getpid(),
     }
     manager: Optional[InactiveManager] = None
     runner: Optional[FastRenewalRunner] = None
     stop_event = threading.Event()
+    checkpoint_stop = threading.Event()
     timer: Optional[threading.Timer] = None
+    checkpoint_thread: Optional[threading.Thread] = None
     logs: list[str] = []
     statuses: list[str] = []
+    resource_samples: list[dict[str, float]] = []
+    report_lock = threading.Lock()
     cleanup_escape_sent = False
     original_priority = _enable_safe_process_priority()
     started = time.perf_counter()
+    process = psutil.Process()
+    logical_cpus = max(1, int(psutil.cpu_count(logical=True) or 1))
+    process.cpu_percent(interval=None)
+
+    def sample_resources() -> None:
+        try:
+            memory = process.memory_info()
+            try:
+                private_bytes = int(
+                    getattr(process.memory_full_info(), "private")
+                )
+            except (AttributeError, psutil.Error):
+                private_bytes = int(memory.rss)
+            resource_samples.append(
+                {
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "cpu_system_percent": (
+                        float(process.cpu_percent(interval=None))
+                        / float(logical_cpus)
+                    ),
+                    "rss_mb": float(memory.rss) / (1024.0 * 1024.0),
+                    "private_mb": float(private_bytes) / (1024.0 * 1024.0),
+                }
+            )
+            del resource_samples[:-2000]
+        except psutil.Error:
+            pass
+
+    def resource_summary() -> dict[str, object]:
+        if not resource_samples:
+            return {
+                "samples": 0,
+                "within_limits": False,
+            }
+        cpu_values = [
+            float(sample["cpu_system_percent"])
+            for sample in resource_samples[1:]
+        ]
+        if not cpu_values:
+            cpu_values = [
+                float(resource_samples[-1]["cpu_system_percent"])
+            ]
+        rss_values = [
+            float(sample["rss_mb"]) for sample in resource_samples
+        ]
+        private_values = [
+            float(sample["private_mb"]) for sample in resource_samples
+        ]
+        cpu_average = float(np.mean(cpu_values))
+        cpu_p95 = float(np.percentile(cpu_values, 95))
+        rss_growth = max(rss_values) - rss_values[0]
+        private_growth = max(private_values) - private_values[0]
+        within_limits = bool(
+            cpu_average <= HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT
+            and cpu_p95 <= HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT
+            and rss_growth <= HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB
+            and private_growth
+            <= HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB
+        )
+        return {
+            "samples": len(resource_samples),
+            "sample_interval_seconds": (
+                HEADLESS_MONITOR_CHECKPOINT_SECONDS
+            ),
+            "cpu_system_percent_average": cpu_average,
+            "cpu_system_percent_p95": cpu_p95,
+            "cpu_average_limit_percent": (
+                HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT
+            ),
+            "cpu_p95_limit_percent": (
+                HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT
+            ),
+            "rss_start_mb": rss_values[0],
+            "rss_peak_mb": max(rss_values),
+            "rss_growth_mb": rss_growth,
+            "rss_growth_limit_mb": HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB,
+            "private_start_mb": private_values[0],
+            "private_peak_mb": max(private_values),
+            "private_growth_mb": private_growth,
+            "private_growth_limit_mb": (
+                HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB
+            ),
+            "within_limits": within_limits,
+        }
+
+    def current_telemetry() -> dict[str, object]:
+        if runner is None:
+            return {}
+        try:
+            return dict(runner.telemetry)
+        except RuntimeError:
+            return {}
+
+    def write_checkpoint(*, finished: bool) -> None:
+        snapshot = dict(report)
+        telemetry = current_telemetry()
+        if telemetry:
+            snapshot["telemetry"] = telemetry
+            snapshot["order_inputs"] = int(
+                telemetry.get("order_clicks", 0)
+            )
+        snapshot.update(
+            {
+                "finished": bool(finished),
+                "updated_at_unix": time.time(),
+                "elapsed_seconds": time.perf_counter() - started,
+                "resources": resource_summary(),
+                "log_tail": logs[-100:],
+                "status_tail": statuses[-50:],
+            }
+        )
+        temporary = report_path.with_suffix(".tmp")
+        try:
+            with report_lock:
+                temporary.write_text(
+                    json.dumps(snapshot, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(report_path)
+        except Exception:
+            pass
+
+    def checkpoint_worker() -> None:
+        while not checkpoint_stop.wait(
+            HEADLESS_MONITOR_CHECKPOINT_SECONDS
+        ):
+            sample_resources()
+            write_checkpoint(finished=False)
+
+    sample_resources()
+    write_checkpoint(finished=False)
     try:
         if side_name not in ("buy", "sell"):
             raise ValueError("Only buy or sell can be monitored.")
-        duration = min(8.0 * 60.0 * 60.0, max(1.0, float(duration_seconds)))
+        duration = min(
+            HEADLESS_MONITOR_MAX_SECONDS,
+            max(1.0, float(duration_seconds)),
+        )
+        report["duration_effective_seconds"] = duration
         profile = load_renewal_profile()
         side = profile.side(side_name)
         missing = profile.missing(side_name)
@@ -2308,11 +2472,20 @@ def _headless_monitor_existing(
             statuses.append,
             monitor_only=True,
         )
+        checkpoint_thread = threading.Thread(
+            target=checkpoint_worker,
+            name="renewal-monitor-checkpoint",
+            daemon=True,
+        )
+        checkpoint_thread.start()
         timer = threading.Timer(duration, stop_event.set)
         timer.daemon = True
         timer.start()
         runner.run()
-        telemetry = dict(runner.telemetry)
+        checkpoint_stop.set()
+        checkpoint_thread.join(timeout=2.0)
+        sample_resources()
+        telemetry = current_telemetry()
         order_inputs = int(telemetry.get("order_clicks", 0))
         armed_openings = int(telemetry.get("armed_openings", 0))
         confirmed_openings = int(
@@ -2327,29 +2500,41 @@ def _headless_monitor_existing(
             max(2, int(duration * 1.5)),
         )
         monitor_detected = bool(telemetry.get("monitor_detected", False))
+        elapsed = time.perf_counter() - started
+        duration_completed = bool(
+            not monitor_detected
+            and not initial_mismatch
+            and elapsed >= max(0.0, duration - 0.5)
+        )
+        resources = resource_summary()
         passed = bool(
             order_inputs == 0
             and armed_openings >= 2
             and not initial_mismatch
             and max_open_failures < 3
-            and (
-                monitor_detected
-                or confirmed_openings >= minimum_confirmed_openings
-            )
+            and confirmed_openings >= minimum_confirmed_openings
+            and duration_completed
+            and bool(resources.get("within_limits", False))
         )
         report.update(
             {
                 "passed": passed,
                 "order_inputs": order_inputs,
                 "minimum_confirmed_openings": minimum_confirmed_openings,
+                "duration_completed": duration_completed,
                 "telemetry": telemetry,
+                "resources": resources,
                 "stopped_by": (
                     "price_change_detected"
                     if monitor_detected
                     else (
                         "initial_price_mismatch"
                         if initial_mismatch
-                        else "duration"
+                        else (
+                            "duration"
+                            if duration_completed
+                            else "early_stop"
+                        )
                     )
                 ),
                 "calibrated_frame_size": list(
@@ -2363,13 +2548,14 @@ def _headless_monitor_existing(
             {
                 "error_type": type(exc).__name__,
                 "error": str(exc),
-                "telemetry": (
-                    dict(runner.telemetry) if runner is not None else {}
-                ),
+                "telemetry": current_telemetry(),
             }
         )
         return 1
     finally:
+        checkpoint_stop.set()
+        if checkpoint_thread is not None:
+            checkpoint_thread.join(timeout=2.0)
         stop_event.set()
         if timer is not None:
             timer.cancel()
@@ -2398,24 +2584,20 @@ def _headless_monitor_existing(
                 pass
         if manager is not None:
             manager.stop_capture()
+        sample_resources()
         report.update(
             {
+                "finished": True,
                 "elapsed_seconds": time.perf_counter() - started,
                 "cleanup_escape_sent": cleanup_escape_sent,
+                "resources": resource_summary(),
                 "log_tail": logs[-100:],
                 "status_tail": statuses[-50:],
+                "updated_at_unix": time.time(),
                 "finished_at_unix": time.time(),
             }
         )
-        temporary = report_path.with_suffix(".tmp")
-        try:
-            temporary.write_text(
-                json.dumps(report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temporary.replace(report_path)
-        except Exception:
-            pass
+        write_checkpoint(finished=True)
         _restore_process_priority(original_priority)
 
 
@@ -2459,7 +2641,10 @@ def _headless_calibrate_existing(side_name: str) -> int:
         if manager.hwnd is None:
             raise RuntimeError("FC ONLINE HWND가 없습니다.")
         fit_snapshot, fit_before_size, fit_after_size = (
-            _fit_game_window_to_wgc(manager.hwnd)
+            _fit_game_window_to_wgc(
+                manager.hwnd,
+                allow_supported_fallback=True,
+            )
         )
         full_frame = _wait_for_stable_wgc_frame(manager)
         frame_height, frame_width = full_frame.shape[:2]

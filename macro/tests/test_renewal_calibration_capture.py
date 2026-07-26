@@ -429,6 +429,45 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 renewal_macro._fit_game_window_to_wgc(100)
         restore.assert_called_once_with(snapshot)
 
+        supported_fallback = np.zeros((1040, 1920), dtype=np.uint8)
+        with (
+            mock.patch.object(
+                renewal_macro,
+                "get_window_rect",
+                return_value=current_outer,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "_measure_stable_wgc_frame",
+                return_value=supported_fallback,
+            ),
+            mock.patch.object(
+                renewal_macro,
+                "resize_window_no_activate",
+            ) as resize,
+        ):
+            result, before_size, after_size = (
+                renewal_macro._fit_game_window_to_wgc(
+                    100,
+                    allow_supported_fallback=True,
+                )
+            )
+        self.assertEqual(result.original, current_outer)
+        self.assertEqual(result.resized, current_outer)
+        self.assertEqual(before_size, (1920, 1040))
+        self.assertEqual(after_size, (1920, 1040))
+        resize.assert_not_called()
+
+    def test_headless_monitor_supports_ten_hour_checkpointed_soak(self):
+        self.assertGreaterEqual(
+            renewal_macro.HEADLESS_MONITOR_MAX_SECONDS,
+            10.0 * 60.0 * 60.0,
+        )
+        self.assertLessEqual(
+            renewal_macro.HEADLESS_MONITOR_CHECKPOINT_SECONDS,
+            60.0,
+        )
+
     def test_eight_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.full((height, width), 251, dtype=np.uint8)
