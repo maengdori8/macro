@@ -304,17 +304,33 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
-    def test_speed10_has_no_artificial_cycle_delay(
+    def test_speed10_uses_server_safe_unchanged_cycle_floor(
         self,
     ) -> None:
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(10),
-            0.0,
+            0.500,
         )
         self.assertEqual(
             renewal.renewal_sustained_cycle_seconds(9),
             0.0,
         )
+
+    def test_server_safe_initial_floor_does_not_delay_disabled_mode(
+        self,
+    ) -> None:
+        enabled = renewal.RenewalAdaptiveCyclePacer(
+            enabled=True,
+            initial_floor_seconds=0.500,
+        )
+        disabled = renewal.RenewalAdaptiveCyclePacer(
+            enabled=False,
+            initial_floor_seconds=0.500,
+        )
+        self.assertEqual(enabled.floor_seconds, 0.500)
+        self.assertGreater(enabled.delay_seconds(0.340), 0.0)
+        self.assertEqual(disabled.floor_seconds, 0.0)
+        self.assertEqual(disabled.delay_seconds(0.0), 0.0)
 
     def test_adaptive_pacer_reacts_to_recorded_open_failure_burst(
         self,

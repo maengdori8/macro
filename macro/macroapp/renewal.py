@@ -77,11 +77,11 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
-# Speed 10 follows confirmed WGC state transitions directly.  The ready-list
-# confirmation after ESC is already the safe lower bound for the next click;
-# adding a fixed cycle floor wastes frames on machines where FC closes sooner.
-# Blocking waits for fresh WGC frames keep this from becoming a CPU spin loop.
-RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.0
+# A live 2.9 opens/s run reached FC's "too many lookup requests" suspension
+# after roughly 800 cycles.  Keep the changed-price approval path frame-direct,
+# but cap only completed unchanged cycles at the fastest empirically safe
+# starting rate.  Adaptive recovery can slow it further if FC signals pressure.
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.500
 RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.070
 RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.050
 RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS = 0.005
@@ -91,6 +91,7 @@ RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS = 0.800
 RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS = 3.0
 RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS = 2.0
 RENEWAL_ADAPTIVE_RECOVERY_MAX_SECONDS = 15.0
+RENEWAL_SERVER_PRESSURE_FAILURE_LIMIT = 2
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain
@@ -123,9 +124,17 @@ def renewal_sustained_cycle_seconds(speed_level: int) -> float:
 class RenewalAdaptiveCyclePacer:
     """Find the fastest sustained popup-open rate without a fixed delay."""
 
-    def __init__(self, enabled: bool):
+    def __init__(
+        self,
+        enabled: bool,
+        initial_floor_seconds: float = 0.0,
+    ):
         self.enabled = bool(enabled)
-        self.floor_seconds = 0.0
+        self.floor_seconds = (
+            max(0.0, float(initial_floor_seconds))
+            if self.enabled
+            else 0.0
+        )
         self.increases = 0
         self.decreases = 0
         self.successes_since_failure = 0
@@ -3981,6 +3990,7 @@ class FastRenewalRunner:
             "adaptive_failure_level": 0,
             "adaptive_recovery_waits": 0,
             "adaptive_recovery_total_ms": 0.0,
+            "server_pressure_detected": False,
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
         }
@@ -4182,7 +4192,10 @@ class FastRenewalRunner:
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
         adaptive_pacer = RenewalAdaptiveCyclePacer(
-            self.sustained_pacing and self.profile.speed_level == 10
+            self.sustained_pacing and self.profile.speed_level == 10,
+            renewal_sustained_cycle_seconds(
+                self.profile.speed_level
+            ),
         )
         self.telemetry["adaptive_pacing_enabled"] = (
             adaptive_pacer.enabled
@@ -4840,6 +4853,21 @@ class FastRenewalRunner:
                     action_started,
                     open_failed=True,
                 ):
+                    return False
+                if (
+                    adaptive_pacer.enabled
+                    and adaptive_pacer.failure_level
+                    >= RENEWAL_SERVER_PRESSURE_FAILURE_LIMIT
+                ):
+                    self.telemetry["server_pressure_detected"] = True
+                    self.status(
+                        "FC 조회 제한 신호 · 주문 없이 즉시 정지"
+                    )
+                    self.log(
+                        "[안전 정지 v12] 열기 실패가 2회 누적되어 "
+                        "FC 조회 제한 악화를 막기 위해 정지합니다."
+                    )
+                    update_performance_telemetry()
                     return False
                 if consecutive_open_failures == 3:
                     self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")

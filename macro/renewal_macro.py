@@ -2590,6 +2590,9 @@ def _headless_monitor_existing(
         monitor_pending_change = bool(
             telemetry.get("monitor_pending_change", False)
         )
+        server_pressure_detected = bool(
+            telemetry.get("server_pressure_detected", False)
+        )
         elapsed = time.perf_counter() - started
         duration_completed = bool(
             not monitor_detected
@@ -2603,6 +2606,7 @@ def _headless_monitor_existing(
             and armed_openings >= 2
             and not initial_mismatch
             and not monitor_pending_change
+            and not server_pressure_detected
             and max_open_failures < 3
             and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings
@@ -2619,15 +2623,19 @@ def _headless_monitor_existing(
                 "resources": resources,
                 "open_failure_summary": open_failure_summary,
                 "stopped_by": (
-                    "price_change_detected"
-                    if monitor_detected
+                    "server_pressure_detected"
+                    if server_pressure_detected
                     else (
-                        "initial_price_mismatch"
-                        if initial_mismatch
+                        "price_change_detected"
+                        if monitor_detected
                         else (
-                            "duration"
-                            if duration_completed
-                            else "early_stop"
+                            "initial_price_mismatch"
+                            if initial_mismatch
+                            else (
+                                "duration"
+                                if duration_completed
+                                else "early_stop"
+                            )
                         )
                     )
                 ),
