@@ -77,6 +77,13 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
+# FC stopped accepting popup-open inputs after roughly 800 requests inside a
+# five-minute burst.  The reference video averages about 0.47 s per cycle.
+# Keep speed 10 faster than that while leaving measured headroom below FC's
+# sustained input ceiling.  This floor is applied only after an unchanged
+# popup has closed, so a confirmed price change reaches the order input
+# immediately.
+RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = 0.405
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain
@@ -94,6 +101,16 @@ SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
 )
 WGC_SIZE_SETTLE_SECONDS = 0.50
 WGC_SIZE_SETTLE_TIMEOUT_SECONDS = 4.0
+
+
+def renewal_sustained_cycle_seconds(speed_level: int) -> float:
+    """Return the unchanged-cycle floor without delaying order approval."""
+
+    return (
+        RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS
+        if int(speed_level) >= 10
+        else 0.0
+    )
 
 
 def is_supported_renewal_wgc_size(width: int, height: int) -> bool:
@@ -3752,6 +3769,7 @@ class FastRenewalRunner:
         monitor_only: bool = False,
         active_until: Optional[float] = None,
         time_valid: Optional[Callable[[], bool]] = None,
+        sustained_pacing: bool = True,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -3762,6 +3780,7 @@ class FastRenewalRunner:
         self.log = logger
         self.status = status
         self.monitor_only = bool(monitor_only)
+        self.sustained_pacing = bool(sustained_pacing)
         self.active_until = (
             None if active_until is None else float(active_until)
         )
@@ -3800,6 +3819,9 @@ class FastRenewalRunner:
             "content_frame_size": [],
             "capture_layout_mode": "",
             "frame_size_changes": 0,
+            "cycle_floor_ms": 0.0,
+            "pacing_waits": 0,
+            "pacing_total_ms": 0.0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -3998,6 +4020,14 @@ class FastRenewalRunner:
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
+        sustained_cycle_seconds = (
+            renewal_sustained_cycle_seconds(self.profile.speed_level)
+            if self.sustained_pacing
+            else 0.0
+        )
+        self.telemetry["cycle_floor_ms"] = (
+            sustained_cycle_seconds * 1000.0
+        )
         transition_mode_enabled = bool(
             self.profile.first_frame_fast_exit
             and self.profile.speed_level == 10
@@ -4796,6 +4826,28 @@ class FastRenewalRunner:
                     raise RenewalCaptureRestart(
                         "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
                     )
+                cycle_elapsed = time.perf_counter() - action_started
+                pacing_delay = max(
+                    0.0,
+                    sustained_cycle_seconds - cycle_elapsed,
+                )
+                if pacing_delay > 0:
+                    self.telemetry["pacing_waits"] = (
+                        int(self.telemetry["pacing_waits"]) + 1
+                    )
+                    self.telemetry["pacing_total_ms"] = (
+                        float(self.telemetry["pacing_total_ms"])
+                        + pacing_delay * 1000.0
+                    )
+                    if self._wait(pacing_delay):
+                        cycle_latencies.append(
+                            (
+                                time.perf_counter() - action_started
+                            )
+                            * 1000.0
+                        )
+                        update_performance_telemetry()
+                        return False
                 cycle_latencies.append(
                     (time.perf_counter() - action_started) * 1000.0
                 )

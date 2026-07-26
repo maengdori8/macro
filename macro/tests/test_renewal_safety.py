@@ -293,6 +293,7 @@ def _run(
             logger=lambda _message: None,
             status=lambda _message: None,
             monitor_only=monitor_only,
+            sustained_pacing=False,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -300,6 +301,22 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
+    def test_speed10_sustained_rate_stays_faster_than_reference_video(
+        self,
+    ) -> None:
+        self.assertEqual(
+            renewal.renewal_sustained_cycle_seconds(10),
+            0.405,
+        )
+        self.assertEqual(
+            renewal.renewal_sustained_cycle_seconds(9),
+            0.0,
+        )
+        self.assertGreater(
+            1.0 / renewal.renewal_sustained_cycle_seconds(10),
+            2.14,
+        )
+
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
             renewal.RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS,
