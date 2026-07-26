@@ -919,7 +919,10 @@ class RenewalApp:
         level = int(round(float(value)))
         required_frames = 2 if level >= 8 else 3
         if level == 10:
-            text = "속도 10/10 · 120Hz 프레임 직결 · 고정 대기 0ms · 변경 2프레임"
+            text = (
+                "속도 10/10 · 첫 프레임 동일가격 즉시 ESC · "
+                "4회마다 정밀 확인 · 변경 2프레임"
+            )
         else:
             mode = "안정" if level <= 3 else ("균형" if level <= 7 else "초고속")
             text = (
@@ -1890,11 +1893,21 @@ class RenewalApp:
         target_minute = self._target_minute()
         available_ram = _available_ram_gb()
         self.status_var.set("갱신매크로 시작")
+        fast_policy = (
+            f"첫 프레임 동일가격 ESC · "
+            f"{self.profile.fast_probe_interval}회마다 정밀 확인"
+            if (
+                self.profile.first_frame_fast_exit
+                and self.profile.speed_level == 10
+            )
+            else "동일가격 다중 프레임 확인"
+        )
         self.log(
-            f"[시작 v10] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
+            f"[시작 v11] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
+            f"{fast_policy} · "
             f"{'무주문 측정' if monitor_only else '실주문'} · 애매하면 주문 금지"
         )
         if available_ram is not None:
@@ -1933,7 +1946,7 @@ class RenewalApp:
                 target_minute,
             )
             self.log(
-                f"[시간창 v10] 목표 :{target_minute:02d} · "
+                f"[시간창 v11] 목표 :{target_minute:02d} · "
                 f"{window.start:%Y-%m-%d %H:%M:%S}~"
                 f"{window.end_exclusive:%H:%M:%S}(미포함)"
             )
@@ -2792,7 +2805,7 @@ def _headless_calibrate_existing(side_name: str) -> int:
             corpus_root
             / "mAuto"
             / "renewal_corpus"
-            / f"{time.strftime('%Y%m%d_%H%M%S')}_{side_name}_v10"
+            / f"{time.strftime('%Y%m%d_%H%M%S')}_{side_name}_v11"
         )
         corpus_dir.mkdir(parents=True, exist_ok=False)
         for name, guard in corpus_frames:

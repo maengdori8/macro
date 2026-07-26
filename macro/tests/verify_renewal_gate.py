@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from macroapp.renewal import (
     PriceState,
+    RenewalCalibratedPriceClassifier,
     RenewalPriceClassifier,
     _translate_image,
 )
@@ -258,10 +259,13 @@ def main() -> int:
 
     same_orders = 0
     same_ambiguous = 0
+    same_fast_exit_misses = 0
     started = time.perf_counter()
     for cycle in range(max(1, int(args.same_cycles))):
         first = classifier.classify(baseline)
         second = classifier.classify(baseline)
+        if not RenewalCalibratedPriceClassifier.fast_unchanged(first):
+            same_fast_exit_misses += 1
         if (
             first.state is PriceState.CHANGED
             and classifier.same_candidate(first, second)
@@ -327,12 +331,15 @@ def main() -> int:
     adversarial_seconds = time.perf_counter() - started
 
     changed_misses = 0
+    changed_fast_exits = 0
     changed_failures: list[dict[str, object]] = []
     started = time.perf_counter()
     for index in range(max(1, int(args.changed_cases))):
         name, candidate = changed_corpus[index % len(changed_corpus)]
         first = classifier.classify(candidate)
         second = classifier.classify(candidate.copy())
+        if RenewalCalibratedPriceClassifier.fast_unchanged(first):
+            changed_fast_exits += 1
         detected = (
             first.state is PriceState.CHANGED
             and second.state is PriceState.CHANGED
@@ -416,8 +423,10 @@ def main() -> int:
     passed = bool(
         same_orders == 0
         and same_ambiguous == 0
+        and same_fast_exit_misses == 0
         and adversarial_orders == 0
         and changed_misses == 0
+        and changed_fast_exits == 0
         and latency["adversarial"]["p99_ms"] <= 1.0
         and latency["adversarial"]["p99_9_ms"] <= 2.0
         and latency["changed"]["p99_ms"] <= 1.0
@@ -431,6 +440,7 @@ def main() -> int:
             "same": {
                 "orders": same_orders,
                 "ambiguous": same_ambiguous,
+                "fast_exit_misses": same_fast_exit_misses,
                 "seconds": same_seconds,
             },
             "adversarial": {
@@ -442,6 +452,7 @@ def main() -> int:
             "changed": {
                 "variants": len(changed_corpus),
                 "misses": changed_misses,
+                "fast_exits": changed_fast_exits,
                 "failures": changed_failures,
                 "seconds": changed_seconds,
             },

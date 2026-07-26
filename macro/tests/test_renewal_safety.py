@@ -93,9 +93,11 @@ class _FakeEngine:
         self.cycle_index = -1
         self.open_frames: list[np.ndarray] = []
         self.open_index = 0
+        self.open_packet_counts: list[int] = []
         self.mode = "closed"
         self.closed_guard = np.zeros((60, 100), dtype=np.uint8)
         self.sequence_id = 0
+        self.runner_telemetry: dict[str, object] = {}
 
     def set_capture_region(self, region) -> None:
         self.capture_region = region
@@ -117,8 +119,14 @@ class _FakeEngine:
         elif self.open_index < len(self.open_frames):
             frame = self.open_frames[self.open_index]
             self.open_index += 1
+            while len(self.open_packet_counts) <= max(0, self.cycle_index):
+                self.open_packet_counts.append(0)
+            self.open_packet_counts[max(0, self.cycle_index)] += 1
         elif self.open_frames:
             frame = self.open_frames[-1]
+            while len(self.open_packet_counts) <= max(0, self.cycle_index):
+                self.open_packet_counts.append(0)
+            self.open_packet_counts[max(0, self.cycle_index)] += 1
         else:
             return None
         self.sequence_id += 1
@@ -130,6 +138,7 @@ class _FakeEngine:
             self.cycle_index += 1
             self.mode = "open"
             self.open_index = 0
+            self.open_packet_counts.append(0)
             if self.repeat_guard is not None:
                 self.open_frames = [
                     self.repeat_guard,
@@ -252,7 +261,7 @@ def _run(
                 side_effect=engine.on_escape,
             )
         )
-        return renewal.FastRenewalRunner(
+        runner = renewal.FastRenewalRunner(
             manager=manager,
             profile=profile,
             side=side,
@@ -260,7 +269,10 @@ def _run(
             logger=lambda _message: None,
             status=lambda _message: None,
             monitor_only=monitor_only,
-        ).run()
+        )
+        completed = runner.run()
+        engine.runner_telemetry = dict(runner.telemetry)
+        return completed
 
 
 class RenewalSafetyTests(unittest.TestCase):
@@ -291,18 +303,21 @@ class RenewalSafetyTests(unittest.TestCase):
         loaded = renewal.RenewalProfile.from_dict(legacy)
         self.assertIn("v10 우측 상한가/하한가 재설정", loaded.missing("buy"))
 
-    def test_v10_profile_round_trip_keeps_alignment_frame_and_schedule(self) -> None:
+    def test_v11_profile_round_trip_keeps_fast_exit_and_schedule(self) -> None:
         self.profile.buy.noise_global = 0.004
         self.profile.buy.noise_slice = 0.018
         self.profile.buy.unchanged_limit = 0.038
+        self.profile.fast_probe_interval = 6
         loaded = renewal.RenewalProfile.from_dict(self.profile.to_dict())
-        self.assertEqual(loaded.to_dict()["version"], 10)
+        self.assertEqual(loaded.to_dict()["version"], 11)
         self.assertTrue(loaded.buy.complete())
         self.assertAlmostEqual(loaded.buy.noise_global, 0.004)
         self.assertAlmostEqual(loaded.buy.unchanged_limit, 0.038)
         self.assertEqual(len(loaded.buy.baseline_variants_png), 1)
         self.assertEqual(loaded.buy.calibrated_frame_size(), (200, 100))
         self.assertEqual(loaded.target_minute, 20)
+        self.assertTrue(loaded.first_frame_fast_exit)
+        self.assertEqual(loaded.fast_probe_interval, 6)
 
     def test_v9_accepts_only_expected_right_limit_price_row(self) -> None:
         buy_rect = renewal.NormalizedRect(0.6810, 0.4113, 0.7951, 0.4571)
@@ -786,6 +801,9 @@ class RenewalSafetyTests(unittest.TestCase):
             first.reason,
             "illumination_normalized_same_glyph",
         )
+        self.assertTrue(
+            renewal.RenewalCalibratedPriceClassifier.fast_unchanged(first)
+        )
         self.assertTrue(classifier.same_candidate(first, second))
 
         changed_image = baseline.copy()
@@ -797,6 +815,28 @@ class RenewalSafetyTests(unittest.TestCase):
             changed.state,
             renewal.PriceState.UNCHANGED,
         )
+
+    def test_stable_right_clipped_price_never_becomes_change(self) -> None:
+        raw = np.frombuffer(
+            base64.b64decode(_REAL_SAME_ILLUMINATION_BASELINE),
+            dtype=np.uint8,
+        )
+        baseline = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(baseline)
+        clipped = baseline.copy()
+        clipped[:, -20:] = int(np.median(baseline[0]))
+        classifier = renewal.RenewalPriceClassifier(
+            baseline,
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+
+        first = classifier.classify(clipped)
+        second = classifier.classify(clipped.copy())
+
+        self.assertIs(first.state, renewal.PriceState.AMBIGUOUS)
+        self.assertFalse(first.geometry_valid)
+        self.assertFalse(classifier.same_candidate(first, second))
 
     def test_recorded_same_price_15_reopen_is_unchanged(self) -> None:
         def decode(encoded: str) -> np.ndarray:
@@ -840,7 +880,10 @@ class RenewalSafetyTests(unittest.TestCase):
         second = classifier.classify(candidate.copy())
 
         self.assertIs(first.state, renewal.PriceState.AMBIGUOUS)
-        self.assertEqual(first.reason, "global_glyph_resampling")
+        self.assertIn(
+            first.reason,
+            {"global_glyph_resampling", "incomplete_price_row"},
+        )
         self.assertFalse(classifier.same_candidate(first, second))
         self.assertIsNot(first.state, renewal.PriceState.CHANGED)
 
@@ -1232,6 +1275,97 @@ class RenewalSafetyTests(unittest.TestCase):
             [],
         )
 
+    def test_first_strong_unchanged_frame_exits_immediately_after_arming(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        shifted_guard = renewal._translate_image(self.guard, 3, 0)
+        engine = _FakeEngine(
+            stop_event,
+            repeat_guard=shifted_guard,
+            stop_after_closes=7,
+        )
+
+        self.assertFalse(_run(self.profile, engine, monitor_only=True))
+
+        # The first two independent popups and every fourth eligible popup
+        # are full precision probes.  All other unchanged popups close on
+        # their first fully aligned WGC frame.
+        self.assertGreaterEqual(engine.open_packet_counts[0], 4)
+        self.assertGreaterEqual(engine.open_packet_counts[1], 4)
+        self.assertEqual(engine.open_packet_counts[2:5], [1, 1, 1])
+        self.assertGreaterEqual(engine.open_packet_counts[5], 4)
+        self.assertEqual(engine.open_packet_counts[6], 1)
+        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 4)
+        self.assertEqual(engine.runner_telemetry["precision_probe_count"], 3)
+        self.assertEqual(engine.runner_telemetry["fast_exit_max_streak"], 3)
+        self.assertLess(
+            float(engine.runner_telemetry["fast_exit_input_p95_ms"]),
+            2.0,
+        )
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_precision_probe_catches_change_after_same_first_frame(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard] * 4,
+                [self.guard] * 4,
+                [self.guard],
+                [self.guard],
+                [self.guard],
+                [self.guard, self.changed_guard, self.changed_guard],
+            ],
+        )
+
+        self.assertFalse(_run(self.profile, engine, monitor_only=True))
+        self.assertTrue(engine.runner_telemetry["monitor_detected"])
+        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 3)
+        self.assertGreaterEqual(engine.open_packet_counts[-1], 3)
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_changed_first_frame_still_requires_second_unique_frame(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            cycles=[
+                [self.guard] * 4,
+                [self.guard] * 4,
+                [self.changed_guard, self.changed_guard],
+            ],
+        )
+
+        self.assertFalse(_run(self.profile, engine, monitor_only=True))
+        self.assertTrue(engine.runner_telemetry["monitor_detected"])
+        self.assertEqual(engine.open_packet_counts[-1], 2)
+        self.assertEqual(engine.runner_telemetry["fast_exit_count"], 0)
+        self.assertEqual(
+            [point for point in engine.clicks if point != (20, 10)],
+            [],
+        )
+
+    def test_fast_unchanged_signal_never_accepts_change_or_ambiguity(self) -> None:
+        classifier = renewal.RenewalCalibratedPriceClassifier(
+            self.base_price,
+            [self.base_price],
+            unchanged_limit=0.035,
+            stability_limit=0.015,
+        )
+        same = classifier.classify(self.base_price.copy())
+        changed = classifier.classify(self.changed_price.copy())
+        blank = classifier.classify(np.full_like(self.base_price, 238))
+
+        self.assertTrue(classifier.fast_unchanged(same))
+        self.assertFalse(classifier.fast_unchanged(changed))
+        self.assertFalse(classifier.fast_unchanged(blank))
+
     def test_incomplete_popups_continue_until_external_stop_without_order(self) -> None:
         stop_event = threading.Event()
         engine = _FakeEngine(
@@ -1531,6 +1665,16 @@ class RenewalSafetyTests(unittest.TestCase):
         completed = _run(self.profile, engine)
         self.assertFalse(completed)
         self.assertEqual(engine.escapes, 10_000)
+        self.assertEqual(
+            engine.runner_telemetry["fast_exit_count"],
+            7_499,
+        )
+        self.assertEqual(
+            engine.runner_telemetry["precision_probe_count"],
+            2_501,
+        )
+        self.assertEqual(sum(engine.open_packet_counts), 17_503)
+        self.assertLess(sum(engine.open_packet_counts), 20_000)
         self.assertEqual(
             [point for point in engine.clicks if point != (20, 10)],
             [],

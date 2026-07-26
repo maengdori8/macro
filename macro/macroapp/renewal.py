@@ -47,12 +47,15 @@ if hasattr(cv2, "ipp"):
 
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-RENEWAL_PROFILE_VERSION = 10
+RENEWAL_PROFILE_VERSION = 11
 RENEWAL_CALIBRATION_VERSION = 7
 RENEWAL_CALIBRATION_OPENINGS = 8
 RENEWAL_CALIBRATION_FRAMES_PER_OPENING = 3
 RENEWAL_MAX_BASELINE_VARIANTS = 8
 RENEWAL_BASELINE_VARIANT_GLOBAL_LIMIT = 0.005
+RENEWAL_FAST_UNCHANGED_GLOBAL_LIMIT = 0.005
+RENEWAL_FAST_PROBE_INTERVAL = 4
+RENEWAL_FULL_PROBE_UNCHANGED_FRAMES = 4
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
@@ -439,6 +442,8 @@ class RenewalProfile:
     slice_threshold: float = 0.29
     modal_max_score: float = 0.75
     target_minute: int = 20
+    first_frame_fast_exit: bool = True
+    fast_probe_interval: int = RENEWAL_FAST_PROBE_INTERVAL
 
     def side(self, side: str) -> RenewalSideProfile:
         return self.buy if side == "buy" else self.sell
@@ -495,6 +500,8 @@ class RenewalProfile:
             "slice_threshold": float(self.slice_threshold),
             "modal_max_score": float(self.modal_max_score),
             "target_minute": int(self.target_minute),
+            "first_frame_fast_exit": bool(self.first_frame_fast_exit),
+            "fast_probe_interval": int(self.fast_probe_interval),
         }
 
     @classmethod
@@ -526,6 +533,21 @@ class RenewalProfile:
             )
             profile.target_minute = min(
                 59, max(0, int(value.get("target_minute", 20)))
+            )
+            profile.first_frame_fast_exit = bool(
+                value.get("first_frame_fast_exit", True)
+            )
+            profile.fast_probe_interval = min(
+                20,
+                max(
+                    2,
+                    int(
+                        value.get(
+                            "fast_probe_interval",
+                            RENEWAL_FAST_PROBE_INTERVAL,
+                        )
+                    ),
+                ),
             )
         except (TypeError, ValueError):
             pass
@@ -1122,6 +1144,11 @@ class RenewalPriceClassifier:
     _GLYPH_RESAMPLE_KERNEL = np.ones((5, 5), dtype=np.uint8)
     _GLYPH_RESAMPLE_LOCAL_LIMIT = 0.001
     _GLYPH_RESAMPLE_EXACT_FLOOR = 0.150
+    # The rightmost FC price suffix ("조") is invariant when the numeric
+    # price changes.  A transition frame that loses the right edge can look
+    # like a stable shorter number for two frames, so it may never authorize
+    # an order unless this independent suffix anchor remains intact.
+    _SUFFIX_ANCHOR_DIFF_LIMIT = 0.080
 
     def __init__(
         self,
@@ -1170,6 +1197,24 @@ class RenewalPriceClassifier:
         )
         if self.baseline_local_glyph_count < 64:
             raise ValueError("The baseline price glyph mask is incomplete.")
+        self._suffix_anchor_bounds = self._find_suffix_anchor_bounds(
+            self.baseline_local_glyph_mask
+        )
+        if self._suffix_anchor_bounds is None:
+            self._baseline_suffix_mask = np.empty(
+                (0, 0),
+                dtype=np.uint8,
+            )
+            self._baseline_suffix_dilated = self._baseline_suffix_mask
+        else:
+            suffix_x1, suffix_x2 = self._suffix_anchor_bounds
+            self._baseline_suffix_mask = self.baseline_local_glyph_mask[
+                :, suffix_x1:suffix_x2
+            ].copy()
+            self._baseline_suffix_dilated = cv2.dilate(
+                self._baseline_suffix_mask,
+                RenewalChangeDetector._DILATE_KERNEL,
+            )
         self.baseline_local_glyph_dilated = cv2.dilate(
             self.baseline_local_glyph_mask,
             RenewalChangeDetector._DILATE_KERNEL,
@@ -1307,6 +1352,102 @@ class RenewalPriceClassifier:
         )
         foreground = cv2.subtract(background, image)
         return cv2.compare(foreground, 16, cv2.CMP_GE)
+
+    @staticmethod
+    def _find_suffix_anchor_bounds(
+        glyph_mask: np.ndarray,
+    ) -> Optional[tuple[int, int]]:
+        points = cv2.findNonZero(glyph_mask)
+        if points is None:
+            return None
+        x, y, width, height = cv2.boundingRect(points)
+        if width < 12 or height < 4:
+            return None
+        columns = np.count_nonzero(
+            glyph_mask[y : y + height, x : x + width],
+            axis=0,
+        )
+        zero_runs: list[tuple[int, int]] = []
+        start: Optional[int] = None
+        for index, count in enumerate(columns):
+            if int(count) == 0 and start is None:
+                start = index
+            elif int(count) != 0 and start is not None:
+                zero_runs.append((start, index))
+                start = None
+        separators = [
+            (run_start, run_end)
+            for run_start, run_end in zero_runs
+            if run_end < width
+        ]
+        if not separators:
+            return None
+        _separator_start, separator_end = separators[-1]
+        suffix_width = width - separator_end
+        if not (
+            max(6, int(round(width * 0.08)))
+            <= suffix_width
+            <= int(round(width * 0.45))
+        ):
+            return None
+        bounds = (
+            max(0, x + separator_end - 2),
+            min(glyph_mask.shape[1], x + width + 2),
+        )
+        suffix_mask = glyph_mask[:, bounds[0] : bounds[1]]
+        component_count, _labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(
+                (suffix_mask > 0).astype(np.uint8),
+                8,
+            )
+        )
+        meaningful_components = sum(
+            1
+            for component in range(1, component_count)
+            if int(stats[component, cv2.CC_STAT_AREA]) >= 4
+        )
+        if meaningful_components < 2:
+            return None
+        return bounds
+
+    def _suffix_anchor_matches(self, image: np.ndarray) -> bool:
+        if self._suffix_anchor_bounds is None:
+            # Tiny synthetic/unit-test glyphs may not contain FC's invariant
+            # Korean suffix.  Runtime FC baselines do, and only those can use
+            # this additional veto.
+            return True
+        current_mask = self._local_glyph_mask(image)
+        suffix_x1, suffix_x2 = self._suffix_anchor_bounds
+        current_suffix = current_mask[:, suffix_x1:suffix_x2]
+        if current_suffix.shape != self._baseline_suffix_mask.shape:
+            return False
+        current_dilated = cv2.dilate(
+            current_suffix,
+            RenewalChangeDetector._DILATE_KERNEL,
+        )
+        first_difference = cv2.bitwise_and(
+            self._baseline_suffix_mask,
+            cv2.bitwise_not(current_dilated),
+        )
+        second_difference = cv2.bitwise_and(
+            current_suffix,
+            cv2.bitwise_not(self._baseline_suffix_dilated),
+        )
+        difference = cv2.bitwise_or(
+            first_difference,
+            second_difference,
+        )
+        union = cv2.bitwise_or(
+            self._baseline_suffix_mask,
+            current_suffix,
+        )
+        union_count = int(cv2.countNonZero(union))
+        if union_count <= 0:
+            return False
+        difference_ratio = (
+            float(cv2.countNonZero(difference)) / float(union_count)
+        )
+        return difference_ratio <= self._SUFFIX_ANCHOR_DIFF_LIMIT
 
     def _glyph_difference_evidence_after_illumination(
         self,
@@ -1897,6 +2038,7 @@ class RenewalPriceClassifier:
                 and self._complete_glyph_row(aligned)
                 and prepared_geometry_valid
                 and self._projection_integrity_edges(structural_edges)
+                and self._suffix_anchor_matches(aligned)
             )
         if not alignment_valid:
             geometry_valid = False
@@ -2177,6 +2319,30 @@ class RenewalCalibratedPriceClassifier:
         second: PriceClassification,
     ) -> bool:
         return self.primary.same_candidate(first, second)
+
+    @staticmethod
+    def fast_unchanged(
+        classification: PriceClassification,
+    ) -> bool:
+        """Return true only for a one-frame equality strong enough to ESC.
+
+        This signal can only reject the current popup. It is never an order
+        approval signal; changed prices still require unique matching frames.
+        A native-glyph illumination match is allowed even when its edge score
+        is above the exact-render threshold.  That is the measured first-frame
+        FC case where the same price appears 1-4 px away before settling.
+        """
+
+        return bool(
+            classification.state is PriceState.UNCHANGED
+            and classification.geometry_valid
+            and (
+                classification.global_score
+                <= RENEWAL_FAST_UNCHANGED_GLOBAL_LIMIT
+                or classification.reason
+                == "illumination_normalized_same_glyph"
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -3185,6 +3351,12 @@ class FastRenewalRunner:
             "startup_popup_recovered": False,
             "capture_restarts": 0,
             "schedule_expired": False,
+            "fast_exit_count": 0,
+            "precision_probe_count": 0,
+            "fast_exit_max_streak": 0,
+            "fast_exit_input_p95_ms": 0.0,
+            "cycle_p50_ms": 0.0,
+            "cycle_p95_ms": 0.0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -3236,7 +3408,7 @@ class FastRenewalRunner:
                 )
                 self.status("화면 복구 중 · 주문 입력 없음")
                 self.log(
-                    "[복구 v10] "
+                    "[복구 v11] "
                     f"{exc} · WGC/HWND 재연결 "
                     f"{self.telemetry['capture_restarts']}회"
                 )
@@ -3249,7 +3421,7 @@ class FastRenewalRunner:
         if not self._schedule_deadline_active():
             self.telemetry["schedule_expired"] = True
             self.status("네이버 시간창 종료 · 주문 없이 정지")
-            self.log("[시간창 v10] 허용 시간이 끝나 입력 없이 정지합니다.")
+            self.log("[시간창 v11] 허용 시간이 끝나 입력 없이 정지합니다.")
         return False
 
     def _run_capture_session(self) -> bool:
@@ -3348,7 +3520,17 @@ class FastRenewalRunner:
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
+        fast_mode_enabled = bool(
+            self.profile.first_frame_fast_exit
+            and self.profile.speed_level == 10
+        )
+        fast_probe_interval = max(
+            2,
+            int(self.profile.fast_probe_interval),
+        )
         armed_openings = 0
+        fast_eligible_cycles = 0
+        fast_exit_streak = 0
         order_latched = False
         cycle_count = 0
         consecutive_open_failures = 0
@@ -3358,14 +3540,18 @@ class FastRenewalRunner:
         open_latencies: deque[float] = deque(maxlen=120)
         close_latencies: deque[float] = deque(maxlen=120)
         classify_latencies: deque[float] = deque(maxlen=240)
+        fast_exit_input_latencies: deque[float] = deque(maxlen=240)
+        cycle_latencies: deque[float] = deque(maxlen=240)
         cycle_window_started = time.perf_counter()
         run_started = cycle_window_started
         last_status_update = 0.0
         self.status("기준 가격 독립 확인 0/2")
         self.log(
-            f"[갱신 v10] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
+            f"[갱신 v11] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
+            f"첫 프레임 ESC {'ON' if fast_mode_enabled else 'OFF'}, "
+            f"{fast_probe_interval}회마다 정밀 확인, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
 
@@ -3406,6 +3592,12 @@ class FastRenewalRunner:
                         classify_latencies,
                         99,
                     ),
+                    "fast_exit_input_p95_ms": percentile(
+                        fast_exit_input_latencies,
+                        95,
+                    ),
+                    "cycle_p50_ms": percentile(cycle_latencies, 50),
+                    "cycle_p95_ms": percentile(cycle_latencies, 95),
                     "replaced_frames": (
                         engine.get_replaced_frame_count()
                         if hasattr(engine, "get_replaced_frame_count")
@@ -3502,9 +3694,18 @@ class FastRenewalRunner:
             *,
             allow_stopped: bool = False,
             pending_open_started: Optional[float] = None,
+            fast_decision_started: Optional[float] = None,
         ) -> bool:
             self.telemetry["current_popup_escape_sent"] = True
             clicker.press_escape()
+            if fast_decision_started is not None:
+                fast_exit_input_latencies.append(
+                    (
+                        time.perf_counter()
+                        - float(fast_decision_started)
+                    )
+                    * 1000.0
+                )
             closing_started = time.perf_counter()
             if self.profile.close_settle_ms > 0:
                 settle_seconds = self.profile.close_settle_ms / 1000.0
@@ -3589,6 +3790,21 @@ class FastRenewalRunner:
         ):
             cycle_count += 1
             self.telemetry["cycle_count"] = cycle_count
+            fast_exit_allowed = False
+            precision_probe = armed_openings < required_arm_openings
+            if (
+                fast_mode_enabled
+                and armed_openings >= required_arm_openings
+            ):
+                fast_eligible_cycles += 1
+                precision_probe = (
+                    fast_eligible_cycles % fast_probe_interval == 0
+                )
+                fast_exit_allowed = not precision_probe
+            if precision_probe:
+                self.telemetry["precision_probe_count"] = (
+                    int(self.telemetry["precision_probe_count"]) + 1
+                )
             action_started = time.perf_counter()
             if not self._time_window_active():
                 break
@@ -3617,6 +3833,9 @@ class FastRenewalRunner:
             guard_shifts: list[tuple[int, int]] = []
             ambiguous = False
             decision: Optional[PriceState] = None
+            fast_exit = False
+            fast_decision_started: Optional[float] = None
+            classified_frames = 0
             open_recorded = False
             deadline = (
                 time.monotonic() + RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS
@@ -3656,6 +3875,7 @@ class FastRenewalRunner:
                 price = crop_price_from_guard(registration.aligned, price_box)
                 classify_started = time.perf_counter()
                 result = classifier.classify(price)
+                classified_frames += 1
                 classify_latencies.append(
                     (time.perf_counter() - classify_started) * 1000.0
                 )
@@ -3682,6 +3902,17 @@ class FastRenewalRunner:
                     continue
 
                 if (
+                    classified_frames == 1
+                    and fast_exit_allowed
+                    and classifier.fast_unchanged(result)
+                ):
+                    decision = PriceState.UNCHANGED
+                    fast_exit = True
+                    fast_decision_started = packet.captured_at
+                    ambiguous = False
+                    break
+
+                if (
                     last_result is not None
                     and classifier.same_candidate(last_result, result)
                 ):
@@ -3696,7 +3927,16 @@ class FastRenewalRunner:
                     guard_shifts[:] = guard_shifts[-1:]
                 last_result = result
 
-                if stable_count < required_frames:
+                decision_frames = required_frames
+                if (
+                    result.state is PriceState.UNCHANGED
+                    and precision_probe
+                ):
+                    decision_frames = max(
+                        decision_frames,
+                        RENEWAL_FULL_PROBE_UNCHANGED_FRAMES,
+                    )
+                if stable_count < decision_frames:
                     continue
                 decision = result.state
                 ambiguous = False
@@ -3742,7 +3982,7 @@ class FastRenewalRunner:
                 if consecutive_open_failures == 3:
                     self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")
                     self.log(
-                        "[복구 v10] 완성된 가격 팝업을 3회 연속 "
+                        "[복구 v11] 완성된 가격 팝업을 3회 연속 "
                         "확인하지 못했지만 주문 없이 계속 시도합니다."
                     )
                 if consecutive_open_failures >= 10:
@@ -3762,6 +4002,7 @@ class FastRenewalRunner:
                 and ambiguous
                 and last_ambiguous_result is not None
             ):
+                fast_exit_streak = 0
                 self.telemetry["ambiguous_count"] = (
                     int(self.telemetry["ambiguous_count"]) + 1
                 )
@@ -3795,6 +4036,7 @@ class FastRenewalRunner:
                 continue
 
             if decision is PriceState.CHANGED and last_result is not None:
+                fast_exit_streak = 0
                 if armed_openings < required_arm_openings:
                     self.telemetry["initial_mismatch"] = True
                     self.status("기준 가격 불일치 · v10 우측 가격영역 재설정 필요")
@@ -3830,7 +4072,7 @@ class FastRenewalRunner:
                     self.telemetry["monitor_detected"] = True
                     self.status("무주문 측정 · 가격 변경 감지 · 입력 0회")
                     self.log(
-                        f"[무주문 측정 v10] {cycle_count}회에서 변경 확정, "
+                        f"[무주문 측정 v11] {cycle_count}회에서 변경 확정, "
                         f"고유 프레임 {sequence_ids}, 입력하지 않고 정지"
                     )
                     save_renewal_diagnostic(
@@ -3892,7 +4134,7 @@ class FastRenewalRunner:
                     * 1000.0
                 )
                 self.log(
-                    f"[갱신 완료 v10] {cycle_count}회 확인, "
+                    f"[갱신 완료 v11] {cycle_count}회 확인, "
                     f"고유 프레임 {sequence_ids}, 전역 {last_result.global_score:.4f}, "
                     f"한자리 {last_result.slice_score:.4f}, "
                     f"가격 이동 ({last_result.shift_x},{last_result.shift_y}), "
@@ -3932,6 +4174,18 @@ class FastRenewalRunner:
                 self.telemetry["unchanged_openings"] = (
                     int(self.telemetry["unchanged_openings"]) + 1
                 )
+                if fast_exit:
+                    fast_exit_streak += 1
+                    self.telemetry["fast_exit_count"] = (
+                        int(self.telemetry["fast_exit_count"]) + 1
+                    )
+                    self.telemetry["fast_exit_max_streak"] = max(
+                        int(self.telemetry["fast_exit_max_streak"]),
+                        fast_exit_streak,
+                    )
+                    self.status("첫 프레임 동일가격 · 즉시 ESC")
+                else:
+                    fast_exit_streak = 0
                 if armed_openings < required_arm_openings:
                     armed_openings += 1
                     self.telemetry["armed_openings"] = armed_openings
@@ -3940,14 +4194,22 @@ class FastRenewalRunner:
                     )
                     if armed_openings == required_arm_openings:
                         self.log(
-                            "[안전 확인 v10] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
+                            "[안전 확인 v11] 서로 다른 두 팝업에서 기준 가격 일치 · 주문 가능"
                         )
-                if not close_modal():
+                if not close_modal(
+                    fast_decision_started=(
+                        fast_decision_started if fast_exit else None
+                    )
+                ):
                     raise RenewalCaptureRestart(
                         "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
                     )
+                cycle_latencies.append(
+                    (time.perf_counter() - action_started) * 1000.0
+                )
             else:
                 # 팝업이 완전히 열리지 않았거나 고유 프레임이 부족한 사이클입니다.
+                fast_exit_streak = 0
                 if not close_modal():
                     raise RenewalCaptureRestart(
                         "불완전 팝업을 닫은 뒤 목록 화면 미확인"
@@ -3984,10 +4246,12 @@ class FastRenewalRunner:
                     else 0
                 )
                 self.log(
-                    f"[갱신 v10] {cycle_count}회 확인 중 · "
+                    f"[갱신 v11] {cycle_count}회 확인 중 · "
                     f"최근 100회 평균 {window_seconds * 10.0:.1f}ms/사이클 · "
                     f"WGC {capture_hz:.1f}Hz · 열림 {open_p50:.1f}ms · "
                     f"닫힘 {close_p50:.1f}ms · 판정 p95 {classify_p95:.3f}ms · "
+                    f"첫 프레임 ESC {self.telemetry['fast_exit_count']}회 · "
+                    f"정밀 확인 {self.telemetry['precision_probe_count']}회 · "
                     f"최신교체 {replaced}"
                 )
             now = time.perf_counter()
@@ -4002,8 +4266,14 @@ class FastRenewalRunner:
                     else 0.0
                 )
                 capture_hz = 1000.0 / frame_ms if frame_ms > 0 else 0.0
+                policy = (
+                    "첫 프레임 ESC"
+                    if fast_mode_enabled
+                    else f"동일가격 {required_frames}프레임"
+                )
                 self.status(
-                    f"120Hz 직결 {capture_hz:.0f}Hz · 변경 {required_frames}프레임 · "
+                    f"120Hz 직결 {capture_hz:.0f}Hz · {policy} · "
+                    f"변경 {required_frames}프레임 · "
                     f"{'무주문' if self.monitor_only else '실주문'} · {cycle_count}회"
                 )
 
