@@ -500,6 +500,33 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
         )
         self.assertTrue(summary["within_limit"])
 
+    def test_finished_checkpoint_keeps_the_resources_used_for_pass(self):
+        accepted = {
+            "within_limits": True,
+            "cpu_system_percent_average": 2.5,
+        }
+        later_sample = {
+            "within_limits": False,
+            "cpu_system_percent_average": 3.5,
+        }
+        selected = renewal_macro._headless_checkpoint_resources(
+            {"resources": accepted},
+            finished=True,
+            live_resources=later_sample,
+        )
+        self.assertEqual(selected, accepted)
+        self.assertIsNot(selected, accepted)
+
+    def test_running_checkpoint_uses_current_resources(self):
+        previous = {"within_limits": True}
+        current = {"within_limits": False}
+        selected = renewal_macro._headless_checkpoint_resources(
+            {"resources": previous},
+            finished=False,
+            live_resources=current,
+        )
+        self.assertEqual(selected, current)
+
     def test_eight_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80
         opened = np.full((height, width), 251, dtype=np.uint8)

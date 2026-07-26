@@ -144,6 +144,18 @@ def _headless_open_failure_summary(
     }
 
 
+def _headless_checkpoint_resources(
+    report: dict[str, object],
+    *,
+    finished: bool,
+    live_resources: dict[str, object],
+) -> dict[str, object]:
+    finalized = report.get("resources")
+    if finished and isinstance(finalized, dict):
+        return dict(finalized)
+    return dict(live_resources)
+
+
 def _calibration_popup_opacity(
     guard: np.ndarray,
 ) -> tuple[float, float, bool]:
@@ -2461,12 +2473,17 @@ def _headless_monitor_existing(
             snapshot["open_failure_summary"] = (
                 _headless_open_failure_summary(telemetry)
             )
+        checkpoint_resources = _headless_checkpoint_resources(
+            report,
+            finished=finished,
+            live_resources=resource_summary(),
+        )
         snapshot.update(
             {
                 "finished": bool(finished),
                 "updated_at_unix": time.time(),
                 "elapsed_seconds": time.perf_counter() - started,
-                "resources": resource_summary(),
+                "resources": checkpoint_resources,
                 "log_tail": logs[-100:],
                 "status_tail": statuses[-50:],
             }
@@ -2631,13 +2648,14 @@ def _headless_monitor_existing(
                 pass
         if manager is not None:
             manager.stop_capture()
-        sample_resources()
+        if "resources" not in report:
+            sample_resources()
+            report["resources"] = resource_summary()
         report.update(
             {
                 "finished": True,
                 "elapsed_seconds": time.perf_counter() - started,
                 "cleanup_escape_sent": cleanup_escape_sent,
-                "resources": resource_summary(),
                 "log_tail": logs[-100:],
                 "status_tail": statuses[-50:],
                 "updated_at_unix": time.time(),
