@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_commit": "b68d2c72e4cfbdf6b26e5442e11650aaea08ce4a",
+  "elapsed_seconds": 870.415428,
+  "cycle_count": 2474,
+  "confirmed_openings": 2430,
+  "open_failures": 43,
+  "max_consecutive_open_failures": 2,
+  "natural_success_cycle_seconds": 0.336,
+  "order_inputs": 0,
+  "monitor_detected": false,
+  "frame_size_changes": 0
+}

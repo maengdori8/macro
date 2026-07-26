@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import threading
 import time
@@ -312,6 +313,63 @@ class RenewalSafetyTests(unittest.TestCase):
             renewal.renewal_sustained_cycle_seconds(9),
             0.0,
         )
+
+    def test_adaptive_pacer_reacts_to_recorded_open_failure_burst(
+        self,
+    ) -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "renewal_sustained_open_failure_870s.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        natural_cycle = float(
+            fixture["natural_success_cycle_seconds"]
+        )
+        pacer = renewal.RenewalAdaptiveCyclePacer(enabled=True)
+        for _ in range(240):
+            pacer.record_success(natural_cycle)
+
+        pacer.record_failure()
+        self.assertGreaterEqual(
+            pacer.floor_seconds,
+            natural_cycle
+            + renewal.RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS,
+        )
+        self.assertGreater(
+            pacer.delay_seconds(natural_cycle),
+            0.0,
+        )
+
+        for _ in range(int(fixture["open_failures"]) - 1):
+            pacer.record_failure()
+        self.assertEqual(
+            pacer.increases,
+            int(fixture["open_failures"]),
+        )
+        self.assertLessEqual(
+            pacer.floor_seconds,
+            renewal.RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS,
+        )
+
+        floor_before_decay = pacer.floor_seconds
+        for _ in range(
+            renewal.RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES
+        ):
+            pacer.record_success(natural_cycle)
+        self.assertAlmostEqual(
+            pacer.floor_seconds,
+            floor_before_decay
+            - renewal.RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS,
+            places=6,
+        )
+
+    def test_disabled_adaptive_pacer_never_delays(self) -> None:
+        pacer = renewal.RenewalAdaptiveCyclePacer(enabled=False)
+        pacer.record_success(0.340)
+        pacer.record_failure()
+        self.assertEqual(pacer.floor_seconds, 0.0)
+        self.assertEqual(pacer.delay_seconds(0.0), 0.0)
 
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(

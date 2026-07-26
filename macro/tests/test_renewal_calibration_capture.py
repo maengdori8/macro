@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -467,6 +469,36 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             renewal_macro.HEADLESS_MONITOR_CHECKPOINT_SECONDS,
             60.0,
         )
+
+    def test_headless_monitor_rejects_recorded_sustained_open_failures(
+        self,
+    ):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "renewal_sustained_open_failure_870s.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        summary = renewal_macro._headless_open_failure_summary(
+            {
+                "confirmed_openings": fixture["confirmed_openings"],
+                "open_failures": fixture["open_failures"],
+            }
+        )
+        self.assertFalse(summary["within_limit"])
+        self.assertGreater(
+            summary["open_failure_rate"],
+            summary["open_failure_rate_limit"],
+        )
+
+    def test_headless_monitor_accepts_rare_recovered_open_failure(self):
+        summary = renewal_macro._headless_open_failure_summary(
+            {
+                "confirmed_openings": 100_000,
+                "open_failures": 5,
+            }
+        )
+        self.assertTrue(summary["within_limit"])
 
     def test_eight_openings_accept_new_stable_frames_and_skip_stale_size(self):
         height, width = 40, 80

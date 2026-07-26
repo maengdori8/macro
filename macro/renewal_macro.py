@@ -114,6 +114,34 @@ HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT = 3.0
 HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT = 8.0
 HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
+HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
+
+
+def _headless_open_failure_summary(
+    telemetry: dict[str, object],
+) -> dict[str, object]:
+    confirmed = max(0, int(telemetry.get("confirmed_openings", 0)))
+    failures = max(0, int(telemetry.get("open_failures", 0)))
+    attempts = confirmed + failures
+    failure_rate = (
+        float(failures) / float(attempts)
+        if attempts > 0
+        else 0.0
+    )
+    return {
+        "confirmed_openings": confirmed,
+        "open_failures": failures,
+        "open_attempts": attempts,
+        "open_failure_rate": failure_rate,
+        "open_failure_rate_limit": (
+            HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT
+        ),
+        "within_limit": bool(
+            attempts > 0
+            and failure_rate
+            <= HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT
+        ),
+    }
 
 
 def _calibration_popup_opacity(
@@ -2430,6 +2458,9 @@ def _headless_monitor_existing(
             snapshot["order_inputs"] = int(
                 telemetry.get("order_clicks", 0)
             )
+            snapshot["open_failure_summary"] = (
+                _headless_open_failure_summary(telemetry)
+            )
         snapshot.update(
             {
                 "finished": bool(finished),
@@ -2520,11 +2551,13 @@ def _headless_monitor_existing(
             and elapsed >= max(0.0, duration - 0.5)
         )
         resources = resource_summary()
+        open_failure_summary = _headless_open_failure_summary(telemetry)
         passed = bool(
             order_inputs == 0
             and armed_openings >= 2
             and not initial_mismatch
             and max_open_failures < 3
+            and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings
             and duration_completed
             and bool(resources.get("within_limits", False))
@@ -2537,6 +2570,7 @@ def _headless_monitor_existing(
                 "duration_completed": duration_completed,
                 "telemetry": telemetry,
                 "resources": resources,
+                "open_failure_summary": open_failure_summary,
                 "stopped_by": (
                     "price_change_detected"
                     if monitor_detected
