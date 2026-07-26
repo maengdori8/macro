@@ -64,6 +64,7 @@ from macroapp.renewal import (
     is_supported_renewal_wgc_size,
     load_renewal_profile,
     price_box_in_guard,
+    renewal_sustained_cycle_seconds,
     save_renewal_profile,
     save_renewal_diagnostic,
     validate_limit_price_selection,
@@ -116,6 +117,7 @@ HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
 HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
 HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS = 5.0
+HEADLESS_MONITOR_EXPECTED_PACED_CYCLE_RATIO = 0.93
 
 
 def _headless_open_failure_summary(
@@ -143,6 +145,22 @@ def _headless_open_failure_summary(
             <= HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT
         ),
     }
+
+
+def _headless_minimum_confirmed_openings(
+    duration_seconds: float,
+    speed_level: int,
+) -> int:
+    """Set the soak floor from the sustained pacing used by the runner."""
+
+    duration = max(0.0, float(duration_seconds))
+    cycle_floor = renewal_sustained_cycle_seconds(speed_level)
+    expected_rate = (
+        HEADLESS_MONITOR_EXPECTED_PACED_CYCLE_RATIO / cycle_floor
+        if cycle_floor > 0.0
+        else 1.5
+    )
+    return min(1000, max(2, int(duration * expected_rate)))
 
 
 def _headless_checkpoint_resources(
@@ -2582,9 +2600,9 @@ def _headless_monitor_existing(
             telemetry.get("max_consecutive_open_failures", 0)
         )
         initial_mismatch = bool(telemetry.get("initial_mismatch", False))
-        minimum_confirmed_openings = min(
-            1000,
-            max(2, int(duration * 1.5)),
+        minimum_confirmed_openings = _headless_minimum_confirmed_openings(
+            duration,
+            profile.speed_level,
         )
         monitor_detected = bool(telemetry.get("monitor_detected", False))
         monitor_pending_change = bool(
