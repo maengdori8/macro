@@ -77,34 +77,6 @@ RENEWAL_TRANSITION_CHANGE_MAX_SHIFT = 6
 # This is only a fail-closed deadline. A completed popup is consumed
 # immediately; the longer ceiling does not add a successful-path delay.
 RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS = 1.0
-# Isolated live runs first reached FC's "too many lookup requests" suspension
-# around 1,000 opens.  After a prior 1,040-open run, a fresh 0.7 s run was
-# rejected after only 530 more opens even with an 18-minute idle gap.  Together
-# those timestamps fit a rolling budget near 1,000 opens/30 min, not 10 min.
-# Use 900 opens/30 min (10% headroom).  Changed-price approval remains
-# frame-direct; this floor applies only after an unchanged popup is classified.
-RENEWAL_SERVER_REQUEST_WINDOW_SECONDS = 30.0 * 60.0
-RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW = 900
-RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS = (
-    RENEWAL_SERVER_REQUEST_WINDOW_SECONDS
-    / RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW
-)
-RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS = 0.070
-RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS = 0.050
-RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS = 0.005
-RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES = 3600
-RENEWAL_ADAPTIVE_PACING_FALLBACK_CYCLE_SECONDS = 0.340
-# The adaptive ceiling must never sit below the sustained server-safe floor.
-# Otherwise the first failed popup clamps a 2.0 s floor back to 0.8 s and the
-# next retry accelerates while FC is already rejecting requests.
-RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS = max(
-    5.000,
-    RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS,
-)
-RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS = 3.0
-RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS = 2.0
-RENEWAL_ADAPTIVE_RECOVERY_MAX_SECONDS = 15.0
-RENEWAL_SERVER_PRESSURE_FAILURE_LIMIT = 2
 # A stop can race an action click: ESC may be processed while the list is
 # still visible, and the delayed popup can then appear roughly 0.5 s later.
 # Cleanup alone observes through this measured window; normal cycles retain
@@ -140,95 +112,10 @@ WGC_SIZE_SETTLE_TIMEOUT_SECONDS = 4.0
 
 
 def renewal_sustained_cycle_seconds(speed_level: int) -> float:
-    """Return the unchanged-cycle floor without delaying order approval."""
+    """Return zero: renewal cycles never receive an artificial floor."""
 
-    return (
-        RENEWAL_SPEED10_SUSTAINED_CYCLE_SECONDS
-        if int(speed_level) >= 10
-        else 0.0
-    )
-
-
-class RenewalAdaptiveCyclePacer:
-    """Find the fastest sustained popup-open rate without a fixed delay."""
-
-    def __init__(
-        self,
-        enabled: bool,
-        initial_floor_seconds: float = 0.0,
-    ):
-        self.enabled = bool(enabled)
-        self.floor_seconds = (
-            max(0.0, float(initial_floor_seconds))
-            if self.enabled
-            else 0.0
-        )
-        self.increases = 0
-        self.decreases = 0
-        self.successes_since_failure = 0
-        self.failure_level = 0
-        self._successful_cycles: deque[float] = deque(maxlen=240)
-
-    def record_success(self, cycle_seconds: float) -> None:
-        if not self.enabled:
-            return
-        measured = max(0.0, float(cycle_seconds))
-        if measured > 0.0:
-            self._successful_cycles.append(measured)
-        self.successes_since_failure += 1
-        if (
-            self.floor_seconds > 0.0
-            and self.successes_since_failure
-            >= RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES
-        ):
-            self.floor_seconds = max(
-                0.0,
-                self.floor_seconds
-                - RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS,
-            )
-            self.successes_since_failure = 0
-            self.failure_level = max(0, self.failure_level - 1)
-            self.decreases += 1
-
-    def record_failure(self) -> float:
-        if not self.enabled:
-            return 0.0
-        baseline = (
-            float(np.median(self._successful_cycles))
-            if self._successful_cycles
-            else RENEWAL_ADAPTIVE_PACING_FALLBACK_CYCLE_SECONDS
-        )
-        measured_target = (
-            baseline
-            + RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS
-        )
-        stepped_target = (
-            self.floor_seconds
-            + RENEWAL_ADAPTIVE_PACING_FAILURE_STEP_SECONDS
-            if self.floor_seconds > 0.0
-            else 0.0
-        )
-        self.floor_seconds = min(
-            RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS,
-            max(measured_target, stepped_target),
-        )
-        self.successes_since_failure = 0
-        self.increases += 1
-        self.failure_level += 1
-        return min(
-            RENEWAL_ADAPTIVE_RECOVERY_MAX_SECONDS,
-            RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS
-            + (self.failure_level - 1)
-            * RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS,
-        )
-
-    def delay_seconds(self, elapsed_seconds: float) -> float:
-        if not self.enabled:
-            return 0.0
-        return max(
-            0.0,
-            self.floor_seconds - max(0.0, float(elapsed_seconds)),
-        )
+    _ = speed_level
+    return 0.0
 
 
 def is_supported_renewal_wgc_size(width: int, height: int) -> bool:
@@ -4272,7 +4159,6 @@ class FastRenewalRunner:
         continuous_monitor: bool = False,
         active_until: Optional[float] = None,
         time_valid: Optional[Callable[[], bool]] = None,
-        sustained_pacing: bool = True,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -4286,7 +4172,6 @@ class FastRenewalRunner:
         self.continuous_monitor = bool(
             continuous_monitor and self.monitor_only
         )
-        self.sustained_pacing = bool(sustained_pacing)
         self.active_until = (
             None if active_until is None else float(active_until)
         )
@@ -4342,6 +4227,9 @@ class FastRenewalRunner:
             "server_pressure_detected": False,
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
+            "unlimited_cycle_mode": self.profile.speed_level == 10,
+            "artificial_waits": 0,
+            "artificial_wait_ms": 0.0,
             "action_context_rejections": 0,
             "action_context_luma": 0.0,
             "action_context_edge": 0.0,
@@ -4567,15 +4455,6 @@ class FastRenewalRunner:
 
         required_frames = 2 if self.profile.speed_level >= 8 else 3
         required_arm_openings = 2
-        adaptive_pacer = RenewalAdaptiveCyclePacer(
-            self.sustained_pacing and self.profile.speed_level == 10,
-            renewal_sustained_cycle_seconds(
-                self.profile.speed_level
-            ),
-        )
-        self.telemetry["adaptive_pacing_enabled"] = (
-            adaptive_pacer.enabled
-        )
         transition_mode_enabled = bool(
             self.profile.first_frame_fast_exit
             and self.profile.speed_level == 10
@@ -4609,7 +4488,7 @@ class FastRenewalRunner:
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"전환 가격 2프레임 {'ON' if transition_mode_enabled else 'OFF'}, "
-            "완성 팝업 대기 없음, "
+            "완성 팝업 대기 없음, 인위적 사이클 대기 0ms, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
 
@@ -4676,75 +4555,12 @@ class FastRenewalRunner:
                 }
             )
 
-        def update_adaptive_pacing_telemetry() -> None:
-            self.telemetry["cycle_floor_ms"] = (
-                adaptive_pacer.floor_seconds * 1000.0
-            )
-            self.telemetry["adaptive_pacing_increases"] = (
-                adaptive_pacer.increases
-            )
-            self.telemetry["adaptive_pacing_decreases"] = (
-                adaptive_pacer.decreases
-            )
-            self.telemetry["adaptive_successes_since_failure"] = (
-                adaptive_pacer.successes_since_failure
-            )
-            self.telemetry["adaptive_failure_level"] = (
-                adaptive_pacer.failure_level
-            )
+        def record_completed_cycle(action_started: float) -> None:
+            """Record natural FC/WGC latency without adding any delay."""
 
-        def pace_completed_cycle(
-            action_started: float,
-            *,
-            open_failed: bool,
-        ) -> bool:
-            cycle_elapsed = time.perf_counter() - action_started
-            recovery_delay = 0.0
-            if open_failed:
-                recovery_delay = adaptive_pacer.record_failure()
-            else:
-                adaptive_pacer.record_success(cycle_elapsed)
-            update_adaptive_pacing_telemetry()
-            pacing_delay = (
-                recovery_delay
-                if open_failed
-                else adaptive_pacer.delay_seconds(cycle_elapsed)
-            )
-            if pacing_delay > 0.0:
-                self.telemetry["pacing_waits"] = (
-                    int(self.telemetry["pacing_waits"]) + 1
-                )
-                self.telemetry["pacing_total_ms"] = (
-                    float(self.telemetry["pacing_total_ms"])
-                    + pacing_delay * 1000.0
-                )
-                if open_failed:
-                    self.telemetry["adaptive_recovery_waits"] = (
-                        int(
-                            self.telemetry[
-                                "adaptive_recovery_waits"
-                            ]
-                        )
-                        + 1
-                    )
-                    self.telemetry["adaptive_recovery_total_ms"] = (
-                        float(
-                            self.telemetry[
-                                "adaptive_recovery_total_ms"
-                            ]
-                        )
-                        + pacing_delay * 1000.0
-                    )
-                if self._wait(pacing_delay):
-                    cycle_latencies.append(
-                        (time.perf_counter() - action_started) * 1000.0
-                    )
-                    update_performance_telemetry()
-                    return True
             cycle_latencies.append(
                 (time.perf_counter() - action_started) * 1000.0
             )
-            return False
 
         def next_guard_packet(
             deadline: float,
@@ -5598,11 +5414,7 @@ class FastRenewalRunner:
                         "다른 선수→감시 선수를 왕복했고 활성 버튼·"
                         "목표 행·닫힌 가격표를 2프레임 확인했습니다."
                     )
-                    if pace_completed_cycle(
-                        action_started,
-                        open_failed=False,
-                    ):
-                        return False
+                    record_completed_cycle(action_started)
                     continue
                 if recovery_state == "unsafe":
                     update_performance_telemetry()
@@ -5620,28 +5432,9 @@ class FastRenewalRunner:
                 if recovery_state == "ready_enabled":
                     # The click was dropped while the exact target list state
                     # remained visible. Sending ESC here would close the
-                    # transfer market, so retry only after adaptive pacing.
+                    # transfer market, so retry immediately.
                     self.telemetry["popup_may_be_open"] = False
-                if pace_completed_cycle(
-                    action_started,
-                    open_failed=True,
-                ):
-                    return False
-                if (
-                    adaptive_pacer.enabled
-                    and adaptive_pacer.failure_level
-                    >= RENEWAL_SERVER_PRESSURE_FAILURE_LIMIT
-                ):
-                    self.telemetry["server_pressure_detected"] = True
-                    self.status(
-                        "FC 조회 제한 신호 · 주문 없이 즉시 정지"
-                    )
-                    self.log(
-                        "[안전 정지 v12] 열기 실패가 2회 누적되어 "
-                        "FC 조회 제한 악화를 막기 위해 정지합니다."
-                    )
-                    update_performance_telemetry()
-                    return False
+                record_completed_cycle(action_started)
                 if consecutive_open_failures == 3:
                     self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")
                     self.log(
@@ -5905,11 +5698,7 @@ class FastRenewalRunner:
                         raise RenewalCaptureRestart(
                             "무주문 변경 확인 뒤 목록 화면 미확인"
                         )
-                    if pace_completed_cycle(
-                        action_started,
-                        open_failed=False,
-                    ):
-                        return False
+                    record_completed_cycle(action_started)
                     continue
 
                 if order_latched:
@@ -6051,11 +5840,7 @@ class FastRenewalRunner:
                     raise RenewalCaptureRestart(
                         "동일가격 팝업을 닫은 뒤 목록 화면 미확인"
                     )
-                if pace_completed_cycle(
-                    action_started,
-                    open_failed=False,
-                ):
-                    return False
+                record_completed_cycle(action_started)
             else:
                 # 팝업이 완전히 열리지 않았거나 고유 프레임이 부족한 사이클입니다.
                 fast_exit_streak = 0

@@ -474,7 +474,6 @@ def _run(
             status=lambda _message: None,
             monitor_only=monitor_only,
             continuous_monitor=continuous_monitor,
-            sustained_pacing=False,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -482,154 +481,13 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
-    def test_speed10_uses_server_safe_unchanged_cycle_floor(
-        self,
-    ) -> None:
-        self.assertEqual(
-            renewal.renewal_sustained_cycle_seconds(10),
-            2.000,
-        )
-        self.assertEqual(
-            renewal.renewal_sustained_cycle_seconds(9),
-            0.0,
-        )
-
-    def test_server_safe_initial_floor_does_not_delay_disabled_mode(
-        self,
-    ) -> None:
-        enabled = renewal.RenewalAdaptiveCyclePacer(
-            enabled=True,
-            initial_floor_seconds=2.000,
-        )
-        disabled = renewal.RenewalAdaptiveCyclePacer(
-            enabled=False,
-            initial_floor_seconds=2.000,
-        )
-        self.assertEqual(enabled.floor_seconds, 2.000)
-        self.assertGreater(enabled.delay_seconds(0.340), 0.0)
-        self.assertEqual(disabled.floor_seconds, 0.0)
-        self.assertEqual(disabled.delay_seconds(0.0), 0.0)
-
-    def test_failed_open_never_reduces_server_safe_floor(self) -> None:
-        fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "renewal_sustained_open_failure_11s.json"
-        )
-        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        pacer = renewal.RenewalAdaptiveCyclePacer(
-            enabled=True,
-            initial_floor_seconds=float(
-                fixture["configured_cycle_floor_seconds"]
-            ),
-        )
-
-        recovery = pacer.record_failure()
-
-        self.assertGreaterEqual(
-            pacer.floor_seconds,
-            float(fixture["configured_cycle_floor_seconds"]),
-        )
-        self.assertNotEqual(
-            pacer.floor_seconds,
-            float(fixture["incorrect_reported_cycle_floor_seconds"]),
-        )
-        self.assertGreaterEqual(
-            recovery,
-            renewal.RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS,
-        )
-        self.assertEqual(int(fixture["order_inputs"]), 0)
-
-    def test_server_safe_floor_has_headroom_below_live_rejection_rate(
-        self,
-    ) -> None:
-        fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "renewal_sustained_open_failure_552s.json"
-        )
-        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        safe_requests = (
-            renewal.RENEWAL_SERVER_REQUEST_WINDOW_SECONDS
-            / renewal.renewal_sustained_cycle_seconds(10)
-        )
-        self.assertEqual(
-            safe_requests,
-            renewal.RENEWAL_SERVER_SAFE_REQUESTS_PER_WINDOW,
-        )
-        self.assertLess(
-            safe_requests,
-            float(fixture["popup_openings"]) * 0.90,
-        )
-        self.assertEqual(int(fixture["order_inputs"]), 0)
-        self.assertTrue(bool(fixture["server_pressure_detected"]))
-
-    def test_adaptive_pacer_reacts_to_recorded_open_failure_burst(
-        self,
-    ) -> None:
-        fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "renewal_sustained_open_failure_390s.json"
-        )
-        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        natural_cycle = float(
-            fixture["natural_success_cycle_seconds"]
-        )
-        pacer = renewal.RenewalAdaptiveCyclePacer(enabled=True)
-        for _ in range(240):
-            pacer.record_success(natural_cycle)
-
-        first_recovery = pacer.record_failure()
-        self.assertGreaterEqual(
-            pacer.floor_seconds,
-            natural_cycle
-            + renewal.RENEWAL_ADAPTIVE_PACING_FAILURE_HEADROOM_SECONDS,
-        )
-        self.assertGreaterEqual(
-            first_recovery,
-            renewal.RENEWAL_ADAPTIVE_RECOVERY_BASE_SECONDS,
-        )
-        self.assertGreater(
-            pacer.delay_seconds(natural_cycle),
-            0.0,
-        )
-
-        second_recovery = pacer.record_failure()
-        self.assertGreaterEqual(
-            second_recovery,
-            first_recovery
-            + renewal.RENEWAL_ADAPTIVE_RECOVERY_STEP_SECONDS,
-        )
-        for _ in range(int(fixture["open_failures"]) - 2):
-            pacer.record_failure()
-        self.assertEqual(
-            pacer.increases,
-            int(fixture["open_failures"]),
-        )
-        self.assertLessEqual(
-            pacer.floor_seconds,
-            renewal.RENEWAL_ADAPTIVE_PACING_MAX_CYCLE_SECONDS,
-        )
-
-        floor_before_decay = pacer.floor_seconds
-        for _ in range(
-            renewal.RENEWAL_ADAPTIVE_PACING_DECAY_SUCCESSES
-        ):
-            pacer.record_success(natural_cycle)
-        self.assertAlmostEqual(
-            pacer.floor_seconds,
-            floor_before_decay
-            - renewal.RENEWAL_ADAPTIVE_PACING_DECAY_STEP_SECONDS,
-            places=6,
-        )
-
-    def test_disabled_adaptive_pacer_never_delays(self) -> None:
-        pacer = renewal.RenewalAdaptiveCyclePacer(enabled=False)
-        pacer.record_success(0.340)
-        self.assertEqual(pacer.record_failure(), 0.0)
-        self.assertEqual(pacer.floor_seconds, 0.0)
-        self.assertEqual(pacer.delay_seconds(0.0), 0.0)
+    def test_all_speeds_have_zero_artificial_cycle_floor(self) -> None:
+        for speed_level in range(1, 11):
+            with self.subTest(speed_level=speed_level):
+                self.assertEqual(
+                    renewal.renewal_sustained_cycle_seconds(speed_level),
+                    0.0,
+                )
 
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
@@ -1999,7 +1857,6 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
-
     def test_transition_price_exits_on_second_unique_frame_after_arming(
         self,
     ) -> None:
@@ -2700,6 +2557,15 @@ class RenewalSafetyTests(unittest.TestCase):
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
+        telemetry = engine.runner_telemetry
+        self.assertTrue(telemetry["unlimited_cycle_mode"])
+        self.assertEqual(telemetry["artificial_waits"], 0)
+        self.assertEqual(telemetry["artificial_wait_ms"], 0.0)
+        self.assertEqual(telemetry["pacing_waits"], 0)
+        self.assertEqual(telemetry["pacing_total_ms"], 0.0)
+        self.assertFalse(telemetry["adaptive_pacing_enabled"])
+        self.assertEqual(telemetry["cycle_floor_ms"], 0.0)
+        self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_stable_change_orders_once_in_correct_sequence_and_stops(self) -> None:
         stop_event = threading.Event()

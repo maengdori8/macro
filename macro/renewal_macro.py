@@ -66,7 +66,6 @@ from macroapp.renewal import (
     is_supported_renewal_wgc_size,
     load_renewal_profile,
     price_box_in_guard,
-    renewal_sustained_cycle_seconds,
     save_renewal_profile,
     save_renewal_diagnostic,
     validate_limit_price_selection,
@@ -123,7 +122,7 @@ HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
 HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
 HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS = 5.0
-HEADLESS_MONITOR_EXPECTED_PACED_CYCLE_RATIO = 0.93
+HEADLESS_MONITOR_UNLIMITED_MIN_CYCLES_PER_SECOND = 1.5
 
 
 def _headless_open_failure_summary(
@@ -170,16 +169,20 @@ def _headless_minimum_confirmed_openings(
     duration_seconds: float,
     speed_level: int,
 ) -> int:
-    """Set the soak floor from the sustained pacing used by the runner."""
+    """Require the minimum useful throughput for unlimited speed 10."""
 
     duration = max(0.0, float(duration_seconds))
-    cycle_floor = renewal_sustained_cycle_seconds(speed_level)
-    expected_rate = (
-        HEADLESS_MONITOR_EXPECTED_PACED_CYCLE_RATIO / cycle_floor
-        if cycle_floor > 0.0
-        else 1.5
+    _ = speed_level
+    return min(
+        1000,
+        max(
+            2,
+            int(
+                duration
+                * HEADLESS_MONITOR_UNLIMITED_MIN_CYCLES_PER_SECOND
+            ),
+        ),
     )
-    return min(1000, max(2, int(duration * expected_rate)))
 
 
 def _headless_checkpoint_resources(
@@ -2754,6 +2757,17 @@ def _headless_monitor_existing(
             telemetry.get("server_pressure_detected", False)
         )
         elapsed = time.perf_counter() - started
+        unlimited_cycle_mode = bool(
+            telemetry.get("unlimited_cycle_mode", False)
+        )
+        artificial_waits = int(telemetry.get("artificial_waits", 0))
+        artificial_wait_ms = float(
+            telemetry.get("artificial_wait_ms", 0.0)
+        )
+        cycle_p50_ms = float(telemetry.get("cycle_p50_ms", 0.0))
+        confirmed_cycles_per_second = (
+            float(confirmed_openings) / elapsed if elapsed > 0.0 else 0.0
+        )
         duration_completed = bool(
             not monitor_detected
             and not initial_mismatch
@@ -2767,9 +2781,13 @@ def _headless_monitor_existing(
             and not initial_mismatch
             and not monitor_pending_change
             and not server_pressure_detected
+            and unlimited_cycle_mode
+            and artificial_waits == 0
+            and artificial_wait_ms == 0.0
             and max_open_failures < 3
             and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings
+            and cycle_p50_ms <= 400.0
             and duration_completed
             and bool(resources.get("within_limits", False))
         )
@@ -2778,6 +2796,13 @@ def _headless_monitor_existing(
                 "passed": passed,
                 "order_inputs": order_inputs,
                 "minimum_confirmed_openings": minimum_confirmed_openings,
+                "confirmed_cycles_per_second": (
+                    confirmed_cycles_per_second
+                ),
+                "cycle_p50_limit_ms": 400.0,
+                "unlimited_cycle_mode": unlimited_cycle_mode,
+                "artificial_waits": artificial_waits,
+                "artificial_wait_ms": artificial_wait_ms,
                 "duration_completed": duration_completed,
                 "telemetry": telemetry,
                 "resources": resources,
