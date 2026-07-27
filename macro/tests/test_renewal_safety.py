@@ -304,6 +304,37 @@ class _DroppedActionEngine(_FakeEngine):
             self.stop_event.set()
 
 
+class _DelayedModalDuringGrayRecoveryEngine(_FakeEngine):
+    """A popup arrives only after the gray-list recovery check starts."""
+
+    def __init__(self, stop_event: threading.Event, guard: np.ndarray):
+        super().__init__(
+            stop_event,
+            repeat_guard=guard,
+            stop_after_closes=1,
+        )
+        self.delay_pending = False
+        self.full_packets_after_failure = 0
+
+    def on_click(self, hwnd: int, x: int, y: int) -> None:
+        if (x, y) == (20, 10) and not self.delay_pending:
+            self.clicks.append((x, y))
+            self.action_disabled = True
+            self.mode = "closed"
+            self.open_frames = [self.repeat_guard, self.repeat_guard]
+            self.delay_pending = True
+            return
+        super().on_click(hwnd, x, y)
+
+    def get_latest_frame_packet(self, timeout: float = 0.0):
+        if self.delay_pending and self.capture_region is None:
+            self.full_packets_after_failure += 1
+            if self.full_packets_after_failure == 4:
+                self.mode = "open"
+                self.delay_pending = False
+        return super().get_latest_frame_packet(timeout)
+
+
 def _profile(baseline: np.ndarray, guard: np.ndarray) -> renewal.RenewalProfile:
     full_frame = np.full((100, 200), 128, dtype=np.uint8)
     full_frame[20:80, 100:200] = np.zeros_like(guard)
@@ -2349,6 +2380,40 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(telemetry["recovered_open_failures"], 1)
         self.assertEqual(telemetry["reselection_failures"], 0)
         self.assertEqual(telemetry["reselection_clicks"], 2)
+        self.assertEqual(telemetry["order_clicks"], 0)
+
+    def test_delayed_modal_is_closed_before_any_reselection_click(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DelayedModalDuringGrayRecoveryEngine(
+            stop_event,
+            self.guard,
+        )
+
+        with patch.object(
+            renewal,
+            "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+            0.05,
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                continuous_monitor=True,
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(20, 10)])
+        self.assertEqual(engine.escapes, 1)
+        self.assertEqual(engine.mode, "closed")
+        telemetry = engine.runner_telemetry
+        self.assertEqual(
+            telemetry["reselection_delayed_modal_detections"],
+            1,
+        )
+        self.assertEqual(telemetry["reselection_attempts"], 0)
+        self.assertEqual(telemetry["reselection_clicks"], 0)
         self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_gray_action_does_not_return_to_target_without_alt_evidence(

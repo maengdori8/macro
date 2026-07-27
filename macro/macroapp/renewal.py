@@ -117,6 +117,7 @@ RENEWAL_POPUP_CLEANUP_GRACE_SECONDS = 0.65
 # calibrated target row is selected again.
 RENEWAL_RESELECT_VERIFY_FRAMES = 2
 RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS = 0.65
+RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS = 0.65
 RENEWAL_RESELECT_LIST_BOUNDS = (0.14, 0.18, 0.46, 0.90)
 RENEWAL_RESELECT_MIN_POINT_DISTANCE = 0.025
 # FC replaces both ends of a selected player row with hover controls
@@ -4323,6 +4324,7 @@ class FastRenewalRunner:
             "reselection_attempts": 0,
             "reselection_successes": 0,
             "recovered_open_failures": 0,
+            "reselection_delayed_modal_detections": 0,
             "reselection_failures": 0,
             "reselection_clicks": 0,
             "reselection_unsafe_rejections": 0,
@@ -4901,6 +4903,52 @@ class FastRenewalRunner:
                 )
             return ready
 
+        def classify_full_state(frame: np.ndarray) -> str:
+            if (
+                frame.ndim != 2
+                or frame.shape[1] < frame_width
+                or frame.shape[0] < frame_height
+            ):
+                return "unknown"
+            content = frame[:frame_height, :frame_width]
+            gx1, gy1, gx2, gy2 = guard_region
+            guard = content[gy1:gy2, gx1:gx2]
+            modal_valid = modal_guard.register(
+                guard,
+                side_profile.guard_luma_noise,
+                side_profile.guard_edge_noise,
+            ).valid
+            ready_valid = ready_guard.register(
+                guard,
+                side_profile.closed_guard_luma_noise,
+                side_profile.closed_guard_edge_noise,
+            ).valid
+            action_validation = validate_action_ready_frame(
+                content,
+                side_profile,
+            )
+            self.telemetry["action_context_luma"] = (
+                action_validation.luma_delta
+            )
+            self.telemetry["action_context_edge"] = (
+                action_validation.edge_delta
+            )
+            target_validation = validate_reselect_target_frame(
+                content,
+                side_profile,
+            )
+            if modal_valid:
+                return "modal"
+            if ready_valid and target_validation.valid:
+                return (
+                    "ready_enabled"
+                    if action_validation.valid
+                    else "ready_disabled"
+                )
+            if not target_validation.valid:
+                return "target_left"
+            return "unknown"
+
         def observe_full_state(
             deadline: float,
             *,
@@ -4920,54 +4968,7 @@ class FastRenewalRunner:
                 )
                 if packet is None:
                     return "unknown"
-                frame = packet.image
-                if (
-                    frame.ndim != 2
-                    or frame.shape[1] < frame_width
-                    or frame.shape[0] < frame_height
-                ):
-                    stable_state = ""
-                    stable_count = 0
-                    continue
-                content = frame[:frame_height, :frame_width]
-                gx1, gy1, gx2, gy2 = guard_region
-                guard = content[gy1:gy2, gx1:gx2]
-                modal_valid = modal_guard.register(
-                    guard,
-                    side_profile.guard_luma_noise,
-                    side_profile.guard_edge_noise,
-                ).valid
-                ready_valid = ready_guard.register(
-                    guard,
-                    side_profile.closed_guard_luma_noise,
-                    side_profile.closed_guard_edge_noise,
-                ).valid
-                action_validation = validate_action_ready_frame(
-                    content,
-                    side_profile,
-                )
-                self.telemetry["action_context_luma"] = (
-                    action_validation.luma_delta
-                )
-                self.telemetry["action_context_edge"] = (
-                    action_validation.edge_delta
-                )
-                target_validation = validate_reselect_target_frame(
-                    content,
-                    side_profile,
-                )
-                if modal_valid:
-                    state = "modal"
-                elif ready_valid and target_validation.valid:
-                    state = (
-                        "ready_enabled"
-                        if action_validation.valid
-                        else "ready_disabled"
-                    )
-                elif not target_validation.valid:
-                    state = "target_left"
-                else:
-                    state = "unknown"
+                state = classify_full_state(packet.image)
                 if state == stable_state:
                     stable_count += 1
                 else:
@@ -4979,6 +4980,30 @@ class FastRenewalRunner:
                 ):
                     return state
             return "unknown"
+
+        def observe_delayed_modal_grace(deadline: float) -> str:
+            """Hold a proven gray list state long enough to catch a late popup."""
+
+            ready_disabled_frames = 0
+            while (
+                not self.stop_event.is_set()
+                and self._time_window_active()
+            ):
+                packet = next_guard_packet(deadline)
+                if packet is None:
+                    return (
+                        "ready_disabled"
+                        if ready_disabled_frames
+                        >= RENEWAL_RESELECT_VERIFY_FRAMES
+                        else "unsafe"
+                    )
+                state = classify_full_state(packet.image)
+                if state in ("modal", "ready_enabled"):
+                    return state
+                if state != "ready_disabled":
+                    return "unsafe"
+                ready_disabled_frames += 1
+            return "unsafe"
 
         def recover_disabled_action() -> str:
             """Recover only a proven gray action button on the target row.
@@ -5018,6 +5043,35 @@ class FastRenewalRunner:
                     )
                     + 1
                 )
+                grace_state = observe_delayed_modal_grace(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS
+                )
+                if grace_state == "modal":
+                    self.telemetry[
+                        "reselection_delayed_modal_detections"
+                    ] = (
+                        int(
+                            self.telemetry[
+                                "reselection_delayed_modal_detections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "modal"
+                if grace_state == "ready_enabled":
+                    self.telemetry["popup_may_be_open"] = False
+                    return "ready_enabled"
+                if grace_state != "ready_disabled":
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
                 self.telemetry["reselection_attempts"] = (
                     int(self.telemetry["reselection_attempts"]) + 1
                 )
