@@ -4480,6 +4480,7 @@ class FastRenewalRunner:
             "reselection_successes": 0,
             "recovered_open_failures": 0,
             "reselection_delayed_modal_detections": 0,
+            "reselection_transient_dim_frames": 0,
             "reselection_failures": 0,
             "reselection_clicks": 0,
             "reselection_unsafe_rejections": 0,
@@ -5333,6 +5334,43 @@ class FastRenewalRunner:
                     and state == "ready_disabled"
                 ):
                     return state
+                if (
+                    state in ("unsafe", "unknown")
+                    and bool(
+                        last_reselection_metrics.get(
+                            "identity_valid",
+                            False,
+                        )
+                    )
+                    and not bool(
+                        last_reselection_metrics.get(
+                            "modal_valid",
+                            False,
+                        )
+                    )
+                ):
+                    # FC briefly dims the exact same target/list screen when
+                    # its purchase endpoint has saturated. The target glyph
+                    # identity remains exact, but the closed guard and button
+                    # fills are temporarily invalid. This helper is entered
+                    # only after two fresh frames already proved the normal
+                    # disabled target state. Hold the full delayed-popup
+                    # grace, count only the still-exact player identity as
+                    # continuity, and then allow only the row-reselection
+                    # recovery. It can never authorize the action/order
+                    # button.
+                    self.telemetry[
+                        "reselection_transient_dim_frames"
+                    ] = (
+                        int(
+                            self.telemetry[
+                                "reselection_transient_dim_frames"
+                            ]
+                        )
+                        + 1
+                    )
+                    expected_frames += 1
+                    continue
                 if state != expected_state:
                     return "unsafe"
                 expected_frames += 1

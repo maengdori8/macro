@@ -294,6 +294,43 @@ class _DisabledActionRecoveryEngine(_FakeEngine):
         super().on_click(hwnd, x, y)
 
 
+class _TransientDimGrayRecoveryEngine(_DisabledActionRecoveryEngine):
+    """Dims the identity-matched list briefly after a proven gray button."""
+
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        guard: np.ndarray,
+    ):
+        super().__init__(stop_event, guard)
+        self.full_packets_after_failure = 0
+        self.dim_current_frame = False
+
+    def get_latest_frame_packet(self, timeout: float = 0.0):
+        if (
+            not self.disable_first_action
+            and self.action_disabled
+            and self.capture_region is None
+        ):
+            self.full_packets_after_failure += 1
+            self.dim_current_frame = (
+                self.full_packets_after_failure in (3, 4)
+            )
+        else:
+            self.dim_current_frame = False
+        return super().get_latest_frame_packet(timeout)
+
+    def render_full_frame(self) -> np.ndarray:
+        frame = super().render_full_frame()
+        if self.dim_current_frame:
+            frame = np.clip(
+                frame.astype(np.float32) * 0.75 + 25.0,
+                0,
+                255,
+            ).astype(np.uint8)
+        return frame
+
+
 class _DroppedTargetReselectEngine(_FakeEngine):
     """Drops a configurable number of safe target-row reselection clicks."""
 
@@ -551,9 +588,10 @@ def _run(
             video_speed_mode=video_speed_mode,
             video_target_cycle_seconds=video_target_cycle_seconds,
         )
-        completed = runner.run()
-        engine.runner_telemetry = dict(runner.telemetry)
-        return completed
+        try:
+            return runner.run()
+        finally:
+            engine.runner_telemetry = dict(runner.telemetry)
 
 
 class RenewalSafetyTests(unittest.TestCase):
@@ -2849,6 +2887,39 @@ class RenewalSafetyTests(unittest.TestCase):
             places=3,
         )
         self.assertEqual(telemetry["video_accelerations"], 0)
+        self.assertEqual(telemetry["order_clicks"], 0)
+
+    def test_gray_recovery_waits_through_identity_matched_dim_frames(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _TransientDimGrayRecoveryEngine(
+            stop_event,
+            self.guard,
+        )
+
+        with patch.object(
+            renewal,
+            "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+            0.020,
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                continuous_monitor=True,
+            )
+
+        self.assertFalse(completed)
+        telemetry = engine.runner_telemetry
+        self.assertGreaterEqual(
+            telemetry["reselection_transient_dim_frames"],
+            1,
+        )
+        self.assertEqual(telemetry["runtime_disabled_action_detections"], 1)
+        self.assertEqual(telemetry["reselection_attempts"], 1)
+        self.assertEqual(telemetry["reselection_successes"], 1)
+        self.assertEqual(telemetry["reselection_failures"], 0)
         self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_delayed_modal_is_closed_before_any_reselection_click(
