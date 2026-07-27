@@ -1048,6 +1048,31 @@ def validate_reselect_target_frame(
     )
 
 
+def validate_reselect_target_identity_frame(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+) -> ActionReadyValidation:
+    """Match the calibrated target row while ignoring its selected fill.
+
+    FC renders the same player row with opposite foreground/background tones
+    after another row is selected. The glyph edges remain stable while the
+    uniform fill changes heavily. This relaxed result may authorize only a
+    click on the calibrated target row. Opening a purchase/sale popup still
+    requires ``validate_reselect_target_frame`` to pass afterwards.
+    """
+
+    return _validate_calibrated_anchor(
+        full_frame,
+        side_profile,
+        side_profile.reselect_target_rect,
+        side_profile.reselect_target_png,
+        luma_limit=255.0,
+        edge_limit=0.080,
+        preserve_uniform_fill=False,
+        compare_x_fraction=RENEWAL_RESELECT_ANCHOR_X_FRACTION,
+    )
+
+
 @dataclass(frozen=True)
 class PriceRegionValidation:
     valid: bool
@@ -4328,6 +4353,10 @@ class FastRenewalRunner:
             "reselection_failures": 0,
             "reselection_clicks": 0,
             "reselection_unsafe_rejections": 0,
+            "startup_target_restore_attempts": 0,
+            "startup_target_restore_successes": 0,
+            "startup_target_restore_failures": 0,
+            "startup_target_restore_delayed_modal_detections": 0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -4937,6 +4966,12 @@ class FastRenewalRunner:
                 content,
                 side_profile,
             )
+            target_identity_validation = (
+                validate_reselect_target_identity_frame(
+                    content,
+                    side_profile,
+                )
+            )
             if modal_valid:
                 return "modal"
             if ready_valid and target_validation.valid:
@@ -4945,7 +4980,7 @@ class FastRenewalRunner:
                     if action_validation.valid
                     else "ready_disabled"
                 )
-            if not target_validation.valid:
+            if ready_valid and target_identity_validation.valid:
                 return "target_left"
             return "unknown"
 
@@ -4981,10 +5016,14 @@ class FastRenewalRunner:
                     return state
             return "unknown"
 
-        def observe_delayed_modal_grace(deadline: float) -> str:
-            """Hold a proven gray list state long enough to catch a late popup."""
+        def observe_delayed_modal_grace(
+            deadline: float,
+            *,
+            expected_state: str = "ready_disabled",
+        ) -> str:
+            """Hold a proven list state long enough to catch a late popup."""
 
-            ready_disabled_frames = 0
+            expected_frames = 0
             while (
                 not self.stop_event.is_set()
                 and self._time_window_active()
@@ -4992,18 +5031,120 @@ class FastRenewalRunner:
                 packet = next_guard_packet(deadline)
                 if packet is None:
                     return (
-                        "ready_disabled"
-                        if ready_disabled_frames
+                        expected_state
+                        if expected_frames
                         >= RENEWAL_RESELECT_VERIFY_FRAMES
                         else "unsafe"
                     )
                 state = classify_full_state(packet.image)
                 if state in ("modal", "ready_enabled"):
                     return state
-                if state != "ready_disabled":
+                if (
+                    expected_state == "target_left"
+                    and state == "ready_disabled"
+                ):
+                    return state
+                if state != expected_state:
                     return "unsafe"
-                ready_disabled_frames += 1
+                expected_frames += 1
             return "unsafe"
+
+        def restore_startup_target() -> str:
+            """Restore a visible calibrated target row before monitoring.
+
+            The identity-only match can authorize the target-row click but
+            never the action button. Two fresh fully selected target frames
+            must pass after the click before normal action validation runs.
+            """
+
+            try:
+                engine.set_capture_region(None)
+                state = observe_full_state(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS
+                )
+                if state in ("ready_enabled", "ready_disabled", "modal"):
+                    return state
+                if state != "target_left":
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
+
+                grace_state = observe_delayed_modal_grace(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS,
+                    expected_state="target_left",
+                )
+                if grace_state == "modal":
+                    self.telemetry[
+                        "startup_target_restore_delayed_modal_detections"
+                    ] = (
+                        int(
+                            self.telemetry[
+                                "startup_target_restore_delayed_modal_detections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "modal"
+                if grace_state in ("ready_enabled", "ready_disabled"):
+                    return grace_state
+                if grace_state != "target_left":
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
+
+                self.telemetry["startup_target_restore_attempts"] = (
+                    int(
+                        self.telemetry[
+                            "startup_target_restore_attempts"
+                        ]
+                    )
+                    + 1
+                )
+                target_started = time.perf_counter()
+                clicker.click_prepared(reselect_target_click)
+                self.telemetry["reselection_clicks"] = (
+                    int(self.telemetry["reselection_clicks"]) + 1
+                )
+                target_state = observe_full_state(
+                    time.monotonic()
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                    not_before=target_started,
+                )
+                if target_state in ("ready_enabled", "ready_disabled"):
+                    self.telemetry["startup_target_restore_successes"] = (
+                        int(
+                            self.telemetry[
+                                "startup_target_restore_successes"
+                            ]
+                        )
+                        + 1
+                    )
+                    return target_state
+                self.telemetry["startup_target_restore_failures"] = (
+                    int(
+                        self.telemetry[
+                            "startup_target_restore_failures"
+                        ]
+                    )
+                    + 1
+                )
+                return target_state if target_state == "modal" else "unsafe"
+            finally:
+                engine.set_capture_region(guard_region)
 
         def recover_disabled_action() -> str:
             """Recover only a proven gray action button on the target row.
@@ -5138,6 +5279,25 @@ class FastRenewalRunner:
         if self.stop_event.is_set():
             update_performance_telemetry()
             return False
+
+        startup_target_state = restore_startup_target()
+        if startup_target_state == "modal":
+            self.telemetry["popup_may_be_open"] = True
+            self.telemetry["current_popup_escape_sent"] = False
+            if not close_modal():
+                raise RenewalCaptureRestart(
+                    "A delayed popup appeared while restoring the target "
+                    "player row and could not be proven closed."
+                )
+            startup_target_state = restore_startup_target()
+        if startup_target_state not in ("ready_enabled", "ready_disabled"):
+            self.telemetry["action_context_rejections"] = (
+                int(self.telemetry["action_context_rejections"]) + 1
+            )
+            raise RuntimeError(
+                "The calibrated target player row could not be restored "
+                "safely. No purchase/sale action was sent."
+            )
 
         startup_action_state = recover_disabled_action()
         if self.stop_event.is_set():

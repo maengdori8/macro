@@ -100,6 +100,7 @@ class _FakeEngine:
         self.closed_guard = np.zeros((60, 100), dtype=np.uint8)
         self.full_frame = np.full((100, 200), 128, dtype=np.uint8)
         self.target_selected = True
+        self.target_identity_matches = True
         self.action_disabled = False
         self.sequence_id = 0
         self.runner_telemetry: dict[str, object] = {}
@@ -152,6 +153,9 @@ class _FakeEngine:
             frame[7:14, 8:33] = 40
         if not self.target_selected:
             frame[28:33, 29:72] = 40
+        if not self.target_identity_matches:
+            frame[28:30, 29:72] = 0
+            frame[30:33, 29:72] = 255
         return frame
 
     def on_click(self, _hwnd: int, x: int, y: int) -> None:
@@ -331,6 +335,29 @@ class _DelayedModalDuringGrayRecoveryEngine(_FakeEngine):
             self.full_packets_after_failure += 1
             if self.full_packets_after_failure == 4:
                 self.mode = "open"
+                self.delay_pending = False
+        return super().get_latest_frame_packet(timeout)
+
+
+class _DelayedModalDuringStartupTargetRestoreEngine(_FakeEngine):
+    """A popup appears while an unselected target row is being observed."""
+
+    def __init__(self, stop_event: threading.Event, guard: np.ndarray):
+        super().__init__(
+            stop_event,
+            repeat_guard=guard,
+            stop_after_closes=2,
+        )
+        self.target_selected = False
+        self.delay_pending = True
+        self.full_packets = 0
+
+    def get_latest_frame_packet(self, timeout: float = 0.0):
+        if self.delay_pending and self.capture_region is None:
+            self.full_packets += 1
+            if self.full_packets == 4:
+                self.mode = "open"
+                self.open_frames = [self.repeat_guard, self.repeat_guard]
                 self.delay_pending = False
         return super().get_latest_frame_packet(timeout)
 
@@ -815,6 +842,48 @@ class RenewalSafetyTests(unittest.TestCase):
         frame[y1:y2, left:right] = 0
 
         result = renewal.validate_reselect_target_frame(frame, side)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "context_mismatch")
+
+    def test_target_identity_validation_ignores_selected_fill_only(
+        self,
+    ) -> None:
+        side = self.profile.buy
+        self.assertIsNotNone(side.reselect_target_rect)
+        frame = np.full((100, 200), 128, dtype=np.uint8)
+        x1, y1, x2, y2 = side.reselect_target_rect.to_pixels(200, 100)
+        frame[y1:y2, x1:x2] = 40
+
+        selected = renewal.validate_reselect_target_frame(frame, side)
+        identity = renewal.validate_reselect_target_identity_frame(
+            frame,
+            side,
+        )
+
+        self.assertFalse(selected.valid)
+        self.assertTrue(identity.valid)
+        self.assertEqual(identity.edge_delta, 0.0)
+
+    def test_target_identity_validation_rejects_changed_glyph_edges(
+        self,
+    ) -> None:
+        side = self.profile.buy
+        self.assertIsNotNone(side.reselect_target_rect)
+        frame = np.full((100, 200), 128, dtype=np.uint8)
+        x1, y1, x2, y2 = side.reselect_target_rect.to_pixels(200, 100)
+        width = x2 - x1
+        core_left, core_right = renewal.RENEWAL_RESELECT_ANCHOR_X_FRACTION
+        left = x1 + int(round(width * core_left))
+        right = x1 + int(round(width * core_right))
+        middle = y1 + max(1, (y2 - y1) // 2)
+        frame[y1:middle, left:right] = 0
+        frame[middle:y2, left:right] = 255
+
+        result = renewal.validate_reselect_target_identity_frame(
+            frame,
+            side,
+        )
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "context_mismatch")
@@ -1809,12 +1878,12 @@ class RenewalSafetyTests(unittest.TestCase):
     def test_duplicate_wgc_sequence_ids_never_order(self) -> None:
         stop_event = threading.Event()
         engine = _DuplicateSequenceEngine(stop_event, self.guard)
-        completed = _run(self.profile, engine)
-        self.assertFalse(completed)
-        self.assertEqual(
-            [point for point in engine.clicks if point != (20, 10)],
-            [],
-        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "target player row could not be restored",
+        ):
+            _run(self.profile, engine)
+        self.assertEqual(engine.clicks, [])
 
     def test_expired_schedule_never_sends_game_input(self) -> None:
         stop_event = threading.Event()
@@ -2336,15 +2405,78 @@ class RenewalSafetyTests(unittest.TestCase):
             1,
         )
 
-    def test_wrong_target_row_stops_before_first_click(self) -> None:
+    def test_visible_target_row_is_restored_before_first_open(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            repeat_guard=self.guard,
+            stop_after_closes=1,
+        )
+        engine.target_selected = False
+
+        completed = _run(self.profile, engine, monitor_only=True)
+
+        self.assertFalse(completed)
+        self.assertEqual(engine.clicks, [(50, 30), (20, 10)])
+        self.assertEqual(
+            engine.runner_telemetry["startup_target_restore_attempts"],
+            1,
+        )
+        self.assertEqual(
+            engine.runner_telemetry["startup_target_restore_successes"],
+            1,
+        )
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
+
+    def test_wrong_target_identity_stops_before_first_click(self) -> None:
         stop_event = threading.Event()
         engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
         engine.target_selected = False
+        engine.target_identity_matches = False
 
-        with self.assertRaisesRegex(RuntimeError, "활성 버튼"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "target player row could not be restored",
+        ):
             _run(self.profile, engine)
 
         self.assertEqual(engine.clicks, [])
+
+    def test_delayed_modal_is_closed_before_startup_target_restore(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DelayedModalDuringStartupTargetRestoreEngine(
+            stop_event,
+            self.guard,
+        )
+
+        with patch.object(
+            renewal,
+            "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+            0.05,
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(engine.escapes, 2)
+        self.assertEqual(engine.clicks, [(50, 30), (20, 10)])
+        telemetry = engine.runner_telemetry
+        self.assertEqual(
+            telemetry[
+                "startup_target_restore_delayed_modal_detections"
+            ],
+            1,
+        )
+        self.assertEqual(
+            telemetry["startup_target_restore_successes"],
+            1,
+        )
+        self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_gray_action_reselects_other_then_target_without_order(
         self,
