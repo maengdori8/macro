@@ -30,6 +30,12 @@ import numpy as np
 
 from macroapp import input_message
 from macroapp.capture import CapturedFrame
+from macroapp.renewal_budget import (
+    RENEWAL_REQUEST_INTERVAL_SECONDS,
+    RENEWAL_REQUEST_LIMIT,
+    RENEWAL_REQUEST_WINDOW_SECONDS,
+    RenewalRequestBudget,
+)
 from macroapp.window import InactiveManager
 
 
@@ -88,8 +94,12 @@ RENEWAL_POPUP_CLEANUP_GRACE_SECONDS = 0.65
 # are still present.  The alternate row must then be observed before the
 # calibrated target row is selected again.
 RENEWAL_RESELECT_VERIFY_FRAMES = 2
-RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS = 0.65
+RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS = 0.75
 RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS = 0.65
+RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS = 3
+RENEWAL_RESELECT_HOVER_SECONDS = 0.025
+RENEWAL_RESELECT_DOWN_UP_SECONDS = 0.012
+RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS = (60.0, 120.0, 300.0)
 RENEWAL_RESELECT_LIST_BOUNDS = (0.14, 0.18, 0.46, 0.90)
 RENEWAL_RESELECT_MIN_POINT_DISTANCE = 0.025
 # FC replaces both ends of a selected player row with hover controls
@@ -112,10 +122,13 @@ WGC_SIZE_SETTLE_TIMEOUT_SECONDS = 4.0
 
 
 def renewal_sustained_cycle_seconds(speed_level: int) -> float:
-    """Return zero: renewal cycles never receive an artificial floor."""
+    """Return the evenly spaced cadence used by 30-minute stability mode."""
 
-    _ = speed_level
-    return 0.0
+    return (
+        RENEWAL_REQUEST_INTERVAL_SECONDS
+        if int(speed_level) >= 10
+        else 0.0
+    )
 
 
 def is_supported_renewal_wgc_size(width: int, height: int) -> bool:
@@ -957,6 +970,78 @@ def validate_reselect_target_identity_frame(
         edge_limit=0.080,
         preserve_uniform_fill=False,
         compare_x_fraction=RENEWAL_RESELECT_ANCHOR_X_FRACTION,
+    )
+
+
+def validate_reselect_target_selected_structure(
+    full_frame: np.ndarray,
+    side_profile: RenewalSideProfile,
+) -> ActionReadyValidation:
+    """Detect FC's bright selected-row fill after hover is moved elsewhere.
+
+    Older v14 profiles can contain an anchor captured while hover controls
+    were visible. Player identity remains usable, but exact comparison rejects
+    the same selected row after those controls disappear. This broad fill
+    signal is accepted only together with the identity anchor at runtime.
+    """
+
+    calibrated_size = side_profile.calibrated_frame_size()
+    point = side_profile.reselect_target_point
+    rect = side_profile.reselect_target_rect
+    if (
+        full_frame is None
+        or full_frame.size == 0
+        or calibrated_size is None
+        or point is None
+        or rect is None
+    ):
+        return ActionReadyValidation(
+            False,
+            float("inf"),
+            1.0,
+            "missing_selected_row",
+        )
+    width, height = calibrated_size
+    if (
+        full_frame.ndim != 2
+        or full_frame.shape[1] < width
+        or full_frame.shape[0] < height
+    ):
+        return ActionReadyValidation(
+            False,
+            float("inf"),
+            1.0,
+            "frame_shape",
+        )
+    rx1, ry1, rx2, ry2 = rect.to_pixels(width, height)
+    x1 = max(
+        rx1,
+        int(round(RENEWAL_RESELECT_LIST_BOUNDS[0] * width)),
+    )
+    x2 = min(
+        rx2,
+        int(round(RENEWAL_RESELECT_LIST_BOUNDS[2] * width)),
+    )
+    _point_x, center_y = point.to_pixel(width, height)
+    half_height = max(6, min(18, (ry2 - ry1) // 3))
+    y1 = max(ry1, center_y - half_height)
+    y2 = min(ry2, center_y + half_height + 1)
+    if x2 - x1 < 24 or y2 - y1 < 4:
+        return ActionReadyValidation(
+            False,
+            float("inf"),
+            1.0,
+            "selected_row_shape",
+        )
+    candidate = full_frame[y1:y2, x1:x2]
+    bright_ratio = float(np.mean(candidate >= 210))
+    median_luma = float(np.median(candidate))
+    valid = bool(bright_ratio >= 0.60 and median_luma >= 220.0)
+    return ActionReadyValidation(
+        valid,
+        median_luma,
+        1.0 - bright_ratio,
+        "selected_row_fill" if valid else "selected_row_fill_missing",
     )
 
 
@@ -3913,6 +3998,8 @@ def save_renewal_diagnostic(
     *,
     aligned_frames: Optional[list[np.ndarray]] = None,
     guard_frames: Optional[list[np.ndarray]] = None,
+    retention_limit: int = 50,
+    retention_group: Optional[str] = None,
 ) -> None:
     """차단 또는 주문 판정의 직전 프레임을 제한적으로 저장합니다.
 
@@ -3964,10 +4051,19 @@ def save_renewal_diagnostic(
             encoding="utf-8",
         )
         event_dirs = sorted(
-            (path for path in diagnostic_root.iterdir() if path.is_dir()),
+            (
+                path
+                for path in diagnostic_root.iterdir()
+                if path.is_dir()
+                and (
+                    retention_group is None
+                    or retention_group in path.name
+                )
+            ),
             key=lambda path: path.name,
         )
-        for old_dir in event_dirs[:-50]:
+        keep_count = max(1, int(retention_limit))
+        for old_dir in event_dirs[:-keep_count]:
             for child in old_dir.iterdir():
                 if child.is_file():
                     child.unlink(missing_ok=True)
@@ -4010,6 +4106,48 @@ class _FastClicker:
     @staticmethod
     def click_prepared(click: input_message.PreparedMouseClick) -> None:
         input_message.post_prepared_mouse_click(click)
+
+    @staticmethod
+    def hover_prepared(click: input_message.PreparedMouseClick) -> None:
+        input_message.post_mouse_move(click.hwnd, click.x, click.y)
+
+    @staticmethod
+    def click_prepared_recovery(
+        click: input_message.PreparedMouseClick,
+    ) -> None:
+        """Send a row-selection click slowly enough for FC to consume it.
+
+        The zero-delay prepared path remains reserved for popup and order
+        buttons. FC can drop a player-row click when MOVE/DOWN/UP are posted
+        in the same scheduler slice, so recovery alone gets a tiny hover and
+        down/up separation.
+        """
+
+        foreground = input_message.get_foreground_hwnd()
+        needs_spoof = foreground not in (0, click.hwnd)
+        spoofed = False
+        if needs_spoof:
+            spoofed = input_message.spoof_window_active(
+                click.hwnd,
+                True,
+            )
+            if not spoofed:
+                input_message.spoof_window_active(click.hwnd, False)
+                raise RenewalCaptureRestart(
+                    "비활성 선수 행 클릭 문맥을 만들지 못해 입력을 차단했습니다."
+                )
+        try:
+            input_message.post_mouse_click(
+                click.hwnd,
+                click.x,
+                click.y,
+                use_send_message=True,
+                hover_delay=RENEWAL_RESELECT_HOVER_SECONDS,
+                down_up_delay=RENEWAL_RESELECT_DOWN_UP_SECONDS,
+            )
+        finally:
+            if spoofed:
+                input_message.spoof_window_active(click.hwnd, False)
 
     def press_escape(self) -> None:
         """구매/판매 창을 닫는 ESC를 최상위 창에 한 번 전달합니다."""
@@ -4159,6 +4297,10 @@ class FastRenewalRunner:
         continuous_monitor: bool = False,
         active_until: Optional[float] = None,
         time_valid: Optional[Callable[[], bool]] = None,
+        stability_mode: bool = True,
+        request_budget: Optional[RenewalRequestBudget] = None,
+        request_time: Optional[Callable[[], float]] = None,
+        require_initial_budget_cooldown: bool = True,
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -4176,6 +4318,23 @@ class FastRenewalRunner:
             None if active_until is None else float(active_until)
         )
         self.time_valid = time_valid
+        self.stability_mode = bool(stability_mode)
+        self.request_time = request_time or time.time
+        self.request_budget = (
+            request_budget
+            if self.stability_mode and request_budget is not None
+            else (
+                RenewalRequestBudget(
+                    require_initial_cooldown=(
+                        require_initial_budget_cooldown
+                    ),
+                )
+                if self.stability_mode
+                else None
+            )
+        )
+        self._open_failure_recovery_level = 0
+        self._open_successes_since_recovery = 0
         self.telemetry: dict[str, object] = {
             "cycle_count": 0,
             "popup_openings": 0,
@@ -4216,7 +4375,11 @@ class FastRenewalRunner:
             "content_frame_size": [],
             "capture_layout_mode": "",
             "frame_size_changes": 0,
-            "cycle_floor_ms": 0.0,
+            "cycle_floor_ms": (
+                RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
+                if self.stability_mode
+                else 0.0
+            ),
             "adaptive_pacing_enabled": False,
             "adaptive_pacing_increases": 0,
             "adaptive_pacing_decreases": 0,
@@ -4227,7 +4390,15 @@ class FastRenewalRunner:
             "server_pressure_detected": False,
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
-            "unlimited_cycle_mode": self.profile.speed_level == 10,
+            "unlimited_cycle_mode": False,
+            "stability_mode": self.stability_mode,
+            "request_budget_window_seconds": (
+                RENEWAL_REQUEST_WINDOW_SECONDS
+            ),
+            "request_budget_limit": RENEWAL_REQUEST_LIMIT,
+            "request_events_in_window": 0,
+            "request_next_allowed_at": 0.0,
+            "request_initial_cooldown": False,
             "artificial_waits": 0,
             "artificial_wait_ms": 0.0,
             "action_context_rejections": 0,
@@ -4245,6 +4416,13 @@ class FastRenewalRunner:
             "startup_target_restore_successes": 0,
             "startup_target_restore_failures": 0,
             "startup_target_restore_delayed_modal_detections": 0,
+            "target_restore_attempts": 0,
+            "target_restore_dropped_clicks": 0,
+            "target_restore_reconnects": 0,
+            "target_restore_elapsed_ms": 0.0,
+            "open_failure_recovery_waits": 0,
+            "open_failure_recovery_total_ms": 0.0,
+            "open_failure_recovery_level": 0,
         }
 
     def _wait(self, seconds: float) -> bool:
@@ -4488,7 +4666,9 @@ class FastRenewalRunner:
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"전환 가격 2프레임 {'ON' if transition_mode_enabled else 'OFF'}, "
-            "완성 팝업 대기 없음, 인위적 사이클 대기 0ms, "
+            "완성 팝업 대기 없음, "
+            f"30분 안정 {RENEWAL_REQUEST_LIMIT}회/"
+            f"{RENEWAL_REQUEST_WINDOW_SECONDS:.0f}초, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
 
@@ -4561,6 +4741,71 @@ class FastRenewalRunner:
             cycle_latencies.append(
                 (time.perf_counter() - action_started) * 1000.0
             )
+
+        def reserve_request_slot() -> bool:
+            """Wait for and atomically reserve one stable popup-open slot."""
+
+            if not self.stability_mode or self.request_budget is None:
+                return True
+            wait_started: Optional[float] = None
+
+            def finish_wait() -> None:
+                if wait_started is None:
+                    return
+                waited_ms = (
+                    time.perf_counter() - wait_started
+                ) * 1000.0
+                self.telemetry["pacing_total_ms"] = (
+                    float(self.telemetry["pacing_total_ms"])
+                    + waited_ms
+                )
+                self.telemetry["artificial_wait_ms"] = (
+                    float(self.telemetry["artificial_wait_ms"])
+                    + waited_ms
+                )
+
+            while (
+                not self.stop_event.is_set()
+                and self._time_window_active()
+            ):
+                now = float(self.request_time())
+                decision = self.request_budget.reserve(now)
+                self.telemetry["request_events_in_window"] = (
+                    decision.events_in_window
+                )
+                self.telemetry["request_next_allowed_at"] = (
+                    decision.next_allowed_at
+                )
+                self.telemetry["request_initial_cooldown"] = (
+                    decision.initial_cooldown
+                )
+                if decision.allowed:
+                    finish_wait()
+                    return True
+                if wait_started is None:
+                    wait_started = time.perf_counter()
+                    self.telemetry["pacing_waits"] = (
+                        int(self.telemetry["pacing_waits"]) + 1
+                    )
+                    self.telemetry["artificial_waits"] = (
+                        int(self.telemetry["artificial_waits"]) + 1
+                    )
+                if decision.initial_cooldown:
+                    self.status(
+                        "30분 안정화 대기 · 기존 무제한 조회 기록 만료 중"
+                    )
+                else:
+                    self.status(
+                        "30분 안정 모드 · "
+                        f"{decision.events_in_window}/"
+                        f"{RENEWAL_REQUEST_LIMIT} · "
+                        f"다음 시도 {decision.wait_seconds:.1f}초"
+                    )
+                if self._wait(min(5.0, max(0.01, decision.wait_seconds))):
+                    finish_wait()
+                    return False
+            finish_wait()
+            return False
 
         def next_guard_packet(
             deadline: float,
@@ -4748,7 +4993,11 @@ class FastRenewalRunner:
                 )
             return ready
 
+        last_reselection_frame: Optional[np.ndarray] = None
+        last_reselection_metrics: dict[str, object] = {}
+
         def classify_full_state(frame: np.ndarray) -> str:
+            nonlocal last_reselection_frame, last_reselection_metrics
             if (
                 frame.ndim != 2
                 or frame.shape[1] < frame_width
@@ -4788,9 +5037,54 @@ class FastRenewalRunner:
                     side_profile,
                 )
             )
+            target_structure_validation = (
+                validate_reselect_target_selected_structure(
+                    content,
+                    side_profile,
+                )
+            )
+            target_selected_valid = bool(
+                target_validation.valid
+                or (
+                    target_identity_validation.valid
+                    and target_structure_validation.valid
+                )
+            )
+            target_rect = side_profile.reselect_target_rect
+            if target_rect is not None:
+                tx1, ty1, tx2, ty2 = target_rect.to_pixels(
+                    frame_width,
+                    frame_height,
+                )
+                last_reselection_frame = content[
+                    ty1:ty2,
+                    tx1:tx2,
+                ].copy()
+            last_reselection_metrics = {
+                "action_valid": action_validation.valid,
+                "action_luma": action_validation.luma_delta,
+                "action_edge": action_validation.edge_delta,
+                "target_valid": target_validation.valid,
+                "target_luma": target_validation.luma_delta,
+                "target_edge": target_validation.edge_delta,
+                "identity_valid": target_identity_validation.valid,
+                "identity_luma": target_identity_validation.luma_delta,
+                "identity_edge": target_identity_validation.edge_delta,
+                "selected_structure_valid": (
+                    target_structure_validation.valid
+                ),
+                "selected_structure_median": (
+                    target_structure_validation.luma_delta
+                ),
+                "selected_structure_dark_ratio": (
+                    target_structure_validation.edge_delta
+                ),
+                "modal_valid": modal_valid,
+                "ready_valid": ready_valid,
+            }
             if modal_valid:
                 return "modal"
-            if ready_valid and target_validation.valid:
+            if ready_valid and target_selected_valid:
                 return (
                     "ready_enabled"
                     if action_validation.valid
@@ -4798,7 +5092,31 @@ class FastRenewalRunner:
                 )
             if ready_valid and target_identity_validation.valid:
                 return "target_left"
+            if ready_valid:
+                return "unsafe"
             return "unknown"
+
+        def save_reselection_failure(reason: str) -> None:
+            if (
+                last_reselection_frame is None
+                or side_profile.reselect_target_png == ""
+            ):
+                return
+            try:
+                target_baseline = decode_gray_png(
+                    side_profile.reselect_target_png
+                )
+            except ValueError:
+                return
+            save_renewal_diagnostic(
+                self.side_name,
+                f"reselection_{reason}",
+                target_baseline,
+                [last_reselection_frame],
+                dict(last_reselection_metrics),
+                retention_limit=20,
+                retention_group=f"_{self.side_name}_reselection_",
+            )
 
         def observe_full_state(
             deadline: float,
@@ -4865,23 +5183,116 @@ class FastRenewalRunner:
                 expected_frames += 1
             return "unsafe"
 
+        def observe_target_hover(deadline: float) -> str:
+            """Prove the same target remains under a virtual hover.
+
+            Hover controls can make an unselected row resemble the selected
+            baseline. Both representations are accepted only as pre-click
+            identity evidence; neither can authorize the action button.
+            """
+
+            safe_frames = 0
+            while (
+                not self.stop_event.is_set()
+                and self._time_window_active()
+            ):
+                packet = next_guard_packet(deadline)
+                if packet is None:
+                    return "hover_safe" if safe_frames >= 2 else "unknown"
+                state = classify_full_state(packet.image)
+                if state == "modal":
+                    return "modal"
+                if state in (
+                    "target_left",
+                    "ready_enabled",
+                    "ready_disabled",
+                ):
+                    safe_frames += 1
+                    continue
+                if state == "unsafe":
+                    return "unsafe"
+            return "unknown"
+
+        def observe_target_selection(
+            deadline: float,
+            *,
+            not_before: float,
+        ) -> str:
+            """Wait the full retry window for a row click to become visible."""
+
+            stable_state = ""
+            stable_count = 0
+            target_left_frames = 0
+            while (
+                not self.stop_event.is_set()
+                and self._time_window_active()
+            ):
+                packet = next_guard_packet(
+                    deadline,
+                    not_before=not_before,
+                )
+                if packet is None:
+                    return (
+                        "target_left"
+                        if target_left_frames >= 2
+                        else "unknown"
+                    )
+                state = classify_full_state(packet.image)
+                if state == "target_left":
+                    target_left_frames += 1
+                    stable_state = state
+                    stable_count = 0
+                    continue
+                if state == stable_state:
+                    stable_count += 1
+                else:
+                    stable_state = state
+                    stable_count = 1
+                if (
+                    state in (
+                        "ready_enabled",
+                        "ready_disabled",
+                        "modal",
+                        "unsafe",
+                    )
+                    and stable_count >= RENEWAL_RESELECT_VERIFY_FRAMES
+                ):
+                    return state
+            return "unknown"
+
         def restore_startup_target() -> str:
             """Restore a visible calibrated target row before monitoring.
 
             The identity-only match can authorize the target-row click but
             never the action button. Two fresh fully selected target frames
             must pass after the click before normal action validation runs.
+            Dropped target-row clicks are retried without turning a safe,
+            identity-proven screen into a terminal renewal error.
             """
 
+            restore_started = time.perf_counter()
             try:
                 engine.set_capture_region(None)
+                # Neutralize a cursor left over the target row. Its hover
+                # controls can resemble the selected-row baseline even when
+                # the row was never clicked.
+                clicker.hover_prepared(reselect_alternate_click)
+                neutral_started = time.perf_counter()
                 state = observe_full_state(
                     time.monotonic()
-                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS
+                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                    not_before=neutral_started,
                 )
                 if state in ("ready_enabled", "ready_disabled", "modal"):
                     return state
+                if state == "unknown":
+                    save_reselection_failure("startup_unknown")
+                    self.telemetry["target_restore_reconnects"] = (
+                        int(self.telemetry["target_restore_reconnects"]) + 1
+                    )
+                    return "reconnect"
                 if state != "target_left":
+                    save_reselection_failure("startup_unsafe")
                     self.telemetry["reselection_unsafe_rejections"] = (
                         int(
                             self.telemetry[
@@ -4892,64 +5303,136 @@ class FastRenewalRunner:
                     )
                     return "unsafe"
 
-                grace_state = observe_delayed_modal_grace(
-                    time.monotonic()
-                    + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS,
-                    expected_state="target_left",
-                )
-                if grace_state == "modal":
-                    self.telemetry[
-                        "startup_target_restore_delayed_modal_detections"
-                    ] = (
+                for attempt in range(
+                    1,
+                    RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS + 1,
+                ):
+                    self.status(
+                        "대상 선수 재선택 복구 중 · "
+                        f"시도 {attempt}/"
+                        f"{RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS}"
+                    )
+                    self.telemetry["startup_target_restore_attempts"] = (
                         int(
                             self.telemetry[
-                                "startup_target_restore_delayed_modal_detections"
+                                "startup_target_restore_attempts"
                             ]
                         )
                         + 1
                     )
-                    return "modal"
-                if grace_state in ("ready_enabled", "ready_disabled"):
-                    return grace_state
-                if grace_state != "target_left":
-                    self.telemetry["reselection_unsafe_rejections"] = (
-                        int(
-                            self.telemetry[
-                                "reselection_unsafe_rejections"
-                            ]
-                        )
-                        + 1
+                    self.telemetry["target_restore_attempts"] = (
+                        int(self.telemetry["target_restore_attempts"]) + 1
                     )
-                    return "unsafe"
-
-                self.telemetry["startup_target_restore_attempts"] = (
-                    int(
+                    # FC drops same-slice MOVE/DOWN/UP row clicks. Hover first
+                    # while continuously proving the same player identity.
+                    clicker.hover_prepared(reselect_target_click)
+                    hover_state = observe_target_hover(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS
+                    )
+                    if hover_state == "modal":
                         self.telemetry[
-                            "startup_target_restore_attempts"
-                        ]
-                    )
-                    + 1
-                )
-                target_started = time.perf_counter()
-                clicker.click_prepared(reselect_target_click)
-                self.telemetry["reselection_clicks"] = (
-                    int(self.telemetry["reselection_clicks"]) + 1
-                )
-                target_state = observe_full_state(
-                    time.monotonic()
-                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
-                    not_before=target_started,
-                )
-                if target_state in ("ready_enabled", "ready_disabled"):
-                    self.telemetry["startup_target_restore_successes"] = (
-                        int(
-                            self.telemetry[
-                                "startup_target_restore_successes"
-                            ]
+                            "startup_target_restore_delayed_modal_detections"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "startup_target_restore_delayed_modal_detections"
+                                ]
+                            )
+                            + 1
                         )
-                        + 1
+                        return "modal"
+                    if hover_state == "unknown":
+                        save_reselection_failure(
+                            "startup_hover_unknown"
+                        )
+                        self.telemetry["target_restore_reconnects"] = (
+                            int(
+                                self.telemetry[
+                                    "target_restore_reconnects"
+                                ]
+                            )
+                            + 1
+                        )
+                        return "reconnect"
+                    if hover_state != "hover_safe":
+                        save_reselection_failure(
+                            "startup_hover_unsafe"
+                        )
+                        self.telemetry[
+                            "reselection_unsafe_rejections"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "reselection_unsafe_rejections"
+                                ]
+                            )
+                            + 1
+                        )
+                        return "unsafe"
+
+                    clicker.click_prepared_recovery(
+                        reselect_target_click
                     )
-                    return target_state
+                    self.telemetry["reselection_clicks"] = (
+                        int(self.telemetry["reselection_clicks"]) + 1
+                    )
+                    # Move away before verification so hover-only controls
+                    # cannot masquerade as a successful row selection.
+                    clicker.hover_prepared(action_click)
+                    target_verify_started = time.perf_counter()
+                    target_state = observe_target_selection(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                        not_before=target_verify_started,
+                    )
+                    if target_state in (
+                        "ready_enabled",
+                        "ready_disabled",
+                    ):
+                        self.telemetry[
+                            "startup_target_restore_successes"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "startup_target_restore_successes"
+                                ]
+                            )
+                            + 1
+                        )
+                        return target_state
+                    if target_state == "modal":
+                        return "modal"
+                    if target_state == "unsafe":
+                        save_reselection_failure("target_unsafe")
+                        self.telemetry[
+                            "reselection_unsafe_rejections"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "reselection_unsafe_rejections"
+                                ]
+                            )
+                            + 1
+                        )
+                        return "unsafe"
+                    if target_state == "target_left":
+                        self.telemetry[
+                            "target_restore_dropped_clicks"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "target_restore_dropped_clicks"
+                                ]
+                            )
+                            + 1
+                        )
+                        continue
+                    save_reselection_failure("target_unknown")
+                    self.telemetry["target_restore_reconnects"] = (
+                        int(self.telemetry["target_restore_reconnects"]) + 1
+                    )
+                    return "reconnect"
                 self.telemetry["startup_target_restore_failures"] = (
                     int(
                         self.telemetry[
@@ -4958,8 +5441,16 @@ class FastRenewalRunner:
                     )
                     + 1
                 )
-                return target_state if target_state == "modal" else "unsafe"
+                self.telemetry["target_restore_reconnects"] = (
+                    int(self.telemetry["target_restore_reconnects"]) + 1
+                )
+                save_reselection_failure("target_click_dropped")
+                return "reconnect"
             finally:
+                self.telemetry["target_restore_elapsed_ms"] = (
+                    float(self.telemetry["target_restore_elapsed_ms"])
+                    + (time.perf_counter() - restore_started) * 1000.0
+                )
                 engine.set_capture_region(guard_region)
 
         def recover_disabled_action() -> str:
@@ -4981,7 +5472,11 @@ class FastRenewalRunner:
                     return "ready_enabled"
                 if state == "modal":
                     return "modal"
+                if state == "unknown":
+                    save_reselection_failure("disabled_unknown")
+                    return "reconnect"
                 if state != "ready_disabled":
+                    save_reselection_failure("disabled_unsafe")
                     self.telemetry["reselection_unsafe_rejections"] = (
                         int(
                             self.telemetry[
@@ -5020,6 +5515,7 @@ class FastRenewalRunner:
                     self.telemetry["popup_may_be_open"] = False
                     return "ready_enabled"
                 if grace_state != "ready_disabled":
+                    save_reselection_failure("disabled_grace_unsafe")
                     self.telemetry["reselection_unsafe_rejections"] = (
                         int(
                             self.telemetry[
@@ -5034,37 +5530,141 @@ class FastRenewalRunner:
                 )
                 self.telemetry["popup_may_be_open"] = False
 
-                alternate_started = time.perf_counter()
-                clicker.click_prepared(reselect_alternate_click)
-                self.telemetry["reselection_clicks"] = (
-                    int(self.telemetry["reselection_clicks"]) + 1
-                )
-                alternate_state = observe_full_state(
-                    time.monotonic()
-                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
-                    not_before=alternate_started,
-                )
+                alternate_state = "ready_disabled"
+                for _attempt in range(
+                    RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS
+                ):
+                    clicker.hover_prepared(reselect_alternate_click)
+                    alternate_hover_state = observe_delayed_modal_grace(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS,
+                        expected_state="ready_disabled",
+                    )
+                    if alternate_hover_state == "modal":
+                        return "modal"
+                    if alternate_hover_state == "ready_enabled":
+                        self.telemetry["popup_may_be_open"] = False
+                        return "ready_enabled"
+                    if alternate_hover_state != "ready_disabled":
+                        save_reselection_failure(
+                            "alternate_hover_unsafe"
+                        )
+                        return (
+                            "reconnect"
+                            if alternate_hover_state == "unknown"
+                            else "unsafe"
+                        )
+                    alternate_started = time.perf_counter()
+                    clicker.click_prepared_recovery(
+                        reselect_alternate_click
+                    )
+                    self.telemetry["reselection_clicks"] = (
+                        int(self.telemetry["reselection_clicks"]) + 1
+                    )
+                    alternate_state = observe_full_state(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                        not_before=alternate_started,
+                    )
+                    if alternate_state == "target_left":
+                        break
+                    if alternate_state == "ready_enabled":
+                        self.telemetry["popup_may_be_open"] = False
+                        return "ready_enabled"
+                    if alternate_state == "ready_disabled":
+                        continue
+                    if alternate_state == "modal":
+                        return "modal"
+                    if alternate_state == "unknown":
+                        save_reselection_failure("alternate_unknown")
+                        return "reconnect"
+                    save_reselection_failure("alternate_unsafe")
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
                 if alternate_state != "target_left":
                     self.telemetry["reselection_failures"] = (
                         int(self.telemetry["reselection_failures"]) + 1
                     )
-                    return "unsafe"
+                    save_reselection_failure("alternate_click_dropped")
+                    return "reconnect"
 
-                target_started = time.perf_counter()
-                clicker.click_prepared(reselect_target_click)
-                self.telemetry["reselection_clicks"] = (
-                    int(self.telemetry["reselection_clicks"]) + 1
-                )
-                target_state = observe_full_state(
-                    time.monotonic()
-                    + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
-                    not_before=target_started,
-                )
+                target_state = "target_left"
+                for _attempt in range(
+                    RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS
+                ):
+                    clicker.hover_prepared(reselect_target_click)
+                    target_hover_state = observe_target_hover(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS
+                    )
+                    if target_hover_state == "modal":
+                        return "modal"
+                    if target_hover_state != "hover_safe":
+                        save_reselection_failure(
+                            "disabled_target_hover_unsafe"
+                        )
+                        return (
+                            "reconnect"
+                            if target_hover_state == "unknown"
+                            else "unsafe"
+                        )
+                    clicker.click_prepared_recovery(
+                        reselect_target_click
+                    )
+                    self.telemetry["reselection_clicks"] = (
+                        int(self.telemetry["reselection_clicks"]) + 1
+                    )
+                    clicker.hover_prepared(action_click)
+                    target_verify_started = time.perf_counter()
+                    target_state = observe_target_selection(
+                        time.monotonic()
+                        + RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS,
+                        not_before=target_verify_started,
+                    )
+                    if target_state == "ready_enabled":
+                        break
+                    if target_state in ("target_left", "ready_disabled"):
+                        self.telemetry[
+                            "target_restore_dropped_clicks"
+                        ] = (
+                            int(
+                                self.telemetry[
+                                    "target_restore_dropped_clicks"
+                                ]
+                            )
+                            + 1
+                        )
+                        continue
+                    if target_state == "modal":
+                        return "modal"
+                    if target_state == "unknown":
+                        save_reselection_failure("disabled_target_unknown")
+                        return "reconnect"
+                    save_reselection_failure("disabled_target_unsafe")
+                    self.telemetry["reselection_unsafe_rejections"] = (
+                        int(
+                            self.telemetry[
+                                "reselection_unsafe_rejections"
+                            ]
+                        )
+                        + 1
+                    )
+                    return "unsafe"
                 if target_state != "ready_enabled":
                     self.telemetry["reselection_failures"] = (
                         int(self.telemetry["reselection_failures"]) + 1
                     )
-                    return "unsafe"
+                    save_reselection_failure(
+                        "disabled_target_click_dropped"
+                    )
+                    return "reconnect"
 
                 self.telemetry["reselection_successes"] = (
                     int(self.telemetry["reselection_successes"]) + 1
@@ -5097,6 +5697,9 @@ class FastRenewalRunner:
             return False
 
         startup_target_state = restore_startup_target()
+        if self.stop_event.is_set():
+            update_performance_telemetry()
+            return False
         if startup_target_state == "modal":
             self.telemetry["popup_may_be_open"] = True
             self.telemetry["current_popup_escape_sent"] = False
@@ -5106,6 +5709,13 @@ class FastRenewalRunner:
                     "player row and could not be proven closed."
                 )
             startup_target_state = restore_startup_target()
+        if self.stop_event.is_set():
+            update_performance_telemetry()
+            return False
+        if startup_target_state == "reconnect":
+            raise RenewalCaptureRestart(
+                "대상 선수 재선택 클릭이 반영되지 않아 안전하게 다시 연결합니다."
+            )
         if startup_target_state not in ("ready_enabled", "ready_disabled"):
             self.telemetry["action_context_rejections"] = (
                 int(self.telemetry["action_context_rejections"]) + 1
@@ -5119,6 +5729,10 @@ class FastRenewalRunner:
         if self.stop_event.is_set():
             update_performance_telemetry()
             return False
+        if startup_action_state == "reconnect":
+            raise RenewalCaptureRestart(
+                "회색 구매/판매 버튼 복구 클릭이 반영되지 않아 다시 연결합니다."
+            )
         if startup_action_state not in ("ready_enabled", "recovered"):
             self.telemetry["action_context_rejections"] = (
                 int(self.telemetry["action_context_rejections"]) + 1
@@ -5137,6 +5751,8 @@ class FastRenewalRunner:
             self.telemetry["cycle_count"] = cycle_count
             action_started = time.perf_counter()
             if not self._time_window_active():
+                break
+            if not reserve_request_slot():
                 break
             if hasattr(engine, "get_frame_size"):
                 current_size = engine.get_frame_size()
@@ -5389,6 +6005,7 @@ class FastRenewalRunner:
 
             if decision is None and not ambiguous:
                 consecutive_open_failures += 1
+                self._open_successes_since_recovery = 0
                 self.telemetry["open_failures"] = (
                     int(self.telemetry["open_failures"]) + 1
                 )
@@ -5400,6 +6017,9 @@ class FastRenewalRunner:
                     consecutive_open_failures,
                 )
                 recovery_state = recover_disabled_action()
+                if self.stop_event.is_set():
+                    update_performance_telemetry()
+                    return False
                 if recovery_state == "recovered":
                     self.telemetry["recovered_open_failures"] = (
                         int(self.telemetry["recovered_open_failures"]) + 1
@@ -5422,6 +6042,11 @@ class FastRenewalRunner:
                         "회색 버튼 복구 화면을 안전하게 확인하지 못했습니다. "
                         "추가 입력 없이 정지합니다."
                     )
+                if recovery_state == "reconnect":
+                    update_performance_telemetry()
+                    raise RenewalCaptureRestart(
+                        "선수 재선택 클릭이 반영되지 않아 안전하게 다시 연결합니다."
+                    )
                 if (
                     recovery_state == "modal"
                     and not close_modal()
@@ -5435,20 +6060,58 @@ class FastRenewalRunner:
                     # transfer market, so retry immediately.
                     self.telemetry["popup_may_be_open"] = False
                 record_completed_cycle(action_started)
-                if consecutive_open_failures == 3:
-                    self.status("팝업 확인 실패 · 시간창 안에서 계속 복구")
-                    self.log(
-                        "[복구 v12] 완성된 가격 팝업을 3회 연속 "
-                        "확인하지 못했지만 주문 없이 계속 시도합니다."
+                if consecutive_open_failures >= 2:
+                    recovery_wait = RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS[
+                        min(
+                            self._open_failure_recovery_level,
+                            len(RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS) - 1,
+                        )
+                    ]
+                    self._open_failure_recovery_level = min(
+                        len(RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS) - 1,
+                        self._open_failure_recovery_level + 1,
                     )
-                if consecutive_open_failures >= 10:
+                    self.telemetry["open_failure_recovery_level"] = (
+                        self._open_failure_recovery_level
+                    )
+                    self.telemetry["open_failure_recovery_waits"] = (
+                        int(
+                            self.telemetry[
+                                "open_failure_recovery_waits"
+                            ]
+                        )
+                        + 1
+                    )
+                    self.telemetry[
+                        "open_failure_recovery_total_ms"
+                    ] = (
+                        float(
+                            self.telemetry[
+                                "open_failure_recovery_total_ms"
+                            ]
+                        )
+                        + recovery_wait * 1000.0
+                    )
+                    self.status(
+                        "FC 조회 회복 대기 · "
+                        f"{recovery_wait:.0f}초 · 주문 입력 없음"
+                    )
+                    if self._wait(recovery_wait):
+                        update_performance_telemetry()
+                        return False
                     update_performance_telemetry()
-                    raise RenewalCaptureRestart("팝업 확인 10회 연속 실패")
+                    raise RenewalCaptureRestart(
+                        "팝업 열기 2회 연속 실패 후 회복 대기 완료"
+                    )
                 continue
 
             consecutive_open_failures = 0
             self.telemetry["consecutive_open_failures"] = 0
             if decision is not None:
+                self._open_successes_since_recovery += 1
+                if self._open_successes_since_recovery >= 20:
+                    self._open_failure_recovery_level = 0
+                    self.telemetry["open_failure_recovery_level"] = 0
                 self.telemetry["confirmed_openings"] = (
                     int(self.telemetry["confirmed_openings"]) + 1
                 )

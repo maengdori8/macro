@@ -77,6 +77,11 @@ from macroapp.renewal import (
     wait_for_stable_wgc_frame,
 )
 from macroapp.renewal_soak import run_verification_soak
+from macroapp.renewal_budget import (
+    RENEWAL_REQUEST_INTERVAL_SECONDS,
+    RENEWAL_REQUEST_LIMIT,
+    RENEWAL_REQUEST_WINDOW_SECONDS,
+)
 from macroapp.renewal_time import (
     NAVER_TIME_REFRESH_SECONDS,
     NaverMonotonicClock,
@@ -122,7 +127,8 @@ HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
 HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
 HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS = 5.0
-HEADLESS_MONITOR_UNLIMITED_MIN_CYCLES_PER_SECOND = 1.5
+HEADLESS_MONITOR_STABLE_RATE_RATIO = 0.95
+HEADLESS_MONITOR_CYCLE_P50_GRACE_MS = 400.0
 
 
 def _headless_open_failure_summary(
@@ -169,18 +175,20 @@ def _headless_minimum_confirmed_openings(
     duration_seconds: float,
     speed_level: int,
 ) -> int:
-    """Require the minimum useful throughput for unlimited speed 10."""
+    """Require sustained throughput under the 30-minute stable cadence."""
 
     duration = max(0.0, float(duration_seconds))
     _ = speed_level
+    expected_rate = (
+        RENEWAL_REQUEST_LIMIT
+        / RENEWAL_REQUEST_WINDOW_SECONDS
+        * HEADLESS_MONITOR_STABLE_RATE_RATIO
+    )
     return min(
         1000,
         max(
             2,
-            int(
-                duration
-                * HEADLESS_MONITOR_UNLIMITED_MIN_CYCLES_PER_SECOND
-            ),
+            int(duration * expected_rate),
         ),
     )
 
@@ -1087,8 +1095,8 @@ class RenewalApp:
         required_frames = 2 if level >= 8 else 3
         if level == 10:
             text = (
-                "속도 10/10 · 전환 중 가격 선판정 · "
-                "고유 2프레임 즉시 ESC/변경 확인"
+                "속도 10/10 · 인식 2프레임 즉시 · "
+                "30분 안정 840회 · 약 2.14초 간격"
             )
         else:
             mode = "안정" if level <= 3 else ("균형" if level <= 7 else "초고속")
@@ -2175,6 +2183,7 @@ class RenewalApp:
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
             f"{fast_policy} · "
+            "30분 안정 840회/약 2.14초 · "
             f"{'무주문 측정' if monitor_only else '실주문'} · 애매하면 주문 금지"
         )
         if available_ram is not None:
@@ -2306,6 +2315,9 @@ class RenewalApp:
                 time_valid=lambda: (
                     self.naver_clock.is_fresh()
                     and self.naver_clock.now() < window.end_exclusive
+                ),
+                request_time=lambda: (
+                    self.naver_clock.now().timestamp()
                 ),
             ).run()
         except Exception as exc:
@@ -2512,7 +2524,7 @@ def _headless_monitor_existing(
 
     report_path = app_dir() / "renewal_headless_monitor.json"
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "side": side_name,
         "duration_requested_seconds": float(duration_seconds),
         "started_at_unix": time.time(),
@@ -2528,6 +2540,7 @@ def _headless_monitor_existing(
     checkpoint_stop = threading.Event()
     timer: Optional[threading.Timer] = None
     checkpoint_thread: Optional[threading.Thread] = None
+    clock_thread: Optional[threading.Thread] = None
     logs: list[str] = []
     statuses: list[str] = []
     resource_samples: list[dict[str, float]] = []
@@ -2694,6 +2707,10 @@ def _headless_monitor_existing(
             sample_resources()
             write_checkpoint(finished=False)
 
+    def clock_worker(clock: NaverMonotonicClock) -> None:
+        while not checkpoint_stop.wait(NAVER_TIME_REFRESH_SECONDS):
+            clock.sync()
+
     sample_resources()
     write_checkpoint(finished=False)
     try:
@@ -2711,6 +2728,12 @@ def _headless_monitor_existing(
             raise RuntimeError(
                 "Renewal calibration is incomplete: " + ", ".join(missing)
             )
+        naver_clock = NaverMonotonicClock()
+        if not naver_clock.sync():
+            raise RuntimeError(
+                "Naver time synchronization failed; stable request input "
+                "is blocked."
+            )
         manager = InactiveManager(WINDOW_TITLE, logger=logs.append)
         runner = FastRenewalRunner(
             manager,
@@ -2721,6 +2744,8 @@ def _headless_monitor_existing(
             statuses.append,
             monitor_only=True,
             continuous_monitor=True,
+            time_valid=naver_clock.is_fresh,
+            request_time=lambda: naver_clock.now().timestamp(),
         )
         checkpoint_thread = threading.Thread(
             target=checkpoint_worker,
@@ -2728,12 +2753,20 @@ def _headless_monitor_existing(
             daemon=True,
         )
         checkpoint_thread.start()
+        clock_thread = threading.Thread(
+            target=clock_worker,
+            args=(naver_clock,),
+            name="renewal-monitor-clock",
+            daemon=True,
+        )
+        clock_thread.start()
         timer = threading.Timer(duration, stop_event.set)
         timer.daemon = True
         timer.start()
         runner.run()
         checkpoint_stop.set()
         checkpoint_thread.join(timeout=2.0)
+        clock_thread.join(timeout=2.0)
         sample_resources()
         telemetry = current_telemetry()
         order_inputs = int(telemetry.get("order_clicks", 0))
@@ -2760,11 +2793,19 @@ def _headless_monitor_existing(
         unlimited_cycle_mode = bool(
             telemetry.get("unlimited_cycle_mode", False)
         )
+        stability_mode = bool(telemetry.get("stability_mode", False))
+        request_events_in_window = int(
+            telemetry.get("request_events_in_window", 0)
+        )
         artificial_waits = int(telemetry.get("artificial_waits", 0))
         artificial_wait_ms = float(
             telemetry.get("artificial_wait_ms", 0.0)
         )
         cycle_p50_ms = float(telemetry.get("cycle_p50_ms", 0.0))
+        cycle_p50_limit_ms = (
+            RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
+            + HEADLESS_MONITOR_CYCLE_P50_GRACE_MS
+        )
         confirmed_cycles_per_second = (
             float(confirmed_openings) / elapsed if elapsed > 0.0 else 0.0
         )
@@ -2781,13 +2822,13 @@ def _headless_monitor_existing(
             and not initial_mismatch
             and not monitor_pending_change
             and not server_pressure_detected
-            and unlimited_cycle_mode
-            and artificial_waits == 0
-            and artificial_wait_ms == 0.0
+            and stability_mode
+            and not unlimited_cycle_mode
+            and request_events_in_window <= RENEWAL_REQUEST_LIMIT
             and max_open_failures < 3
             and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings
-            and cycle_p50_ms <= 400.0
+            and cycle_p50_ms <= cycle_p50_limit_ms
             and duration_completed
             and bool(resources.get("within_limits", False))
         )
@@ -2799,8 +2840,11 @@ def _headless_monitor_existing(
                 "confirmed_cycles_per_second": (
                     confirmed_cycles_per_second
                 ),
-                "cycle_p50_limit_ms": 400.0,
+                "cycle_p50_limit_ms": cycle_p50_limit_ms,
                 "unlimited_cycle_mode": unlimited_cycle_mode,
+                "stability_mode": stability_mode,
+                "request_events_in_window": request_events_in_window,
+                "request_budget_limit": RENEWAL_REQUEST_LIMIT,
                 "artificial_waits": artificial_waits,
                 "artificial_wait_ms": artificial_wait_ms,
                 "duration_completed": duration_completed,
@@ -2843,6 +2887,8 @@ def _headless_monitor_existing(
         checkpoint_stop.set()
         if checkpoint_thread is not None:
             checkpoint_thread.join(timeout=2.0)
+        if clock_thread is not None:
+            clock_thread.join(timeout=2.0)
         stop_event.set()
         if timer is not None:
             timer.cancel()

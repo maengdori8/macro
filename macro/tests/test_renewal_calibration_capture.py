@@ -470,20 +470,20 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             60.0,
         )
 
-    def test_headless_monitor_acceptance_tracks_unlimited_throughput(self):
+    def test_headless_monitor_acceptance_tracks_stable_request_budget(self):
         self.assertEqual(
             renewal_macro._headless_minimum_confirmed_openings(
                 60.0,
                 10,
             ),
-            90,
+            26,
         )
         self.assertEqual(
             renewal_macro._headless_minimum_confirmed_openings(
                 600.0,
                 9,
             ),
-            900,
+            266,
         )
         self.assertEqual(
             renewal_macro._headless_minimum_confirmed_openings(

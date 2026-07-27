@@ -253,6 +253,7 @@ class _DisabledActionRecoveryEngine(_FakeEngine):
         *,
         alternate_click_works: bool = True,
         target_click_works: bool = True,
+        stop_after_noop_clicks: int | None = None,
     ):
         super().__init__(
             stop_event,
@@ -262,6 +263,8 @@ class _DisabledActionRecoveryEngine(_FakeEngine):
         self.disable_first_action = True
         self.alternate_click_works = alternate_click_works
         self.target_click_works = target_click_works
+        self.stop_after_noop_clicks = stop_after_noop_clicks
+        self.noop_clicks = 0
 
     def on_click(self, hwnd: int, x: int, y: int) -> None:
         if (x, y) == (20, 10) and self.disable_first_action:
@@ -272,9 +275,52 @@ class _DisabledActionRecoveryEngine(_FakeEngine):
             return
         if (x, y) == (50, 40) and not self.alternate_click_works:
             self.clicks.append((x, y))
+            self.noop_clicks += 1
+            if (
+                self.stop_after_noop_clicks is not None
+                and self.noop_clicks >= self.stop_after_noop_clicks
+            ):
+                self.stop_event.set()
             return
         if (x, y) == (50, 30) and not self.target_click_works:
             self.clicks.append((x, y))
+            self.noop_clicks += 1
+            if (
+                self.stop_after_noop_clicks is not None
+                and self.noop_clicks >= self.stop_after_noop_clicks
+            ):
+                self.stop_event.set()
+            return
+        super().on_click(hwnd, x, y)
+
+
+class _DroppedTargetReselectEngine(_FakeEngine):
+    """Drops a configurable number of safe target-row reselection clicks."""
+
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        guard: np.ndarray,
+        *,
+        dropped_target_clicks: int,
+    ):
+        super().__init__(
+            stop_event,
+            repeat_guard=guard,
+            stop_after_closes=1,
+        )
+        self.target_selected = False
+        self.dropped_target_clicks = int(dropped_target_clicks)
+        self.target_click_count = 0
+
+    def on_click(self, hwnd: int, x: int, y: int) -> None:
+        if (x, y) == (50, 30):
+            self.clicks.append((x, y))
+            self.target_click_count += 1
+            if self.target_click_count <= self.dropped_target_clicks:
+                return
+            self.target_selected = True
+            self.action_disabled = False
             return
         super().on_click(hwnd, x, y)
 
@@ -461,6 +507,31 @@ def _run(
         stack.enter_context(
             patch.object(
                 renewal.input_message,
+                "post_mouse_click",
+                side_effect=lambda hwnd, x, y, **_kwargs: engine.on_click(
+                    hwnd,
+                    x,
+                    y,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                renewal.input_message,
+                "post_mouse_move",
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                renewal.input_message,
+                "get_foreground_hwnd",
+                return_value=manager.hwnd,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                renewal.input_message,
                 "send_key_to_window",
                 side_effect=engine.on_escape,
             )
@@ -474,6 +545,7 @@ def _run(
             status=lambda _message: None,
             monitor_only=monitor_only,
             continuous_monitor=continuous_monitor,
+            stability_mode=False,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -481,19 +553,59 @@ def _run(
 
 
 class RenewalSafetyTests(unittest.TestCase):
-    def test_all_speeds_have_zero_artificial_cycle_floor(self) -> None:
-        for speed_level in range(1, 11):
+    def test_speed10_uses_30_minute_stable_cycle_floor(self) -> None:
+        for speed_level in range(1, 10):
             with self.subTest(speed_level=speed_level):
                 self.assertEqual(
                     renewal.renewal_sustained_cycle_seconds(speed_level),
                     0.0,
                 )
+        self.assertAlmostEqual(
+            renewal.renewal_sustained_cycle_seconds(10),
+            1800.0 / 840.0,
+            places=6,
+        )
 
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
             renewal.RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS,
             0.80,
         )
+
+    def test_reselection_retention_never_deletes_other_diagnostics(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "mAuto" / "renewal_diagnostics"
+            root.mkdir(parents=True)
+            unrelated = root / "20260101_000000_000000000_buy_ordered"
+            unrelated.mkdir()
+            with patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": temporary},
+            ):
+                for reason in (
+                    "reselection_first",
+                    "reselection_second",
+                ):
+                    renewal.save_renewal_diagnostic(
+                        "buy",
+                        reason,
+                        self.base_price,
+                        [self.base_price],
+                        {},
+                        retention_limit=1,
+                        retention_group="_buy_reselection_",
+                    )
+                    time.sleep(0.001)
+
+            self.assertTrue(unrelated.is_dir())
+            reselection_dirs = [
+                path
+                for path in root.iterdir()
+                if "_buy_reselection_" in path.name
+            ]
+            self.assertEqual(len(reselection_dirs), 1)
 
     def setUp(self) -> None:
         self.base_price = _price("82400", 40, 20)
@@ -665,7 +777,6 @@ class RenewalSafetyTests(unittest.TestCase):
                 renewal.NormalizedPoint(0.80, 0.40),
             )
         )
-
     def test_target_row_validation_ignores_hover_controls_at_both_ends(
         self,
     ) -> None:
@@ -685,6 +796,38 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(result.luma_delta, 0.0)
         self.assertEqual(result.edge_delta, 0.0)
+
+    def test_selected_row_fill_is_independent_of_hover_anchor(self) -> None:
+        side = self.profile.buy
+        self.assertIsNotNone(side.reselect_target_rect)
+        selected = np.full((100, 200), 32, dtype=np.uint8)
+        x1, y1, x2, y2 = side.reselect_target_rect.to_pixels(200, 100)
+        list_x1 = max(
+            x1,
+            int(
+                round(
+                    renewal.RENEWAL_RESELECT_LIST_BOUNDS[0] * 200
+                )
+            ),
+        )
+        selected[y1:y2, list_x1:x2] = 248
+        unselected = np.full_like(selected, 32)
+
+        selected_result = (
+            renewal.validate_reselect_target_selected_structure(
+                selected,
+                side,
+            )
+        )
+        unselected_result = (
+            renewal.validate_reselect_target_selected_structure(
+                unselected,
+                side,
+            )
+        )
+
+        self.assertTrue(selected_result.valid)
+        self.assertFalse(unselected_result.valid)
 
     def test_target_row_validation_rejects_changed_player_identity_core(
         self,
@@ -1736,12 +1879,10 @@ class RenewalSafetyTests(unittest.TestCase):
     def test_duplicate_wgc_sequence_ids_never_order(self) -> None:
         stop_event = threading.Event()
         engine = _DuplicateSequenceEngine(stop_event, self.guard)
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "target player row could not be restored",
-        ):
-            _run(self.profile, engine)
+        completed = _run(self.profile, engine)
+        self.assertFalse(completed)
         self.assertEqual(engine.clicks, [])
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
 
     def test_expired_schedule_never_sends_game_input(self) -> None:
         stop_event = threading.Event()
@@ -1756,6 +1897,7 @@ class RenewalSafetyTests(unittest.TestCase):
             status=lambda _message: None,
             active_until=time.monotonic() - 0.001,
             time_valid=lambda: True,
+            stability_mode=False,
         )
         self.assertFalse(runner.run())
         self.assertEqual(engine.clicks, [])
@@ -1784,6 +1926,7 @@ class RenewalSafetyTests(unittest.TestCase):
             status=lambda _message: None,
             active_until=time.monotonic() + 2.0,
             time_valid=time_valid,
+            stability_mode=False,
         )
         self.assertFalse(runner.run())
         self.assertGreaterEqual(checks, 3)
@@ -1838,6 +1981,13 @@ class RenewalSafetyTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(
                     renewal.input_message,
+                    "post_mouse_move",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    renewal.input_message,
                     "send_key_to_window",
                     side_effect=engine.on_escape,
                 )
@@ -1850,6 +2000,7 @@ class RenewalSafetyTests(unittest.TestCase):
                 logger=lambda _message: None,
                 status=lambda _message: None,
                 monitor_only=True,
+                stability_mode=False,
             )
             self.assertFalse(runner.run())
         self.assertTrue(runner.telemetry["monitor_detected"])
@@ -1972,10 +2123,17 @@ class RenewalSafetyTests(unittest.TestCase):
             stop_event,
             stop_after_actions=5,
         )
-        with patch.object(
-            renewal,
-            "RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS",
-            0.01,
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_POPUP_OPEN_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS",
+                (0.0, 0.0, 0.0),
+            ),
         ):
             completed = _run(
                 self.profile,
@@ -1986,6 +2144,14 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(engine.clicks, [(20, 10)] * 5)
         self.assertEqual(engine.escapes, 0)
         self.assertEqual(engine.mode, "closed")
+        self.assertEqual(
+            engine.runner_telemetry["open_failure_recovery_waits"],
+            2,
+        )
+        self.assertGreaterEqual(
+            engine.runner_telemetry["capture_restarts"],
+            2,
+        )
 
     def test_recorded_false_orders_replay_as_unchanged(self) -> None:
         diagnostic_root = (
@@ -2285,6 +2451,92 @@ class RenewalSafetyTests(unittest.TestCase):
         )
         self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
 
+    def test_target_reselection_recovers_1_3_and_10_dropped_clicks(
+        self,
+    ) -> None:
+        for dropped_clicks in (1, 3, 10):
+            with self.subTest(dropped_clicks=dropped_clicks):
+                stop_event = threading.Event()
+                engine = _DroppedTargetReselectEngine(
+                    stop_event,
+                    self.guard,
+                    dropped_target_clicks=dropped_clicks,
+                )
+                with (
+                    patch.object(
+                        renewal,
+                        "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+                        0.001,
+                    ),
+                    patch.object(
+                        renewal,
+                        "RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS",
+                        0.01,
+                    ),
+                ):
+                    completed = _run(
+                        self.profile,
+                        engine,
+                        monitor_only=True,
+                    )
+
+                self.assertFalse(completed)
+                self.assertEqual(
+                    engine.target_click_count,
+                    dropped_clicks + 1,
+                )
+                self.assertEqual(
+                    [point for point in engine.clicks if point == (20, 10)],
+                    [(20, 10)],
+                )
+                telemetry = engine.runner_telemetry
+                self.assertEqual(telemetry["order_clicks"], 0)
+                self.assertEqual(
+                    telemetry["target_restore_dropped_clicks"],
+                    dropped_clicks,
+                )
+                self.assertEqual(
+                    telemetry["target_restore_reconnects"],
+                    dropped_clicks // 3,
+                )
+
+    def test_stop_during_target_reselection_is_not_an_error(self) -> None:
+        stop_event = threading.Event()
+        engine = _DroppedTargetReselectEngine(
+            stop_event,
+            self.guard,
+            dropped_target_clicks=100,
+        )
+        original_click = engine.on_click
+
+        def stop_after_three(hwnd: int, x: int, y: int) -> None:
+            original_click(hwnd, x, y)
+            if engine.target_click_count >= 3:
+                stop_event.set()
+
+        engine.on_click = stop_after_three
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(engine.target_click_count, 3)
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
+
     def test_wrong_target_identity_stops_before_first_click(self) -> None:
         stop_event = threading.Event()
         engine = _FakeEngine(stop_event, cycles=[[self.guard, self.guard]])
@@ -2405,7 +2657,7 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(telemetry["reselection_clicks"], 0)
         self.assertEqual(telemetry["order_clicks"], 0)
 
-    def test_gray_action_does_not_return_to_target_without_alt_evidence(
+    def test_gray_action_dropped_alternate_clicks_reconnect_without_order(
         self,
     ) -> None:
         stop_event = threading.Event()
@@ -2413,21 +2665,38 @@ class RenewalSafetyTests(unittest.TestCase):
             stop_event,
             self.guard,
             alternate_click_works=False,
+            stop_after_noop_clicks=3,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "추가 입력 없이 정지"):
-            _run(
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            completed = _run(
                 self.profile,
                 engine,
                 monitor_only=True,
                 continuous_monitor=True,
             )
 
-        self.assertEqual(engine.clicks, [(20, 10), (50, 40)])
+        self.assertFalse(completed)
+        self.assertEqual(
+            engine.clicks,
+            [(20, 10), (50, 40), (50, 40), (50, 40)],
+        )
         self.assertEqual(engine.escapes, 0)
         self.assertTrue(engine.action_disabled)
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
 
-    def test_gray_action_target_restore_failure_stops_without_open_retry(
+    def test_gray_action_dropped_target_clicks_reconnect_without_order(
         self,
     ) -> None:
         stop_event = threading.Event()
@@ -2435,22 +2704,42 @@ class RenewalSafetyTests(unittest.TestCase):
             stop_event,
             self.guard,
             target_click_works=False,
+            stop_after_noop_clicks=3,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "추가 입력 없이 정지"):
-            _run(
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS",
+                0.001,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            completed = _run(
                 self.profile,
                 engine,
                 monitor_only=True,
                 continuous_monitor=True,
             )
 
+        self.assertFalse(completed)
         self.assertEqual(
             engine.clicks,
-            [(20, 10), (50, 40), (50, 30)],
+            [
+                (20, 10),
+                (50, 40),
+                (50, 30),
+                (50, 30),
+                (50, 30),
+            ],
         )
         self.assertEqual(engine.escapes, 0)
         self.assertFalse(engine.target_selected)
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
 
     def test_exact_initial_size_still_waits_for_wgc_settle(self) -> None:
         stop_event = threading.Event()
@@ -2523,7 +2812,7 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertFalse(completed)
         self.assertEqual(engine.clicks, [(20, 10)])
 
-    def test_unchanged_10000_cycles_has_zero_orders(self) -> None:
+    def test_unchanged_100000_cycles_has_zero_orders(self) -> None:
         stop_event = threading.Event()
         transition_guard = cv2.addWeighted(
             self.guard,
@@ -2535,14 +2824,14 @@ class RenewalSafetyTests(unittest.TestCase):
         engine = _FakeEngine(
             stop_event,
             repeat_guard=transition_guard,
-            stop_after_closes=10_000,
+            stop_after_closes=100_000,
         )
         completed = _run(self.profile, engine)
         self.assertFalse(completed)
-        self.assertEqual(engine.escapes, 10_000)
+        self.assertEqual(engine.escapes, 100_000)
         self.assertEqual(
             engine.runner_telemetry["fast_exit_count"],
-            9_998,
+            99_998,
         )
         self.assertEqual(
             engine.runner_telemetry["precision_probe_count"],
@@ -2550,15 +2839,16 @@ class RenewalSafetyTests(unittest.TestCase):
         )
         self.assertEqual(
             engine.runner_telemetry["transition_exit_count"],
-            10_000,
+            100_000,
         )
-        self.assertEqual(sum(engine.open_packet_counts), 20_000)
+        self.assertEqual(sum(engine.open_packet_counts), 200_000)
         self.assertEqual(
             [point for point in engine.clicks if point != (20, 10)],
             [],
         )
         telemetry = engine.runner_telemetry
-        self.assertTrue(telemetry["unlimited_cycle_mode"])
+        self.assertFalse(telemetry["unlimited_cycle_mode"])
+        self.assertFalse(telemetry["stability_mode"])
         self.assertEqual(telemetry["artificial_waits"], 0)
         self.assertEqual(telemetry["artificial_wait_ms"], 0.0)
         self.assertEqual(telemetry["pacing_waits"], 0)
