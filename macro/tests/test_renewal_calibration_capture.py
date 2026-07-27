@@ -296,6 +296,35 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             renewal_macro.CALIBRATION_STABLE_FRAME_DELTA,
         )
 
+    def test_closed_calibration_rejects_repeated_esc_transition(self):
+        class PixelDetector:
+            def __init__(self, expected: int):
+                self.expected = expected
+
+            def register(self, image, _luma_noise, _edge_noise):
+                valid = int(image[0, 0]) == self.expected
+                return SimpleNamespace(valid=valid, aligned=image.copy())
+
+        open_detector = PixelDetector(251)
+        closed_detector = PixelDetector(42)
+        repeated_transition = np.full((40, 80), 233, dtype=np.uint8)
+        closed = np.full((40, 80), 42, dtype=np.uint8)
+
+        self.assertIsNone(
+            renewal_macro._calibration_closed_guard_candidate(
+                open_detector,
+                closed_detector,
+                repeated_transition,
+            )
+        )
+        accepted = renewal_macro._calibration_closed_guard_candidate(
+            open_detector,
+            closed_detector,
+            closed,
+        )
+        self.assertIsNotNone(accepted)
+        self.assertTrue(np.array_equal(accepted, closed))
+
     def test_stable_wgc_wait_discards_transient_oversized_frame(self):
         transient = np.zeros((1056, 1936), dtype=np.uint8)
         stable = np.zeros((1048, 1928), dtype=np.uint8)

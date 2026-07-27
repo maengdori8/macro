@@ -319,6 +319,30 @@ def _calibration_guard_delta(
     return float(cv2.mean(cv2.absdiff(previous, current))[0])
 
 
+def _calibration_closed_guard_candidate(
+    open_detector: RenewalModalGuard,
+    closed_detector: Optional[RenewalModalGuard],
+    guard: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Accept a closed sample only after the real list guard returns.
+
+    At 120 Hz FC can publish four distinct WGC packets containing the same
+    white ESC transition render.  Merely proving that the open-popup template
+    disappeared therefore captures the transition as a false closed state.
+    A calibration that started from the enabled list also has exact closed
+    evidence, so require that evidence before persisting the sample.
+    """
+
+    if open_detector.register(guard, 0.0, 0.0).valid:
+        return None
+    if closed_detector is None:
+        return guard.copy()
+    registration = closed_detector.register(guard, 0.0, 0.0)
+    if not registration.valid:
+        return None
+    return registration.aligned.copy()
+
+
 def _wait_for_stable_wgc_frame(
     manager: InactiveManager,
     *,
@@ -3184,16 +3208,27 @@ def _headless_calibrate_existing(side_name: str) -> int:
                 if frame is None:
                     break
                 guard = frame[gy1:gy2, gx1:gx2].copy()
-                if guard_detector.register(guard, 0.0, 0.0).valid:
+                closed_guard = _calibration_closed_guard_candidate(
+                    guard_detector,
+                    (
+                        initial_state_detector
+                        if not initial_is_open_popup
+                        else None
+                    ),
+                    guard,
+                )
+                if closed_guard is None:
                     stable.clear()
                     continue
                 if stable:
                     delta = float(
-                        cv2.mean(cv2.absdiff(stable[-1], guard))[0]
+                        cv2.mean(
+                            cv2.absdiff(stable[-1], closed_guard)
+                        )[0]
                     )
                     if delta > CALIBRATION_STABLE_FRAME_DELTA:
                         stable.clear()
-                stable.append(guard)
+                stable.append(closed_guard)
                 if len(stable) >= 4:
                     return stable[-4:]
             raise RuntimeError(
