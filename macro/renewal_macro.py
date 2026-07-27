@@ -47,6 +47,7 @@ from macroapp.renewal import (
     RENEWAL_CALIBRATION_VERSION,
     RENEWAL_CALIBRATION_FRAMES_PER_OPENING,
     RENEWAL_CALIBRATION_OPENINGS,
+    RENEWAL_VIDEO_TARGET_CYCLE_SECONDS,
     SUPPORTED_RENEWAL_WGC_SIZES,
     FastRenewalRunner,
     NormalizedPoint,
@@ -122,6 +123,7 @@ WGC_SIZE_STABLE_TIMEOUT_SECONDS = 4.0
 HEADLESS_MONITOR_MAX_SECONDS = 12.0 * 60.0 * 60.0
 HEADLESS_MONITOR_CHECKPOINT_SECONDS = 30.0
 HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT = 3.0
+HEADLESS_VIDEO_CPU_AVERAGE_LIMIT_PERCENT = 4.0
 HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT = 8.0
 HEADLESS_MONITOR_PRIVATE_GROWTH_LIMIT_MB = 10.0
 HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB = 20.0
@@ -129,6 +131,8 @@ HEADLESS_MONITOR_OPEN_FAILURE_RATE_LIMIT = 0.005
 HEADLESS_MONITOR_MIN_RESOURCE_SAMPLE_INTERVAL_SECONDS = 5.0
 HEADLESS_MONITOR_STABLE_RATE_RATIO = 0.95
 HEADLESS_MONITOR_CYCLE_P50_GRACE_MS = 400.0
+HEADLESS_VIDEO_RATE_RATIO = 0.80
+HEADLESS_VIDEO_CYCLE_P50_GRACE_MS = 100.0
 
 
 def _headless_open_failure_summary(
@@ -174,18 +178,25 @@ def _headless_open_failure_summary(
 def _headless_minimum_confirmed_openings(
     duration_seconds: float,
     speed_level: int,
+    *,
+    video_speed_mode: bool = False,
 ) -> int:
-    """Require sustained throughput under the 30-minute stable cadence."""
+    """Require sustained throughput for the selected real-game cadence."""
 
     duration = max(0.0, float(duration_seconds))
     _ = speed_level
     expected_rate = (
-        RENEWAL_REQUEST_LIMIT
-        / RENEWAL_REQUEST_WINDOW_SECONDS
-        * HEADLESS_MONITOR_STABLE_RATE_RATIO
+        HEADLESS_VIDEO_RATE_RATIO
+        / RENEWAL_VIDEO_TARGET_CYCLE_SECONDS
+        if video_speed_mode
+        else (
+            RENEWAL_REQUEST_LIMIT
+            / RENEWAL_REQUEST_WINDOW_SECONDS
+            * HEADLESS_MONITOR_STABLE_RATE_RATIO
+        )
     )
     return min(
-        1000,
+        10000 if video_speed_mode else 1000,
         max(
             2,
             int(duration * expected_rate),
@@ -1095,8 +1106,8 @@ class RenewalApp:
         required_frames = 2 if level >= 8 else 3
         if level == 10:
             text = (
-                "속도 10/10 · 인식 2프레임 즉시 · "
-                "30분 안정 840회 · 약 2.14초 간격"
+                "속도 10/10 · 360ms부터 자동가속 · "
+                "회색 버튼 때만 후퇴(최대 450ms) · 가격 2프레임"
             )
         else:
             mode = "안정" if level <= 3 else ("균형" if level <= 7 else "초고속")
@@ -2177,13 +2188,18 @@ class RenewalApp:
             )
             else "동일가격 다중 프레임 확인"
         )
+        cadence_policy = (
+            "영상속도 360ms부터 자동가속·회색 버튼 최대 450ms"
+            if self.profile.speed_level == 10
+            else "30분 안정 840회/약 2.14초"
+        )
         self.log(
             f"[시작 v12] {'구매/상한가' if side == 'buy' else '판매/하한가'} "
             f"속도={self.profile.speed_level}/10 "
             f"열기={self.profile.open_settle_ms}ms "
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
             f"{fast_policy} · "
-            "30분 안정 840회/약 2.14초 · "
+            f"{cadence_policy} · "
             f"{'무주문 측정' if monitor_only else '실주문'} · 애매하면 주문 금지"
         )
         if available_ram is not None:
@@ -2319,6 +2335,7 @@ class RenewalApp:
                 request_time=lambda: (
                     self.naver_clock.now().timestamp()
                 ),
+                video_speed_mode=(self.profile.speed_level == 10),
             ).run()
         except Exception as exc:
             failed = True
@@ -2515,6 +2532,8 @@ def _headless_fit_wgc() -> int:
 def _headless_monitor_existing(
     side_name: str,
     duration_seconds: float,
+    *,
+    video_speed_mode: bool = False,
 ) -> int:
     """Run the real renewal loop with all order inputs permanently disabled.
 
@@ -2524,8 +2543,9 @@ def _headless_monitor_existing(
 
     report_path = app_dir() / "renewal_headless_monitor.json"
     report: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "side": side_name,
+        "video_speed_mode_requested": bool(video_speed_mode),
         "duration_requested_seconds": float(duration_seconds),
         "started_at_unix": time.time(),
         "updated_at_unix": time.time(),
@@ -2618,8 +2638,13 @@ def _headless_monitor_existing(
         cpu_p95 = float(np.percentile(cpu_values, 95))
         rss_growth = max(rss_values) - rss_values[0]
         private_growth = max(private_values) - private_values[0]
+        cpu_average_limit = (
+            HEADLESS_VIDEO_CPU_AVERAGE_LIMIT_PERCENT
+            if video_speed_mode
+            else HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT
+        )
         within_limits = bool(
-            cpu_average <= HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT
+            cpu_average <= cpu_average_limit
             and cpu_p95 <= HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT
             and rss_growth <= HEADLESS_MONITOR_RSS_GROWTH_LIMIT_MB
             and private_growth
@@ -2632,9 +2657,7 @@ def _headless_monitor_existing(
             ),
             "cpu_system_percent_average": cpu_average,
             "cpu_system_percent_p95": cpu_p95,
-            "cpu_average_limit_percent": (
-                HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT
-            ),
+            "cpu_average_limit_percent": cpu_average_limit,
             "cpu_p95_limit_percent": (
                 HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT
             ),
@@ -2746,6 +2769,7 @@ def _headless_monitor_existing(
             continuous_monitor=True,
             time_valid=naver_clock.is_fresh,
             request_time=lambda: naver_clock.now().timestamp(),
+            video_speed_mode=video_speed_mode,
         )
         checkpoint_thread = threading.Thread(
             target=checkpoint_worker,
@@ -2781,6 +2805,7 @@ def _headless_monitor_existing(
         minimum_confirmed_openings = _headless_minimum_confirmed_openings(
             duration,
             profile.speed_level,
+            video_speed_mode=video_speed_mode,
         )
         monitor_detected = bool(telemetry.get("monitor_detected", False))
         monitor_pending_change = bool(
@@ -2794,6 +2819,9 @@ def _headless_monitor_existing(
             telemetry.get("unlimited_cycle_mode", False)
         )
         stability_mode = bool(telemetry.get("stability_mode", False))
+        video_speed_mode_active = bool(
+            telemetry.get("video_speed_mode", False)
+        )
         request_events_in_window = int(
             telemetry.get("request_events_in_window", 0)
         )
@@ -2803,8 +2831,15 @@ def _headless_monitor_existing(
         )
         cycle_p50_ms = float(telemetry.get("cycle_p50_ms", 0.0))
         cycle_p50_limit_ms = (
-            RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
-            + HEADLESS_MONITOR_CYCLE_P50_GRACE_MS
+            (
+                RENEWAL_VIDEO_TARGET_CYCLE_SECONDS * 1000.0
+                + HEADLESS_VIDEO_CYCLE_P50_GRACE_MS
+            )
+            if video_speed_mode
+            else (
+                RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
+                + HEADLESS_MONITOR_CYCLE_P50_GRACE_MS
+            )
         )
         confirmed_cycles_per_second = (
             float(confirmed_openings) / elapsed if elapsed > 0.0 else 0.0
@@ -2816,19 +2851,30 @@ def _headless_monitor_existing(
         )
         resources = resource_summary()
         open_failure_summary = _headless_open_failure_summary(telemetry)
+        mode_passed = bool(
+            (
+                video_speed_mode_active
+                and not stability_mode
+                and cycle_p50_ms <= cycle_p50_limit_ms
+            )
+            if video_speed_mode
+            else (
+                stability_mode
+                and not unlimited_cycle_mode
+                and request_events_in_window <= RENEWAL_REQUEST_LIMIT
+                and cycle_p50_ms <= cycle_p50_limit_ms
+            )
+        )
         passed = bool(
             order_inputs == 0
             and armed_openings >= 2
             and not initial_mismatch
             and not monitor_pending_change
             and not server_pressure_detected
-            and stability_mode
-            and not unlimited_cycle_mode
-            and request_events_in_window <= RENEWAL_REQUEST_LIMIT
             and max_open_failures < 3
             and bool(open_failure_summary["within_limit"])
             and confirmed_openings >= minimum_confirmed_openings
-            and cycle_p50_ms <= cycle_p50_limit_ms
+            and mode_passed
             and duration_completed
             and bool(resources.get("within_limits", False))
         )
@@ -2843,6 +2889,7 @@ def _headless_monitor_existing(
                 "cycle_p50_limit_ms": cycle_p50_limit_ms,
                 "unlimited_cycle_mode": unlimited_cycle_mode,
                 "stability_mode": stability_mode,
+                "video_speed_mode": video_speed_mode_active,
                 "request_events_in_window": request_events_in_window,
                 "request_budget_limit": RENEWAL_REQUEST_LIMIT,
                 "artificial_waits": artificial_waits,
@@ -3588,6 +3635,13 @@ def main() -> int:
                 monitor_seconds = float(argument.split("=", 1)[1])
             except ValueError:
                 return 2
+    for argument in sys.argv[1:]:
+        if argument.startswith("--headless-video-monitor-existing="):
+            return _headless_monitor_existing(
+                argument.split("=", 1)[1].strip().lower(),
+                monitor_seconds,
+                video_speed_mode=True,
+            )
     for argument in sys.argv[1:]:
         if argument.startswith("--headless-monitor-existing="):
             return _headless_monitor_existing(

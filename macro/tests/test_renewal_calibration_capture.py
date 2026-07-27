@@ -469,6 +469,14 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
             renewal_macro.HEADLESS_MONITOR_CHECKPOINT_SECONDS,
             60.0,
         )
+        self.assertGreater(
+            renewal_macro.HEADLESS_VIDEO_CPU_AVERAGE_LIMIT_PERCENT,
+            renewal_macro.HEADLESS_MONITOR_CPU_AVERAGE_LIMIT_PERCENT,
+        )
+        self.assertLessEqual(
+            renewal_macro.HEADLESS_VIDEO_CPU_AVERAGE_LIMIT_PERCENT,
+            renewal_macro.HEADLESS_MONITOR_CPU_P95_LIMIT_PERCENT,
+        )
 
     def test_headless_monitor_acceptance_tracks_stable_request_budget(self):
         self.assertEqual(
@@ -491,6 +499,22 @@ class RenewalCalibrationCaptureTests(unittest.TestCase):
                 10,
             ),
             1000,
+        )
+        self.assertEqual(
+            renewal_macro._headless_minimum_confirmed_openings(
+                60.0,
+                10,
+                video_speed_mode=True,
+            ),
+            133,
+        )
+        self.assertEqual(
+            renewal_macro._headless_minimum_confirmed_openings(
+                1800.0,
+                10,
+                video_speed_mode=True,
+            ),
+            4000,
         )
 
     def test_headless_monitor_rejects_recorded_sustained_open_failures(

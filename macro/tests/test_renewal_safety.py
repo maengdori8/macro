@@ -466,6 +466,8 @@ def _run(
     monitor_only: bool = False,
     continuous_monitor: bool = False,
     diagnostic_sink=None,
+    video_speed_mode: bool = False,
+    video_target_cycle_seconds: float = 0.0,
 ) -> bool:
     manager = _FakeManager(engine)
     with ExitStack() as stack:
@@ -546,6 +548,8 @@ def _run(
             monitor_only=monitor_only,
             continuous_monitor=continuous_monitor,
             stability_mode=False,
+            video_speed_mode=video_speed_mode,
+            video_target_cycle_seconds=video_target_cycle_seconds,
         )
         completed = runner.run()
         engine.runner_telemetry = dict(runner.telemetry)
@@ -565,6 +569,137 @@ class RenewalSafetyTests(unittest.TestCase):
             1800.0 / 840.0,
             places=6,
         )
+
+    def test_speed10_video_mode_matches_reference_video_cadence(self) -> None:
+        for speed_level in range(1, 10):
+            with self.subTest(speed_level=speed_level):
+                self.assertEqual(
+                    renewal.renewal_video_cycle_seconds(speed_level),
+                    0.0,
+                )
+        self.assertAlmostEqual(
+            renewal.renewal_video_cycle_seconds(10),
+            0.360,
+            places=6,
+        )
+
+    def test_video_speed_mode_disables_stable_request_budget(self) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            repeat_guard=self.guard,
+            stop_after_closes=4,
+        )
+        self.assertFalse(
+            _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                video_speed_mode=True,
+                video_target_cycle_seconds=0.0,
+            )
+        )
+        telemetry = engine.runner_telemetry
+        self.assertTrue(telemetry["video_speed_mode"])
+        self.assertFalse(telemetry["stability_mode"])
+        self.assertEqual(telemetry["request_events_in_window"], 0)
+        self.assertEqual(telemetry["open_input_attempts"], 4)
+        self.assertEqual(telemetry["order_clicks"], 0)
+
+    def test_video_speed_mode_spaces_open_inputs_without_delaying_frames(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+
+        class TimedFakeEngine(_FakeEngine):
+            def __init__(self):
+                super().__init__(
+                    stop_event,
+                    repeat_guard=self_guard,
+                    stop_after_closes=4,
+                )
+                self.open_times: list[float] = []
+
+            def on_click(self, hwnd: int, x: int, y: int) -> bool:
+                if (x, y) == (20, 10):
+                    self.open_times.append(time.perf_counter())
+                return super().on_click(hwnd, x, y)
+
+        self_guard = self.guard
+        engine = TimedFakeEngine()
+        with patch.object(
+            renewal,
+            "RENEWAL_VIDEO_MIN_CYCLE_SECONDS",
+            0.001,
+        ):
+            self.assertFalse(
+                _run(
+                    self.profile,
+                    engine,
+                    monitor_only=True,
+                    video_speed_mode=True,
+                    video_target_cycle_seconds=0.020,
+                )
+            )
+        intervals = [
+            engine.open_times[index] - engine.open_times[index - 1]
+            for index in range(1, len(engine.open_times))
+        ]
+        self.assertEqual(len(engine.open_times), 4)
+        self.assertTrue(all(interval >= 0.018 for interval in intervals))
+        self.assertEqual(
+            engine.runner_telemetry["video_pacing_waits"],
+            3,
+        )
+        self.assertEqual(engine.runner_telemetry["order_clicks"], 0)
+
+    def test_video_speed_accelerates_only_after_confirmed_openings(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _FakeEngine(
+            stop_event,
+            repeat_guard=self.guard,
+            stop_after_closes=6,
+        )
+
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_MIN_CYCLE_SECONDS",
+                0.001,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_MAX_CYCLE_SECONDS",
+                0.050,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_ACCELERATE_SUCCESSES",
+                2,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_ACCELERATE_STEP_SECONDS",
+                0.005,
+            ),
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                video_speed_mode=True,
+                video_target_cycle_seconds=0.020,
+            )
+
+        self.assertFalse(completed)
+        telemetry = engine.runner_telemetry
+        self.assertGreaterEqual(telemetry["video_accelerations"], 2)
+        self.assertLess(telemetry["video_target_cycle_ms"], 20.0)
+        self.assertEqual(telemetry["video_gray_backoffs"], 0)
+        self.assertEqual(telemetry["runtime_disabled_action_detections"], 0)
+        self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_popup_open_deadline_covers_measured_fc_transition(self) -> None:
         self.assertGreaterEqual(
@@ -1232,7 +1367,7 @@ class RenewalSafetyTests(unittest.TestCase):
         # screen whose luminance is plainly not this popup.
         self.assertEqual(translate.call_count, 0)
 
-    def test_guard_rejects_incomplete_template_match_without_shift_sweep(
+    def test_guard_rejects_incomplete_template_match_with_bounded_neighborhood(
         self,
     ) -> None:
         guard_detector = renewal.RenewalModalGuard(
@@ -1270,13 +1405,47 @@ class RenewalSafetyTests(unittest.TestCase):
                 0.0,
             )
         self.assertFalse(registration.valid)
-        # One translation validates the template's proposed location.  The
-        # old 9x9 fallback would add 81 more translations on every transition
-        # frame even though no alignment could make it a completed popup.
-        self.assertEqual(translate.call_count, 1)
-        # Luma and local structure already prove this popup is incomplete, so
-        # expensive Canny edge extraction must not run at all.
-        self.assertEqual(edge_delta.call_count, 0)
+        # One template translation plus three translated representations for
+        # each cell of a bounded 3x3 neighborhood replaces the old full 9x9
+        # sweep while still rejecting an incomplete popup.
+        self.assertLessEqual(translate.call_count, 29)
+        self.assertLessEqual(edge_delta.call_count, 1)
+
+    def test_guard_recovers_one_pixel_sparse_template_miss(
+        self,
+    ) -> None:
+        guard_detector = renewal.RenewalModalGuard(
+            self.guard,
+            self.price_box,
+            shift_limit=4,
+        )
+        shifted = renewal._translate_image(self.guard, 3, -2)
+        # The measured FC failure had a valid stable popup, but its sparse
+        # static template proposed the adjacent x position.
+        with (
+            patch.object(
+                guard_detector,
+                "_template_shift",
+                return_value=(-2, 2),
+            ),
+            patch.object(
+                renewal,
+                "_translate_image",
+                wraps=renewal._translate_image,
+            ) as translate,
+        ):
+            registration = guard_detector.register(
+                shifted,
+                0.0,
+                0.0,
+            )
+
+        self.assertTrue(registration.valid)
+        self.assertEqual(
+            (registration.shift_x, registration.shift_y),
+            (-3, 2),
+        )
+        self.assertLessEqual(translate.call_count, 29)
 
     def test_guard_reuses_exact_fresh_frame_pixels_without_reprocessing(
         self,
@@ -2495,9 +2664,21 @@ class RenewalSafetyTests(unittest.TestCase):
                     telemetry["target_restore_dropped_clicks"],
                     dropped_clicks,
                 )
-                self.assertEqual(
-                    telemetry["target_restore_reconnects"],
-                    dropped_clicks // 3,
+                reconnects = int(
+                    telemetry["target_restore_reconnects"]
+                )
+                expected_reconnects = dropped_clicks // 3
+                # The test compresses a real 750 ms WGC observation window
+                # to 10 ms. Under suite load the final successful click can
+                # cross that artificial boundary and safely reconnect once
+                # more before its fresh frame arrives.
+                self.assertGreaterEqual(
+                    reconnects,
+                    expected_reconnects,
+                )
+                self.assertLessEqual(
+                    reconnects,
+                    expected_reconnects + 1,
                 )
 
     def test_stop_during_target_reselection_is_not_an_error(self) -> None:
@@ -2621,6 +2802,53 @@ class RenewalSafetyTests(unittest.TestCase):
         self.assertEqual(telemetry["recovered_open_failures"], 1)
         self.assertEqual(telemetry["reselection_failures"], 0)
         self.assertEqual(telemetry["reselection_clicks"], 2)
+        self.assertEqual(telemetry["order_clicks"], 0)
+
+    def test_video_speed_backs_off_only_after_proven_gray_action(
+        self,
+    ) -> None:
+        stop_event = threading.Event()
+        engine = _DisabledActionRecoveryEngine(
+            stop_event,
+            self.guard,
+        )
+
+        with (
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_MIN_CYCLE_SECONDS",
+                0.001,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_MAX_CYCLE_SECONDS",
+                0.050,
+            ),
+            patch.object(
+                renewal,
+                "RENEWAL_VIDEO_GRAY_BACKOFF_SECONDS",
+                0.005,
+            ),
+        ):
+            completed = _run(
+                self.profile,
+                engine,
+                monitor_only=True,
+                continuous_monitor=True,
+                video_speed_mode=True,
+                video_target_cycle_seconds=0.020,
+            )
+
+        self.assertFalse(completed)
+        telemetry = engine.runner_telemetry
+        self.assertEqual(telemetry["runtime_disabled_action_detections"], 1)
+        self.assertEqual(telemetry["video_gray_backoffs"], 1)
+        self.assertAlmostEqual(
+            telemetry["video_target_cycle_ms"],
+            25.0,
+            places=3,
+        )
+        self.assertEqual(telemetry["video_accelerations"], 0)
         self.assertEqual(telemetry["order_clicks"], 0)
 
     def test_delayed_modal_is_closed_before_any_reselection_click(

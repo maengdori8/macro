@@ -100,6 +100,20 @@ RENEWAL_RESELECT_MAX_CLICK_ATTEMPTS = 3
 RENEWAL_RESELECT_HOVER_SECONDS = 0.025
 RENEWAL_RESELECT_DOWN_UP_SECONDS = 0.012
 RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS = (60.0, 120.0, 300.0)
+# The supplied 60 fps reference video opens the popup every 458 ms at the
+# median (367 ms minimum). Start at its fastest repeatable range, accelerate
+# while FC keeps the action button enabled, and back off only after a proven
+# gray button. The normal-path ceiling remains below the reference median.
+# Recognition is still frame-driven: pacing never delays a confirmed price
+# change inside an already open popup.
+RENEWAL_VIDEO_TARGET_CYCLE_SECONDS = 0.360
+RENEWAL_VIDEO_MIN_CYCLE_SECONDS = 0.180
+RENEWAL_VIDEO_MAX_CYCLE_SECONDS = 0.450
+RENEWAL_VIDEO_ACCELERATE_STEP_SECONDS = 0.005
+RENEWAL_VIDEO_ACCELERATE_SUCCESSES = 25
+RENEWAL_VIDEO_GRAY_BACKOFF_SECONDS = 0.025
+RENEWAL_VIDEO_GRAY_COOLDOWN_SUCCESSES = 100
+RENEWAL_VIDEO_RECONNECT_FAILURES = 10
 RENEWAL_RESELECT_LIST_BOUNDS = (0.14, 0.18, 0.46, 0.90)
 RENEWAL_RESELECT_MIN_POINT_DISTANCE = 0.025
 # FC replaces both ends of a selected player row with hover controls
@@ -126,6 +140,16 @@ def renewal_sustained_cycle_seconds(speed_level: int) -> float:
 
     return (
         RENEWAL_REQUEST_INTERVAL_SECONDS
+        if int(speed_level) >= 10
+        else 0.0
+    )
+
+
+def renewal_video_cycle_seconds(speed_level: int) -> float:
+    """Return the measured reference-video cadence for speed level 10."""
+
+    return (
+        RENEWAL_VIDEO_TARGET_CYCLE_SECONDS
         if int(speed_level) >= 10
         else 0.0
     )
@@ -3299,6 +3323,14 @@ class RenewalModalGuard:
             self._DILATE_KERNEL,
         )
         template_shift = self._template_shift(candidate_edges)
+        fallback_dx_values = range(
+            -self.shift_limit,
+            self.shift_limit + 1,
+        )
+        fallback_dy_values = range(
+            -self.shift_limit,
+            self.shift_limit + 1,
+        )
         if template_shift is not None:
             template_dx, template_dy = template_shift
             template_aligned = _translate_image(
@@ -3340,23 +3372,19 @@ class RenewalModalGuard:
                             template_edge,
                         ),
                     )
-            # Static popup templates found a concrete alignment, but the
-            # aligned frame still failed the full luma/edge/structure guard.
-            # This is an incomplete popup transition or a different modal.
-            # Searching every other +/-4 px position cannot turn it into
-            # trustworthy popup evidence; it only burns a full frame budget.
-            # Fail closed and let the next fresh WGC frame retry.
-            return self._remember_registration(
-                gray,
-                noise_key,
-                GuardRegistration(
-                    False,
-                    template_aligned,
-                    template_dx,
-                    template_dy,
-                    template_luma,
-                    template_edge,
-                ),
+            # Sparse white popup anchors can make template matching land one
+            # pixel beside the true position even though the complete popup
+            # is stable. Search only the immediate 3x3 neighborhood with the
+            # same strict luma/edge/structure checks. This fixes measured FC
+            # reopen jitter without restoring the old 9x9 transition-frame
+            # cost or admitting a different modal.
+            fallback_dx_values = range(
+                max(-self.shift_limit, template_dx - 1),
+                min(self.shift_limit, template_dx + 1) + 1,
+            )
+            fallback_dy_values = range(
+                max(-self.shift_limit, template_dy - 1),
+                min(self.shift_limit, template_dy + 1) + 1,
             )
         # Edge overlap alone can prefer a diagonal near-match when the whole
         # popup moved horizontally.  Choose by brightness-normalized spatial
@@ -3366,8 +3394,8 @@ class RenewalModalGuard:
         best: Optional[
             tuple[float, float, float, int, int, int]
         ] = None
-        for dy in range(-self.shift_limit, self.shift_limit + 1):
-            for dx in range(-self.shift_limit, self.shift_limit + 1):
+        for dy in fallback_dy_values:
+            for dx in fallback_dx_values:
                 shifted_gray = _translate_image(gray, dx, dy)
                 shifted_spatial = self._registration_luma(shifted_gray)
                 absolute = cv2.absdiff(self.baseline, shifted_gray)
@@ -4301,6 +4329,10 @@ class FastRenewalRunner:
         request_budget: Optional[RenewalRequestBudget] = None,
         request_time: Optional[Callable[[], float]] = None,
         require_initial_budget_cooldown: bool = True,
+        video_speed_mode: bool = False,
+        video_target_cycle_seconds: float = (
+            RENEWAL_VIDEO_TARGET_CYCLE_SECONDS
+        ),
     ):
         if side not in ("buy", "sell"):
             raise ValueError(f"지원하지 않는 갱신 구분입니다: {side}")
@@ -4318,7 +4350,31 @@ class FastRenewalRunner:
             None if active_until is None else float(active_until)
         )
         self.time_valid = time_valid
-        self.stability_mode = bool(stability_mode)
+        self.video_speed_mode = bool(
+            video_speed_mode and self.profile.speed_level == 10
+        )
+        requested_video_cycle = max(
+            0.0,
+            float(video_target_cycle_seconds),
+        )
+        self.video_target_cycle_seconds = (
+            (
+                min(
+                    RENEWAL_VIDEO_MAX_CYCLE_SECONDS,
+                    max(
+                        RENEWAL_VIDEO_MIN_CYCLE_SECONDS,
+                        requested_video_cycle,
+                    ),
+                )
+                if requested_video_cycle > 0.0
+                else 0.0
+            )
+            if self.video_speed_mode
+            else 0.0
+        )
+        self.stability_mode = bool(
+            stability_mode and not self.video_speed_mode
+        )
         self.request_time = request_time or time.time
         self.request_budget = (
             request_budget
@@ -4376,9 +4432,13 @@ class FastRenewalRunner:
             "capture_layout_mode": "",
             "frame_size_changes": 0,
             "cycle_floor_ms": (
-                RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
-                if self.stability_mode
-                else 0.0
+                self.video_target_cycle_seconds * 1000.0
+                if self.video_speed_mode
+                else (
+                    RENEWAL_REQUEST_INTERVAL_SECONDS * 1000.0
+                    if self.stability_mode
+                    else 0.0
+                )
             ),
             "adaptive_pacing_enabled": False,
             "adaptive_pacing_increases": 0,
@@ -4391,6 +4451,17 @@ class FastRenewalRunner:
             "pacing_waits": 0,
             "pacing_total_ms": 0.0,
             "unlimited_cycle_mode": False,
+            "video_speed_mode": self.video_speed_mode,
+            "video_target_cycle_ms": (
+                self.video_target_cycle_seconds * 1000.0
+            ),
+            "video_pacing_waits": 0,
+            "video_pacing_total_ms": 0.0,
+            "video_accelerations": 0,
+            "video_gray_backoffs": 0,
+            "video_success_streak": 0,
+            "video_gray_cooldown_successes": 0,
+            "open_input_attempts": 0,
             "stability_mode": self.stability_mode,
             "request_budget_window_seconds": (
                 RENEWAL_REQUEST_WINDOW_SECONDS
@@ -4660,17 +4731,101 @@ class FastRenewalRunner:
             RenewalCalibratedPriceClassifier
         ] = None
         monitor_candidate_cycle = 0
+        last_open_input_at: Optional[float] = None
+        video_cycle_seconds = self.video_target_cycle_seconds
+        video_success_streak = 0
+        video_gray_cooldown = 0
         self.status("기준 가격 독립 확인 0/2")
+        cadence_description = (
+            f"영상속도 목표 "
+            f"{self.video_target_cycle_seconds * 1000.0:.0f}ms"
+            if self.video_speed_mode
+            else (
+                f"30분 안정 {RENEWAL_REQUEST_LIMIT}회/"
+                f"{RENEWAL_REQUEST_WINDOW_SECONDS:.0f}초"
+            )
+        )
         self.log(
             f"[갱신 v12] {'구매/상한가' if self.side_name == 'buy' else '판매/하한가'} "
             f"속도 {self.profile.speed_level}, 명확한 변경 {required_frames}프레임, "
             f"동일가격 상한 {side_profile.unchanged_limit:.4f}, "
             f"전환 가격 2프레임 {'ON' if transition_mode_enabled else 'OFF'}, "
             "완성 팝업 대기 없음, "
-            f"30분 안정 {RENEWAL_REQUEST_LIMIT}회/"
-            f"{RENEWAL_REQUEST_WINDOW_SECONDS:.0f}초, "
+            f"{cadence_description}, "
             f"{'무주문 측정' if self.monitor_only else '실주문'}, 애매하면 주문 금지"
         )
+
+        def apply_video_gray_backoff() -> None:
+            nonlocal video_cycle_seconds
+            nonlocal video_success_streak
+            nonlocal video_gray_cooldown
+            if (
+                not self.video_speed_mode
+                or video_cycle_seconds <= 0.0
+            ):
+                return
+            video_cycle_seconds = min(
+                RENEWAL_VIDEO_MAX_CYCLE_SECONDS,
+                video_cycle_seconds
+                + RENEWAL_VIDEO_GRAY_BACKOFF_SECONDS,
+            )
+            video_success_streak = 0
+            video_gray_cooldown = (
+                RENEWAL_VIDEO_GRAY_COOLDOWN_SUCCESSES
+            )
+            self.telemetry["video_target_cycle_ms"] = (
+                video_cycle_seconds * 1000.0
+            )
+            self.telemetry["cycle_floor_ms"] = (
+                video_cycle_seconds * 1000.0
+            )
+            self.telemetry["video_gray_backoffs"] = (
+                int(self.telemetry["video_gray_backoffs"]) + 1
+            )
+            self.telemetry["video_success_streak"] = 0
+            self.telemetry["video_gray_cooldown_successes"] = (
+                video_gray_cooldown
+            )
+
+        def record_video_open_success() -> None:
+            nonlocal video_cycle_seconds
+            nonlocal video_success_streak
+            nonlocal video_gray_cooldown
+            if (
+                not self.video_speed_mode
+                or video_cycle_seconds <= 0.0
+            ):
+                return
+            video_success_streak += 1
+            if video_gray_cooldown > 0:
+                video_gray_cooldown -= 1
+            elif (
+                video_success_streak
+                >= RENEWAL_VIDEO_ACCELERATE_SUCCESSES
+                and video_cycle_seconds
+                > RENEWAL_VIDEO_MIN_CYCLE_SECONDS
+            ):
+                video_cycle_seconds = max(
+                    RENEWAL_VIDEO_MIN_CYCLE_SECONDS,
+                    video_cycle_seconds
+                    - RENEWAL_VIDEO_ACCELERATE_STEP_SECONDS,
+                )
+                video_success_streak = 0
+                self.telemetry["video_accelerations"] = (
+                    int(self.telemetry["video_accelerations"]) + 1
+                )
+            self.telemetry["video_target_cycle_ms"] = (
+                video_cycle_seconds * 1000.0
+            )
+            self.telemetry["cycle_floor_ms"] = (
+                video_cycle_seconds * 1000.0
+            )
+            self.telemetry["video_success_streak"] = (
+                video_success_streak
+            )
+            self.telemetry["video_gray_cooldown_successes"] = (
+                video_gray_cooldown
+            )
 
         def update_performance_telemetry() -> None:
             elapsed = max(1e-9, time.perf_counter() - run_started)
@@ -5495,6 +5650,7 @@ class FastRenewalRunner:
                     )
                     + 1
                 )
+                apply_video_gray_backoff()
                 grace_state = observe_delayed_modal_grace(
                     time.monotonic()
                     + RENEWAL_RESELECT_DELAYED_MODAL_GRACE_SECONDS
@@ -5754,6 +5910,48 @@ class FastRenewalRunner:
                 break
             if not reserve_request_slot():
                 break
+            if (
+                self.video_speed_mode
+                and last_open_input_at is not None
+                and video_cycle_seconds > 0.0
+            ):
+                wait_seconds = max(
+                    0.0,
+                    last_open_input_at
+                    + video_cycle_seconds
+                    - time.perf_counter(),
+                )
+                if wait_seconds > 0.0:
+                    wait_started = time.perf_counter()
+                    self.telemetry["video_pacing_waits"] = (
+                        int(self.telemetry["video_pacing_waits"]) + 1
+                    )
+                    self.telemetry["pacing_waits"] = (
+                        int(self.telemetry["pacing_waits"]) + 1
+                    )
+                    self.telemetry["artificial_waits"] = (
+                        int(self.telemetry["artificial_waits"]) + 1
+                    )
+                    if self._wait(wait_seconds):
+                        update_performance_telemetry()
+                        return False
+                    waited_ms = (
+                        time.perf_counter() - wait_started
+                    ) * 1000.0
+                    self.telemetry["video_pacing_total_ms"] = (
+                        float(self.telemetry["video_pacing_total_ms"])
+                        + waited_ms
+                    )
+                    self.telemetry["pacing_total_ms"] = (
+                        float(self.telemetry["pacing_total_ms"])
+                        + waited_ms
+                    )
+                    self.telemetry["artificial_wait_ms"] = (
+                        float(self.telemetry["artificial_wait_ms"])
+                        + waited_ms
+                    )
+                if not self._time_window_active():
+                    break
             if hasattr(engine, "get_frame_size"):
                 current_size = engine.get_frame_size()
                 if current_size != expected_capture_size:
@@ -5765,6 +5963,10 @@ class FastRenewalRunner:
                         f"{current_size!r} != {expected_capture_size!r}"
                     )
             clicker.click_prepared(action_click)
+            last_open_input_at = time.perf_counter()
+            self.telemetry["open_input_attempts"] = (
+                int(self.telemetry["open_input_attempts"]) + 1
+            )
             self.telemetry["popup_may_be_open"] = True
             self.telemetry["current_popup_escape_sent"] = False
             opening_not_before = time.perf_counter()
@@ -6060,7 +6262,20 @@ class FastRenewalRunner:
                     # transfer market, so retry immediately.
                     self.telemetry["popup_may_be_open"] = False
                 record_completed_cycle(action_started)
-                if consecutive_open_failures >= 2:
+                if (
+                    self.video_speed_mode
+                    and consecutive_open_failures
+                    >= RENEWAL_VIDEO_RECONNECT_FAILURES
+                ):
+                    update_performance_telemetry()
+                    raise RenewalCaptureRestart(
+                        "영상속도 모드 팝업 열기 10회 연속 실패 · "
+                        "고정 대기 없이 WGC/HWND 재연결"
+                    )
+                if (
+                    not self.video_speed_mode
+                    and consecutive_open_failures >= 2
+                ):
                     recovery_wait = RENEWAL_OPEN_FAILURE_RECOVERY_SECONDS[
                         min(
                             self._open_failure_recovery_level,
@@ -6115,6 +6330,7 @@ class FastRenewalRunner:
                 self.telemetry["confirmed_openings"] = (
                     int(self.telemetry["confirmed_openings"]) + 1
                 )
+                record_video_open_success()
 
             if (
                 decision is None
