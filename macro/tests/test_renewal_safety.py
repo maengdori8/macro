@@ -750,6 +750,44 @@ class RenewalSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_target_row_validation_ignores_hover_controls_at_both_ends(
+        self,
+    ) -> None:
+        side = self.profile.buy
+        self.assertIsNotNone(side.reselect_target_rect)
+        frame = np.full((100, 200), 128, dtype=np.uint8)
+        x1, y1, x2, y2 = side.reselect_target_rect.to_pixels(200, 100)
+        width = x2 - x1
+        core_left, core_right = renewal.RENEWAL_RESELECT_ANCHOR_X_FRACTION
+        left = x1 + int(round(width * core_left))
+        right = x1 + int(round(width * core_right))
+        frame[y1:y2, x1:left] = 0
+        frame[y1:y2, right:x2] = 255
+
+        result = renewal.validate_reselect_target_frame(frame, side)
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.luma_delta, 0.0)
+        self.assertEqual(result.edge_delta, 0.0)
+
+    def test_target_row_validation_rejects_changed_player_identity_core(
+        self,
+    ) -> None:
+        side = self.profile.buy
+        self.assertIsNotNone(side.reselect_target_rect)
+        frame = np.full((100, 200), 128, dtype=np.uint8)
+        x1, y1, x2, y2 = side.reselect_target_rect.to_pixels(200, 100)
+        width = x2 - x1
+        core_left, core_right = renewal.RENEWAL_RESELECT_ANCHOR_X_FRACTION
+        left = x1 + int(round(width * core_left))
+        right = x1 + int(round(width * core_right))
+        frame[y1:y2, left:right] = 0
+
+        result = renewal.validate_reselect_target_frame(frame, side)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "context_mismatch")
+
     def test_proven_top_left_dwm_extension_reuses_calibrated_pixels(self) -> None:
         side = self.profile.buy
         side.calibrated_frame_width = 1920

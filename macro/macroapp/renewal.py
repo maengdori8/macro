@@ -119,6 +119,11 @@ RENEWAL_RESELECT_VERIFY_FRAMES = 2
 RENEWAL_RESELECT_STATE_TIMEOUT_SECONDS = 0.65
 RENEWAL_RESELECT_LIST_BOUNDS = (0.14, 0.18, 0.46, 0.90)
 RENEWAL_RESELECT_MIN_POINT_DISTANCE = 0.025
+# FC replaces both ends of a selected player row with hover controls
+# (favorite/lock/search).  The season badge and player name in the middle stay
+# byte-stable and identify the intended row, so only that invariant core is
+# allowed to approve a reselection.
+RENEWAL_RESELECT_ANCHOR_X_FRACTION = (0.28, 0.68)
 SUPPORTED_RENEWAL_WGC_SIZES = frozenset(
     {
         (1928, 1048),
@@ -901,6 +906,7 @@ def _validate_calibrated_anchor(
     luma_limit: float,
     edge_limit: float,
     preserve_uniform_fill: bool,
+    compare_x_fraction: tuple[float, float] = (0.0, 1.0),
 ) -> ActionReadyValidation:
     if (
         full_frame is None
@@ -929,6 +935,25 @@ def _validate_calibrated_anchor(
     except (TypeError, ValueError):
         return ActionReadyValidation(False, float("inf"), 1.0, "decode")
     if candidate.shape != baseline.shape or candidate.size < 64:
+        return ActionReadyValidation(False, float("inf"), 1.0, "anchor_shape")
+    fraction_left, fraction_right = compare_x_fraction
+    compare_x1 = max(
+        0,
+        min(
+            baseline.shape[1] - 1,
+            int(round(baseline.shape[1] * float(fraction_left))),
+        ),
+    )
+    compare_x2 = max(
+        compare_x1 + 1,
+        min(
+            baseline.shape[1],
+            int(round(baseline.shape[1] * float(fraction_right))),
+        ),
+    )
+    candidate = candidate[:, compare_x1:compare_x2]
+    baseline = baseline[:, compare_x1:compare_x2]
+    if candidate.size < 64:
         return ActionReadyValidation(False, float("inf"), 1.0, "anchor_shape")
 
     difference = candidate.astype(np.float32) - baseline.astype(np.float32)
@@ -1018,6 +1043,7 @@ def validate_reselect_target_frame(
         luma_limit=4.00,
         edge_limit=0.120,
         preserve_uniform_fill=True,
+        compare_x_fraction=RENEWAL_RESELECT_ANCHOR_X_FRACTION,
     )
 
 
