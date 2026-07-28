@@ -2,6 +2,7 @@ const admin = require("firebase-admin");
 const sec = require("../lib/security");
 const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 const {
+  shouldProcessHeartbeat,
   shouldSkipStatus,
   rememberStatus,
   shouldPersistStatusDocument,
@@ -55,6 +56,16 @@ module.exports = async function handler(req, res) {
     const rl = await sec.rateLimit(db, { bucket: "status_post", ip, max: 30, windowMs: 60000 });
     if (!rl.allowed) {
       return res.status(429).json({ success: false, message: "요청이 너무 많습니다." });
+    }
+    // Existing clients report every 30 seconds. Select one deterministic
+    // 30-second bucket per five minutes before touching Firestore. This is
+    // stateless, so it limits reads across every serverless instance too.
+    if (!shouldProcessHeartbeat(statusPayload)) {
+      return res.status(200).json({
+        success: true,
+        sampled: false,
+        nextReportSeconds: 300,
+      });
     }
     if (shouldSkipStatus(statusPayload)) {
       return res.status(200).json({

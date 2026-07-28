@@ -4,6 +4,9 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   DEFAULT_STATUS_TTL_MS,
+  HEARTBEAT_BUCKET_MS,
+  HEARTBEAT_BUCKET_COUNT,
+  shouldProcessHeartbeat,
   shouldSkipStatus,
   rememberStatus,
   shouldPersistStatusDocument,
@@ -45,6 +48,65 @@ test("thirty-second heartbeats persist at most 288 times per day", () => {
     rememberStatus(BASE, now);
   }
   assert.equal(writes, 288);
+});
+
+test("stateless sampling selects one running heartbeat every five minutes", () => {
+  let selected = 0;
+  const oneDay = 24 * 60 * 60 * 1000;
+  for (let now = 0; now < oneDay; now += HEARTBEAT_BUCKET_MS) {
+    if (shouldProcessHeartbeat(BASE, now)) selected += 1;
+  }
+  assert.equal(HEARTBEAT_BUCKET_COUNT, 10);
+  assert.equal(selected, 288);
+});
+
+test("sampling phase is stable per license and device", () => {
+  const selectedBuckets = [];
+  for (let bucket = 0; bucket < HEARTBEAT_BUCKET_COUNT; bucket += 1) {
+    if (
+      shouldProcessHeartbeat(
+        BASE,
+        bucket * HEARTBEAT_BUCKET_MS
+      )
+    ) {
+      selectedBuckets.push(bucket);
+    }
+  }
+  assert.equal(selectedBuckets.length, 1);
+  assert.equal(
+    shouldProcessHeartbeat(
+      BASE,
+      (selectedBuckets[0] + HEARTBEAT_BUCKET_COUNT) *
+        HEARTBEAT_BUCKET_MS
+    ),
+    true
+  );
+});
+
+test("stop reports always bypass heartbeat sampling", () => {
+  const stopped = { ...BASE, running: false };
+  for (let bucket = 0; bucket < HEARTBEAT_BUCKET_COUNT; bucket += 1) {
+    assert.equal(
+      shouldProcessHeartbeat(
+        stopped,
+        bucket * HEARTBEAT_BUCKET_MS
+      ),
+      true
+    );
+  }
+});
+
+test("a full day of routine status reports performs at most 576 reads", () => {
+  let reads = 0;
+  for (
+    let now = 0;
+    now < 24 * 60 * 60 * 1000;
+    now += HEARTBEAT_BUCKET_MS
+  ) {
+    if (!shouldProcessHeartbeat(BASE, now)) continue;
+    reads += 2; // license authorization + shared status document
+  }
+  assert.equal(reads, 576);
 });
 
 test("stop and message changes bypass the unchanged throttle", () => {
