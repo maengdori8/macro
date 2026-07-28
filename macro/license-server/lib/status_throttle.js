@@ -51,6 +51,32 @@ function rememberStatus(payload, now = Date.now()) {
   }
 }
 
+function toMillis(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  return 0;
+}
+
+function shouldPersistStatusDocument(
+  current,
+  payload,
+  now = Date.now(),
+  ttlMs = DEFAULT_STATUS_TTL_MS
+) {
+  if (!current) return true;
+  const currentRank =
+    current.rank === undefined ? null : current.rank;
+  if (currentRank !== payload.rank) return true;
+  if (Boolean(current.running) !== Boolean(payload.running)) return true;
+  if (String(current.message || "") !== String(payload.message || "")) {
+    return true;
+  }
+  const updatedAt = toMillis(current.updatedAt);
+  return updatedAt <= 0 || Number(now) - updatedAt >= Number(ttlMs);
+}
+
 function resetStatusThrottleForTests() {
   statusCache.clear();
 }
@@ -59,5 +85,6 @@ module.exports = {
   DEFAULT_STATUS_TTL_MS,
   shouldSkipStatus,
   rememberStatus,
+  shouldPersistStatusDocument,
   resetStatusThrottleForTests,
 };

@@ -4,6 +4,7 @@ const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 const {
   shouldSkipStatus,
   rememberStatus,
+  shouldPersistStatusDocument,
 } = require("../lib/status_throttle");
 
 if (!admin.apps.length) {
@@ -86,9 +87,30 @@ module.exports = async function handler(req, res) {
         return res.status(403).json({ success: false, message: "등록되지 않은 기기입니다." });
       }
 
+      const statusRef = db.collection("status").doc(key);
+      const currentStatus = await sec.withTimeout(
+        statusRef.get(),
+        STATUS_DB_TIMEOUT_MS,
+        "current status lookup"
+      );
+      if (
+        currentStatus.exists &&
+        !shouldPersistStatusDocument(
+          currentStatus.data(),
+          statusPayload
+        )
+      ) {
+        rememberStatus(statusPayload);
+        return res.status(200).json({
+          success: true,
+          unchanged: true,
+          nextReportSeconds: 300,
+        });
+      }
+
       try {
         await sec.withTimeout(
-          db.collection("status").doc(key).set(
+          statusRef.set(
             {
               rank: statusPayload.rank,
               running: statusPayload.running,

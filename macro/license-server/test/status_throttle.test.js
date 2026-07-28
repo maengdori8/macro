@@ -6,6 +6,7 @@ const {
   DEFAULT_STATUS_TTL_MS,
   shouldSkipStatus,
   rememberStatus,
+  shouldPersistStatusDocument,
   resetStatusThrottleForTests,
 } = require("../lib/status_throttle");
 
@@ -56,5 +57,54 @@ test("stop and message changes bypass the unchanged throttle", () => {
   assert.equal(
     shouldSkipStatus({ ...BASE, message: "stopped" }, 2000),
     false
+  );
+});
+
+test("shared Firestore state limits heartbeats across serverless instances", () => {
+  let current = null;
+  let writes = 0;
+  for (
+    let now = 1000;
+    now < 1000 + 24 * 60 * 60 * 1000;
+    now += 30000
+  ) {
+    if (!shouldPersistStatusDocument(current, BASE, now)) continue;
+    writes += 1;
+    current = {
+      rank: BASE.rank,
+      running: BASE.running,
+      message: BASE.message,
+      updatedAt: now,
+    };
+  }
+  assert.equal(writes, 288);
+});
+
+test("shared status writes immediately when rank or running changes", () => {
+  const current = {
+    rank: BASE.rank,
+    running: BASE.running,
+    message: BASE.message,
+    updatedAt: 1000,
+  };
+  assert.equal(
+    shouldPersistStatusDocument(current, BASE, 2000),
+    false
+  );
+  assert.equal(
+    shouldPersistStatusDocument(
+      current,
+      { ...BASE, rank: BASE.rank + 1 },
+      2000
+    ),
+    true
+  );
+  assert.equal(
+    shouldPersistStatusDocument(
+      current,
+      { ...BASE, running: false },
+      2000
+    ),
+    true
   );
 });
