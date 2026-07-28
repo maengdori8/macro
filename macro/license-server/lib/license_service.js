@@ -71,7 +71,7 @@ async function verifyAndActivateLicense({
       signatureExpiresAt: lifecycle.signatureExpiresAt || null,
       activatedAt: lifecycle.activatedAt || null,
     };
-  });
+  }, { maxAttempts: 3 });
 }
 
 module.exports = {

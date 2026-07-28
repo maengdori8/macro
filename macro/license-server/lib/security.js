@@ -1,5 +1,10 @@
 // 공용 보안 유틸리티: CORS, Rate Limiting, 입력 검증, 보안 헤더
-const admin = require("firebase-admin");
+
+const RATE_LIMIT_MAX_ENTRIES = 10000;
+const RATE_LIMIT_STATE_KEY = "__mAutoLicenseRateLimitsV2";
+const rateLimitState =
+  globalThis[RATE_LIMIT_STATE_KEY] ||
+  (globalThis[RATE_LIMIT_STATE_KEY] = new Map());
 
 // ─── 클라이언트 IP 추출 ───
 function getClientIp(req) {
@@ -50,35 +55,75 @@ function applyCors(req, res, allowedOrigins) {
   return true;
 }
 
-// ─── Rate Limiting (Firestore 기반, IP별) ───
-// failClosed=true: 오류 시 차단(관리자용), false: 통과(일반 사용자)
-async function rateLimit(db, { bucket, ip, max, windowMs, failClosed = false }) {
-  const ref = db.collection("ratelimits").doc(`${bucket}_${ip}`);
-  const now = Date.now();
-  try {
-    const result = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      let count = 1;
-      let windowStart = now;
-      if (snap.exists) {
-        const d = snap.data();
-        if (now - (d.windowStart || 0) < windowMs) {
-          count = (d.count || 0) + 1;
-          windowStart = d.windowStart;
-        }
-      }
-      tx.set(ref, {
-        count,
-        windowStart,
-        expiresAt: windowStart + windowMs,
-      });
-      return { allowed: count <= max, count };
-    });
-    return result;
-  } catch (e) {
-    console.error("RateLimit error:", e);
-    return { allowed: !failClosed, count: 0 };
+// ─── Rate Limiting (서버리스 인스턴스 메모리 기반, IP별) ───
+// Firestore에 요청마다 기록하면 상태 보고만으로 무료 쓰기 할당량이 고갈된다.
+// 인스턴스별 제한은 전역 분산 제한보다 느슨하지만, 입력 검증·관리자 키 검증과
+// 함께 사용하면서 DB 쓰기를 0으로 유지하는 것이 라이선스 가용성에 더 안전하다.
+async function rateLimit(
+  _db,
+  { bucket, ip, max, windowMs, now = Date.now() }
+) {
+  const safeBucket = String(bucket || "default").slice(0, 64);
+  const safeIp = String(ip || "unknown").slice(0, 128);
+  const key = `${safeBucket}:${safeIp}`;
+  const previous = rateLimitState.get(key);
+  let windowStart = Number(now);
+  let count = 1;
+
+  if (
+    previous &&
+    Number(now) - Number(previous.windowStart) < Number(windowMs)
+  ) {
+    windowStart = Number(previous.windowStart);
+    count = Number(previous.count) + 1;
   }
+  rateLimitState.delete(key);
+  rateLimitState.set(key, { windowStart, count });
+
+  if (rateLimitState.size > RATE_LIMIT_MAX_ENTRIES) {
+    for (const [entryKey, entry] of rateLimitState) {
+      if (
+        Number(now) - Number(entry.windowStart) >= Number(windowMs) ||
+        rateLimitState.size > RATE_LIMIT_MAX_ENTRIES
+      ) {
+        rateLimitState.delete(entryKey);
+      }
+      if (rateLimitState.size <= RATE_LIMIT_MAX_ENTRIES) break;
+    }
+  }
+  return { allowed: count <= Number(max), count };
+}
+
+function withTimeout(promise, timeoutMs, label = "database operation") {
+  const safeTimeout = Math.max(1, Number(timeoutMs) || 1);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`${label} timed out`);
+      error.code = "DB_TIMEOUT";
+      reject(error);
+    }, safeTimeout);
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
+function isTransientStoreError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  return [
+    "4",
+    "8",
+    "14",
+    "deadline-exceeded",
+    "resource-exhausted",
+    "unavailable",
+    "db_timeout",
+  ].includes(code);
+}
+
+function resetRateLimitsForTests() {
+  rateLimitState.clear();
 }
 
 // ─── 입력 검증 ───
@@ -136,6 +181,9 @@ module.exports = {
   setSecurityHeaders,
   applyCors,
   rateLimit,
+  withTimeout,
+  isTransientStoreError,
+  resetRateLimitsForTests,
   isValidKeyFormat,
   isValidHwidFormat,
   isValidDiscordId,

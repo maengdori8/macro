@@ -55,3 +55,54 @@ test("다른 출처의 관리자 요청은 허용하지 않는다", () => {
   assert.equal(allowed, false);
   assert.equal(res.headers["Access-Control-Allow-Origin"], undefined);
 });
+
+test("memory rate limit performs zero Firestore operations", async () => {
+  security.resetRateLimitsForTests();
+  const db = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("Firestore must not be touched by rate limiting");
+      },
+    }
+  );
+
+  const options = {
+    bucket: "verify",
+    ip: "127.0.0.1",
+    max: 2,
+    windowMs: 60000,
+    now: 1000,
+  };
+  assert.deepEqual(await security.rateLimit(db, options), {
+    allowed: true,
+    count: 1,
+  });
+  assert.deepEqual(await security.rateLimit(db, options), {
+    allowed: true,
+    count: 2,
+  });
+  assert.deepEqual(await security.rateLimit(db, options), {
+    allowed: false,
+    count: 3,
+  });
+  assert.deepEqual(
+    await security.rateLimit(db, { ...options, now: 61000 }),
+    { allowed: true, count: 1 }
+  );
+});
+
+test("database timeout fails fast with a retryable code", async () => {
+  await assert.rejects(
+    security.withTimeout(new Promise(() => {}), 10, "test database"),
+    (error) => error.code === "DB_TIMEOUT"
+  );
+  assert.equal(
+    security.isTransientStoreError({ code: "DB_TIMEOUT" }),
+    true
+  );
+  assert.equal(
+    security.isTransientStoreError({ code: "resource-exhausted" }),
+    true
+  );
+});
