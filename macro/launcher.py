@@ -228,6 +228,15 @@ def main():
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
+    # 빌드 산출물이 로컬 모듈과 표준 라이브러리를 빠짐없이 포함했는지,
+    # 실제 macro.exe를 실행하지 않고 검사할 수 있는 설치 전 게이트입니다.
+    if "--startup-selftest" in sys.argv[1:]:
+        if len(UPDATE_PUBKEY_HEX) != 64:
+            return 1
+        if parse_version("1.2.3") != (1, 2, 3):
+            return 1
+        return 0
+
     app_dir = get_app_dir()
 
     # 설치 직후 재실행(/postupdate)이면 업데이트 확인을 건너뜁니다.
@@ -238,10 +247,11 @@ def main():
         if update and not _recently_attempted(update["version"]):
             _record_attempt(update["version"])
             if download_and_install(update["url"], update["sha256"]):
-                return  # 설치기에게 넘기고 종료. 새 런처가 macro를 실행합니다.
+                return 0  # 설치기에게 넘기고 종료. 새 런처가 macro를 실행합니다.
 
     launch_macro(app_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
