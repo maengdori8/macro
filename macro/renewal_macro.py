@@ -713,6 +713,9 @@ class RenewalApp:
         self.side_var = tk.StringVar(value="buy")
         self.speed_var = tk.IntVar(value=self.profile.speed_level)
         self.target_minute_var = tk.IntVar(value=self.profile.target_minute)
+        # 시간 제한은 실행할 때 사용자가 명시적으로 켜는 선택 기능입니다.
+        # 앱을 다시 열면 항상 무한반복이 기본값입니다.
+        self.schedule_enabled_var = tk.BooleanVar(value=False)
         self.monitor_only_var = tk.BooleanVar(value=False)
         self.speed_status_var = tk.StringVar()
         self.status_var = tk.StringVar(value="좌표 설정 후 F8")
@@ -960,8 +963,22 @@ class RenewalApp:
         self.monitor_checkbox.pack(anchor=tk.W, pady=(8, 0))
         self._on_speed_changed(str(self.speed_var.get()))
 
-        schedule_panel = self._panel(body, "4. 네이버 시간창")
+        schedule_panel = self._panel(body, "4. 실행 시간 (선택)")
         schedule_panel.pack(fill=tk.X, pady=(0, 10))
+        self.schedule_checkbox = tk.Checkbutton(
+            schedule_panel,
+            text="특정 시간에만 실행 (네이버 시간 기준)",
+            variable=self.schedule_enabled_var,
+            command=self._on_schedule_toggle,
+            bg=c["panel"],
+            fg=c["text"],
+            activebackground=c["panel"],
+            activeforeground=c["text"],
+            selectcolor=c["input"],
+            highlightthickness=0,
+            font=self._font(9, bold=True),
+        )
+        self.schedule_checkbox.pack(anchor=tk.W, pady=(0, 8))
         schedule_row = tk.Frame(schedule_panel, bg=c["panel"])
         schedule_row.pack(fill=tk.X)
         tk.Label(
@@ -1008,6 +1025,7 @@ class RenewalApp:
             fg=c["muted"],
             font=self._font(9),
         ).pack(fill=tk.X, pady=(8, 0))
+        self._on_schedule_toggle()
 
         turbo_panel = self._panel(body, "5. 16GB 터보 세션")
         turbo_panel.pack(fill=tk.X, pady=(0, 10))
@@ -1147,7 +1165,33 @@ class RenewalApp:
         except (tk.TclError, TypeError, ValueError):
             return int(self.profile.target_minute)
 
+    def _schedule_enabled(self) -> bool:
+        try:
+            return bool(self.schedule_enabled_var.get())
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _on_schedule_toggle(self) -> None:
+        running = bool(
+            self.worker_thread is not None
+            and self.worker_thread.is_alive()
+        )
+        if hasattr(self, "target_minute_spinbox"):
+            self.target_minute_spinbox.configure(
+                state=(
+                    tk.NORMAL
+                    if self._schedule_enabled() and not running
+                    else tk.DISABLED
+                )
+            )
+        self._refresh_schedule_status()
+
     def _refresh_schedule_status(self) -> None:
+        if not self._schedule_enabled():
+            self.schedule_status_var.set(
+                "무한반복 · 주문 완료 또는 사용자가 정지할 때까지 계속 감시"
+            )
+            return
         minute = self._target_minute()
         if not self.naver_clock.is_fresh():
             error = self.naver_clock.last_error
@@ -2201,6 +2245,7 @@ class RenewalApp:
         self._set_running(True)
         side = self.side_var.get()
         monitor_only = bool(self.monitor_only_var.get())
+        schedule_enabled = self._schedule_enabled()
         target_minute = self._target_minute()
         available_ram = _available_ram_gb()
         self.status_var.set("갱신매크로 시작")
@@ -2224,6 +2269,7 @@ class RenewalApp:
             f"명확한 변경={2 if self.profile.speed_level >= 8 else 3}프레임 "
             f"{fast_policy} · "
             f"{cadence_policy} · "
+            f"{'네이버 시간창' if schedule_enabled else '무한반복'} · "
             f"{'무주문 측정' if monitor_only else '실주문'} · 애매하면 주문 금지"
         )
         if available_ram is not None:
@@ -2236,7 +2282,7 @@ class RenewalApp:
         self._report(True, "갱신매크로 시작")
         self.worker_thread = threading.Thread(
             target=self._worker,
-            args=(side, monitor_only, target_minute),
+            args=(side, monitor_only, schedule_enabled, target_minute),
             daemon=True,
         )
         self.worker_thread.start()
@@ -2245,6 +2291,7 @@ class RenewalApp:
         self,
         side: str,
         monitor_only: bool,
+        schedule_enabled: bool,
         target_minute: int,
     ) -> None:
         manager: Optional[InactiveManager] = None
@@ -2252,93 +2299,126 @@ class RenewalApp:
         completed = False
         failed = False
         try:
-            if not self.naver_clock.is_fresh() and not self.naver_clock.sync():
-                raise RuntimeError(
-                    "네이버 시간 동기화 실패: "
-                    + (self.naver_clock.last_error or "응답 없음")
-                )
-            window = next_schedule_window(
-                self.naver_clock.now(),
-                target_minute,
-            )
-            self.log(
-                f"[시간창 v12] 목표 :{target_minute:02d} · "
-                f"{window.start:%Y-%m-%d %H:%M:%S}~"
-                f"{window.end_exclusive:%H:%M:%S}(미포함)"
-            )
-            boundary_resynced = False
-            last_wait_second = -1
-            while not self.stop_event.is_set():
+            active_until: Optional[float] = None
+            runner_time_valid = None
+            runner_request_time = time.time
+            if schedule_enabled:
                 if not self.naver_clock.is_fresh():
                     if not self.naver_clock.sync():
                         raise RuntimeError(
-                            "대기 중 네이버 시간 동기화가 만료되었습니다."
+                            "네이버 시간 동기화 실패: "
+                            + (self.naver_clock.last_error or "응답 없음")
                         )
-                    window = next_schedule_window(
-                        self.naver_clock.now(),
-                        target_minute,
-                    )
-                now = self.naver_clock.now()
-                remaining = (window.start - now).total_seconds()
-                if remaining <= 0:
-                    break
-                if remaining <= 15.0 and not boundary_resynced:
-                    if not self.naver_clock.sync():
-                        raise RuntimeError(
-                            "시간창 시작 직전 네이버 재동기화에 실패했습니다."
-                        )
-                    window = next_schedule_window(
-                        self.naver_clock.now(),
-                        target_minute,
-                    )
-                    boundary_resynced = True
-                    continue
-                wait_second = int(max(0.0, remaining))
-                if wait_second != last_wait_second:
-                    last_wait_second = wait_second
-                    self.ui_queue.put(
-                        (
-                            "status",
-                            f"네이버 시간 대기 · {window.start:%H:%M:%S}부터 "
-                            f"동작 · {wait_second}초 남음",
-                        )
-                    )
-                self.stop_event.wait(min(0.25, max(0.01, remaining)))
-            if self.stop_event.is_set():
-                return
-            if not self.naver_clock.is_fresh():
-                raise RuntimeError("네이버 시간 정보가 만료되어 입력을 차단했습니다.")
-
-            active_until = self.naver_clock.to_monotonic(
-                window.end_exclusive
-            )
-            self.ui_queue.put(
-                (
-                    "status",
-                    f"시간창 활성 · {window.end_exclusive:%H:%M:%S} 전까지 반복",
+                window = next_schedule_window(
+                    self.naver_clock.now(),
+                    target_minute,
                 )
-            )
-
-            def refresh_clock() -> None:
-                next_refresh = time.monotonic() + NAVER_TIME_REFRESH_SECONDS
-                next_retry = 0.0
-                while not refresh_stop.wait(1.0):
-                    now_monotonic = time.monotonic()
-                    must_sync = (
-                        not self.naver_clock.is_fresh()
-                        or now_monotonic >= next_refresh
-                    )
-                    if not must_sync or now_monotonic < next_retry:
-                        continue
-                    if self.naver_clock.sync():
-                        next_refresh = (
-                            time.monotonic() + NAVER_TIME_REFRESH_SECONDS
+                self.log(
+                    f"[시간창 v12] 목표 :{target_minute:02d} · "
+                    f"{window.start:%Y-%m-%d %H:%M:%S}~"
+                    f"{window.end_exclusive:%H:%M:%S}(미포함)"
+                )
+                boundary_resynced = False
+                last_wait_second = -1
+                while not self.stop_event.is_set():
+                    if not self.naver_clock.is_fresh():
+                        if not self.naver_clock.sync():
+                            raise RuntimeError(
+                                "대기 중 네이버 시간 동기화가 만료되었습니다."
+                            )
+                        window = next_schedule_window(
+                            self.naver_clock.now(),
+                            target_minute,
                         )
-                        next_retry = 0.0
-                    else:
-                        next_retry = time.monotonic() + 5.0
+                    now = self.naver_clock.now()
+                    remaining = (window.start - now).total_seconds()
+                    if remaining <= 0:
+                        break
+                    if remaining <= 15.0 and not boundary_resynced:
+                        if not self.naver_clock.sync():
+                            raise RuntimeError(
+                                "시간창 시작 직전 네이버 재동기화에 실패했습니다."
+                            )
+                        window = next_schedule_window(
+                            self.naver_clock.now(),
+                            target_minute,
+                        )
+                        boundary_resynced = True
+                        continue
+                    wait_second = int(max(0.0, remaining))
+                    if wait_second != last_wait_second:
+                        last_wait_second = wait_second
+                        self.ui_queue.put(
+                            (
+                                "status",
+                                f"네이버 시간 대기 · {window.start:%H:%M:%S}부터 "
+                                f"동작 · {wait_second}초 남음",
+                            )
+                        )
+                    self.stop_event.wait(
+                        min(0.25, max(0.01, remaining))
+                    )
+                if self.stop_event.is_set():
+                    return
+                if not self.naver_clock.is_fresh():
+                    raise RuntimeError(
+                        "네이버 시간 정보가 만료되어 입력을 차단했습니다."
+                    )
 
-            threading.Thread(target=refresh_clock, daemon=True).start()
+                active_until = self.naver_clock.to_monotonic(
+                    window.end_exclusive
+                )
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"시간창 활성 · {window.end_exclusive:%H:%M:%S} 전까지 반복",
+                    )
+                )
+
+                def refresh_clock() -> None:
+                    next_refresh = (
+                        time.monotonic() + NAVER_TIME_REFRESH_SECONDS
+                    )
+                    next_retry = 0.0
+                    while not refresh_stop.wait(1.0):
+                        now_monotonic = time.monotonic()
+                        must_sync = (
+                            not self.naver_clock.is_fresh()
+                            or now_monotonic >= next_refresh
+                        )
+                        if not must_sync or now_monotonic < next_retry:
+                            continue
+                        if self.naver_clock.sync():
+                            next_refresh = (
+                                time.monotonic()
+                                + NAVER_TIME_REFRESH_SECONDS
+                            )
+                            next_retry = 0.0
+                        else:
+                            next_retry = time.monotonic() + 5.0
+
+                threading.Thread(
+                    target=refresh_clock,
+                    daemon=True,
+                ).start()
+                runner_time_valid = lambda: (
+                    self.naver_clock.is_fresh()
+                    and self.naver_clock.now() < window.end_exclusive
+                )
+                runner_request_time = lambda: (
+                    self.naver_clock.now().timestamp()
+                )
+            else:
+                self.log(
+                    "[시간창 v12] 사용 안 함 · 주문 완료 또는 수동 정지까지 무한반복"
+                )
+                self.ui_queue.put(
+                    (
+                        "status",
+                        "무한반복 활성 · 주문 완료 또는 수동 정지까지 감시",
+                    )
+                )
+
             manager = InactiveManager(
                 self.window_title_var.get().strip(),
                 logger=self.log,
@@ -2352,13 +2432,8 @@ class RenewalApp:
                 status=lambda message: self.ui_queue.put(("status", message)),
                 monitor_only=monitor_only,
                 active_until=active_until,
-                time_valid=lambda: (
-                    self.naver_clock.is_fresh()
-                    and self.naver_clock.now() < window.end_exclusive
-                ),
-                request_time=lambda: (
-                    self.naver_clock.now().timestamp()
-                ),
+                time_valid=runner_time_valid,
+                request_time=runner_request_time,
                 video_speed_mode=(self.profile.speed_level == 10),
             ).run()
         except Exception as exc:
@@ -2396,8 +2471,15 @@ class RenewalApp:
         for button in self._capture_buttons:
             button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.speed_scale.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self.target_minute_spinbox.configure(
+        self.schedule_checkbox.configure(
             state=tk.DISABLED if running else tk.NORMAL
+        )
+        self.target_minute_spinbox.configure(
+            state=(
+                tk.DISABLED
+                if running or not self._schedule_enabled()
+                else tk.NORMAL
+            )
         )
         self.monitor_checkbox.configure(
             state=tk.DISABLED if running else tk.NORMAL
