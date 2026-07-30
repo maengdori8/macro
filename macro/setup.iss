@@ -1,7 +1,7 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
 [Setup]
 AppName=Macro
-AppVersion=1.0.24
+AppVersion=1.0.34
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
@@ -28,10 +28,16 @@ ArchitecturesAllowed=x64compatible
 ; macro는 폴더형(standalone) 빌드 — macro.exe + 부품 DLL 전체를 설치폴더에 그대로 푼다.
 ; (onefile의 실시간 임시추출이 일부 PC에서 'STATUS_IN_PAGE_ERROR / 파일 액세스 불가'를
 ;  일으켜, 폴더형으로 전환함. dist\macro_app\ 안의 모든 파일을 재귀로 담는다.)
-Source: "dist\macro_app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\macro_app\*"; DestDir: "{app}"; Excludes: "license.key,logs\*,_update_tmp\*,_update.zip,startup_error.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+; 감독모드 전용 설치본: 예전 통합 설치본이 남긴 갱신/테스트 실행 파일과 바로가기도 제거합니다.
+[InstallDelete]
+Type: files; Name: "{app}\renewal_macro.exe"
+Type: files; Name: "{app}\gamepad_test.exe"
+Type: files; Name: "{group}\Macro 갱신.lnk"
+Type: files; Name: "{commondesktop}\Macro 갱신.lnk"
 
 ; 런타임 생성물 정리: 캡처 템플릿이 재설치 후에도 몰래 살아남지 않게 합니다.
 ; license.key는 재설치 시 재인증을 피하기 위해 남겨둡니다.

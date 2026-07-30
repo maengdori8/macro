@@ -158,6 +158,17 @@ LOOP_SLEEP_SECONDS = 0.03
 # 대상 창을 찾지 못했을 때 재검색하는 간격입니다.
 WINDOW_RETRY_SECONDS = 2.0
 
+# ─── 잘못 열린 알림 패널 자동 복구 ───
+# 일부 PC에서 화면 좌표가 어긋나 하단 알림(종) 버튼이 눌리면 오른쪽 패널이 전체 자동화를
+# 가립니다. 오른쪽의 밝은 패널 + 왼쪽의 어두운 오버레이를 연속 확인한 뒤 같은 종 버튼을
+# 다시 눌러 닫습니다. 좌표는 WGC 프레임 비율이라 창 테두리 유무에도 같은 위치를 가리킵니다.
+NOTIFICATION_PANEL_GUARD_ENABLED = True
+NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS = 0.25
+NOTIFICATION_PANEL_CONFIRM_COUNT = 2
+NOTIFICATION_PANEL_RETRY_SECONDS = 1.5
+NOTIFICATION_TOGGLE_X_FRACTION = 0.783
+NOTIFICATION_TOGGLE_Y_FRACTION = 0.977
+
 # WGC 세션 시작 뒤 첫 프레임을 기다리는 최대 시간입니다.
 WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 # 시작 후에는 이벤트를 이 시간까지만 기다려 정지 요청에도 빠르게 반응합니다.
@@ -214,9 +225,8 @@ SKIP_A_CLICK = False
 # 전략: 아래 후보 버튼을 한 사이클에 하나씩 눌러보고(자동 탐색), 스킵이 사라지면
 # 그 버튼을 '학습'해 다음부터 바로 사용한다 — 비활성 100% 유지.
 # 이미 답을 알면 SKIP_A_BUTTON에 지정(예: "b")하면 탐색 없이 바로 그 버튼만 쓴다.
-# 실측(2026-07-03): focus_s가 통하지만 포커스 전환 때문에 화면이 깜빡임.
-# → 깜빡임 0인 무포커스 기법(attach_post_s, attach_state_s)을 먼저 재학습하도록 비워둔다.
-# 무깜빡임 기법이 통하면 그게 학습되고, 안 통하면 focus_s로 폴백(깜빡이지만 동작).
+# 실측(2026-07-28): focus_s 계열은 대상 HWND를 실제 전면으로 순간 전환하므로
+# 완전 비활성 계약을 위반한다. 자동 후보와 폴백에서 영구 제외한다.
 SKIP_A_BUTTON = ""
 # 실측: 가상패드는 START 외 전부 무시. 그리고 사용자 요구 = '화면 변화 0'(자동화).
 # 기본 스윕은 '깜빡임 0 + 유출 0' 방식만 넣는다(적대적 리뷰로 검증한 4기법):
@@ -227,21 +237,21 @@ SKIP_A_BUTTON = ""
 #   (가상패드 후보도 화면 변화 0이라 함께 순회 — 이 게임엔 대부분 무효지만 무해)
 # 통한 입력은 학습돼 다음부턴 바로 사용된다.
 #
-# ⚠️ 스윕에 일부러 뺀 것(부작용 있음, 필요하면 SKIP_A_BUTTON로 수동 지정):
-#   "focus_s" = 확실히 동작하지만 SetFocus가 top-level을 활성화해 '화면이 깜빡임'.
-#   "si_s"    = 깜빡임은 없지만 그 순간 활성인 다른 앱에 's'가 새어 들어갈 수 있음.
+# ⚠️ 실측으로 영구 제외한 것:
+#   "focus_s" = 대상 top-level을 실제 전면으로 순간 전환하므로 엄격 모드에서 금지.
+#                수동 설정이나 과거 학습값에 남아 있어도 안전 후보 목록 밖이라 복원되지 않는다.
+#   "si_s"    = 현재 전면인 다른 앱으로만 전역 S가 전달돼 대상 게임의 비활성 입력이 아니다.
 # 진단: 어떤 것도 안 통하면 게임 입력이 RawInput/DirectInput 포그라운드 전용이라
 # 유저모드로는 '비활성+깜빡임0+유출0'이 원리적으로 불가(로그의 창 클래스 덤프로 판별).
-# focus_child_s = focus_s와 같은 원리인데 자식 창에 SetFocus → 깜빡임 없이 동작 기대.
-# 실측상 focus_s(top-level)만 먹혔으므로, 그 '먹히는 원리'를 유지하되 깜빡임만 제거한 이게
-# 1순위. 안 되면(자식 창 없음 등) 나머지 무깜빡임 기법으로 순회.
+# focus_child_s = 자식 창이 있을 때만 SetFocus를 시도하는 안전 후보. 현재 FC 창에서는
+# 자식 대상이 없어 action_failed로 끝나며, top-level focus_s로 폴백하지 않는다.
 # 실측 확정(사용자): 컷신 스킵을 넘기는 입력은 오직 '키보드 s' 또는 '게임패드 A' 뿐이다.
 # (다른 버튼·키·pause 메뉴로는 안 넘어감.) 게다가 hold-to-skip — 전면에서 'A 홀드'로 넘어감.
 # → 스윕이 훑는 축은 '다른 동작'이 아니라 [스킵 입력=s/A] × [전달 경로] × [탭 vs 홀드].
 #   원래 스윕은 0.15초 '탭'만 했다 → hold-to-skip이면 탭은 원리상 못 넘김. '홀드'가 빠진 축.
 # 배경 유일 희망 = s를 '메시지'로 딥 전송(게임이 메시지 계층=CEF로 스킵을 읽을 때만 통함).
 #   게임패드 A는 값이 배경에 도달하나 컷신은 전면 게이팅이라 실패 예상(그래도 사실 확인용 포함).
-#   si_s(SendInput 전역)·focus_s(top-level SetFocus)는 유출/깜빡임이라 스윕 제외(수동 지정만).
+#   si_s(SendInput 전역)·focus_s(top-level SetFocus)는 비활성 계약 위반이라 영구 제외.
 # 전달 경로: char_s=WM_CHAR 딥(CEF), attach_state_s=GetKeyState 속이기, attach_post_s=큐공유+Post,
 #   pm_s=WM_KEYDOWN 딥, focus_child_s=자식 SetFocus(무깜빡임 기대). '*_hold'=1초 홀드.
 SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
@@ -252,6 +262,86 @@ SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
                         "a_hold", "a")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-skip 대응)
+# 완전 비활성 실험 모드. 후보 입력 동안 별도 감시 스레드가 전면 HWND를 연속 확인하고,
+# 대상 게임 HWND가 한 번이라도 전면이 된 후보만 해당 세션에서 즉시 격리합니다.
+SKIP_STRICT_INACTIVE_EXPERIMENT = True
+SKIP_INACTIVE_EXPERIMENT_CANDIDATES = (
+    "spoof_start_hold",
+    "start_hold",
+    "click_prompt",
+    "spoof_a_hold",
+    "a_hold",
+    "spoof_char_s_hold",
+    "spoof_pm_s_hold",
+    "sync_char_s_hold",
+    "sync_pm_s_hold",
+    "char_s_hold",
+    "attach_state_s_hold",
+    "attach_post_s_hold",
+    "pm_s_hold",
+    "focus_child_s_hold",
+    "spoof_char_s",
+    "spoof_pm_s",
+    "sync_char_s",
+    "sync_pm_s",
+    "char_s",
+    "attach_state_s",
+    "attach_post_s",
+    "pm_s",
+    "focus_child_s",
+    "spoof_start",
+    "start",
+    "a",
+)
+# 키보드 표시 장치에서는 화면에 [S] SKIP이 뜨며, 이 경우 실제 s 전달 경로를 먼저
+# 탐색해야 합니다. A 경로도 뒤에서 사실 확인하되 우선순위를 분리합니다.
+SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES = (
+    # Test the requested Start route first. All routes remain under the exact
+    # target-HWND foreground monitor and require the final three-second control.
+    "spoof_start_hold",
+    "start_hold",
+    "click_prompt",
+    "spoof_a_hold",
+    "spoof_char_s_hold",
+    "spoof_pm_s_hold",
+    "sync_char_s_hold",
+    "sync_pm_s_hold",
+    "spoof_char_s",
+    "spoof_pm_s",
+    "sync_char_s",
+    "sync_pm_s",
+    "char_s_hold",
+    "attach_state_s_hold",
+    "attach_post_s_hold",
+    "pm_s_hold",
+    "focus_child_s_hold",
+    "char_s",
+    "attach_state_s",
+    "attach_post_s",
+    "pm_s",
+    "focus_child_s",
+    "spoof_start",
+    "start",
+    "a_hold",
+    "a",
+)
+SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS = 0.20
+SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS = 1.50
+SKIP_EXPERIMENT_CONFIRM_SUCCESSES = 5
+# 상대가 먼저 누르거나 자연 종료된 화면을 우리 입력 성공으로 오인하지 않도록 후보 입력 전에
+# 무입력 상태로 프롬프트가 유지되는지 관찰합니다. 실기기에서 일반 S 프롬프트가 약 2초 뒤
+# 자연 종료되는 사례가 확인되어, 최종 확인은 그보다 긴 3초를 사용합니다.
+SKIP_EXPERIMENT_CONTROL_SECONDS = 3.0
+# Discovery first screens at 0.11s and 0.89s, then requires three separate
+# successes after the full 3.00s no-input control before learning a candidate.
+SKIP_EXPERIMENT_PROGRESSIVE_CONTROL = True
+SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES = 3
+# Require sustained disappearance so animation/capture flicker cannot be
+# mistaken for either our success or an opponent/natural exit.
+SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS = 0.40
+SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS = 0.005
+SKIP_EXPERIMENT_LOG_FILENAME = "skip_experiments.jsonl"
+SKIP_EXPERIMENT_LEARNING_FILENAME = "skip_learning.json"
 # 최후수단(전면 순간전환+SendInput 키보드 s)은 '탐색을 다 돌고도' 이 시간 이상 지났을 때만.
 # 0 = 완전 끄기(기본) → 비활성 100% 보장. 스킵을 못 넘겨도 컷신은 자연 종료되므로 안전.
 SKIP_A_SENDINPUT_AFTER_SECONDS = 0.0
@@ -270,7 +360,7 @@ SKIP_A_ACTIVATE_SPOOF = True
 SKIP_A_FOREGROUND_AFTER_SECONDS = 2.0  # 스푸핑으로 이 시간 넘게 안 사라지면 전면화 폴백 시도
                                        # (SKIP_A_FOREGROUND=True일 때만).
 SKIP_A_FOREGROUND = False
-SKIP_A_HOLD_SECONDS = 1.0         # 전면화 중 A를 홀드하는 시간(hold-to-skip). 스킵되는 최소값으로
+SKIP_A_HOLD_SECONDS = 1.2         # A를 홀드하는 시간. 1.0초 경계 누락을 피하도록 여유를 둠.
                                   # 낮출수록 번쩍임이 짧아짐(예: 0.6). 너무 낮으면 게이지가 안 참.
 SKIP_A_FG_COOLDOWN_SECONDS = 2.5  # 전면화-홀드 사이 최소 간격. (A) SKIP이 떠 있는 내내 매 사이클
                                   # 전면화하면 FIFA가 반복해서 번쩍이므로, 컷신당 사실상 1번만 하게 막음.
@@ -288,6 +378,7 @@ SKIP_OCR_BOTTOM_FRACTION = 1.0
 # OCR 'skip' 텍스트를 읽지 않는다(= A형일 때 Start 경로로 안 샌다).
 # 템플릿 파일이 없으면 match는 항상 False → 기존처럼 OCR 텍스트→Start로 안전 폴백.
 SKIP_A_MATCH_THRESHOLD = 0.82     # (A) SKIP 템플릿 상관도 이 값 이상이면 A형으로 판정
+SKIP_S_MATCH_THRESHOLD = 0.80     # [S] SKIP 템플릿 상관도 — 키보드 표시 장치 전용
 SKIP_TEXT_CONSENSUS = 2           # 일반 스킵(OCR 'skip')은 이만큼 연속 감지돼야 Start(단발 노이즈 차단)
 SKIP_FALLBACK_BOTH_SECONDS = 0.6  # 한 스킵이 이 시간 넘게 안 사라지면 A·Start 둘 다(템플릿 빗나가도 안 갇힘)
 

@@ -28,6 +28,69 @@ def downscale_screen(screen_gray: np.ndarray) -> np.ndarray:
     return cv2.resize(screen_gray, (w // f, h // f), interpolation=_INTER_AREA)
 
 
+def is_notification_panel_open(screen_gray: np.ndarray) -> bool:
+    """FC ONLINE 오른쪽 알림 패널이 열린 화면인지 가볍게 판정합니다.
+
+    열린 알림 화면에는 세 특징이 동시에 있습니다.
+    1) 오른쪽 약 20%가 긴 흰색 패널이고,
+    2) 가운데 화면은 검은 오버레이로 어두워지며,
+    3) 패널 위쪽에는 검은 제목 띠가 있습니다.
+
+    세 조건을 모두 요구해 이적시장 같은 일반 화면이나 순간적인 밝은 효과를 알림으로
+    오인하지 않습니다. 제목 표시줄이 있는 창 모드와 없는 전체 화면을 모두 처리합니다.
+    """
+
+    try:
+        frame = np.asarray(screen_gray)
+        if frame.ndim != 2:
+            return False
+        height, width = frame.shape
+        if height < 240 or width < 480:
+            return False
+
+        panel_x1 = int(width * 0.80)
+        panel_x2 = max(panel_x1 + 1, int(width * 0.995))
+        body_y1 = int(height * 0.06)
+        body_y2 = max(body_y1 + 1, int(height * 0.90))
+
+        # 4픽셀 간격 샘플만으로도 넓은 단색 패널은 충분히 판정되며 매 프레임 비용이 작습니다.
+        panel = frame[body_y1:body_y2:4, panel_x1:panel_x2:4]
+        dimmed = frame[
+            body_y1:body_y2:4,
+            int(width * 0.45):int(width * 0.72):4,
+        ]
+        if panel.size == 0 or dimmed.size == 0:
+            return False
+
+        panel_mean = float(np.mean(panel))
+        dimmed_mean = float(np.mean(dimmed))
+        panel_bright_fraction = float(np.count_nonzero(panel > 180)) / float(panel.size)
+
+        # 전체 화면 모드: y=0부터 제목 띠, 창 모드: Windows 제목 표시줄 바로 아래 제목 띠.
+        borderless_header = frame[
+            0:max(1, int(height * 0.03)):2,
+            panel_x1:panel_x2:4,
+        ]
+        windowed_header = frame[
+            int(height * 0.025):max(int(height * 0.025) + 1, int(height * 0.058)):2,
+            panel_x1:panel_x2:4,
+        ]
+        header_dark_fraction = max(
+            float(np.count_nonzero(borderless_header < 80)) / float(borderless_header.size),
+            float(np.count_nonzero(windowed_header < 80)) / float(windowed_header.size),
+        )
+
+        return (
+            panel_mean >= 205.0
+            and panel_bright_fraction >= 0.78
+            and dimmed_mean <= 60.0
+            and panel_mean - dimmed_mean >= 140.0
+            and header_dark_fraction >= 0.75
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
 def find_template_center(
     screen_gray: np.ndarray,
     target: TargetImage,
