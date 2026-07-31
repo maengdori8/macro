@@ -1,5 +1,7 @@
 from __future__ import annotations
 import io
+import json
+import os
 import platform
 import queue
 import random
@@ -30,6 +32,9 @@ from macroapp.config import (
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
     CUSTOM_TARGETS_DIR_NAME,
+    NOTIFICATION_PANEL_GUARD_ENABLED, NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS,
+    NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
+    NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
@@ -37,6 +42,16 @@ from macroapp.config import (
     SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS, SKIP_A_SWEEP_HOLD_SECONDS,
     SKIP_A_SENDINPUT_AFTER_SECONDS, SKIP_A_FOREGROUND, SKIP_A_HOLD_SECONDS,
     SKIP_A_FG_COOLDOWN_SECONDS, SKIP_A_ACTIVATE_SPOOF, SKIP_A_FOREGROUND_AFTER_SECONDS,
+    SKIP_STRICT_INACTIVE_EXPERIMENT, SKIP_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS, SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
+    SKIP_EXPERIMENT_CONFIRM_SUCCESSES, SKIP_EXPERIMENT_CONTROL_SECONDS,
+    SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
+    SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
+    SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+    SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+    SKIP_EXPERIMENT_LOG_FILENAME, SKIP_EXPERIMENT_LEARNING_FILENAME,
+    SKIP_A_MATCH_THRESHOLD, SKIP_S_MATCH_THRESHOLD,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -50,7 +65,15 @@ from macroapp.license_client import (
     STATUS_REPORT_INTERVAL_SECONDS, _send_status, get_hwid, verify_license_server,
     format_remaining_time, load_saved_license, save_license_key,
 )
-from macroapp.matching import find_template_center, downscale_screen
+from macroapp.matching import find_template_center, downscale_screen, is_notification_panel_open
+from macroapp.skip_experiment import (
+    SkipExperimentTracker,
+    SkipOutcome,
+    load_device_learning,
+    remove_device_learning,
+    run_guarded_inactive_action,
+    save_device_learning,
+)
 from macroapp.window import InactiveManager
 class AutomationApp:
     """tkinter UI와 자동화 스레드를 관리합니다."""
@@ -158,6 +181,8 @@ class AutomationApp:
         self._skip_seen_since = None    # 현재 스킵이 처음 감지된 시각(안전망 타이머용)
         self._skip_text_streak = 0      # 일반 스킵(OCR) 연속 감지 횟수(단발 노이즈 차단)
         self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start" (A형은 sticky)
+        self._skip_prompt_variant = None  # hold-to-skip 표시: None|"a"|"s"
+        self._skip_prompt_center = None   # WGC 좌표의 A/S 표시 중심(비활성 클릭 후보용)
         # (A) SKIP 자동 버튼 탐색·학습 상태 — 게임이 가상 A를 무시해서, 어떤 입력이
         # 실제로 스킵을 넘기는지 후보를 하나씩 눌러보고 성공한 것을 학습한다.
         self._skip_a_learned = None     # 학습된(또는 SKIP_A_BUTTON 지정) 입력 이름
@@ -165,7 +190,26 @@ class AutomationApp:
         self._skip_last_press = None    # (입력이름, 시각) — 에피소드 종료 시 학습 판정용
         self._skip_learned_fail = 0     # 학습된 입력이 연속 무효면 학습 취소용
         self._skip_a_dumped = False     # (A) SKIP 첫 감지 시 창 클래스 1회 진단 덤프
+        self._skip_diag_count = 0       # 세션당 진단 이미지 최대 개수 제한용
         self._skip_fg_last_at = 0.0     # 마지막 전면화-홀드 시각(쿨다운 — 반복 번쩍임 방지)
+        try:
+            self._skip_device_id = get_hwid()
+        except Exception:
+            self._skip_device_id = "unknown"
+        self._skip_learning_path = (
+            self.base_dir / "logs" / SKIP_EXPERIMENT_LEARNING_FILENAME
+        )
+        self._skip_learned_profiles = load_device_learning(
+            self._skip_learning_path,
+            self._skip_device_id,
+        )
+        self._skip_experiment = self._new_skip_experiment_tracker()
+        self._skip_s_experiment = self._new_skip_s_experiment_tracker()
+        # 잘못 열린 알림 패널 감지·복구 상태. 열린 동안 일반 타겟 클릭을 막아 추가 오작동을 피한다.
+        self._notification_check_at = 0.0
+        self._notification_streak = 0
+        self._notification_visible = False
+        self._notification_last_action_at = 0.0
         self._gate_fail_log_at = 0.0    # 게이트 미검출 로그 스로틀(과다 로그 방지)
         # 목표 도달 자동 정지 — 시작 시 UI에서 스냅샷한 평문 값(OCR 워커가 스레드 안전하게 읽음)
         self._stop_mode = "off"         # off | rank | score
@@ -923,6 +967,14 @@ class AutomationApp:
             f"[시작] 자동화를 시작합니다. "
             f"캡처={capture_mode}, 클릭={click_mode}, 영역={region}, 창='{window_title}'"
         )
+        if self._skip_learned_profiles:
+            restored = ", ".join(
+                f"{variant.upper()}={candidate.upper()}"
+                for variant, candidate in sorted(
+                    self._skip_learned_profiles.items()
+                )
+            )
+            self.log(f"[SKIP 학습] 이 기기 우선 후보 복원: {restored}")
 
         self.worker_thread = threading.Thread(
             target=self._automation_loop,
@@ -1180,7 +1232,16 @@ class AutomationApp:
             self._skip_last_press = None
             self._skip_learned_fail = 0
             self._skip_a_dumped = False
+            self._skip_diag_count = 0
             self._skip_fg_last_at = 0.0
+            self._skip_experiment = self._new_skip_experiment_tracker()
+            self._skip_s_experiment = self._new_skip_s_experiment_tracker()
+            self._skip_prompt_variant = None
+            self._skip_prompt_center = None
+            self._notification_check_at = 0.0
+            self._notification_streak = 0
+            self._notification_visible = False
+            self._notification_last_action_at = 0.0
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
@@ -1230,6 +1291,19 @@ class AutomationApp:
                     # WGC는 새 프레임 이벤트를 이미 기다렸으므로 추가 polling sleep이 필요 없습니다.
                     if capture_mode != "wgc":
                         self.interruptible_sleep(LOOP_SLEEP_SECONDS)
+                    continue
+
+                # 일부 PC에서 좌표 오차로 하단 종 버튼이 눌려 알림 패널이 열리면 모든 타겟을
+                # 가립니다. 패널이 보이는 동안 일반 매칭/OCR을 멈추고 종 버튼을 다시 눌러 닫습니다.
+                if self._try_close_notification_panel(
+                    screen_gray,
+                    manager,
+                    click_mode,
+                    capture_mode,
+                    region,
+                    now_mono,
+                ):
+                    self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
                 # 최신 프레임을 OCR 워커 스레드에 공개. (seq, gray) 튜플 대입은 원자적이라
@@ -1445,12 +1519,15 @@ class AutomationApp:
         # 슈퍼챔스 티어가 다음 매치로 새서 거짓 정지하는 일을 막는다(#5). 표시용 보강은 아래에서.
         self._maybe_stop_on_target(rank, score, tier)
 
-        # 마지막 값 유지: 이번에 '읽힌' 필드만 갱신하고, 없는 필드는 직전 값을 보존한다.
-        # → 로비(등수 없음)에서 읽어도 매칭 때 잡은 등수가 안 지워지고 계속 표시된다.
+        # 마지막 값 유지: 이번에 '읽힌' 필드만 갱신한다.
+        # 다만 새 결과 패널에서 등수/점수는 읽혔는데 티어만 없으면 이전 매치 티어를
+        # 그대로 표시하지 않는다. 새 티어 OCR 실패는 빈 값으로 처리하는 편이 안전하다.
         if rank is not None:
             self._last_rank = rank
         if tier is not None:
             self._last_tier = tier
+        elif rank is not None or score is not None:
+            self._last_tier = None
         if score is not None:
             self._last_score = score
 
@@ -1476,6 +1553,171 @@ class AutomationApp:
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 
+    def _new_skip_experiment_tracker(self) -> SkipExperimentTracker:
+        return SkipExperimentTracker(
+            SKIP_INACTIVE_EXPERIMENT_CANDIDATES,
+            result_window_seconds=SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
+            attempt_gap_seconds=SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS,
+            confirm_successes=SKIP_EXPERIMENT_CONFIRM_SUCCESSES,
+            control_seconds=SKIP_EXPERIMENT_CONTROL_SECONDS,
+            exit_confirm_seconds=SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
+            progressive_control=SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
+            control_ramp_successes=SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+            learned=(
+                self._skip_learned_profiles.get("a")
+                or (SKIP_A_BUTTON or "").strip().lower()
+                or None
+            ),
+        )
+
+    def _new_skip_s_experiment_tracker(self) -> SkipExperimentTracker:
+        return SkipExperimentTracker(
+            SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES,
+            result_window_seconds=SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
+            attempt_gap_seconds=SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS,
+            confirm_successes=SKIP_EXPERIMENT_CONFIRM_SUCCESSES,
+            control_seconds=SKIP_EXPERIMENT_CONTROL_SECONDS,
+            exit_confirm_seconds=SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
+            progressive_control=SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
+            control_ramp_successes=SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+            learned=self._skip_learned_profiles.get("s"),
+        )
+
+    def _save_skip_learning(self, variant: str, candidate: str) -> None:
+        if save_device_learning(
+            self._skip_learning_path,
+            self._skip_device_id,
+            variant,
+            candidate,
+        ):
+            self._skip_learned_profiles[variant] = candidate
+
+    def _reconcile_skip_learning(
+        self,
+        variant: str,
+        experiment: SkipExperimentTracker,
+    ) -> None:
+        """Remove a persisted winner immediately after runtime invalidation."""
+
+        persisted = self._skip_learned_profiles.get(variant)
+        if not persisted or experiment.learned == persisted:
+            return
+        if remove_device_learning(
+            self._skip_learning_path,
+            self._skip_device_id,
+            variant,
+        ):
+            self._skip_learned_profiles.pop(variant, None)
+
+    def _write_skip_experiment_event(
+        self,
+        outcome: SkipOutcome,
+        *,
+        guard=None,
+        variant: Optional[str] = None,
+        control_seconds: Optional[float] = None,
+    ) -> None:
+        """Append one machine-readable SKIP experiment result without touching UI."""
+
+        event = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "device_id": self._skip_device_id,
+            "variant": variant,
+            "status": outcome.status,
+            "candidate": outcome.candidate,
+            "latency_seconds": outcome.latency_seconds,
+            "learned": outcome.learned,
+            "detail": outcome.detail,
+            "control_seconds": (
+                SKIP_EXPERIMENT_CONTROL_SECONDS
+                if control_seconds is None else float(control_seconds)
+            ),
+            "control_policy": (
+                "progressive"
+                if SKIP_EXPERIMENT_PROGRESSIVE_CONTROL else "fixed"
+            ),
+            "control_result": (
+                "exited_before_input"
+                if outcome.detail == "opponent_or_natural_exit_during_control"
+                else "survived_to_input"
+                if (
+                    (guard is not None and guard.attempted)
+                    or (
+                        outcome.candidate is not None
+                        and outcome.status in {
+                            "pending",
+                            "success",
+                            "failed",
+                            "quarantined",
+                        }
+                    )
+                )
+                else None
+            ),
+        }
+        if guard is not None:
+            event["guard"] = {
+                "attempted": guard.attempted,
+                "action_ok": guard.action_ok,
+                "foreground_before": guard.foreground_before,
+                "foreground_after": guard.foreground_after,
+                "foreground_samples": list(guard.foreground_samples),
+                "invariant_ok": guard.invariant_ok,
+                "reason": guard.reason,
+                "elapsed_seconds": guard.elapsed_seconds,
+            }
+        try:
+            log_dir = self.base_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(
+                log_dir / SKIP_EXPERIMENT_LOG_FILENAME,
+                "a",
+                encoding="utf-8",
+            ) as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _report_skip_experiment_outcome(
+        self,
+        outcome: Optional[SkipOutcome],
+        *,
+        guard=None,
+        variant: Optional[str] = None,
+        control_seconds: Optional[float] = None,
+    ) -> None:
+        if outcome is None:
+            return
+        self._write_skip_experiment_event(
+            outcome,
+            guard=guard,
+            variant=variant,
+            control_seconds=control_seconds,
+        )
+        candidate = (outcome.candidate or "-").upper()
+        if outcome.status == "success":
+            suffix = f", {outcome.latency_seconds:.2f}초" if outcome.latency_seconds is not None else ""
+            self.queue_log(f"[SKIP 실험] {candidate} 성공 후보{suffix} ({outcome.detail})")
+            if outcome.learned:
+                self.queue_log(
+                    f"[SKIP 실험] {candidate} {SKIP_EXPERIMENT_CONFIRM_SUCCESSES}회 확인 → 우선 입력으로 학습"
+                )
+        elif outcome.status == "quarantined":
+            self.queue_log(
+                f"[SKIP 실험] {candidate} 전면창 불변 위반 → 세션에서 격리 ({outcome.detail})"
+            )
+        elif outcome.status == "failed":
+            self.queue_log(f"[SKIP 실험] {candidate} 실패 → 다음 후보 ({outcome.detail})")
+        elif outcome.status == "blocked":
+            self.queue_log("[SKIP 실험] 안전 후보가 모두 격리됨 → 입력 없이 자연 종료 대기")
+        elif (
+            outcome.status == "unattributed"
+            and outcome.detail == "opponent_or_natural_exit_during_control"
+        ):
+            self.queue_log(
+                "[SKIP 대조] 입력 전에 종료됨 → 상대 스킵/자연 종료로 분류, 학습 제외"
+            )
+
     @staticmethod
     def _skip_a_choose(learned, sweep_idx: int, elapsed: float):
         """(A) SKIP 다음 행동 결정(순수 로직 — Mac 단위검증용).
@@ -1494,11 +1736,16 @@ class AutomationApp:
             return ("sendinput", None)
         return ("restart", None)
 
-    def _press_skip_candidate(self, name: str, manager: InactiveManager) -> bool:
+    @staticmethod
+    def _press_skip_candidate(
+        name: str,
+        manager: InactiveManager,
+        prompt_center: Optional[tuple[int, int]] = None,
+    ) -> bool:
         """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식 — 화면 변화 0).
 
-        실측 확정: 컷신 스킵 입력은 '키보드 s' 또는 '게임패드 A' 뿐(다른 키·버튼 무효).
-        따라서 현재 키는 s만 쓰지만, 전달 경로 분기와 홀드 변형을 깔끔히 다루려고
+        키보드 S, 게임패드 A와 사용자가 요청한 Start 경로를 안전 후보로 탐색한다.
+        전달 경로 분기와 홀드 변형을 깔끔히 다루려고
         '<방법>_<키>'(vk 기반)로 일반화해 둔다.
         - 키보드 '<방법>_s' (딥 메시지 — 게임이 메시지 계층=CEF로 s를 읽을 때 배경 통과):
           · "pm_s":           WM_KEYDOWN 딥 전송(최상위+포커스 자식+모든 자식 창)
@@ -1506,7 +1753,7 @@ class AutomationApp:
           · "attach_state_s": AttachThreadInput+SetKeyboardState(GetKeyState 폴링 속이기)
           · "attach_post_s":  AttachThreadInput(큐 공유)+포커스창 WM_KEYDOWN/UP
         - 스캔코드 전용('s' 고정): "focus_child_s", "focus_s"(깜빡임), "si_s"(유출)
-        - "a": 가상패드 A(vgamepad A=게임 A 확정) / "lt"/"rt": 트리거
+        - "a"/"start": 가상패드 버튼 / "lt"/"rt": 트리거
         - "*_hold": 위 입력을 1초 홀드(hold-to-skip 대응 — 탭으론 원리상 못 넘김)
         """
         # '*_hold' 후보 = 같은 버튼을 길게 홀드(hold-to-skip 프롬프트 대응).
@@ -1516,6 +1763,76 @@ class AutomationApp:
             name = name[:-len("_hold")]
             hold_secs = SKIP_A_SWEEP_HOLD_SECONDS
         try:
+            if name == "click_prompt":
+                if prompt_center is None:
+                    return False
+                end_x, end_y = prompt_center
+                start_x, start_y = manager.get_virtual_start_position(
+                    end_x,
+                    end_y,
+                )
+                return manager.post_curved_click(
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                )
+            if name in {"spoof_a", "spoof_start"}:
+                if not manager.hwnd:
+                    return False
+                gamepad_name = name.removeprefix("spoof_")
+                button = input_gamepad.KEY_TO_GAMEPAD.get(gamepad_name)
+                if button is None:
+                    return False
+                spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                try:
+                    if not spoofed:
+                        return False
+                    return send_gamepad_button(button, press_delay=hold_secs)
+                finally:
+                    input_message.spoof_window_active(manager.hwnd, False)
+            if name in {"spoof_char_s", "spoof_pm_s"}:
+                if not manager.hwnd:
+                    return False
+                vk = input_message.KEY_TO_VK.get("s")
+                if not vk:
+                    return False
+                spoofed = input_message.spoof_window_active(
+                    manager.hwnd,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    if name == "spoof_char_s":
+                        return input_message.post_char_deep(
+                            manager.hwnd,
+                            vk,
+                            ord("s"),
+                            press_delay=hold_secs,
+                        )
+                    return input_message.post_key_deep(
+                        manager.hwnd,
+                        vk,
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    input_message.spoof_window_active(
+                        manager.hwnd,
+                        False,
+                    )
+            if name in {"sync_char_s", "sync_pm_s"}:
+                if not manager.hwnd:
+                    return False
+                vk = input_message.KEY_TO_VK.get("s")
+                if not vk:
+                    return False
+                return input_message.send_key_deep_sync(
+                    manager.hwnd,
+                    vk,
+                    char_code=ord("s") if name == "sync_char_s" else None,
+                    press_delay=hold_secs,
+                )
             # 스캔코드 전용(아무 키 일반화 불가 — 's' 고정).
             if name == "focus_child_s":
                 if manager.hwnd:
@@ -1587,9 +1904,10 @@ class AutomationApp:
             y2 = min(h, int(h * SKIP_OCR_BOTTOM_FRACTION))
             crop = screen_gray[y1:y2, x1:x2]   # 원본 해상도 — (A) 템플릿은 여기서 매칭
             # 1) (A) SKIP 템플릿 우선(정밀). 매칭되면 OCR을 안 보므로 A형이 Start로 안 샌다.
-            is_a, _score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
+            is_a, skip_a_score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
+            is_s, skip_s_score, s_center = rank_ocr.match_skip_s(crop, self.base_dir)
             has_text = False
-            if not is_a:
+            if not is_a and not is_s:
                 # 2) 일반 스킵: OCR용으로만 폭 축소 후 텍스트 확인(글자는 크므로 인식 유지).
                 ocr_crop = crop
                 if SKIP_OCR_MAX_WIDTH and ocr_crop.shape[1] > SKIP_OCR_MAX_WIDTH:
@@ -1602,10 +1920,43 @@ class AutomationApp:
         except Exception:
             return False
 
-        if not is_a and not has_text:
-            # 스킵 없음 → 에피소드 종료. 종료 직전(1.5초 내)에 누른 후보가 있으면
-            # 그 입력이 스킵을 넘긴 것으로 보고 '학습'한다(다음부턴 바로 그 버튼).
-            if self._skip_kind == "a" and self._skip_last_press is not None:
+        if not is_a and not is_s and not has_text:
+            # 스킵 없음 → 에피소드 종료. 엄격 실험 모드에서는 직전 입력과 소멸 시각을
+            # 연결하고, 같은 후보가 반복 확인된 뒤에만 학습한다. 자연 종료는 귀속하지 않는다.
+            if self._skip_kind == "a" and SKIP_STRICT_INACTIVE_EXPERIMENT:
+                variant = "s" if self._skip_prompt_variant == "s" else "a"
+                experiment = (
+                    self._skip_s_experiment
+                    if variant == "s"
+                    else self._skip_experiment
+                )
+                episode_control_seconds = experiment.episode_control_seconds
+                outcome = experiment.prompt_disappeared(time.monotonic())
+                if outcome is None:
+                    # Keep the episode/candidate attached while absence is only
+                    # tentative. A reappearing prompt cancels it in choose().
+                    self._skip_active_until = time.monotonic() + 0.3
+                    return True
+                self._report_skip_experiment_outcome(
+                    outcome,
+                    variant=variant,
+                    control_seconds=episode_control_seconds,
+                )
+                self._reconcile_skip_learning(variant, experiment)
+                if outcome.learned:
+                    self._save_skip_learning(variant, outcome.learned)
+                    if variant == "a":
+                        self._skip_a_learned = outcome.learned
+                        self._skip_learned_fail = 0
+            elif SKIP_STRICT_INACTIVE_EXPERIMENT and (
+                self._skip_experiment.pending is not None
+                or self._skip_s_experiment.pending is not None
+            ):
+                # 일반 Start 에피소드 안전망에서 실행된 입력을 다음 A 에피소드에 귀속하지 않는다.
+                self._skip_experiment.reset_episode()
+                self._skip_s_experiment.reset_episode()
+            elif self._skip_kind == "a" and self._skip_last_press is not None:
+                # 기존 호환 모드: 마지막 입력 직후 사라졌으면 바로 학습.
                 name, t = self._skip_last_press
                 if (name != "sendinput" and time.monotonic() - t <= 1.5
                         and self._skip_a_learned != name):
@@ -1617,25 +1968,73 @@ class AutomationApp:
             self._skip_seen_since = None
             self._skip_text_streak = 0
             self._skip_kind = None
+            self._skip_prompt_variant = None
+            self._skip_prompt_center = None
             self._skip_last_press = None
+            self._skip_a_dumped = False
             self._skip_a_sweep_idx = 0   # 다음 에피소드는 처음부터(학습됐으면 학습값 우선)
             return False
 
         now = time.monotonic()
         if self._skip_seen_since is None:
             self._skip_seen_since = now
+            if has_text and not is_a and not is_s:
+                self.queue_log(
+                    f"[SKIP 진단] OCR 감지, A={skip_a_score:.3f}/"
+                    f"{SKIP_A_MATCH_THRESHOLD:.3f}, S={skip_s_score:.3f}/"
+                    f"{SKIP_S_MATCH_THRESHOLD:.3f}"
+                )
+        if (has_text and not is_a and not is_s and not self._skip_a_dumped
+                and self._skip_diag_count < 20):
+            self._skip_a_dumped = True
+            self._skip_diag_count += 1
+            try:
+                diag_dir = self.base_dir / "logs" / "skip_diagnostics"
+                diag_dir.mkdir(parents=True, exist_ok=True)
+                diag_path = diag_dir / (
+                    f"skip_text_{time.strftime('%Y%m%d_%H%M%S')}_"
+                    f"{self._skip_diag_count:02d}_{skip_a_score:.3f}.png"
+                )
+                if cv2.imwrite(str(diag_path), crop):
+                    self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
+            except Exception:
+                pass
         # 감지 중엔 매칭을 잠시 멈춰 스킵 화면에서의 오클릭을 막는다(입력 여부와 무관).
         self._skip_active_until = now + 0.5
 
         press_a = press_start = False
-        if is_a or self._skip_kind == "a":
-            # A형: 이번 프레임 템플릿이 맞았거나, '이미 이 에피소드가 A형으로 확정'된 경우.
+        if is_a or is_s or self._skip_kind == "a":
+            # A/S hold형: 템플릿이 맞았거나 이미 이 에피소드가 hold형으로 확정된 경우.
             # → 움직이는 배경(리플레이) 위에서 템플릿이 프레임마다 깜빡여도 A를 '매 주기' 누른다.
-            # 한 번 A로 분류되면 에피소드 끝까지 A로 고정(sticky) → A 입력이 끊기지 않는다.
+            # hold형 자체는 sticky지만, 실제 장치 입력 전환으로 고신뢰 템플릿이 S↔A로
+            # 바뀌면 변형은 갱신한다. 이전 입력 뒤의 표시 전환을 성공으로 귀속하지 않는다.
+            detected_variant = "a" if is_a else "s" if is_s else None
+            detected_center = a_center if is_a else s_center if is_s else None
+            if detected_center is not None:
+                self._skip_prompt_center = (
+                    x1 + int(detected_center[0]),
+                    y1 + int(detected_center[1]),
+                )
+            if (
+                detected_variant is not None
+                and detected_variant != self._skip_prompt_variant
+            ):
+                previous_variant = self._skip_prompt_variant
+                if previous_variant == "a":
+                    self._skip_experiment.reset_episode()
+                elif previous_variant == "s":
+                    self._skip_s_experiment.reset_episode()
+                self._skip_prompt_variant = detected_variant
+                if previous_variant is not None:
+                    self.queue_log(
+                        f"[SKIP 실험] 표시 전환 "
+                        f"{previous_variant.upper()}→{detected_variant.upper()} "
+                        "확인 → 이전 입력 귀속 취소"
+                    )
             self._skip_kind = "a"
             self._skip_text_streak = 0
             press_a = True
-            kind = "A"
+            kind = (self._skip_prompt_variant or "A").upper()
         else:
             # 아직 A로 분류 안 됨 + 이번 프레임 템플릿도 미스 → 일반(Start) 후보.
             # 단발 OCR 노이즈 + 'A형 첫 프레임이 깜빡인' 경우를 막기 위해 N연속 후에만 Start.
@@ -1655,61 +2054,123 @@ class AutomationApp:
             kind = "A·Start(안전망)"
 
         try:
-            if manager.hwnd and winapi.win32gui is not None:
+            if (not SKIP_STRICT_INACTIVE_EXPERIMENT
+                    and manager.hwnd and winapi.win32gui is not None):
                 WM_ACTIVATE = 0x0006
                 WA_ACTIVE = 1
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             action_label = "입력"
             if press_a:
-                # 실측 결론: 컷신 스킵은 게임이 '전면'일 때만 A를 읽는다(배경 불가).
-                # SKIP_A_FOREGROUND=True면 사용자의 알트탭을 자동화: 게임 잠깐 전면화 →
-                # A 홀드(hold-to-skip) → 원래 창 복원. 화면이 잠깐 바뀌지만 스킵은 된다.
-                a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
-                elapsed = now - self._skip_seen_since
-                want_fg = (SKIP_A_FOREGROUND and manager.hwnd and a_btn is not None
-                           and elapsed >= SKIP_A_FOREGROUND_AFTER_SECONDS)
-                if want_fg and now - self._skip_fg_last_at >= SKIP_A_FG_COOLDOWN_SECONDS:
+                if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_kind == "a":
+                    variant = (
+                        "s" if self._skip_prompt_variant == "s" else "a"
+                    )
+                    experiment = (
+                        self._skip_s_experiment
+                        if variant == "s"
+                        else self._skip_experiment
+                    )
+                    candidate, expired = experiment.choose(now)
+                    self._report_skip_experiment_outcome(
+                        expired,
+                        variant=variant,
+                        control_seconds=experiment.episode_control_seconds,
+                    )
+                    self._reconcile_skip_learning(variant, experiment)
+                    if candidate:
+                        guard = run_guarded_inactive_action(
+                            lambda: self._press_skip_candidate(
+                                candidate,
+                                manager,
+                                self._skip_prompt_center,
+                            ),
+                            input_message.get_foreground_hwnd,
+                            manager.hwnd,
+                            poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                        )
+                        outcome = experiment.record_attempt(
+                            candidate,
+                            time.monotonic(),
+                            guard,
+                        )
+                        self._report_skip_experiment_outcome(
+                            outcome,
+                            guard=guard,
+                            variant=variant,
+                            control_seconds=experiment.episode_control_seconds,
+                        )
+                        self._reconcile_skip_learning(variant, experiment)
+                        action_label = (
+                            f"비활성 {kind} 실험 {candidate.upper()}"
+                            if guard.attempted
+                            else f"비활성 실험 보류({guard.reason})"
+                        )
+                    elif expired is None:
+                        action_label = "비활성 실험 결과 대기"
+                    self._skip_active_until = time.monotonic() + 0.3
+                elif SKIP_STRICT_INACTIVE_EXPERIMENT:
+                    # 일반 Start 스킵의 A 안전망은 후보 학습에서 제외합니다. 전면창 감시만
+                    # 적용한 단순 A 홀드로 오분류 화면이 갇히는 것만 방지합니다.
+                    a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
+                    guard = run_guarded_inactive_action(
+                        lambda: (
+                            send_gamepad_button(
+                                a_btn,
+                                press_delay=SKIP_A_SWEEP_HOLD_SECONDS,
+                            )
+                            if a_btn is not None else False
+                        ),
+                        input_message.get_foreground_hwnd,
+                        manager.hwnd,
+                        poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                    )
+                    action_label = (
+                        "Start 안전망 A홀드(비활성 유지)"
+                        if guard.invariant_ok and guard.action_ok
+                        else f"Start 안전망 보류({guard.reason})"
+                    )
+                else:
+                    # 호환 모드: 전면화 폴백을 명시적으로 켠 기존 설치만 이 경로를 사용합니다.
+                    a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
+                    elapsed = now - self._skip_seen_since
+                    want_fg = (SKIP_A_FOREGROUND and manager.hwnd and a_btn is not None
+                               and elapsed >= SKIP_A_FOREGROUND_AFTER_SECONDS)
+                    if want_fg and now - self._skip_fg_last_at >= SKIP_A_FG_COOLDOWN_SECONDS:
                     # 폴백(옵트인): 스푸핑으로 안 넘어감 → 잠깐 전면화+A홀드+복원.
                     # 컷신당 1번(쿨다운). ALT트릭은 bring_foreground 안에 있음.
-                    self._skip_fg_last_at = now
-                    prev = input_message.get_foreground_hwnd()
-                    if input_message.bring_foreground(manager.hwnd):
-                        time.sleep(0.10)   # FIFA가 전면을 인지할 시간
-                        send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
-                        if prev and prev != int(manager.hwnd):
-                            input_message.bring_foreground(prev)   # 원래 창 복원
-                        action_label = "전면화+A홀드"
-                    else:
-                        action_label = "전면화 실패"
-                    self._skip_active_until = time.monotonic() + 0.5
-                elif SKIP_A_ACTIVATE_SPOOF and manager.hwnd and a_btn is not None:
-                    # 1순위(깜빡임 0): 활성 스푸핑(WM_ACTIVATEAPP+WM_ACTIVATE) 후 배경 A 홀드.
-                    # 홀드끼리 안 겹치게 '홀드시간+여유' 간격으로만 재발사.
-                    if now - self._skip_fg_last_at >= SKIP_A_HOLD_SECONDS + 0.3:
                         self._skip_fg_last_at = now
-                        spoofed = input_message.spoof_window_active(manager.hwnd, True)
-                        try:
-                            if spoofed:
-                                send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
-                                still_inactive = (
-                                    input_message.get_foreground_hwnd() != int(manager.hwnd)
-                                )
-                                action_label = (
-                                    "활성스푸핑+A홀드(비활성 유지)"
-                                    if still_inactive else "비활성 유지 실패"
-                                )
-                            else:
-                                # 실제 전면 창이 바뀌거나 메시지 전달이 지연되면 A도 보내지
-                                # 않아 '비활성 유지' 계약을 우선합니다.
-                                action_label = "활성스푸핑 실패(A 미전송)"
-                        finally:
-                            # 게임 내부 활성 플래그가 남지 않게 가짜 비활성 메시지도 짝으로 보냅니다.
-                            input_message.spoof_window_active(manager.hwnd, False)
-                    self._skip_active_until = time.monotonic() + 0.3
-                else:
-                    # 둘 다 꺼짐 → 스킵 안 함, 컷신 자연 종료 대기(화면 변화 0).
-                    action_label = "스킵끔(자연종료 대기)"
+                        prev = input_message.get_foreground_hwnd()
+                        if input_message.bring_foreground(manager.hwnd):
+                            time.sleep(0.10)
+                            send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
+                            if prev and prev != int(manager.hwnd):
+                                input_message.bring_foreground(prev)
+                            action_label = "전면화+A홀드"
+                        else:
+                            action_label = "전면화 실패"
+                        self._skip_active_until = time.monotonic() + 0.5
+                    elif SKIP_A_ACTIVATE_SPOOF and manager.hwnd and a_btn is not None:
+                        if now - self._skip_fg_last_at >= SKIP_A_HOLD_SECONDS + 0.3:
+                            self._skip_fg_last_at = now
+                            spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                            try:
+                                if spoofed:
+                                    send_gamepad_button(a_btn, press_delay=SKIP_A_HOLD_SECONDS)
+                                    still_inactive = (
+                                        input_message.get_foreground_hwnd() != int(manager.hwnd)
+                                    )
+                                    action_label = (
+                                        "활성스푸핑+A홀드(비활성 유지)"
+                                        if still_inactive else "비활성 유지 실패"
+                                    )
+                                else:
+                                    action_label = "활성스푸핑 실패(A 미전송)"
+                            finally:
+                                input_message.spoof_window_active(manager.hwnd, False)
+                        self._skip_active_until = time.monotonic() + 0.3
+                    else:
+                        action_label = "스킵끔(자연종료 대기)"
             if press_start and start_btn is not None:
                 send_gamepad_button(start_btn, press_delay=SKIP_PRESS_DELAY_SECONDS)
             self._skip_active_until = max(
@@ -1753,6 +2214,82 @@ class AutomationApp:
         jitter_y = random.randint(-max_y_jitter, max_y_jitter)
 
         return center_x + jitter_x, center_y + jitter_y
+
+    def _try_close_notification_panel(
+        self,
+        screen_gray: np.ndarray,
+        manager: Optional[InactiveManager],
+        click_mode: str,
+        capture_mode: str,
+        region: tuple[int, int, int, int],
+        now: float,
+    ) -> bool:
+        """열린 알림 패널을 감지해 하단 종 버튼을 다시 누르고, 처리 중이면 True를 반환합니다."""
+
+        if not NOTIFICATION_PANEL_GUARD_ENABLED:
+            return False
+
+        if now - self._notification_check_at < NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS:
+            return self._notification_visible
+        self._notification_check_at = now
+
+        detected = is_notification_panel_open(screen_gray)
+        if not detected:
+            if self._notification_visible:
+                self.queue_log("[알림 복구] 패널 닫힘 확인 → 자동화 재개")
+            self._notification_streak = 0
+            self._notification_visible = False
+            return False
+
+        self._notification_visible = True
+        self._notification_streak += 1
+        self.queue_status("알림 패널 닫는 중")
+
+        # 한 프레임의 밝기 변화만으로는 누르지 않고 연속 프레임 합의를 기다립니다.
+        if self._notification_streak < max(1, NOTIFICATION_PANEL_CONFIRM_COUNT):
+            return True
+
+        # 클릭 직후의 이전 프레임이 잠깐 남아도 종 버튼을 연타해 다시 여는 일이 없게 합니다.
+        if now - self._notification_last_action_at < NOTIFICATION_PANEL_RETRY_SECONDS:
+            return True
+        self._notification_last_action_at = now
+
+        height, width = screen_gray.shape[:2]
+        toggle_x = min(width - 1, max(0, round((width - 1) * NOTIFICATION_TOGGLE_X_FRACTION)))
+        toggle_y = min(height - 1, max(0, round((height - 1) * NOTIFICATION_TOGGLE_Y_FRACTION)))
+        guard = None
+        if manager is not None and manager.hwnd:
+            start_x, start_y = manager.get_virtual_start_position(
+                toggle_x,
+                toggle_y,
+            )
+            guard = run_guarded_inactive_action(
+                lambda: manager.post_curved_click(
+                    start_x,
+                    start_y,
+                    toggle_x,
+                    toggle_y,
+                ),
+                input_message.get_foreground_hwnd,
+                manager.hwnd,
+                poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+            )
+        action_ok = bool(
+            guard is not None
+            and guard.action_ok
+            and guard.invariant_ok
+        )
+        if action_ok:
+            self.queue_log(
+                f"[알림 복구] 열린 패널 감지 → 종 버튼 비활성 클릭 "
+                f"({toggle_x},{toggle_y}), 전면 불변 유지"
+            )
+        else:
+            reason = guard.reason if guard is not None else "missing_window"
+            self.queue_log(
+                f"[알림 복구] 종 버튼 비활성 클릭 보류({reason}) → 잠시 후 재시도"
+            )
+        return True
 
     def capture_screen_region(self, region: tuple[int, int, int, int]) -> Optional[np.ndarray]:
         """
@@ -2190,4 +2727,8 @@ class LicenseDialog:
         self.result = key
         for widget in self.root.winfo_children():
             widget.destroy()
-        AutomationApp(self.root, license_key=key)
+        app = AutomationApp(self.root, license_key=key)
+        # 실기 회귀 러너용 옵트인. 일반 실행에는 환경변수가 없으므로 UI 동작은 그대로이며,
+        # 테스트 프로세스만 인증 직후 F8과 같은 시작 경로를 자동 호출합니다.
+        if os.environ.get("MAUTO_AUTOSTART_EXPERIMENT", "").strip() == "1":
+            self.root.after(1200, app.start_automation)

@@ -211,6 +211,75 @@ def post_char_deep(hwnd: int, vk_code: int, char_code: int,
         return False
 
 
+def send_key_deep_sync(
+    hwnd: int,
+    vk_code: int,
+    *,
+    char_code: Optional[int] = None,
+    press_delay: float = 0.08,
+    timeout_ms: int = 80,
+) -> bool:
+    """Synchronously deliver key messages without activating the target.
+
+    Some window procedures ignore queued PostMessage keyboard events but handle
+    the same messages when dispatched synchronously. SendMessageTimeout keeps a
+    hung game window from blocking the macro indefinitely. This does not use
+    SendInput, SetFocus, process injection, or memory access.
+    """
+
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    try:
+        _setup_user32_sigs()
+        u = ctypes.windll.user32
+        scan_code = u.MapVirtualKeyW(vk_code, 0)
+        lparam_down = (scan_code << 16) | 1
+        lparam_up = (scan_code << 16) | 1 | (1 << 30) | (1 << 31)
+        targets = [int(hwnd)]
+        focus = _get_thread_focus_hwnd(hwnd)
+        if focus:
+            targets.append(int(focus))
+        targets.extend(_get_child_windows(hwnd))
+        targets = _unique_hwnds(targets)
+        if not targets:
+            return False
+
+        flags = 0x0002 | 0x0020  # SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT
+
+        def deliver(target: int, message: int, wparam: int, lparam: int) -> bool:
+            result = ctypes.c_size_t()
+            return bool(
+                u.SendMessageTimeoutW(
+                    wintypes.HWND(target),
+                    message,
+                    wintypes.WPARAM(wparam),
+                    wintypes.LPARAM(lparam),
+                    flags,
+                    max(1, int(timeout_ms)),
+                    ctypes.byref(result),
+                )
+            )
+
+        delivered_down = False
+        for target in targets:
+            delivered_down = (
+                deliver(target, WM_KEYDOWN, vk_code, lparam_down)
+                or delivered_down
+            )
+            if char_code is not None:
+                deliver(target, WM_CHAR, int(char_code), lparam_down)
+        time.sleep(max(0.0, press_delay))
+        delivered_up = False
+        for target in targets:
+            delivered_up = (
+                deliver(target, WM_KEYUP, vk_code, lparam_up)
+                or delivered_up
+            )
+        return delivered_down and delivered_up
+    except Exception:
+        return False
+
+
 def send_key_attach_state(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
     """AttachThreadInput으로 게임 큐에 붙어 SetKeyboardState로 '키 눌림'을 위조합니다.
 

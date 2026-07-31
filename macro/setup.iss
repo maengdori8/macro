@@ -1,11 +1,7 @@
 ; 버전 업데이트 시 아래 AppVersion도 version.txt와 동일하게 수정하세요
-#ifndef RenewalSource
-#define RenewalSource "dist\renewal_macro.exe"
-#endif
-
 [Setup]
 AppName=Macro
-AppVersion=1.0.32
+AppVersion=1.0.33
 AppPublisher=maengdori
 DefaultDirName={autopf}\Macro
 DefaultGroupName=Macro
@@ -34,9 +30,14 @@ ArchitecturesAllowed=x64compatible
 ;  일으켜, 폴더형으로 전환함. dist\macro_app\ 안의 모든 파일을 재귀로 담는다.)
 Source: "dist\macro_app\*"; DestDir: "{app}"; Excludes: "license.key,logs\*,_update_tmp\*,_update.zip,startup_error.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#RenewalSource}"; DestDir: "{app}"; DestName: "renewal_macro.exe"; Flags: ignoreversion
-Source: "dist\gamepad_test.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+; 감독모드 전용 설치본: 예전 통합 설치본이 남긴 갱신/테스트 실행 파일과 바로가기도 제거합니다.
+[InstallDelete]
+Type: files; Name: "{app}\renewal_macro.exe"
+Type: files; Name: "{app}\gamepad_test.exe"
+Type: files; Name: "{group}\Macro 갱신.lnk"
+Type: files; Name: "{commondesktop}\Macro 갱신.lnk"
 
 ; 런타임 생성물 정리: 캡처 템플릿이 재설치 후에도 몰래 살아남지 않게 합니다.
 ; license.key는 재설치 시 재인증을 피하기 위해 남겨둡니다.
@@ -49,8 +50,6 @@ Type: files; Name: "{app}\_update.zip"
 [Icons]
 Name: "{group}\Macro"; Filename: "{app}\launcher.exe"
 Name: "{commondesktop}\Macro"; Filename: "{app}\launcher.exe"
-Name: "{group}\Macro 갱신"; Filename: "{app}\renewal_macro.exe"
-Name: "{commondesktop}\Macro 갱신"; Filename: "{app}\renewal_macro.exe"
 
 [Run]
 ; postinstall 체크박스 대신 무조건 실행: 런처가 silent 업데이트(/VERYSILENT)로 자신을

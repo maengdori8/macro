@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "side": "buy",
+  "started_at_unix": 1785142138.0013723,
+  "passed": true,
+  "profile": "C:\\Users\\m\\AppData\\Local\\mAuto\\renewal_profile.json",
+  "corpus": "C:\\Users\\m\\AppData\\Local\\mAuto\\renewal_corpus\\20260727_174904_buy_v12",
+  "frame_size": [
+    1920,
+    1040
+  ],
+  "wgc_size_before_fit": [
+    1920,
+    1040
+  ],
+  "wgc_size_after_fit": [
+    1920,
+    1040
+  ],
+  "outer_size_after_fit": [
+    1928,
+    1048
+  ],
+  "openings": 8,
+  "open_frames": 24,
+  "closed_frames": 4,
+  "noise_global": 0.0,
+  "noise_slice": 0.0,
+  "unchanged_limit": 0.035,
+  "stability_limit": 0.015,
+  "finished_at_unix": 1785142144.9977448
+}

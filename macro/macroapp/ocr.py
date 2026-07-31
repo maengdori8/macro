@@ -34,6 +34,7 @@ from macroapp.config import (
     RANK_OCR_PANEL_GAP_SECONDS,
     RANK_OCR_COMMIT_AFTER_GONE,
     SKIP_A_MATCH_THRESHOLD,
+    SKIP_S_MATCH_THRESHOLD,
 )
 
 # 등수 현실 범위(거짓 양성·자릿수 폭주 차단). 0/음수/비현실값은 버린다.
@@ -53,7 +54,7 @@ _CHAMP_TOKENS = ("챔피언스", "챔피언", "챔피")
 # FC Online 감독 모드 티어명을 앵커로 써서 앞 노이즈("내 정보 ..." 등)를 안 먹게 한다.
 # (긴 이름 먼저 — '슈퍼챔피언스'가 '챔피언스'보다 먼저 와야 부분일치 방지.)
 _TIER_NAMES = (
-    "슈퍼챔피언스", "슈퍼 챔피언스", "챔피언스",
+    "슈퍼챔피언스", "슈퍼 챔피언스", "챔피언스", "마스터",
     "월드클래스", "챌린저", "세미프로", "프로", "아마추어", "비기너", "유스", "레전드",
 )
 _TIER_RE = re.compile(r"((?:" + "|".join(_TIER_NAMES) + r")\s*\d*\s*부?\s*감독)")
@@ -62,7 +63,7 @@ _TIER_FALLBACK_RE = re.compile(r"([가-힣]+(?:\s*\d+\s*부)?\s*감독)")
 
 # 티어 정규화용 표준명(공백 제거형). 긴 이름 먼저 → '슈퍼챔피언스'가 '챔피언스'에 안 묻힘.
 _TIER_CANON = (
-    "슈퍼챔피언스", "챔피언스", "월드클래스", "챌린저",
+    "슈퍼챔피언스", "챔피언스", "마스터", "월드클래스", "챌린저",
     "세미프로", "아마추어", "비기너", "레전드", "프로", "유스",
 )
 # 표준키(공백 제거형) → 표시형(공백 복원). 디스코드 표기를 보기 좋게 유지.
@@ -404,6 +405,8 @@ def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
 # None=아직 시도 안 함, False=없음(다시 안 찾음), ndarray=로드된 grayscale 템플릿.
 _SKIP_A_TEMPLATE = None
 _SKIP_A_FILENAME = "target_skip_a.png"
+_SKIP_S_TEMPLATES = None
+_SKIP_S_FILENAMES = ("target_skip_s.png", "target_skip_s_dark.png")
 
 
 def _load_skip_a_template(base_dir):
@@ -433,9 +436,39 @@ def _load_skip_a_template(base_dir):
 
 
 def reset_skip_a_template() -> None:
-    """캐시를 비워 다음 호출 때 템플릿을 다시 로드하게 한다(런 시작 시 호출)."""
-    global _SKIP_A_TEMPLATE
+    """A/S SKIP 캐시를 비워 다음 호출 때 템플릿을 다시 로드하게 한다."""
+    global _SKIP_A_TEMPLATE, _SKIP_S_TEMPLATES
     _SKIP_A_TEMPLATE = None
+    _SKIP_S_TEMPLATES = None
+
+
+def _load_skip_s_templates(base_dir):
+    """'[S] SKIP' 템플릿(grayscale)을 1회 로드해 캐시한다."""
+    global _SKIP_S_TEMPLATES
+    if _SKIP_S_TEMPLATES is not None:
+        return _SKIP_S_TEMPLATES if _SKIP_S_TEMPLATES is not False else ()
+    if cv2 is None:
+        _SKIP_S_TEMPLATES = False
+        return ()
+    try:
+        from macroapp import config as _cfg
+        templates = []
+        for filename in _SKIP_S_FILENAMES:
+            raw = _cfg.read_target_image_bytes(base_dir, filename)
+            if not raw:
+                continue
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            image = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if image is not None and image.size:
+                templates.append(image)
+        if not templates:
+            _SKIP_S_TEMPLATES = False
+            return ()
+        _SKIP_S_TEMPLATES = tuple(templates)
+        return _SKIP_S_TEMPLATES
+    except Exception:
+        _SKIP_S_TEMPLATES = False
+        return ()
 
 
 def match_skip_a(image_gray: np.ndarray, base_dir,
@@ -462,3 +495,37 @@ def match_skip_a(image_gray: np.ndarray, base_dir,
     # 매칭 중심(이미지 좌표) — 호출부가 이 자리를 '클릭'해서 A 없이 스킵할 수 있게 반환.
     center = (int(max_loc[0] + tw // 2), int(max_loc[1] + th // 2))
     return (float(mx) >= threshold, float(mx), center)
+
+
+def match_skip_s(
+    image_gray: np.ndarray,
+    base_dir,
+    threshold: float = SKIP_S_MATCH_THRESHOLD,
+):
+    """'[S] SKIP' 템플릿이 보이면 (True, score, center)를 반환한다."""
+    templates = _load_skip_s_templates(base_dir)
+    if not templates or cv2 is None or image_gray is None or image_gray.size == 0:
+        return (False, 0.0, None)
+    ih, iw = image_gray.shape[:2]
+    best_score = 0.0
+    best_center = None
+    for template in templates:
+        th, tw = template.shape[:2]
+        if th > ih or tw > iw:
+            continue
+        try:
+            result = cv2.matchTemplate(
+                image_gray,
+                template,
+                cv2.TM_CCOEFF_NORMED,
+            )
+            _, score, _, location = cv2.minMaxLoc(result)
+        except Exception:
+            continue
+        if best_center is None or float(score) > best_score:
+            best_score = float(score)
+            best_center = (
+                int(location[0] + tw // 2),
+                int(location[1] + th // 2),
+            )
+    return (best_score >= float(threshold), best_score, best_center)

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "version": "1.0.61",
+  "local_only": true,
+  "commit": "2f0ef6e512d11b9fb4847fbc41d2a0738305d7aa",
+  "artifact": "C:\\Users\\m\\Documents\\GitHub\\macro\\macro\\dist_local_renewal_2f0ef6e\\renewal_macro.exe",
+  "sha256": "CC1A4EC207FA0030EF39C91D4C5CEF0341CDCE4A499460C3D4B2316EC6E2A743",
+  "source_regression": {
+    "passed": true,
+    "tests_passed": 131,
+    "tests_skipped": 2,
+    "subtests_passed": 224
+  },
+  "exe_startup": {
+    "passed": true,
+    "requested_runs": 100,
+    "completed_runs": 100,
+    "failures": 0,
+    "p95_ms": 2491.2791900220327,
+    "maximum_ms": 4098.589499946684
+  },
+  "live_calibration": {
+    "passed": true,
+    "side": "buy",
+    "openings": 8,
+    "open_frames": 24,
+    "closed_frames": 4,
+    "frame_size": [
+      1920,
+      1040
+    ]
+  },
+  "reference_video": {
+    "path": "C:\\Users\\m\\Desktop\\2026-07-26 16-58-24.mp4",
+    "open_cycle_median_ms": 458.3
+  },
+  "live_no_order_monitor": {
+    "passed": true,
+    "duration_seconds": 300.7623010999523,
+    "confirmed_openings": 802,
+    "confirmed_cycles_per_second": 2.666689740737416,
+    "cycle_p50_ms": 333.79500004230067,
+    "cycle_p95_ms": 397.6622649934142,
+    "first_price_p50_ms": 278.3366999938153,
+    "first_price_p95_ms": 347.44087000144646,
+    "final_target_cycle_ms": 239.9999999999999,
+    "gray_backoffs": 1,
+    "open_failures": 2,
+    "max_consecutive_open_failures": 1,
+    "false_change_detections": 0,
+    "order_inputs": 0,
+    "cpu_average_percent": 2.8291666666666666,
+    "cpu_p95_percent": 3.0175,
+    "private_memory_growth_mb": 3.99609375
+  },
+  "deployment": {
+    "github_push": false,
+    "release": false,
+    "automatic_update": false,
+    "actual_order_test": false
+  },
+  "passed": true
+}

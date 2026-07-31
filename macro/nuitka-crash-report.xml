@@ -9,6 +9,12 @@ error: failed to link with LLD: FileNotFound
 </stderr>
     </scons_error_report>
     <scons_error_report>
+      <command>"C:\\Users\\m\\AppData\\Local\\Nuitka\\Nuitka\\Cache\\DOWNLO~1\\pip\\private-6533d32b\\Lib\\site-packages\\ziglang\\zig.exe" cc -o "__constants.o" -c -std=c11 -fvisibility=hidden -fwrapv -pipe -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-constant-logical-operand -Wno-unused-but-set-variable -O3 -D_NUITKA_STANDALONE_MODE -D_NUITKA_ONEFILE_MODE -D_NUITKA_ONEFILE_TEMP_BOOL -D_NUITKA_DLL_MODE -D_NUITKA_ONEFILE_DLL_MODE -D__ZIG__ -D__NUITKA_NO_ASSERT__ -D_NUITKA_FROZEN=152 -D_NUITKA_CONSTANTS_FROM_CODE -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\zlib -IC:\Users\m\AppData\Local\Programs\Python\Python313\include -IC:\Users\m\AppData\Local\Programs\Python\Python313\include\internal\mimalloc -I. -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\include -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\static_src -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\libbacktrace "__constants.c"</command>
+      <stderr>
+error: failed to link with LLD: FileNotFound
+</stderr>
+    </scons_error_report>
+    <scons_error_report>
       <command>"C:\\Users\\m\\AppData\\Local\\Nuitka\\Nuitka\\Cache\\DOWNLO~1\\pip\\private-6533d32b\\Lib\\site-packages\\ziglang\\zig.exe" cc -o "__loader.o" -c -std=c11 -fvisibility=hidden -fwrapv -pipe -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-constant-logical-operand -Wno-unused-but-set-variable -O3 -D_NUITKA_STANDALONE_MODE -D_NUITKA_ONEFILE_MODE -D_NUITKA_ONEFILE_TEMP_BOOL -D_NUITKA_DLL_MODE -D_NUITKA_ONEFILE_DLL_MODE -D__ZIG__ -D__NUITKA_NO_ASSERT__ -D_NUITKA_FROZEN=152 -D_NUITKA_CONSTANTS_FROM_CODE -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\zlib -IC:\Users\m\AppData\Local\Programs\Python\Python313\include -IC:\Users\m\AppData\Local\Programs\Python\Python313\include\internal\mimalloc -I. -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\include -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\static_src -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\libbacktrace "__loader.c"</command>
       <stderr>
 error: failed to link with LLD: FileNotFound
@@ -16,12 +22,6 @@ error: failed to link with LLD: FileNotFound
     </scons_error_report>
     <scons_error_report>
       <command>"C:\\Users\\m\\AppData\\Local\\Nuitka\\Nuitka\\Cache\\DOWNLO~1\\pip\\private-6533d32b\\Lib\\site-packages\\ziglang\\zig.exe" cc -o "module.__main__.o" -c -std=c11 -fvisibility=hidden -fwrapv -pipe -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-constant-logical-operand -Wno-unused-but-set-variable -O3 -D_NUITKA_STANDALONE_MODE -D_NUITKA_ONEFILE_MODE -D_NUITKA_ONEFILE_TEMP_BOOL -D_NUITKA_DLL_MODE -D_NUITKA_ONEFILE_DLL_MODE -D__ZIG__ -D__NUITKA_NO_ASSERT__ -D_NUITKA_FROZEN=152 -D_NUITKA_CONSTANTS_FROM_CODE -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\zlib -IC:\Users\m\AppData\Local\Programs\Python\Python313\include -IC:\Users\m\AppData\Local\Programs\Python\Python313\include\internal\mimalloc -I. -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\include -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\static_src -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\libbacktrace "module.__main__.c"</command>
-      <stderr>
-error: failed to link with LLD: FileNotFound
-</stderr>
-    </scons_error_report>
-    <scons_error_report>
-      <command>"C:\\Users\\m\\AppData\\Local\\Nuitka\\Nuitka\\Cache\\DOWNLO~1\\pip\\private-6533d32b\\Lib\\site-packages\\ziglang\\zig.exe" cc -o "__constants.o" -c -std=c11 -fvisibility=hidden -fwrapv -pipe -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-constant-logical-operand -Wno-unused-but-set-variable -O3 -D_NUITKA_STANDALONE_MODE -D_NUITKA_ONEFILE_MODE -D_NUITKA_ONEFILE_TEMP_BOOL -D_NUITKA_DLL_MODE -D_NUITKA_ONEFILE_DLL_MODE -D__ZIG__ -D__NUITKA_NO_ASSERT__ -D_NUITKA_FROZEN=152 -D_NUITKA_CONSTANTS_FROM_CODE -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\zlib -IC:\Users\m\AppData\Local\Programs\Python\Python313\include -IC:\Users\m\AppData\Local\Programs\Python\Python313\include\internal\mimalloc -I. -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\include -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\static_src -IC:\Users\m\AppData\Local\Programs\Python\PYTHON~1\Lib\SITE-P~1\nuitka\build\inline_copy\libbacktrace "__constants.c"</command>
       <stderr>
 error: failed to link with LLD: FileNotFound
 </stderr>
@@ -44,16 +44,19 @@ error: failed to link with LLD: FileNotFound
     <module_usages />
   </module>
   <module name="__main__" kind="PythonMainModule" usage="root_module" reason="Root module" source_path="${cwd}\gamepad_test.py">
-    <optimization-time pass="1" time="0.0156" micro_passes="4" max_branch_merge="5" merged_total="95" />
-    <optimization-time pass="2" time="0.0156" micro_passes="1" max_branch_merge="4" merged_total="21" />
-    <code-generation-time time="0.0312" />
+    <optimization-time pass="1" time="0.1250" micro_passes="5" max_branch_merge="47" merged_total="3006" />
+    <optimization-time pass="2" time="0.0312" micro_passes="1" max_branch_merge="37" merged_total="578" />
+    <code-generation-time time="0.1406" />
     <distribution-usages>
       <distribution-usage name="vgamepad" />
     </distribution-usages>
     <module_usages>
-      <module_usage name="time" finding="absolute" line="8" />
-      <module_usage name="sys" finding="absolute" line="9" />
-      <module_usage name="vgamepad" finding="absolute" line="12" />
+      <module_usage name="sys" finding="absolute" line="21" />
+      <module_usage name="time" finding="absolute" line="22" />
+      <module_usage name="ctypes" finding="absolute" line="23" />
+      <module_usage name="ctypes.wintypes" finding="absolute" line="24" />
+      <module_usage name="vgamepad" finding="absolute" line="27" />
+      <module_usage name="msvcrt" finding="absolute" line="35" />
       <module_usage name="_collections_abc" finding="absolute" line="1" />
       <module_usage name="_opcode_metadata" finding="absolute" line="1" />
       <module_usage name="_weakrefset" finding="absolute" line="1" />
@@ -800,7 +803,7 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="_socket" kind="PythonExtensionModule" usage="import" reason="Extension module needed for standalone mode." source_path="${sys.prefix}\DLLs\_socket.pyd">
-    <optimization-time pass="1" time="2.9531" />
+    <optimization-time pass="1" time="4.8750" />
     <optimization-time pass="2" time="0.0000" />
     <module_usages />
   </module>
@@ -1066,7 +1069,7 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="ctypes" kind="UncompiledPythonPackage" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\ctypes\__init__.py">
-    <optimization-time pass="1" time="0.1719" micro_passes="5" max_branch_merge="17" merged_total="5367" />
+    <optimization-time pass="1" time="0.2031" micro_passes="5" max_branch_merge="17" merged_total="5403" />
     <optimization-time pass="2" time="0.0000" />
     <module_usages>
       <module_usage name="os" finding="absolute" line="1" />
@@ -1104,10 +1107,17 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="ctypes._endian" kind="UncompiledPythonModule" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\ctypes\_endian.py">
-    <optimization-time pass="1" time="0.0156" micro_passes="4" max_branch_merge="11" merged_total="603" />
+    <optimization-time pass="1" time="0.0156" micro_passes="4" max_branch_merge="11" merged_total="595" />
     <optimization-time pass="2" time="0.0000" />
     <module_usages>
       <module_usage name="sys" finding="absolute" line="1" />
+      <module_usage name="ctypes" finding="absolute" line="2" />
+    </module_usages>
+  </module>
+  <module name="ctypes.wintypes" kind="UncompiledPythonModule" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\ctypes\wintypes.py">
+    <optimization-time pass="1" time="0.0469" micro_passes="3" max_branch_merge="10" merged_total="879" />
+    <optimization-time pass="2" time="0.0000" />
+    <module_usages>
       <module_usage name="ctypes" finding="absolute" line="2" />
     </module_usages>
   </module>
@@ -3756,9 +3766,9 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="vgamepad" kind="CompiledPythonPackage" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\site-packages\vgamepad\__init__.py" distribution="vgamepad">
-    <optimization-time pass="1" time="0.0781" micro_passes="2" max_branch_merge="5" merged_total="22" />
+    <optimization-time pass="1" time="0.1094" micro_passes="2" max_branch_merge="5" merged_total="22" />
     <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="5" merged_total="11" />
-    <code-generation-time time="0.0000" />
+    <code-generation-time time="0.0156" />
     <module_usages>
       <module_usage name="os" finding="absolute" line="1" />
       <module_usage name="platform" finding="absolute" line="1" />
@@ -3768,7 +3778,7 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="vgamepad.lin" kind="CompiledPythonPackage" usage="import path parent" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\site-packages\vgamepad\lin\__init__.py" distribution="vgamepad">
-    <optimization-time pass="1" time="0.0000" micro_passes="2" />
+    <optimization-time pass="1" time="0.0156" micro_passes="2" />
     <optimization-time pass="2" time="0.0000" micro_passes="1" />
     <code-generation-time time="0.0000" />
     <module_usages>
@@ -3776,7 +3786,7 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <module name="vgamepad.lin.virtual_gamepad" kind="CompiledPythonModule" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\site-packages\vgamepad\lin\virtual_gamepad.py" distribution="vgamepad">
-    <optimization-time pass="1" time="0.0469" micro_passes="4" max_branch_merge="24" merged_total="996" />
+    <optimization-time pass="1" time="0.0469" micro_passes="4" max_branch_merge="24" merged_total="940" />
     <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="24" merged_total="191" />
     <code-generation-time time="0.0469" />
     <module_usages>
@@ -3807,17 +3817,17 @@ error: failed to link with LLD: FileNotFound
   </module>
   <module name="vgamepad.win.vigem_commons" kind="CompiledPythonModule" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\site-packages\vgamepad\win\vigem_commons.py" distribution="vgamepad">
     <optimization-time pass="1" time="0.0312" micro_passes="3" max_branch_merge="23" merged_total="1133" />
-    <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="23" merged_total="369" />
-    <code-generation-time time="0.0156" />
+    <optimization-time pass="2" time="0.0156" micro_passes="1" max_branch_merge="23" merged_total="369" />
+    <code-generation-time time="0.0312" />
     <module_usages>
       <module_usage name="enum" finding="absolute" line="5" />
       <module_usage name="ctypes" finding="absolute" line="6" />
     </module_usages>
   </module>
   <module name="vgamepad.win.virtual_gamepad" kind="CompiledPythonModule" usage="import" reason="Instructed by user to follow to all modules." source_path="${sys.prefix}\Lib\site-packages\vgamepad\win\virtual_gamepad.py" distribution="vgamepad">
-    <optimization-time pass="1" time="0.0469" micro_passes="4" max_branch_merge="27" merged_total="845" />
-    <optimization-time pass="2" time="0.0156" micro_passes="1" max_branch_merge="27" merged_total="138" />
-    <code-generation-time time="0.0312" />
+    <optimization-time pass="1" time="0.0156" micro_passes="4" max_branch_merge="27" merged_total="845" />
+    <optimization-time pass="2" time="0.0000" micro_passes="1" max_branch_merge="27" merged_total="138" />
+    <code-generation-time time="0.0469" />
     <module_usages>
       <module_usage name="vgamepad.win.vigem_commons" finding="absolute" line="5" />
       <module_usage name="vgamepad.win.vigem_client" finding="absolute" line="6" />
@@ -3951,10 +3961,12 @@ error: failed to link with LLD: FileNotFound
     </module_usages>
   </module>
   <performance>
-    <memory_usage name="after_launch" value="35520512" />
-    <memory_usage name="before_c_code_generation" value="62713856" />
-    <memory_usage name="before_running_scons" value="65728512" />
+    <memory_usage name="after_launch" value="35528704" />
+    <memory_usage name="before_c_code_generation" value="66519040" />
+    <memory_usage name="before_running_scons" value="67424256" />
   </performance>
+  <data_file name="vgamepad\win\vigem\client\x64\ViGEmClient.dll" source="${sys.prefix}\Lib\site-packages\vgamepad\win\vigem\client\x64\ViGEmClient.dll" size="130048" reason="specified data file 'C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll' on command line" tags="user,copy" />
+  <data_file name="vgamepad\win\vigem\client\x86\ViGEmClient.dll" source="${sys.prefix}\Lib\site-packages\vgamepad\win\vigem\client\x86\ViGEmClient.dll" size="98816" reason="specified data file 'C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll' on command line" tags="user,copy" />
   <data_file name="vgamepad\win\vigem\install\x64\ViGEmBusSetup_x64.msi" source="${sys.prefix}\Lib\site-packages\vgamepad\win\vigem\install\x64\ViGEmBusSetup_x64.msi" size="876544" reason="specified data dir 'C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win' on command line" tags="user,copy,data-dir-contents" />
   <data_file name="vgamepad\win\vigem\install\x86\ViGEmBusSetup_x86.msi" source="${sys.prefix}\Lib\site-packages\vgamepad\win\vigem\install\x86\ViGEmBusSetup_x86.msi" size="819200" reason="specified data dir 'C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win' on command line" tags="user,copy,data-dir-contents" />
   <included_extension name="_bz2.pyd" dest_path="_bz2.pyd" source_path="${sys.prefix}\DLLs\_bz2.pyd" package="" ignored="no" reason="used extension module" tags="copy" />
@@ -3968,10 +3980,10 @@ error: failed to link with LLD: FileNotFound
   <included_extension name="unicodedata.pyd" dest_path="unicodedata.pyd" source_path="${sys.prefix}\DLLs\unicodedata.pyd" package="" ignored="no" reason="used extension module" tags="copy" />
   <included_dll name="vcruntime140.dll" dest_path="vcruntime140.dll" source_path="${sys.prefix}\vcruntime140.dll" package="" ignored="no" reason="Used by '_bz2.pyd'" tags="copy" />
   <included_dll name="vcruntime140_1.dll" dest_path="vcruntime140_1.dll" source_path="${sys.prefix}\vcruntime140_1.dll" package="" ignored="no" reason="Used by '_wmi.pyd'" tags="copy" />
-  <data_composer blob_size="4322555" total="1211">
-    <module_data filename="__bytecode.const" blob_name=".bytecode" blob_size="4307415" input_size="4329106" />
+  <data_composer blob_size="4336303" total="1522">
+    <module_data filename="__bytecode.const" blob_name=".bytecode" blob_size="4316087" input_size="4337849" />
     <module_data filename="__constants.const" blob_name="" blob_size="918" input_size="2324" />
-    <module_data filename="module.__main__.const" blob_name="__main__" blob_size="1124" input_size="1932" />
+    <module_data filename="module.__main__.const" blob_name="__main__" blob_size="6200" input_size="10927" />
     <module_data filename="module.vgamepad.const" blob_name="vgamepad" blob_size="492" input_size="612" />
     <module_data filename="module.vgamepad.lin.const" blob_name="vgamepad.lin" blob_size="210" input_size="339" />
     <module_data filename="module.vgamepad.lin.virtual_gamepad.const" blob_name="vgamepad.lin.virtual_gamepad" blob_size="4319" input_size="6948" />
@@ -3981,10 +3993,10 @@ error: failed to link with LLD: FileNotFound
     <module_data filename="module.vgamepad.win.virtual_gamepad.const" blob_name="vgamepad.win.virtual_gamepad" blob_size="3870" input_size="5956" />
   </data_composer>
   <performance-totals>
-    <optimization-time pass="1" time="21.5312" module_count="325" />
-    <optimization-time pass="2" time="0.0312" module_count="325" />
-    <optimization-time pass="all" time="21.5625" module_count="325" />
-    <code-generation-time time="0.1406" module_count="8" />
+    <optimization-time pass="1" time="23.6562" module_count="326" />
+    <optimization-time pass="2" time="0.0469" module_count="326" />
+    <optimization-time pass="all" time="23.7031" module_count="326" />
+    <code-generation-time time="0.2969" module_count="8" />
   </performance-totals>
   <python_binary filename="gamepad_test.dll" backend_resource_mode="c23_embed" reproducible="no" />
   <onefile_binary filename="gamepad_test.exe" />
@@ -3999,6 +4011,8 @@ error: failed to link with LLD: FileNotFound
     <option value="--output-filename=gamepad_test.exe" />
     <option value="--windows-uac-admin" />
     <option value="--include-data-dir=C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win=vgamepad\win" />
+    <option value="--include-data-files=C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll" />
+    <option value="--include-data-files=C:\Users\m\AppData\Local\Programs\Python\Python313\Lib\site-packages\vgamepad\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" />
     <option value="gamepad_test.py" />
   </command_line>
   <plugins>

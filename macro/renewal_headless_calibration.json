@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "side": "buy",
+  "started_at_unix": 1785069500.446983,
+  "passed": false,
+  "error_type": "error",
+  "error": "(5, 'PostMessage', '액세스가 거부되었습니다.')",
+  "packets_seen": 0,
+  "capture_metrics": [],
+  "initial_guard_luma": 63.013315803667744,
+  "initial_guard_white_ratio": 0.0006910733549083064,
+  "initial_is_open_popup": false,
+  "finished_at_unix": 1785069501.903408
+}
