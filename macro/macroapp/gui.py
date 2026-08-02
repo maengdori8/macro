@@ -8,6 +8,7 @@ import random
 import threading
 import time
 import traceback
+import zlib
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,13 +30,14 @@ from macroapp.input_gamepad import _get_gamepad, send_gamepad_button, send_gamep
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
+    WINDOW_VALIDATION_INTERVAL_SECONDS,
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
     CUSTOM_TARGETS_DIR_NAME,
     NOTIFICATION_PANEL_GUARD_ENABLED, NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS,
     NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
-    RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS,
+    RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
     SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
@@ -66,6 +68,8 @@ from macroapp.license_client import (
     format_remaining_time, load_saved_license, save_license_key,
 )
 from macroapp.matching import find_template_center, downscale_screen, is_notification_panel_open
+from macroapp.mining_ui import MiningDashboard
+from macroapp.session import SessionTracker
 from macroapp.skip_experiment import (
     SkipExperimentTracker,
     SkipOutcome,
@@ -75,27 +79,66 @@ from macroapp.skip_experiment import (
     save_device_learning,
 )
 from macroapp.window import InactiveManager
+
+
+def _ocr_regions_fingerprint(*regions: np.ndarray) -> tuple:
+    """OCR 영역의 저비용 지문. 같은 정지 UI의 winocr 재호출을 피합니다."""
+
+    values: list[object] = []
+    for region in regions:
+        frame = np.asarray(region)
+        if frame.ndim != 2 or frame.size == 0:
+            values.extend((0, 0, 0))
+            continue
+        height, width = frame.shape
+        step_y = max(1, height // 24)
+        step_x = max(1, width // 48)
+        sampled = np.ascontiguousarray(frame[::step_y, ::step_x])
+        values.extend((height, width, zlib.adler32(sampled.tobytes())))
+    return tuple(values)
+
+
 class AutomationApp:
     """tkinter UI와 자동화 스레드를 관리합니다."""
 
-    # 다크 + 레드 테마 팔레트 (UI 전반에서 공유)
+    # 장시간 봐도 눈이 편한 뉴트럴 다크 + 단일 강조색(인디고) 팔레트.
+    # 채도를 낮춘 배경 위에 강조색 하나만 쓰면 정보 위계가 또렷해집니다.
     COLORS = {
-        "bg": "#101010",
-        "panel": "#1A1A1A",
-        "border": "#2B2B2B",
-        "input": "#262626",
-        "text": "#F3F3F3",
-        "muted": "#9C9C9C",
-        "accent": "#D93A2B",
-        "accent_active": "#B72D20",
-        "accent_soft": "#FF6A55",
-        "disabled": "#3A3A3A",
-        "ok": "#69DB7C",
+        "bg": "#0A0D14",            # 앱 배경(가장 어두운 층)
+        "sidebar": "#070910",       # 사이드바 — 배경보다 한 단계 더 깊게
+        "sidebar_active": "#151A26",
+        "panel": "#11151E",         # 카드 표면
+        "row": "#161B26",           # 카드 안 리스트 행(한 단계 밝게)
+        "row_hover": "#1B2130",
+        "border": "#1E2532",        # 1px 실선 테두리
+        "input": "#0D1119",         # 입력/트랙 배경
+        "grid": "#1A2028",
+        "text": "#E9EDF5",
+        "muted": "#78839A",
+        "accent": "#635BFF",
+        "accent_active": "#4F46E5",
+        "accent_hover": "#7169FF",
+        "accent_soft": "#7CD9F5",   # 수치·링크용 보조 강조
+        "disabled": "#1C2230",
+        "disabled_text": "#4E5769",
+        "ok": "#34D399",
+        "ok_bg": "#0C2A22",
+        "danger": "#FB7185",
+        "danger_bg": "#2C1520",
+        "warn": "#FBBF24",
+        "warn_bg": "#2E2410",
     }
 
-    def __init__(self, root: tk.Tk, license_key: Optional[str] = None):
+    def __init__(
+        self,
+        root: tk.Tk,
+        license_key: Optional[str] = None,
+        *,
+        preview: bool = False,
+    ):
         self.root = root
         self.license_key = license_key
+        self.preview = bool(preview)
         self.license_info: Optional[dict] = None
 
         self.root.title("mAuto")
@@ -105,8 +148,9 @@ class AutomationApp:
         screen_height = self.root.winfo_screenheight()
         window_height = min(780, max(560, screen_height - 110))
         offset_y = max(0, min(60, screen_height - window_height - 90))
-        self.root.geometry(f"1180x{window_height}+80+{offset_y}")
-        self.root.minsize(1080, 560)
+        self.root.geometry(f"1320x{window_height}+60+{offset_y}")
+        # 오른쪽 설정 열이 고정폭이라, 이보다 좁히면 타겟 행 끝(기본값 버튼)이 잘립니다.
+        self.root.minsize(1280, 640)
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         initial_status = "대기 중"
         self.status_var = tk.StringVar(value=initial_status)
@@ -149,13 +193,19 @@ class AutomationApp:
         }
 
         # 타겟별 템플릿 캡처 UI 상태 (썸네일 PhotoImage는 GC 방지를 위해 보관)
-        self.clock_var = tk.StringVar(value="--:--:--")
+        self.clock_var = tk.StringVar(value="00:00:00")
+        self.session_matches_var = tk.StringVar(value="0")
+        self.session_record_var = tk.StringVar(value="0승 · 0무 · 0패")
+        self.session_rate_var = tk.StringVar(value="0.0 경기/h")
+        self.session_fc_var = tk.StringVar(value="0 FC")
+        self._session_tracker = SessionTracker()
         self._thumb_refs: dict[str, Any] = {}
         self._thumb_labels: dict[str, tk.Label] = {}
         self._target_source_vars: dict[str, tk.StringVar] = {}
         self._target_source_labels: dict[str, tk.Label] = {}
         self._capture_buttons: dict[str, tk.Button] = {}
         self._reset_buttons: dict[str, tk.Button] = {}
+        self._threshold_canvases: dict[str, tk.Canvas] = {}
         self._capturing_template = False
 
         self.stop_event = threading.Event()
@@ -175,6 +225,10 @@ class AutomationApp:
         self._latest_frame = None
         self._frame_seq = 0
         self._rank_consensus = rank_ocr.RankConsensus()  # 다중 프레임 투표(단발 오인식 폐기)
+        self._rank_ocr_cache_key = None
+        self._rank_ocr_cache_info = None
+        self._rank_ocr_cache_at = 0.0
+        self._rank_ocr_cache_hits = 0
         self._ocr_manager = None        # OCR 워커가 SKIP 입력에 쓰는 매니저
         self._ocr_thread = None         # OCR 전용 스레드
         self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
@@ -247,7 +301,7 @@ class AutomationApp:
         self._tick_clock()
 
         # 가상 게임패드를 미리 생성해 게임이 컨트롤러를 일찍 인식하게 합니다.
-        if winapi.vg is not None:
+        if not self.preview and winapi.vg is not None:
             try:
                 _get_gamepad()
                 self.log("[게임패드] 가상 Xbox 컨트롤러를 연결했습니다.")
@@ -279,88 +333,534 @@ class AutomationApp:
         family = "Malgun Gothic" if platform.system() == "Windows" else "Arial"
         return (family, size, "bold") if bold else (family, size)
 
-    def _panel(self, parent: tk.Misc, title: Optional[str] = None) -> tk.Frame:
-        """테두리가 있는 어두운 패널 프레임을 만듭니다."""
+    @staticmethod
+    def _round_rect(canvas: tk.Canvas, x1: int, y1: int, x2: int, y2: int, radius: int, **kwargs):
+        """캔버스에 둥근 사각형을 그립니다(tkinter 기본 위젯에는 라운드가 없습니다)."""
+
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _panel(
+        self,
+        parent: tk.Misc,
+        title: Optional[str] = None,
+        *,
+        subtitle: Optional[str] = None,
+        padx: int = 16,
+        pady: int = 14,
+    ) -> tk.Frame:
+        """1px 테두리의 카드 프레임을 만듭니다. 제목은 좌측 정렬 + 강조 바."""
 
         c = self.COLORS
         frame = tk.Frame(
             parent,
             bg=c["panel"],
-            padx=12,
-            pady=10,
+            padx=padx,
+            pady=pady,
             highlightbackground=c["border"],
             highlightthickness=1,
         )
         if title:
+            head = tk.Frame(frame, bg=c["panel"])
+            head.pack(fill=tk.X, pady=(0, 12))
+            bar = tk.Frame(head, bg=c["accent"], width=3, height=15)
+            bar.pack(side=tk.LEFT)
+            bar.pack_propagate(False)
             tk.Label(
-                frame,
+                head,
                 text=title,
                 bg=c["panel"],
                 fg=c["text"],
                 font=self._font(11, bold=True),
-            ).pack(pady=(0, 8))
+            ).pack(side=tk.LEFT, padx=(9, 0))
+            if subtitle:
+                tk.Label(
+                    head,
+                    text=subtitle,
+                    bg=c["panel"],
+                    fg=c["muted"],
+                    font=self._font(8),
+                ).pack(side=tk.RIGHT, pady=(3, 0))
         return frame
 
-    def _accent_button(
+    def _button(
         self,
         parent: tk.Misc,
         text: str,
         command,
+        *,
+        tone: str = "primary",
         small: bool = False,
     ) -> tk.Button:
-        """스크린샷 느낌의 빨간 강조 버튼을 만듭니다."""
+        """톤(primary/ghost/danger)에 맞춘 플랫 버튼 + 호버 효과."""
 
         c = self.COLORS
-        return tk.Button(
+        palettes = {
+            "primary": (c["accent"], c["accent_hover"], "#FFFFFF"),
+            "ghost": (c["input"], c["row_hover"], c["text"]),
+            "danger": (c["input"], c["danger_bg"], c["danger"]),
+        }
+        base, hover, fg = palettes.get(tone, palettes["primary"])
+        button = tk.Button(
             parent,
             text=text,
             command=command,
-            bg=c["accent"],
-            fg="#FFFFFF",
-            activebackground=c["accent_active"],
-            activeforeground="#FFFFFF",
-            disabledforeground="#8A8A8A",
+            bg=base,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            disabledforeground=c["disabled_text"],
             relief=tk.FLAT,
             bd=0,
             cursor="hand2",
-            font=self._font(9 if small else 11, bold=not small),
+            font=self._font(9 if small else 11, bold=True),
             padx=10 if small else 18,
-            pady=1 if small else 8,
+            pady=2 if small else 9,
+        )
+        button._tone_colors = (base, hover)  # 호버·비활성 복원용
+        button.bind("<Enter>", lambda _e, b=button, v=hover: self._hover_button(b, v))
+        button.bind("<Leave>", lambda _e, b=button, v=base: self._hover_button(b, v))
+        return button
+
+    @staticmethod
+    def _hover_button(button: tk.Button, color: str) -> None:
+        """비활성 버튼은 호버 색을 무시합니다."""
+
+        if str(button["state"]) == tk.DISABLED:
+            return
+        button.configure(bg=color)
+
+    def _segmented(
+        self,
+        parent: tk.Misc,
+        variable: tk.StringVar,
+        options: tuple,
+        command=None,
+    ) -> tk.Frame:
+        """라디오 버튼을 대신하는 세그먼트 토글(선택 항목만 강조)."""
+
+        c = self.COLORS
+        holder = tk.Frame(
+            parent,
+            bg=c["input"],
+            padx=2,
+            pady=2,
+            highlightbackground=c["border"],
+            highlightthickness=1,
+        )
+        items: dict[str, tk.Label] = {}
+
+        def paint(*_args) -> None:
+            current = variable.get()
+            for value, label in items.items():
+                selected = value == current
+                label.configure(
+                    bg=c["accent"] if selected else c["input"],
+                    fg="#FFFFFF" if selected else c["muted"],
+                )
+
+        def choose(value: str) -> None:
+            variable.set(value)
+            paint()
+            if command is not None:
+                command()
+
+        for text, value in options:
+            label = tk.Label(
+                holder,
+                text=text,
+                bg=c["input"],
+                fg=c["muted"],
+                font=self._font(9, bold=True),
+                padx=12,
+                pady=5,
+                cursor="hand2",
+            )
+            label.pack(side=tk.LEFT)
+            label.bind("<Button-1>", lambda _e, v=value: choose(v))
+            label.bind(
+                "<Enter>",
+                lambda _e, v=value, w=label: (
+                    None if variable.get() == v else w.configure(bg=c["row_hover"], fg=c["text"])
+                ),
+            )
+            label.bind("<Leave>", lambda _e: paint())
+            items[value] = label
+
+        paint()
+        # on_capture_mode_changed 처럼 코드가 값을 바꿔도 강조가 따라오게 합니다.
+        variable.trace_add("write", paint)
+        return holder
+
+    def _entry(
+        self,
+        parent: tk.Misc,
+        variable,
+        *,
+        width: int = 7,
+        center: bool = True,
+    ) -> tk.Entry:
+        """테두리만 있는 납작한 입력칸(포커스 시 강조색 테두리)."""
+
+        c = self.COLORS
+        return tk.Entry(
+            parent,
+            textvariable=variable,
+            width=width,
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["accent_soft"],
+            relief=tk.FLAT,
+            bd=0,
+            justify=tk.CENTER if center else tk.LEFT,
+            font=self._font(9),
+            highlightbackground=c["border"],
+            highlightcolor=c["accent"],
+            highlightthickness=1,
         )
 
+    def _field(self, parent: tk.Misc, label: str, variable, *, width: int = 6) -> tk.Frame:
+        """작은 라벨 + 입력칸 묶음(영역 X/Y/W/H 처럼 짧은 값용)."""
+
+        c = self.COLORS
+        holder = tk.Frame(parent, bg=c["panel"])
+        tk.Label(
+            holder,
+            text=label,
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8, bold=True),
+            width=2,
+        ).pack(side=tk.LEFT)
+        self._entry(holder, variable, width=width).pack(side=tk.LEFT, ipady=4)
+        return holder
+
+    def _setting_row(self, parent: tk.Misc, label: str) -> tk.Frame:
+        """'기본 설정' 카드의 한 줄(왼쪽 라벨 + 오른쪽 컨트롤)."""
+
+        c = self.COLORS
+        row = tk.Frame(parent, bg=c["panel"])
+        row.pack(fill=tk.X, pady=4)
+        tk.Label(
+            row,
+            text=label,
+            bg=c["panel"],
+            fg=c["muted"],
+            width=11,
+            anchor=tk.W,
+            font=self._font(9, bold=True),
+        ).pack(side=tk.LEFT)
+        return row
+
+    # ── 임계값 슬라이더(캔버스 자체 구현 — tk.Scale은 옛 윈도우 느낌이라 대체) ──
+
+    def _slider(self, parent: tk.Misc, name: str, *, width: int = 120, height: int = 24) -> tk.Canvas:
+        c = self.COLORS
+        canvas = tk.Canvas(
+            parent,
+            width=width,
+            height=height,
+            bg=c["row"],
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        canvas._hover = False
+        canvas.bind("<Configure>", lambda _e, n=name: self._draw_slider(n))
+        canvas.bind("<Button-1>", lambda e, n=name: self._slider_set(n, e.x))
+        canvas.bind("<B1-Motion>", lambda e, n=name: self._slider_set(n, e.x))
+        canvas.bind("<Enter>", lambda _e, n=name, w=canvas: (setattr(w, "_hover", True), self._draw_slider(n)))
+        canvas.bind("<Leave>", lambda _e, n=name, w=canvas: (setattr(w, "_hover", False), self._draw_slider(n)))
+        self._threshold_canvases[name] = canvas
+        return canvas
+
+    def _slider_set(self, name: str, x: int) -> None:
+        """클릭/드래그한 x좌표를 0.50~1.00 임계값으로 변환합니다."""
+
+        canvas = self._threshold_canvases.get(name)
+        if canvas is None:
+            return
+        pad = 10
+        width = max(1, canvas.winfo_width() - pad * 2)
+        ratio = min(1.0, max(0.0, (x - pad) / width))
+        value = round(0.5 + ratio * 0.5, 2)
+        self.threshold_vars[name].set(value)
+        self.update_threshold(name, value)
+
+    def _draw_slider(self, name: str) -> None:
+        """트랙 + 채워진 구간 + 손잡이를 다시 그립니다."""
+
+        canvas = self._threshold_canvases.get(name)
+        if canvas is None:
+            return
+        c = self.COLORS
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1:
+            return
+        pad = 10
+        mid = height // 2
+        left, right = pad, width - pad
+        value = float(self.threshold_vars[name].get())
+        ratio = min(1.0, max(0.0, (value - 0.5) / 0.5))
+        knob_x = left + (right - left) * ratio
+
+        canvas.delete("all")
+        canvas.create_line(left, mid, right, mid, fill=c["input"], width=5, capstyle=tk.ROUND)
+        if knob_x > left:
+            canvas.create_line(
+                left, mid, knob_x, mid,
+                fill=c["accent"], width=5, capstyle=tk.ROUND,
+            )
+        radius = 7 if getattr(canvas, "_hover", False) else 6
+        canvas.create_oval(
+            knob_x - radius, mid - radius, knob_x + radius, mid + radius,
+            fill="#FFFFFF",
+            outline=c["accent_hover"] if getattr(canvas, "_hover", False) else c["accent"],
+            width=2,
+        )
+
+    def _sidebar_button(self, parent: tk.Misc, icon: str, text: str, page: str) -> tk.Frame:
+        """왼쪽 강조 바가 붙는 사이드바 내비게이션 항목을 만듭니다."""
+
+        c = self.COLORS
+        item = tk.Frame(parent, bg=c["sidebar"], cursor="hand2")
+        item.pack(fill=tk.X, pady=2)
+        indicator = tk.Frame(item, bg=c["sidebar"], width=3)
+        indicator.pack(side=tk.LEFT, fill=tk.Y)
+        body = tk.Frame(item, bg=c["sidebar"], padx=13, pady=10)
+        body.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        icon_label = tk.Label(
+            body,
+            text=icon,
+            bg=c["sidebar"],
+            fg=c["muted"],
+            font=self._font(9),
+        )
+        icon_label.pack(side=tk.LEFT)
+        text_label = tk.Label(
+            body,
+            text=text,
+            bg=c["sidebar"],
+            fg=c["muted"],
+            anchor=tk.W,
+            font=self._font(10, bold=True),
+        )
+        text_label.pack(side=tk.LEFT, padx=(9, 0))
+
+        widgets = (item, body, icon_label, text_label)
+        for widget in widgets:
+            widget.bind("<Button-1>", lambda _e, p=page: self._show_page(p))
+            widget.bind("<Enter>", lambda _e, p=page: self._hover_nav(p, True))
+            widget.bind("<Leave>", lambda _e, p=page: self._hover_nav(p, False))
+        self._nav_buttons[page] = {
+            "item": item,
+            "indicator": indicator,
+            "body": body,
+            "icon": icon_label,
+            "text": text_label,
+        }
+        return item
+
+    def _hover_nav(self, page: str, entering: bool) -> None:
+        parts = self._nav_buttons.get(page)
+        if parts is None or page == self._current_page:
+            return
+        c = self.COLORS
+        bg = c["sidebar_active"] if entering else c["sidebar"]
+        fg = c["text"] if entering else c["muted"]
+        for key in ("item", "body", "icon", "text"):
+            parts[key].configure(bg=bg)
+        parts["icon"].configure(fg=fg)
+        parts["text"].configure(fg=fg)
+
+    def _show_page(self, page: str) -> None:
+        """선택한 본문 페이지만 표시하고 내비게이션 강조를 갱신합니다."""
+
+        if page not in self._pages:
+            return
+        c = self.COLORS
+        self._current_page = page
+        self._pages[page].tkraise()
+        for name, parts in self._nav_buttons.items():
+            selected = name == page
+            bg = c["sidebar_active"] if selected else c["sidebar"]
+            fg = c["text"] if selected else c["muted"]
+            for key in ("item", "body", "icon", "text"):
+                parts[key].configure(bg=bg)
+            parts["indicator"].configure(bg=c["accent"] if selected else c["sidebar"])
+            parts["icon"].configure(fg=c["accent"] if selected else c["muted"])
+            parts["text"].configure(fg=fg)
+
     def _build_ui(self) -> None:
-        """다크 + 레드 테마의 2단 레이아웃 UI를 만듭니다."""
+        """뉴트럴 다크 테마의 사이드바 + 2단 레이아웃 UI를 만듭니다."""
 
         c = self.COLORS
         self.root.configure(bg=c["bg"])
 
-        main_frame = tk.Frame(self.root, bg=c["bg"], padx=14, pady=14)
+        shell = tk.Frame(self.root, bg=c["bg"])
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        sidebar = tk.Frame(shell, bg=c["sidebar"], width=214, pady=18)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+        # 사이드바와 본문을 가르는 1px 라인(면 분리가 또렷해집니다).
+        tk.Frame(shell, bg=c["border"], width=1).pack(side=tk.LEFT, fill=tk.Y)
+
+        brand = tk.Frame(sidebar, bg=c["sidebar"])
+        brand.pack(fill=tk.X, padx=16, pady=(0, 24))
+        mark = tk.Canvas(
+            brand,
+            width=34,
+            height=34,
+            bg=c["sidebar"],
+            highlightthickness=0,
+            bd=0,
+        )
+        mark.pack(side=tk.LEFT)
+        self._round_rect(mark, 1, 1, 33, 33, 10, fill=c["accent"], outline="")
+        mark.create_text(17, 17, text="M", fill="#FFFFFF", font=self._font(13, bold=True))
+        brand_text = tk.Frame(brand, bg=c["sidebar"])
+        brand_text.pack(side=tk.LEFT, padx=(11, 0))
+        tk.Label(
+            brand_text,
+            text="mAuto",
+            bg=c["sidebar"],
+            fg=c["text"],
+            font=self._font(13, bold=True),
+            anchor=tk.W,
+        ).pack(anchor=tk.W)
+        tk.Label(
+            brand_text,
+            text="FC ONLINE",
+            bg=c["sidebar"],
+            fg=c["muted"],
+            font=self._font(7, bold=True),
+            anchor=tk.W,
+        ).pack(anchor=tk.W, pady=(1, 0))
+
+        tk.Label(
+            sidebar,
+            text="M E N U",
+            bg=c["sidebar"],
+            fg=c["muted"],
+            font=self._font(7, bold=True),
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=19, pady=(0, 7))
+        self._pages: dict[str, tk.Frame] = {}
+        self._nav_buttons: dict[str, dict[str, tk.Misc]] = {}
+        self._current_page = ""
+        nav_host = tk.Frame(sidebar, bg=c["sidebar"], padx=8)
+        nav_host.pack(fill=tk.X)
+        self._sidebar_button(nav_host, "◆", "운영 · 자동화", "automation")
+        self._sidebar_button(nav_host, "◈", "FC 채굴 현황", "mining")
+
+        sidebar_bottom = tk.Frame(sidebar, bg=c["sidebar"], padx=16)
+        sidebar_bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(sidebar_bottom, bg=c["border"], height=1).pack(fill=tk.X, pady=(0, 11))
+        status_line = tk.Frame(sidebar_bottom, bg=c["sidebar"])
+        status_line.pack(fill=tk.X)
+        self.sidebar_dot = tk.Label(
+            status_line,
+            text="●",
+            bg=c["sidebar"],
+            fg=c["muted"],
+            font=self._font(8),
+        )
+        self.sidebar_dot.pack(side=tk.LEFT)
+        tk.Label(
+            status_line,
+            textvariable=self.status_var,
+            bg=c["sidebar"],
+            fg=c["text"],
+            font=self._font(9, bold=True),
+            anchor=tk.W,
+        ).pack(side=tk.LEFT, padx=(7, 0))
+        tk.Label(
+            status_line,
+            text=f"v{APP_VERSION}",
+            bg=c["sidebar"],
+            fg=c["muted"],
+            font=self._font(7),
+        ).pack(side=tk.RIGHT)
+
+        page_host = tk.Frame(shell, bg=c["bg"])
+        page_host.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        page_host.grid_rowconfigure(0, weight=1)
+        page_host.grid_columnconfigure(0, weight=1)
+        for name in ("automation", "mining"):
+            frame = tk.Frame(page_host, bg=c["bg"])
+            frame.grid(row=0, column=0, sticky="nsew")
+            self._pages[name] = frame
+
+        main_frame = tk.Frame(
+            self._pages["automation"],
+            bg=c["bg"],
+            padx=20,
+            pady=18,
+        )
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_column = tk.Frame(main_frame, bg=c["bg"])
+        page_header = tk.Frame(main_frame, bg=c["bg"])
+        page_header.pack(fill=tk.X, pady=(0, 16))
+        header_text = tk.Frame(page_header, bg=c["bg"])
+        header_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            header_text,
+            text="감독모드 자동화",
+            bg=c["bg"],
+            fg=c["text"],
+            font=self._font(20, bold=True),
+            anchor=tk.W,
+        ).pack(anchor=tk.W)
+        tk.Label(
+            header_text,
+            text="게임 창을 백그라운드에 둔 채 감지와 입력을 처리합니다.",
+            bg=c["bg"],
+            fg=c["muted"],
+            font=self._font(9),
+            anchor=tk.W,
+        ).pack(anchor=tk.W, pady=(5, 0))
+
+        columns = tk.Frame(main_frame, bg=c["bg"])
+        columns.pack(fill=tk.BOTH, expand=True)
+
+        left_column = tk.Frame(columns, bg=c["bg"])
         left_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        right_column = tk.Frame(main_frame, bg=c["bg"], width=400)
-        right_column.pack(side=tk.LEFT, fill=tk.Y, padx=(14, 0))
+        right_column = tk.Frame(columns, bg=c["bg"], width=452)
+        right_column.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0))
         right_column.pack_propagate(False)
 
-        # ── 왼쪽 아래: 기본 설정 ──
-        # 먼저 pack해 두면 창 높이가 부족할 때 타겟 목록 쪽이 먼저 줄어듭니다.
-        settings_panel = self._panel(left_column, "기본 설정")
-        settings_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
-
         # ── 왼쪽: 타겟 설정 (target_A~H, 템플릿 캡처/임계값) ──
-        targets_panel = self._panel(left_column, "타겟 설정")
+        targets_panel = self._panel(
+            left_column,
+            "타겟 설정",
+            subtitle="임계값이 높을수록 더 엄격하게 매칭합니다",
+        )
         targets_panel.pack(fill=tk.BOTH, expand=True)
 
+        tk.Label(
+            targets_panel,
+            text="캡처: 화면에서 드래그한 영역으로 템플릿 교체   ·   기본값: 빌드 내장 이미지로 복원",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8),
+        ).pack(side=tk.BOTTOM, pady=(10, 0))
+
         for name in self.target_names:
-            row = tk.Frame(targets_panel, bg=c["panel"])
-            row.pack(fill=tk.X, pady=3)
+            # fill=BOTH + expand: 남는 세로 공간을 행이 나눠 가져 표처럼 균일하게 보입니다.
+            row = tk.Frame(targets_panel, bg=c["row"], padx=10, pady=6)
+            row.pack(fill=tk.BOTH, pady=2, expand=True)
 
             tk.Label(
                 row,
                 text=name,
-                bg=c["panel"],
+                bg=c["row"],
                 fg=c["text"],
                 width=9,
                 anchor=tk.W,
@@ -370,324 +870,262 @@ class AutomationApp:
             thumb_holder = tk.Frame(
                 row,
                 bg=c["input"],
-                width=66,
-                height=28,
+                width=68,
+                height=26,
                 highlightbackground=c["border"],
                 highlightthickness=1,
             )
             thumb_holder.pack_propagate(False)
-            thumb_holder.pack(side=tk.LEFT, padx=(0, 10))
+            thumb_holder.pack(side=tk.LEFT, padx=(0, 12))
             thumb_label = tk.Label(thumb_holder, bg=c["input"], fg=c["muted"], font=self._font(8))
             thumb_label.pack(fill=tk.BOTH, expand=True)
             self._thumb_labels[name] = thumb_label
 
-            tk.Scale(
-                row,
-                from_=0.5,
-                to=1.0,
-                resolution=0.01,
-                orient=tk.HORIZONTAL,
-                variable=self.threshold_vars[name],
-                command=lambda value, target_name=name: self.update_threshold(
-                    target_name,
-                    value,
-                ),
-                bg=c["panel"],
-                fg=c["text"],
-                troughcolor=c["input"],
-                activebackground=c["accent_soft"],
-                highlightthickness=0,
-                bd=0,
-                showvalue=False,
-                length=140,
-            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._slider(row, name).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             tk.Label(
                 row,
                 textvariable=self.threshold_label_vars[name],
-                bg=c["panel"],
+                bg=c["row"],
                 fg=c["accent_soft"],
                 width=5,
-                font=self._font(10, bold=True),
-            ).pack(side=tk.LEFT, padx=(6, 6))
+                anchor=tk.E,
+                font=("Consolas", 11, "bold"),
+            ).pack(side=tk.LEFT, padx=(8, 12))
 
             source_var = tk.StringVar(value="기본")
             source_label = tk.Label(
                 row,
                 textvariable=source_var,
-                bg=c["panel"],
+                bg=c["input"],
                 fg=c["muted"],
                 width=5,
-                font=self._font(9),
+                font=self._font(8, bold=True),
+                pady=3,
             )
             source_label.pack(side=tk.LEFT)
             self._target_source_vars[name] = source_var
             self._target_source_labels[name] = source_label
 
-            capture_button = self._accent_button(
+            capture_button = self._button(
                 row,
                 "캡처",
                 lambda target_name=name: self.capture_target_template(target_name),
                 small=True,
             )
-            capture_button.pack(side=tk.LEFT, padx=(8, 4))
+            capture_button.pack(side=tk.LEFT, padx=(10, 5))
             self._capture_buttons[name] = capture_button
 
-            reset_button = tk.Button(
+            reset_button = self._button(
                 row,
-                text="기본값",
-                command=lambda target_name=name: self.reset_target_template(target_name),
-                bg=c["input"],
-                fg=c["text"],
-                activebackground=c["border"],
-                activeforeground=c["text"],
-                disabledforeground="#6A6A6A",
-                relief=tk.FLAT,
-                bd=0,
-                cursor="hand2",
-                font=self._font(9),
-                padx=8,
-                pady=1,
+                "기본값",
+                lambda target_name=name: self.reset_target_template(target_name),
+                tone="ghost",
+                small=True,
             )
             reset_button.pack(side=tk.LEFT)
             self._reset_buttons[name] = reset_button
 
-        tk.Label(
-            targets_panel,
-            text="캡처: 화면에서 드래그한 영역으로 템플릿 교체 · 기본값: 빌드 내장 이미지로 복원",
-            bg=c["panel"],
-            fg=c["muted"],
-            font=self._font(8),
-        ).pack(pady=(8, 0))
+        # ── 오른쪽: 세션(버전·시계·상태) / 기본 설정 / 시작·정지 ──
+        control_panel = self._panel(right_column, padx=18, pady=16)
+        control_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
+        button_row = tk.Frame(control_panel, bg=c["panel"])
+        button_row.pack(fill=tk.X)
+        self.start_button = self._button(button_row, "시작  ·  F8", self.start_automation)
+        self.start_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.stop_button = self._button(
+            button_row,
+            "정지  ·  F9 / ESC",
+            self.stop_automation,
+            tone="danger",
+        )
+        self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        capture_row = tk.Frame(settings_panel, bg=c["panel"])
-        capture_row.pack(fill=tk.X, pady=2)
-        tk.Label(
+        settings_panel = self._panel(right_column, "기본 설정")
+        settings_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
+
+        # ── 기본 설정: 캡처 / 클릭 / 영역 / 자동 정지 / 등수영역% ──
+        capture_row = self._setting_row(settings_panel, "캡처")
+        self._segmented(
             capture_row,
-            text="캡처",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
+            self.capture_mode_var,
+            (("비활성 WGC", "wgc"), ("화면 영역 캡처", "region")),
+            command=self.on_capture_mode_changed,
         ).pack(side=tk.LEFT)
-        for text, value in (("비활성 WGC", "wgc"), ("화면 영역 캡처", "region")):
-            tk.Radiobutton(
-                capture_row,
-                text=text,
-                variable=self.capture_mode_var,
-                value=value,
-                command=self.on_capture_mode_changed,
-                bg=c["panel"],
-                fg=c["text"],
-                selectcolor=c["input"],
-                activebackground=c["panel"],
-                activeforeground=c["text"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT, padx=(0, 12))
 
-        click_row = tk.Frame(settings_panel, bg=c["panel"])
-        click_row.pack(fill=tk.X, pady=2)
-        tk.Label(
+        click_row = self._setting_row(settings_panel, "클릭")
+        self._segmented(
             click_row,
-            text="클릭",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
+            self.click_mode_var,
+            (("PostMessage", "postmessage"), ("마우스 이동 후 복귀", "mouse")),
         ).pack(side=tk.LEFT)
-        for text, value in (("PostMessage", "postmessage"), ("마우스 이동 후 복귀", "mouse")):
-            tk.Radiobutton(
-                click_row,
-                text=text,
-                variable=self.click_mode_var,
-                value=value,
-                bg=c["panel"],
-                fg=c["text"],
-                selectcolor=c["input"],
-                activebackground=c["panel"],
-                activeforeground=c["text"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT, padx=(0, 12))
 
-        region_row = tk.Frame(settings_panel, bg=c["panel"])
-        region_row.pack(fill=tk.X, pady=(6, 0))
-        tk.Label(
-            region_row,
-            text="영역",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
-        ).pack(side=tk.LEFT)
-        for key, label in (
-            ("x", "X"),
-            ("y", "Y"),
-            ("width", "W"),
-            ("height", "H"),
-        ):
-            tk.Label(
-                region_row,
-                text=label,
-                bg=c["panel"],
-                fg=c["muted"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT)
-            tk.Entry(
-                region_row,
-                textvariable=self.region_vars[key],
-                width=7,
-                bg=c["input"],
-                fg=c["text"],
-                insertbackground=c["text"],
-                relief=tk.FLAT,
-                highlightbackground=c["border"],
-                highlightcolor=c["accent"],
-                highlightthickness=1,
-            ).pack(side=tk.LEFT, padx=(4, 10), ipady=2)
+        region_row = self._setting_row(settings_panel, "영역")
+        for key, label in (("x", "X"), ("y", "Y"), ("width", "W"), ("height", "H")):
+            self._field(region_row, label, self.region_vars[key], width=6).pack(
+                side=tk.LEFT,
+                padx=(0, 12),
+            )
 
         # ── 자동 정지: 목표 등수/점수 도달 시 멈춤(둘 중 하나) 또는 안 멈춤 ──
-        stop_row = tk.Frame(settings_panel, bg=c["panel"])
-        stop_row.pack(fill=tk.X, pady=(6, 0))
-        tk.Label(
+        stop_row = self._setting_row(settings_panel, "자동 정지")
+        self._segmented(
             stop_row,
-            text="자동 정지",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
+            self.stop_mode_var,
+            (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score")),
         ).pack(side=tk.LEFT)
-        for text, value in (("안 함", "off"), ("등수 이내", "rank"), ("점수 이상", "score")):
-            tk.Radiobutton(
-                stop_row,
-                text=text,
-                variable=self.stop_mode_var,
-                value=value,
-                bg=c["panel"],
-                fg=c["text"],
-                selectcolor=c["input"],
-                activebackground=c["panel"],
-                activeforeground=c["text"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(
-            stop_row,
-            text="목표",
-            bg=c["panel"],
-            fg=c["muted"],
-            font=self._font(9),
-        ).pack(side=tk.LEFT, padx=(4, 2))
-        tk.Entry(
-            stop_row,
-            textvariable=self.stop_value_var,
-            width=8,
-            bg=c["input"],
-            fg=c["text"],
-            insertbackground=c["text"],
-            relief=tk.FLAT,
-            highlightbackground=c["border"],
-            highlightcolor=c["accent"],
-            highlightthickness=1,
-        ).pack(side=tk.LEFT, padx=(0, 4), ipady=2)
+        self._field(stop_row, "목표", self.stop_value_var, width=7).pack(side=tk.LEFT, padx=(12, 0))
 
         # ── 등수/점수/티어 OCR 박스(프레임 비율 %) — 그 영역만 정확히 읽어 노이즈 제거 ──
-        ocr_row = tk.Frame(settings_panel, bg=c["panel"])
-        ocr_row.pack(fill=tk.X, pady=(6, 0))
-        tk.Label(
-            ocr_row,
-            text="등수영역%",
-            bg=c["panel"],
-            fg=c["text"],
-            width=10,
-            anchor=tk.W,
-            font=self._font(10),
-        ).pack(side=tk.LEFT)
+        ocr_row = self._setting_row(settings_panel, "등수영역 %")
         for key, label in (("left", "좌"), ("top", "상"), ("right", "우"), ("bottom", "하")):
-            tk.Label(
-                ocr_row,
-                text=label,
-                bg=c["panel"],
-                fg=c["muted"],
-                font=self._font(9),
-            ).pack(side=tk.LEFT)
-            tk.Entry(
-                ocr_row,
-                textvariable=self.ocr_box_vars[key],
-                width=5,
-                bg=c["input"],
-                fg=c["text"],
-                insertbackground=c["text"],
-                relief=tk.FLAT,
-                highlightbackground=c["border"],
-                highlightcolor=c["accent"],
-                highlightthickness=1,
-            ).pack(side=tk.LEFT, padx=(2, 8), ipady=2)
+            self._field(ocr_row, label, self.ocr_box_vars[key], width=5).pack(
+                side=tk.LEFT,
+                padx=(0, 12),
+            )
 
-        # ── 오른쪽: 버전 / 시계 / 상태 / 로그 / 시작·정지 ──
-        version_panel = self._panel(right_column)
-        version_panel.pack(fill=tk.X)
-        version_text = f"Version : {APP_VERSION}"
-        if self.license_key:
-            version_text = f"Version : {APP_VERSION}  👑"
+        session_panel = self._panel(right_column, padx=18, pady=16)
+        session_panel.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        version_row = tk.Frame(session_panel, bg=c["panel"])
+        version_row.pack(fill=tk.X)
         tk.Label(
-            version_panel,
-            text=version_text,
+            version_row,
+            text="VERSION",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(7, bold=True),
+        ).pack(side=tk.LEFT, pady=(3, 0))
+        tk.Label(
+            version_row,
+            text=f"{APP_VERSION}{'  👑' if self.license_key else ''}",
             bg=c["panel"],
             fg=c["accent_soft"],
-            font=self._font(12, bold=True),
-        ).pack()
+            font=self._font(10, bold=True),
+        ).pack(side=tk.RIGHT)
+        tk.Frame(session_panel, bg=c["border"], height=1).pack(side=tk.TOP, fill=tk.X, pady=(11, 0))
 
-        clock_panel = self._panel(right_column)
-        clock_panel.pack(fill=tk.X, pady=(12, 0))
+        # 상태 줄을 먼저 아래에 고정해, 창이 낮아져도 상태가 사라지지 않게 합니다.
+        status_row = tk.Frame(session_panel, bg=c["panel"])
+        status_row.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(session_panel, bg=c["border"], height=1).pack(
+            side=tk.BOTTOM,
+            fill=tk.X,
+            pady=(0, 12),
+        )
+
+        clock_box = tk.Frame(session_panel, bg=c["panel"])
+        clock_box.pack(side=tk.TOP, fill=tk.X, pady=(12, 8))
         tk.Label(
-            clock_panel,
+            clock_box,
+            text="세션 진행 시간",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8, bold=True),
+        ).pack(side=tk.LEFT)
+        self.clock_label = tk.Label(
+            clock_box,
             textvariable=self.clock_var,
             bg=c["panel"],
             fg=c["text"],
-            font=("Consolas", 26, "bold"),
-        ).pack()
+            font=("Consolas", 21, "bold"),
+        )
+        self.clock_label.pack(side=tk.RIGHT)
 
-        status_panel = self._panel(right_column)
-        status_panel.pack(fill=tk.X, pady=(12, 0))
-        status_row = tk.Frame(status_panel, bg=c["panel"])
-        status_row.pack()
+        metrics = tk.Frame(session_panel, bg=c["panel"])
+        metrics.pack(side=tk.TOP, fill=tk.X)
+        metric_specs = (
+            (("완료 경기", self.session_matches_var), ("승 · 무 · 패", self.session_record_var)),
+            (("경기 속도", self.session_rate_var), ("예상 적립", self.session_fc_var)),
+        )
+        for row_index, row_specs in enumerate(metric_specs):
+            row = tk.Frame(metrics, bg=c["panel"])
+            row.pack(fill=tk.X, pady=(0, 7 if row_index == 0 else 0))
+            for column_index, (label, variable) in enumerate(row_specs):
+                card = tk.Frame(
+                    row,
+                    bg=c["input"],
+                    highlightthickness=1,
+                    highlightbackground=c["border"],
+                    padx=11,
+                    pady=6,
+                )
+                card.pack(
+                    side=tk.LEFT,
+                    fill=tk.X,
+                    expand=True,
+                    padx=(0, 4) if column_index == 0 else (4, 0),
+                )
+                tk.Label(
+                    card,
+                    text=label,
+                    bg=c["input"],
+                    fg=c["muted"],
+                    font=self._font(7, bold=True),
+                ).pack(anchor="w")
+                tk.Label(
+                    card,
+                    textvariable=variable,
+                    bg=c["input"],
+                    fg=c["text"],
+                    font=self._font(9, bold=True),
+                ).pack(anchor="w", pady=(2, 0))
         tk.Label(
             status_row,
-            text="상태 : ",
+            text="상태",
             bg=c["panel"],
             fg=c["muted"],
-            font=self._font(11),
+            font=self._font(9, bold=True),
         ).pack(side=tk.LEFT)
         self.status_label = tk.Label(
             status_row,
             textvariable=self.status_var,
-            bg=c["panel"],
-            fg=c["accent_soft"],
-            font=self._font(11, bold=True),
+            bg=c["input"],
+            fg=c["muted"],
+            font=self._font(9, bold=True),
+            padx=11,
+            pady=4,
         )
-        self.status_label.pack(side=tk.LEFT)
-
-        # UI 로그 패널은 제거하고 상태와 제어만 간결하게 표시합니다.
-        control_panel = self._panel(right_column, "시작/정지 & ETC")
-        control_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
-        button_row = tk.Frame(control_panel, bg=c["panel"])
-        button_row.pack(fill=tk.X)
-        self.start_button = self._accent_button(button_row, "시작 (F8)", self.start_automation)
-        self.start_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.stop_button = self._accent_button(button_row, "정지 (F9/ESC)", self.stop_automation)
-        self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        self.status_label.pack(side=tk.RIGHT)
 
         self._refresh_all_target_rows()
+        self._paint_status(self.status_var.get())
+
+        self.mining_dashboard = MiningDashboard(
+            self._pages["mining"],
+            base_dir=self.base_dir,
+            colors=c,
+            font_factory=lambda size, bold=False: self._font(size, bold),
+            automation_running=lambda: bool(
+                self.worker_thread is not None and self.worker_thread.is_alive()
+            ),
+            logger=self.queue_log,
+        )
+        self.mining_dashboard.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        self._show_page("automation")
 
     def _tick_clock(self) -> None:
-        """오른쪽 패널의 시계를 1초마다 갱신합니다."""
+        """오른쪽 패널의 세션 경과 시간과 처리량을 1초마다 갱신합니다."""
 
-        self.clock_var.set(time.strftime("%H:%M:%S"))
+        self._refresh_session_ui()
         if not self.closing:
             self.root.after(1000, self._tick_clock)
+
+    def _refresh_session_ui(self) -> None:
+        snapshot = self._session_tracker.snapshot()
+        seconds = max(0, int(snapshot.elapsed_seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.clock_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.session_matches_var.set(f"{snapshot.matches:,}")
+        record = f"{snapshot.wins}승 · {snapshot.draws}무 · {snapshot.losses}패"
+        if snapshot.unknown:
+            record += f" · ?{snapshot.unknown}"
+        self.session_record_var.set(record)
+        self.session_rate_var.set(f"{snapshot.matches_per_hour:.1f} 경기/h")
+        self.session_fc_var.set(
+            f"{snapshot.estimated_fc:,} FC · {snapshot.fc_per_hour:.1f}/h"
+        )
 
     # ── 타겟 템플릿 캡처 ──
 
@@ -815,7 +1253,11 @@ class AutomationApp:
         source_label = self._target_source_labels.get(name)
         if source_var is not None and source_label is not None:
             source_var.set("커스텀" if is_custom else "기본")
-            source_label.configure(fg=c["ok"] if is_custom else c["muted"])
+            # 커스텀은 초록 알약, 기본은 조용한 회색 알약으로 한눈에 구분합니다.
+            source_label.configure(
+                fg=c["ok"] if is_custom else c["muted"],
+                bg=c["ok_bg"] if is_custom else c["input"],
+            )
         self._update_thumbnail(name, target.filename)
 
     def _update_thumbnail(self, name: str, filename: str) -> None:
@@ -961,6 +1403,8 @@ class AutomationApp:
         self._snapshot_ocr_box()
 
         self.stop_event.clear()
+        self._session_tracker.start()
+        self._refresh_session_ui()
         self._set_button_state(running=True)
         self.set_status("실행 중")
         self.log(
@@ -983,7 +1427,7 @@ class AutomationApp:
         )
         self.worker_thread.start()
 
-    def update_threshold(self, target_name: str, value: str) -> None:
+    def update_threshold(self, target_name: str, value: float | str) -> None:
         """슬라이더 값 변경을 thread-safe하게 저장합니다."""
 
         threshold = max(0.0, min(1.0, float(value)))
@@ -991,6 +1435,7 @@ class AutomationApp:
             self.threshold_values[target_name] = threshold
             self._threshold_revision += 1
         self.threshold_label_vars[target_name].set(f"{threshold:.2f}")
+        self._draw_slider(target_name)
 
     def get_threshold(self, target_name: str) -> float:
         """작업 스레드에서 사용할 현재 임계값을 가져옵니다."""
@@ -1026,7 +1471,7 @@ class AutomationApp:
         self.stop_event.set()
         self.set_status("종료 요청됨")
         self.log("[중지 요청] 자동화 루프를 안전하게 중단합니다.")
-        self.stop_button.configure(state=tk.DISABLED)
+        self._set_accent_button_state(self.stop_button, enabled=False)
 
     def _snapshot_stop_condition(self) -> None:
         """시작 시 UI의 자동 정지 조건을 평문 속성으로 고정합니다(메인 스레드 전용).
@@ -1123,6 +1568,9 @@ class AutomationApp:
         """창 닫기 버튼을 눌렀을 때도 자동화 스레드를 자연스럽게 멈춥니다."""
 
         self.closing = True
+        mining_dashboard = getattr(self, "mining_dashboard", None)
+        if mining_dashboard is not None:
+            mining_dashboard.close()
         self._close_log_file()
         # 상태 풀은 여기서 닫지 않습니다: 워커의 finally가 '종료' 상태를 제출한 뒤
         # 인터프리터 종료 시 atexit가 풀을 join하여 마지막 전송이 완료됩니다.
@@ -1219,6 +1667,10 @@ class AutomationApp:
             # 새 객체로 교체(reset 아님): 혹시 직전 run의 워커가 join 타임아웃으로 살아있어도
             # 옛 객체를 만지게 분리해, 새 워커의 투표 상태와 절대 안 섞이게 한다.
             self._rank_consensus = rank_ocr.RankConsensus()
+            self._rank_ocr_cache_key = None
+            self._rank_ocr_cache_info = None
+            self._rank_ocr_cache_at = 0.0
+            self._rank_ocr_cache_hits = 0
             self._last_rank = None       # 마지막 값 유지 초기화(이전 run 잔류 방지)
             self._last_tier = None
             self._last_score = None
@@ -1251,6 +1703,8 @@ class AutomationApp:
             # 상태 전송 타이머
             last_status_report = 0.0
             applied_threshold_revision = -1
+            last_window_validation = float("-inf")
+            window_is_valid = False
 
             # 시작 상태 전송 (단일 워커 풀)
             self._report_status(running=True, message="매크로 시작")
@@ -1266,17 +1720,27 @@ class AutomationApp:
                         targets, applied_threshold_revision
                     )
 
-                if requires_window and manager is not None and not manager.is_valid_window():
-                    self.queue_status("대상 창 검색 중")
-                    manager.find_window()
+                if requires_window and manager is not None:
+                    needs_validation = (
+                        manager.hwnd is None
+                        or now_mono - last_window_validation
+                        >= WINDOW_VALIDATION_INTERVAL_SECONDS
+                    )
+                    if needs_validation:
+                        last_window_validation = now_mono
+                        window_is_valid = manager.is_valid_window()
+                    if not window_is_valid:
+                        self.queue_status("대상 창 검색 중")
+                        window_is_valid = manager.find_window()
+                        last_window_validation = time.monotonic()
 
-                    if self.stop_event.is_set():
-                        break
+                        if self.stop_event.is_set():
+                            break
 
-                    if not manager.is_valid_window():
-                        self.queue_log(f"[대기] {WINDOW_RETRY_SECONDS}초 후 창을 다시 찾습니다.")
-                        self.interruptible_sleep(WINDOW_RETRY_SECONDS)
-                        continue
+                        if not window_is_valid:
+                            self.queue_log(f"[대기] {WINDOW_RETRY_SECONDS}초 후 창을 다시 찾습니다.")
+                            self.interruptible_sleep(WINDOW_RETRY_SECONDS)
+                            continue
 
                 self.queue_status("실행 중")
                 if capture_mode == "region":
@@ -1388,10 +1852,16 @@ class AutomationApp:
                 self._ocr_thread = None
             self._latest_frame = None
             self._ocr_manager = None
+            if self._rank_ocr_cache_hits:
+                self._log_to_file_only(
+                    f"[성능] 동일 OCR 결과 재사용 {self._rank_ocr_cache_hits:,}회"
+                )
             if manager is not None:
                 manager.stop_capture()
             self.queue_status("종료됨")
             self.queue_log("[종료] 자동화 루프가 종료되었습니다.")
+            self._session_tracker.stop()
+            self.ui_queue.put(("session", ""))
             # 종료 상태 전송 (단일 워커 풀)
             self._report_status(running=False, message="매크로 종료")
             self.ui_queue.put(("finished", ""))
@@ -1464,18 +1934,48 @@ class AutomationApp:
         """
         try:
             h, w = screen_gray.shape[:2]
+            l, t, r, b = self._ocr_box
+            x1 = max(0, int(w * l))
+            x2 = min(w, int(w * r))
+            y1 = max(0, int(h * t))
+            y2 = min(h, int(h * b))
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                return
+            crop = screen_gray[y1:y2, x1:x2]
+
             # 매치 화면 게이트: '팀 정보/유니폼 선택' 탭이 안 보이면(구단 관리 등 다른 화면)
             # 등수 OCR을 건너뛰고 '패널 없음'으로 투표 → 오인식 차단 + 패널 소멸 추적.
+            gate_crop = np.empty((0, 0), dtype=np.uint8)
             if MATCH_GATE_ENABLED:
                 gx1 = max(0, int(w * MATCH_GATE_LEFT_FRACTION))
                 gx2 = min(w, int(w * MATCH_GATE_RIGHT_FRACTION))
                 gy1 = max(0, int(h * MATCH_GATE_TOP_FRACTION))
                 gy2 = min(h, int(h * MATCH_GATE_BOTTOM_FRACTION))
                 gate_crop = screen_gray[gy1:gy2, gx1:gx2]
+
+            cache_key = _ocr_regions_fingerprint(gate_crop, crop)
+            if (
+                cache_key == self._rank_ocr_cache_key
+                and self._rank_ocr_cache_info is not None
+                and now - self._rank_ocr_cache_at <= RANK_OCR_CACHE_SECONDS
+            ):
+                self._rank_ocr_cache_hits += 1
+                self._rank_consensus.observe(dict(self._rank_ocr_cache_info), now)
+                return
+
+            if MATCH_GATE_ENABLED:
                 if gate_crop.size == 0 or not rank_ocr.on_match_screen(gate_crop, MATCH_GATE_TOKENS):
-                    self._rank_consensus.observe(
-                        {"rank": None, "is_champion": False, "tier": None,
-                         "score": None, "has_panel": False}, now)
+                    info = {
+                        "rank": None,
+                        "is_champion": False,
+                        "tier": None,
+                        "score": None,
+                        "has_panel": False,
+                    }
+                    self._rank_ocr_cache_key = cache_key
+                    self._rank_ocr_cache_info = dict(info)
+                    self._rank_ocr_cache_at = now
+                    self._rank_consensus.observe(info, now)
                     # 추적성(#10): 매치 화면이 맞는데도 탭바를 못 읽으면(해상도/DPI 어긋남)
                     # 등수가 영영 안 잡힌다. 일반 화면에선 정상이라 파일 로그로 5초마다만 남긴다.
                     if now - self._gate_fail_log_at >= 5.0:
@@ -1485,15 +1985,10 @@ class AutomationApp:
                             "(매치 화면인데 반복되면 해상도/게이트 영역 확인)"
                         )
                     return
-            l, t, r, b = self._ocr_box
-            x1 = max(0, int(w * l))
-            x2 = min(w, int(w * r))
-            y1 = max(0, int(h * t))
-            y2 = min(h, int(h * b))
-            if x2 - x1 < 2 or y2 - y1 < 2:
-                return
-            crop = screen_gray[y1:y2, x1:x2]
             info = rank_ocr.read_rank_panel(crop, logger=None)
+            self._rank_ocr_cache_key = cache_key
+            self._rank_ocr_cache_info = dict(info)
+            self._rank_ocr_cache_at = now
         except Exception:
             return
         # 이번 읽기(빈 결과 포함)를 투표에 반영 → 패널 소멸/경계 추적에 필요.
@@ -1514,6 +2009,7 @@ class AutomationApp:
         self._rank_consensus.reset()
 
         rank, tier, score = committed
+        self._record_session_result(score, tier, now)
         # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
         # 정지 판정엔 '이번 패널에서 실제로 읽힌' 티어만 넘긴다(없으면 None) → 직전 매치의
         # 슈퍼챔스 티어가 다음 매치로 새서 거짓 정지하는 일을 막는다(#5). 표시용 보강은 아래에서.
@@ -1552,6 +2048,29 @@ class AutomationApp:
             self.queue_log(f"[티어/점수] {message}")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
+
+    def _record_session_result(
+        self,
+        score: Optional[int],
+        tier: Optional[str],
+        now: float,
+    ) -> None:
+        """같은 결과 패널의 중복 OCR을 제외하고 세션 통계를 갱신합니다."""
+
+        tracker = getattr(self, "_session_tracker", None)
+        if tracker is None:
+            return
+        outcome = tracker.record_result(score, tier, now=now)
+        if outcome is None:
+            return
+        outcome_label = {
+            "win": "승",
+            "draw": "무",
+            "loss": "패",
+            "unknown": "미판정",
+        }.get(outcome, outcome)
+        self.queue_log(f"[세션] 경기 결과 반영: {outcome_label}")
+        self.ui_queue.put(("session", ""))
 
     def _new_skip_experiment_tracker(self) -> SkipExperimentTracker:
         return SkipExperimentTracker(
@@ -2494,6 +3013,28 @@ class AutomationApp:
         """UI 스레드에서 상태 라벨을 갱신합니다."""
 
         self.status_var.set(status)
+        self._paint_status(status)
+
+    def _paint_status(self, status: str) -> None:
+        """상태 문구의 의미에 맞춰 상태 알약과 사이드바 점 색을 맞춥니다."""
+
+        c = self.COLORS
+        text = status or ""
+        if any(word in text for word in ("오류", "실패", "만료")):
+            fg, bg = c["danger"], c["danger_bg"]
+        elif any(word in text for word in ("요청", "정지", "종료")):
+            fg, bg = c["warn"], c["warn_bg"]
+        elif text.strip() in ("", "대기 중"):
+            fg, bg = c["muted"], c["input"]
+        else:
+            fg, bg = c["ok"], c["ok_bg"]
+
+        label = getattr(self, "status_label", None)
+        if label is not None:
+            label.configure(fg=fg, bg=bg)
+        dot = getattr(self, "sidebar_dot", None)
+        if dot is not None:
+            dot.configure(fg=fg)
 
     def queue_status(self, status: str) -> None:
         """변경된 상태만 UI 큐에 넣어 반복 프레임의 큐 적재를 피합니다."""
@@ -2515,6 +3056,8 @@ class AutomationApp:
 
             if kind == "status":
                 self.set_status(message)
+            elif kind == "session":
+                self._refresh_session_ui()
             elif kind == "finished":
                 self._set_button_state(running=False)
             processed += 1
@@ -2535,12 +3078,13 @@ class AutomationApp:
             self.root.after(1000, self._flush_log_periodic)
 
     def _set_accent_button_state(self, button: tk.Button, enabled: bool) -> None:
-        """빨간 강조 버튼의 활성/비활성 상태와 색을 함께 바꿉니다."""
+        """버튼의 활성/비활성 상태와 색을 함께 바꿉니다(원래 톤으로 복원)."""
 
         c = self.COLORS
+        base = getattr(button, "_tone_colors", (c["accent"], c["accent_hover"]))[0]
         button.configure(
             state=tk.NORMAL if enabled else tk.DISABLED,
-            bg=c["accent"] if enabled else c["disabled"],
+            bg=base if enabled else c["disabled"],
         )
 
     def _set_button_state(self, running: bool) -> None:
@@ -2552,7 +3096,7 @@ class AutomationApp:
         for button in self._capture_buttons.values():
             self._set_accent_button_state(button, enabled=not running)
         for button in self._reset_buttons.values():
-            button.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._set_accent_button_state(button, enabled=not running)
 
 
 class LicenseDialog:
@@ -2564,35 +3108,54 @@ class LicenseDialog:
         self.result: Optional[str] = None
 
         self.root.title("라이센스 인증")
-        self.root.geometry("480x340+200+200")
+        self.root.geometry("460x400+200+200")
         self.root.resizable(False, False)
 
-        bg = "#101010"
-        input_bg = "#262626"
-        text_color = "#F3F3F3"
-        accent = "#D93A2B"
-        error_color = "#FF6B6B"
-        success_color = "#69DB7C"
+        # 본 화면(AutomationApp)과 같은 팔레트를 써서 첫인상을 통일합니다.
+        palette = AutomationApp.COLORS
+        bg = palette["bg"]
+        panel = palette["panel"]
+        border = palette["border"]
+        input_bg = palette["input"]
+        text_color = palette["text"]
+        muted = palette["muted"]
+        accent = palette["accent"]
+        accent_hover = palette["accent_hover"]
+        error_color = palette["danger"]
+        success_color = palette["ok"]
+        font_family = "Malgun Gothic" if platform.system() == "Windows" else "Arial"
 
         self.root.configure(bg=bg)
 
-        main_frame = tk.Frame(self.root, bg=bg, padx=24, pady=20)
+        main_frame = tk.Frame(self.root, bg=bg, padx=30, pady=30)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            main_frame,
-            text="라이센스 인증",
-            bg=bg,
-            fg=accent,
-            font=("Arial", 16, "bold"),
-        ).pack(pady=(0, 16))
+        mark = tk.Canvas(main_frame, width=44, height=44, bg=bg, highlightthickness=0, bd=0)
+        mark.pack(anchor=tk.W)
+        AutomationApp._round_rect(mark, 1, 1, 43, 43, 13, fill=accent, outline="")
+        mark.create_text(22, 22, text="M", fill="#FFFFFF", font=(font_family, 17, "bold"))
 
         tk.Label(
             main_frame,
-            text="라이센스 키를 입력하세요",
+            text="mAuto 라이센스 인증",
             bg=bg,
             fg=text_color,
-            font=("Arial", 10),
+            font=(font_family, 16, "bold"),
+        ).pack(anchor=tk.W, pady=(16, 4))
+        tk.Label(
+            main_frame,
+            text="구매하신 라이센스 키를 입력하면 자동으로 이 PC에 등록됩니다.",
+            bg=bg,
+            fg=muted,
+            font=(font_family, 9),
+        ).pack(anchor=tk.W, pady=(0, 20))
+
+        tk.Label(
+            main_frame,
+            text="LICENSE KEY",
+            bg=bg,
+            fg=muted,
+            font=(font_family, 7, "bold"),
         ).pack(anchor=tk.W, pady=(0, 6))
 
         self.key_var = tk.StringVar()
@@ -2601,13 +3164,17 @@ class LicenseDialog:
             textvariable=self.key_var,
             bg=input_bg,
             fg=text_color,
-            insertbackground=text_color,
+            insertbackground=accent,
             font=("Consolas", 12),
-            relief=tk.SOLID,
-            bd=1,
-            width=40,
+            relief=tk.FLAT,
+            bd=0,
+            highlightbackground=border,
+            highlightcolor=accent,
+            highlightthickness=1,
+            justify=tk.CENTER,
+            width=34,
         )
-        self.key_entry.pack(fill=tk.X, pady=(0, 12))
+        self.key_entry.pack(fill=tk.X, ipady=9)
         self.key_entry.bind("<Return>", lambda _e: self._activate())
 
         self.message_var = tk.StringVar()
@@ -2615,12 +3182,13 @@ class LicenseDialog:
             main_frame,
             textvariable=self.message_var,
             bg=bg,
-            fg=text_color,
-            font=("Arial", 9),
-            wraplength=420,
+            fg=muted,
+            font=(font_family, 9),
+            wraplength=390,
             justify=tk.LEFT,
+            anchor=tk.W,
         )
-        self.message_label.pack(fill=tk.X, pady=(0, 16))
+        self.message_label.pack(fill=tk.X, pady=(10, 18))
 
         btn_frame = tk.Frame(main_frame, bg=bg)
         btn_frame.pack(fill=tk.X)
@@ -2631,38 +3199,43 @@ class LicenseDialog:
             command=self._activate,
             bg=accent,
             fg="#FFFFFF",
-            activebackground="#B72D20",
+            activebackground=accent_hover,
             activeforeground="#FFFFFF",
-            font=("Arial", 11, "bold"),
+            font=(font_family, 11, "bold"),
             relief=tk.FLAT,
-            padx=20,
-            pady=6,
+            bd=0,
+            pady=9,
             cursor="hand2",
         )
-        self.activate_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+        self.activate_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 8))
+        self.activate_btn.bind("<Enter>", lambda _e: self.activate_btn.configure(bg=accent_hover))
+        self.activate_btn.bind("<Leave>", lambda _e: self.activate_btn.configure(bg=accent))
 
         self.exit_btn = tk.Button(
             btn_frame,
             text="종료",
             command=self.root.destroy,
-            bg="#3C3C3C",
-            fg=text_color,
-            font=("Arial", 11),
+            bg=panel,
+            fg=muted,
+            activebackground=border,
+            activeforeground=text_color,
+            font=(font_family, 11, "bold"),
             relief=tk.FLAT,
-            padx=20,
-            pady=6,
+            bd=0,
+            padx=22,
+            pady=9,
             cursor="hand2",
         )
-        self.exit_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.exit_btn.pack(side=tk.RIGHT)
 
         self.info_label = tk.Label(
             main_frame,
             text="",
             bg=bg,
-            fg="#888888",
-            font=("Arial", 8),
+            fg=muted,
+            font=(font_family, 8),
         )
-        self.info_label.pack(side=tk.BOTTOM, pady=(12, 0))
+        self.info_label.pack(side=tk.BOTTOM, pady=(14, 0))
 
         self._error_color = error_color
         self._success_color = success_color

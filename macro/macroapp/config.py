@@ -157,6 +157,9 @@ LOOP_SLEEP_SECONDS = 0.03
 
 # 대상 창을 찾지 못했을 때 재검색하는 간격입니다.
 WINDOW_RETRY_SECONDS = 2.0
+# 매 프레임마다 비교적 비싼 Win32 프로세스/클라이언트 영역 검증을 반복하지 않습니다.
+# 창 종료는 WGC closed 이벤트가 즉시 잡고, 정상 상태의 유효성만 초당 한 번 재확인합니다.
+WINDOW_VALIDATION_INTERVAL_SECONDS = 1.0
 
 # ─── 잘못 열린 알림 패널 자동 복구 ───
 # 일부 PC에서 화면 좌표가 어긋나 하단 알림(종) 버튼이 눌리면 오른쪽 패널이 전체 자동화를
@@ -174,6 +177,9 @@ WGC_FIRST_FRAME_TIMEOUT_SECONDS = 2.0
 # 시작 후에는 이벤트를 이 시간까지만 기다려 정지 요청에도 빠르게 반응합니다.
 # 새 프레임이 오면 즉시 깨어나므로 폴링 지연이나 불필요한 busy loop가 없습니다.
 WGC_FRAME_WAIT_SECONDS = 0.1
+# 자동화 루프의 실효 처리율(LOOP_SLEEP_SECONDS≈30ms)을 넘는 WGC 프레임은
+# BGRA→gray 변환 전에 버립니다. 반응 속도는 그대로 두고 캡처 대역폭을 절반가량 줄입니다.
+WGC_CAPTURE_MAX_FPS = 30.0
 
 # ─── 등수/티어/점수 OCR (공식경기 감독모드 화면에서 내 정보 읽기) ───
 # 내 팀=왼쪽, 상대=오른쪽. 내 점수/티어는 왼쪽 팀 아래에 뜬다(예: '2229점', '챌린저 3부 감독').
@@ -184,6 +190,9 @@ RANK_OCR_ENABLED = True
 # → 워커는 '새 프레임이 올라올 때마다'(프레임 신선도) OCR하고, 이 값은 단지 하한(0=제한 없음).
 RANK_OCR_INTERVAL_SECONDS = 0.1   # 등수 OCR 최소 간격(초). 0=매 프레임(CPU 폭증). 0.1=최대 10회/초로
                                   # 제한 → CPU 대폭↓. 패널이 수 초간 떠 있어 0.1초×3표=0.3초면 확정(인식 충분히 빠름).
+# 게이트+등수 ROI의 작은 지문이 같으면 이전 OCR 결과를 재사용합니다. 투표 횟수와
+# 확정 지연은 유지하면서 같은 정지 UI를 winocr로 반복 해석하지 않습니다.
+RANK_OCR_CACHE_SECONDS = 1.0
 RANK_OCR_LEFT_FRACTION = 0.50     # 가로: 0~이 비율(상대=오른쪽 제외)
 RANK_OCR_TOP_FRACTION = 0.45      # 세로 시작 비율(상단 제목/로고 제외)
 RANK_OCR_BOTTOM_FRACTION = 0.66   # 세로 끝 비율(하단 미리보기 이미지 제외)
@@ -448,6 +457,9 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
 # 1차 사전필터 축소 배율. 클수록 CPU↓ (최종 클릭 정확도는 ROI 정밀매칭이라 무관).
 # 2=가장 안전(권장, 8/8 탐지). 3=CPU 2.4배↓이나 얇은(16px) 템플릿 누락 위험.
 DOWNSCALE_FACTOR = 2
+# 1928x1048·8타겟 실측에서 2스레드와 기본 12스레드의 검색 지연은 같았습니다.
+# 과도한 내부 병렬화만 막아 게임과 OCR에 CPU 여유를 남깁니다.
+OPENCV_WORKER_THREADS = 2
 
 
 @dataclass

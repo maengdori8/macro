@@ -5,13 +5,14 @@ import cv2
 import numpy as np
 
 from macroapp.logging_util import LogCallback
-from macroapp.config import TargetImage, DOWNSCALE_FACTOR
+from macroapp.config import TargetImage, DOWNSCALE_FACTOR, OPENCV_WORKER_THREADS
 
 _INTER_AREA = getattr(cv2, "INTER_AREA", getattr(cv2, "INTER_LINEAR", 1))
 
 # SIMD/멀티스레드 최적화를 명시적으로 켭니다(빌드에 따라 꺼져 있을 수 있음).
 try:
     cv2.setUseOptimized(True)
+    cv2.setNumThreads(max(1, int(OPENCV_WORKER_THREADS)))
 except Exception:
     pass
 

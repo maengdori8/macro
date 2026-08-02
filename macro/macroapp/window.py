@@ -13,6 +13,7 @@ from macroapp.config import (
     TargetImage,
     DWMWA_EXTENDED_FRAME_BOUNDS,
     FC_ONLINE_PROCESS_NAMES,
+    WGC_CAPTURE_MAX_FPS,
     WGC_FRAME_WAIT_SECONDS,
     WGC_FIRST_FRAME_TIMEOUT_SECONDS,
 )
@@ -377,7 +378,11 @@ class InactiveManager:
             return None
 
         if self.capture_engine is None:
-            self.capture_engine = WGCCaptureEngine(self.hwnd, logger=self.log)
+            self.capture_engine = WGCCaptureEngine(
+                self.hwnd,
+                logger=self.log,
+                max_fps=WGC_CAPTURE_MAX_FPS,
+            )
 
         if not self.capture_engine.start_capture():
             return None
@@ -420,6 +425,13 @@ class InactiveManager:
         if self.capture_engine is None:
             return
 
+        throttled = self.capture_engine.get_throttled_frame_count()
+        replaced = self.capture_engine.get_replaced_frame_count()
+        if throttled or replaced:
+            self.log(
+                f"[성능] WGC 색 변환 전 폐기 {throttled:,}프레임 · "
+                f"최신 프레임 교체 {replaced:,}회"
+            )
         self.capture_engine.stop_capture()
         self.capture_engine = None
         self._received_frame = False

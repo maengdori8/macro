@@ -36,7 +36,13 @@ def _supports_native_borderless_wgc() -> bool:
 class WGCCaptureEngine:
     """windows-capture 기반 비동기 WGC 창 캡처 엔진입니다."""
 
-    def __init__(self, hwnd: int, logger: Optional[LogCallback] = None):
+    def __init__(
+        self,
+        hwnd: int,
+        logger: Optional[LogCallback] = None,
+        *,
+        max_fps: float = 0.0,
+    ):
         self.hwnd = int(hwnd)
         self.logger = logger or print
         # 아직 소비되지 않은 최신 grayscale 프레임 하나만 유지합니다.
@@ -55,6 +61,11 @@ class WGCCaptureEngine:
         self._last_consumed_seq = -1
         self._latest_frame_timestamp = 0.0
         self._replaced_frame_count = 0
+        self._last_published_at = 0.0
+        self._throttled_frame_count = 0
+        self._publish_interval = (
+            1.0 / max(1.0, float(max_fps)) if float(max_fps) > 0.0 else 0.0
+        )
         # 갱신 감시처럼 화면의 극히 일부만 필요한 경우에는 BGRA 전체 프레임을
         # grayscale로 바꾸지 않고 이 영역만 변환합니다. 좌표는 WGC 프레임 기준입니다.
         self.capture_region: Optional[tuple[int, int, int, int]] = None
@@ -68,6 +79,20 @@ class WGCCaptureEngine:
         """WGC 프레임을 grayscale 단일 슬롯에 넣고 밀린 프레임은 버립니다."""
 
         try:
+            captured_at = time.perf_counter()
+            # 자동화 소비 속도보다 빠른 프레임은 큰 BGRA ndarray 변환과 grayscale
+            # 복사 전에 버립니다. 최신 프레임 슬롯이 밀리는 경우의 순수 낭비를 제거합니다.
+            with self.frame_lock:
+                if (
+                    self._publish_interval > 0.0
+                    and self._last_published_at > 0.0
+                    and captured_at - self._last_published_at + 1e-9
+                    < self._publish_interval
+                ):
+                    self._throttled_frame_count += 1
+                    return
+                self._last_published_at = captured_at
+
             image_bgra = np.asarray(frame.frame_buffer)
             if image_bgra.size == 0:
                 return
@@ -98,7 +123,7 @@ class WGCCaptureEngine:
                 self.latest_frame = gray
                 self.last_frame_size = (int(frame.width), int(frame.height))
                 self._frame_seq += 1
-                self._latest_frame_timestamp = time.perf_counter()
+                self._latest_frame_timestamp = captured_at
                 self.frame_ready_event.set()
 
             self.first_frame_event.set()
@@ -143,6 +168,8 @@ class WGCCaptureEngine:
             self.last_frame_size = None
             self._latest_frame_timestamp = 0.0
             self._replaced_frame_count = 0
+            self._last_published_at = 0.0
+            self._throttled_frame_count = 0
 
         capture_kwargs: dict[str, object] = {
             "cursor_capture": False,
@@ -234,6 +261,12 @@ class WGCCaptureEngine:
         with self.frame_lock:
             return int(self._replaced_frame_count)
 
+    def get_throttled_frame_count(self) -> int:
+        """grayscale 변환 전에 제한한 누적 프레임 수입니다."""
+
+        with self.frame_lock:
+            return int(self._throttled_frame_count)
+
     def set_capture_region(
         self,
         region: Optional[tuple[int, int, int, int]],
@@ -273,6 +306,7 @@ class WGCCaptureEngine:
             self.last_frame_size = None
             self.capture_region = None
             self._latest_frame_timestamp = 0.0
+            self._last_published_at = 0.0
 
         if capture_control is None:
             if border_mask is not None:
