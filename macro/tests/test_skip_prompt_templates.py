@@ -16,45 +16,24 @@ class SkipPromptTemplateTests(unittest.TestCase):
     def setUp(self) -> None:
         ocr.reset_skip_a_template()
 
-    def test_matches_s_skip_glyph_inside_lower_screen_crop(self) -> None:
+    def test_legacy_1_0_25_bundle_has_no_s_skip_templates(self) -> None:
         for filename in ("target_skip_s.png", "target_skip_s_dark.png"):
             with self.subTest(filename=filename):
-                template = cv2.imread(
-                    str(ROOT / filename),
-                    cv2.IMREAD_GRAYSCALE,
-                )
-                self.assertIsNotNone(template)
-                canvas = np.full((220, 1920), 90, dtype=np.uint8)
-                height, width = template.shape[:2]
-                canvas[150:150 + height, 1760:1760 + width] = template
-
-                matched, score, center = ocr.match_skip_s(canvas, ROOT)
-
-                self.assertTrue(matched)
-                self.assertGreaterEqual(score, 0.99)
-                self.assertEqual(
-                    center,
-                    (1760 + width // 2, 150 + height // 2),
-                )
+                self.assertFalse((ROOT / filename).exists())
 
     def test_rejects_flat_background_as_s_skip(self) -> None:
         canvas = np.full((220, 1920), 90, dtype=np.uint8)
         matched, score, center = ocr.match_skip_s(canvas, ROOT)
         self.assertFalse(matched)
         self.assertLess(score, 0.80)
-        self.assertIsNotNone(center)
+        self.assertIsNone(center)
 
-    def test_a_and_s_templates_do_not_cross_match(self) -> None:
+    def test_a_template_is_not_misclassified_without_s_templates(self) -> None:
         a_template = cv2.imread(
             str(ROOT / "target_skip_a.png"),
             cv2.IMREAD_GRAYSCALE,
         )
-        s_template = cv2.imread(
-            str(ROOT / "target_skip_s.png"),
-            cv2.IMREAD_GRAYSCALE,
-        )
         self.assertIsNotNone(a_template)
-        self.assertIsNotNone(s_template)
 
         def canvas_with(template):
             canvas = np.full((220, 1920), 90, dtype=np.uint8)
@@ -63,11 +42,8 @@ class SkipPromptTemplateTests(unittest.TestCase):
             return canvas
 
         a_canvas = canvas_with(a_template)
-        s_canvas = canvas_with(s_template)
         self.assertTrue(ocr.match_skip_a(a_canvas, ROOT)[0])
         self.assertFalse(ocr.match_skip_s(a_canvas, ROOT)[0])
-        self.assertTrue(ocr.match_skip_s(s_canvas, ROOT)[0])
-        self.assertFalse(ocr.match_skip_a(s_canvas, ROOT)[0])
 
 
 if __name__ == "__main__":
