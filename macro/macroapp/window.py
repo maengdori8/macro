@@ -5,6 +5,7 @@ import platform
 import time
 from typing import Optional
 
+import cv2
 import numpy as np
 
 from macroapp import winapi
@@ -16,6 +17,7 @@ from macroapp.config import (
     WGC_CAPTURE_MAX_FPS,
     WGC_FRAME_WAIT_SECONDS,
     WGC_FIRST_FRAME_TIMEOUT_SECONDS,
+    capture_normalization_scale,
 )
 from macroapp.capture import WGCCaptureEngine
 from macroapp.input_message import (
@@ -170,6 +172,10 @@ class InactiveManager:
         self.virtual_mouse_wgc_pos: Optional[tuple[int, int]] = None
         self.virtual_mouse_client_pos: Optional[tuple[int, int]] = None
         self._received_frame = False
+        # 해상도 자동 보정: 캡처 프레임을 템플릿 기준 크기로 줄인 배율(1.0=보정 없음).
+        # 매칭·OCR은 정규화 프레임 좌표를 쓰고, 클릭 직전에 이 배율로 되돌립니다.
+        self.capture_scale = 1.0
+        self._logged_capture_scale: Optional[tuple] = None
 
         if winapi.WIN32_IMPORT_ERROR is not None:
             self.log("[오류] pywin32 모듈을 불러올 수 없습니다.")
@@ -417,7 +423,60 @@ class InactiveManager:
             return None
 
         self._received_frame = True
-        return gray
+        return self._normalize_frame(gray)
+
+    def _normalize_frame(self, gray: np.ndarray) -> np.ndarray:
+        """다른 해상도로 켠 게임 프레임을 템플릿 기준 크기로 맞춥니다.
+
+        기준 해상도(1928x1048)면 배율이 1.0이라 리사이즈 자체를 건너뜁니다.
+        2560x1440처럼 UI가 커진 해상도는 축소해 같은 템플릿으로 매칭하고,
+        21:9(2560x1080)처럼 세로가 같은 해상도는 UI 크기가 그대로라 보정하지 않습니다.
+        """
+
+        height, width = gray.shape[:2]
+        scale = capture_normalization_scale(height)
+        self.capture_scale = scale
+        self._log_capture_scale(width, height, scale)
+        if scale == 1.0:
+            return gray
+
+        target_width = max(1, int(round(width / scale)))
+        target_height = max(1, int(round(height / scale)))
+        try:
+            # 템플릿 축소와 같은 INTER_AREA를 써야 상관도가 맞습니다(다운스케일 규칙).
+            return cv2.resize(
+                gray,
+                (target_width, target_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        except cv2.error as exc:
+            self.log(f"[해상도] 프레임 정규화에 실패해 원본으로 매칭합니다: {exc}")
+            self.capture_scale = 1.0
+            return gray
+
+    def _log_capture_scale(self, width: int, height: int, scale: float) -> None:
+        """해상도나 배율이 바뀐 순간에만 1회 기록합니다(매 프레임 로그 방지)."""
+
+        signature = (int(width), int(height), round(float(scale), 4))
+        if signature == self._logged_capture_scale:
+            return
+        self._logged_capture_scale = signature
+        if scale == 1.0:
+            self.log(f"[해상도] 캡처 {width}x{height} · 기준 크기와 같아 보정 없음")
+        else:
+            self.log(
+                f"[해상도] 캡처 {width}x{height} · 템플릿 기준 "
+                f"{int(round(width / scale))}x{int(round(height / scale))}로 "
+                f"정규화해 매칭합니다 (배율 {scale:.3f})"
+            )
+
+    def frame_to_capture(self, x: int, y: int) -> tuple[int, int]:
+        """정규화 프레임 좌표를 실제 WGC 프레임 좌표로 되돌립니다."""
+
+        scale = self.capture_scale
+        if scale == 1.0:
+            return int(x), int(y)
+        return int(round(x * scale)), int(round(y * scale))
 
     def stop_capture(self) -> None:
         """실행 중인 WGC 캡처 엔진을 정리합니다."""
@@ -435,6 +494,9 @@ class InactiveManager:
         self.capture_engine.stop_capture()
         self.capture_engine = None
         self._received_frame = False
+        # 창을 다시 찾으면 해상도가 바뀌었을 수 있으므로 보정 상태를 초기화합니다.
+        self.capture_scale = 1.0
+        self._logged_capture_scale = None
 
     def _log_capture_wait(self, message: str) -> None:
         """반복 루프에서 같은 캡처 메시지가 과도하게 쌓이지 않게 합니다."""
@@ -452,11 +514,15 @@ class InactiveManager:
         WGC가 클라이언트 영역만 캡처하는 환경이면 좌표를 그대로 사용합니다.
         WGC가 제목 표시줄/테두리를 포함한 전체 창을 캡처하면, 캡처 원점과
         ClientToScreen(0, 0)의 차이를 빼서 정확한 클라이언트 좌표를 계산합니다.
+
+        입력은 정규화 프레임 좌표입니다. 해상도 보정이 걸려 있으면 먼저 실제
+        WGC 프레임 좌표로 되돌린 뒤 원점 보정을 합니다.
         """
 
         if self.hwnd is None:
             return None
 
+        x, y = self.frame_to_capture(x, y)
         frame_size = (
             self.capture_engine.get_frame_size()
             if self.capture_engine is not None
@@ -465,7 +531,10 @@ class InactiveManager:
         return wgc_to_client(self.hwnd, x, y, frame_size, logger=self.log)
 
     def get_virtual_start_position(self, fallback_x: int, fallback_y: int) -> tuple[int, int]:
-        """PostMessage 곡선 이동의 WGC 기준 시작점을 반환합니다."""
+        """PostMessage 곡선 이동의 시작점을 정규화 프레임 좌표로 반환합니다.
+
+        반환값은 wgc_to_client에 그대로 들어가므로 매칭 결과와 같은 좌표계여야 합니다.
+        """
 
         if self.virtual_mouse_wgc_pos is not None:
             return self.virtual_mouse_wgc_pos
@@ -477,7 +546,11 @@ class InactiveManager:
         )
         if frame_size is not None:
             frame_width, frame_height = frame_size
-            return max(0, frame_width // 2), max(0, frame_height // 2)
+            scale = self.capture_scale if self.capture_scale else 1.0
+            return (
+                max(0, int(frame_width / scale) // 2),
+                max(0, int(frame_height / scale) // 2),
+            )
 
         return int(fallback_x), int(fallback_y)
 
@@ -731,11 +804,15 @@ class InactiveManager:
             return False
 
     def client_to_screen(self, x: int, y: int) -> Optional[tuple[int, int]]:
-        """클라이언트 영역 기준 좌표를 화면 절대 좌표로 변환합니다."""
+        """정규화 프레임 좌표를 화면 절대 좌표로 변환합니다.
+
+        해상도 보정이 걸려 있으면 실제 프레임 좌표로 되돌린 뒤 변환합니다.
+        """
 
         if not self.is_valid_window():
             return None
 
+        x, y = self.frame_to_capture(x, y)
         try:
             screen_x, screen_y = winapi.win32gui.ClientToScreen(self.hwnd, (int(x), int(y)))
             return int(screen_x), int(screen_y)

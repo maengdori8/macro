@@ -461,6 +461,46 @@ DOWNSCALE_FACTOR = 2
 # 과도한 내부 병렬화만 막아 게임과 OCR에 CPU 여유를 남깁니다.
 OPENCV_WORKER_THREADS = 2
 
+# ─── 해상도 자동 보정 ───
+# 내장 타깃 템플릿은 아래 세로 크기의 WGC 클라이언트 프레임에서 잘라낸 '픽셀 조각'입니다.
+# 게임을 다른 해상도로 켜면 UI가 그 비율만큼 커져 단일 배율 matchTemplate이 전부 실패합니다.
+# 그래서 캡처 프레임을 이 세로 크기로 정규화한 뒤 같은 템플릿으로 매칭합니다.
+#
+# 세로(높이) 기준인 이유: 게임 UI는 세로 해상도에 맞춰 커지므로 2560x1440은 1.34배가 되지만,
+# 21:9(2560x1080)처럼 가로만 넓어지는 해상도에서는 UI 크기가 그대로여서 배율이 1.0이 됩니다.
+# 가로 기준으로 잡으면 후자에서 멀쩡한 화면을 잘못 축소하게 됩니다.
+TEMPLATE_REFERENCE_HEIGHT = 1048
+# 창 맞춤(window_fit)이 목표로 삼는 WGC 프레임 크기. 템플릿을 잘라낸 그 크기입니다.
+TEMPLATE_REFERENCE_WIDTH = 1928
+TEMPLATE_REFERENCE_SIZE = (TEMPLATE_REFERENCE_WIDTH, TEMPLATE_REFERENCE_HEIGHT)
+# 이 오차 안이면 리사이즈를 건너뜁니다(기존 1920 사용자 성능 영향 0).
+CAPTURE_SCALE_DEADZONE = 0.01
+# 지원 범위를 벗어난 배율은 보정하지 않습니다(오검출 상태로 클릭하는 것보다 안전).
+CAPTURE_SCALE_MIN = 0.5
+CAPTURE_SCALE_MAX = 2.5
+
+
+def capture_normalization_scale(frame_height: int) -> float:
+    """캡처 프레임 세로를 템플릿 기준 세로로 맞추는 배율을 돌려줍니다.
+
+    1.0이면 보정하지 않습니다(같은 해상도이거나, 지원 범위를 벗어나 보정을 포기한 경우).
+    정규화 프레임 크기 = 원본 크기 / 배율.
+    """
+
+    try:
+        height = int(frame_height)
+    except (TypeError, ValueError):
+        return 1.0
+    if height <= 0 or TEMPLATE_REFERENCE_HEIGHT <= 0:
+        return 1.0
+
+    scale = height / float(TEMPLATE_REFERENCE_HEIGHT)
+    if abs(scale - 1.0) <= CAPTURE_SCALE_DEADZONE:
+        return 1.0
+    if not (CAPTURE_SCALE_MIN <= scale <= CAPTURE_SCALE_MAX):
+        return 1.0
+    return scale
+
 
 @dataclass
 class TargetImage:

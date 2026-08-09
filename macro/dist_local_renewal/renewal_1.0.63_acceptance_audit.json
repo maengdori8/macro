@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "version": "1.0.63",
+  "commit": "eadfce018e68c0430a6dac12a57379c10d0b64a2",
+  "artifact": "C:\\Users\\m\\Documents\\GitHub\\macro\\macro\\dist_local_renewal\\renewal_macro.exe",
+  "sha256": "17417968F65E5F7D74CFC5CEA0314126474EA2635DE202742BC8C0640218EEB4",
+  "local_only": true,
+  "github_push": false,
+  "release": false,
+  "automatic_update": false,
+  "implementation_passed": true,
+  "live_acceptance_passed": false,
+  "passed": false,
+  "validation": {
+    "full_unittest": {
+      "tests_run": 177,
+      "passed": 175,
+      "failed": 0,
+      "skipped_missing_local_fixtures": 2,
+      "elapsed_seconds": 104.637
+    },
+    "timing_repeats": {
+      "runs": 10,
+      "tests_per_run": 4,
+      "passed": true
+    },
+    "wgc_gap_recovery_repeats": {
+      "runs": 20,
+      "passed": true
+    },
+    "unchanged_soak": {
+      "cycles": 100000,
+      "frames": 200000,
+      "orders": 0,
+      "ambiguous": 0,
+      "rss_growth_mb": 0.0,
+      "passed": true
+    },
+    "input_latency": {
+      "runs": 1000,
+      "completed": 1000,
+      "failures": 0,
+      "second_frame_to_input_p50_ms": 0.30525,
+      "second_frame_to_input_p95_ms": 0.62117,
+      "second_frame_to_input_p99_ms": 1.294327,
+      "second_frame_to_input_max_ms": 3.4051,
+      "passed": true
+    },
+    "exe_startup_selftest": {
+      "runs": 10,
+      "failures": 0,
+      "p95_ms": 3385.93902,
+      "maximum_ms": 3508.5831,
+      "passed": true
+    },
+    "live_preflight": {
+      "requested_seconds": 60,
+      "finished": true,
+      "passed": false,
+      "order_inputs": 0,
+      "open_input_attempts": 0,
+      "capture_restarts": 34,
+      "calibrated_frame_size": [1920, 1040],
+      "blocker": "FC window was not on the calibrated selected-player purchase-ready list screen",
+      "fail_closed": true
+    },
+    "live_25_minute": {
+      "requested_seconds": 1500,
+      "started": false,
+      "passed": false,
+      "blocker": "The no-order preflight did not prove the required starting screen"
+    }
+  }
+}

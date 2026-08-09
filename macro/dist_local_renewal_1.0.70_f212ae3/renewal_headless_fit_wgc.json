@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "started_at_unix": 1785683367.9734116,
+  "passed": false,
+  "error_type": "RuntimeError",
+  "error": "FC ONLINE이 목표 크기를 적용하지 않았습니다: 1940x1064",
+  "finished_at_unix": 1785683368.776213
+}

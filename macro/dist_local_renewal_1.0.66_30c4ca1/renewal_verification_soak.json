@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "pid": 5616,
+  "finished": false,
+  "started_at_unix": 1785669811.0906878,
+  "updated_at_unix": 1785669881.1278844,
+  "requested_seconds": 1500.0,
+  "elapsed_seconds": 70.03716780000832,
+  "target_hz": 120.0,
+  "frames": 8405,
+  "unchanged_frames": 8389,
+  "changed_frames": 16,
+  "false_changes": 0,
+  "false_order_candidates": 0,
+  "guard_rejections": 0,
+  "changed_misses": 0,
+  "changed_pair_mismatches": 0,
+  "stable_changed_detections": 8,
+  "input_calls": 0,
+  "frame_interval_ms": {
+    "count": 8404,
+    "average": 8.333432175154327,
+    "p50": 8.0,
+    "p95": 9.05,
+    "p99": 10.100000000000001,
+    "p99_9": 22.0,
+    "maximum": 162.42320000310428
+  },
+  "classify_ms": {
+    "count": 8405,
+    "average": 0.1625145032844971,
+    "p50": 0.03,
+    "p95": 0.43,
+    "p99": 0.87,
+    "p99_9": 3.11,
+    "maximum": 32.434499997179955
+  },
+  "guard_ms": {
+    "count": 8405,
+    "average": 1.04162958962919,
+    "p50": 0.41000000000000003,
+    "p95": 2.79,
+    "p99": 4.61,
+    "p99_9": 10.950000000000001,
+    "maximum": 98.77890000643674
+  },
+  "cpu_total_percent": {
+    "count": 69,
+    "average": 1.3833287969460275,
+    "p50": 1.28,
+    "p95": 2.09,
+    "p99": 2.97,
+    "p99_9": 2.97,
+    "maximum": 2.9743046351875724,
+    "overall_average": 1.3815742489579828
+  },
+  "working_set_mb": {
+    "count": 69,
+    "average": 66.60229846014492,
+    "p50": 66.60000000000001,
+    "p95": 66.7,
+    "p99": 66.8,
+    "p99_9": 66.8,
+    "maximum": 66.81640625
+  },
+  "private_mb": {
+    "count": 69,
+    "average": 45.82772871376812,
+    "p50": 45.800000000000004,
+    "p95": 45.900000000000006,
+    "p99": 45.900000000000006,
+    "p99_9": 45.900000000000006,
+    "maximum": 45.94921875
+  },
+  "memory_growth_mb": 2.28125,
+  "private_growth_mb": 1.8359375,
+  "os_cpu_seconds": 8.109375,
+  "passed": false
+}

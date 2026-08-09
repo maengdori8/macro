@@ -79,6 +79,7 @@ from macroapp.skip_experiment import (
     save_device_learning,
 )
 from macroapp.window import InactiveManager
+from macroapp import window_fit
 
 
 def _ocr_regions_fingerprint(*regions: np.ndarray) -> tuple:
@@ -207,6 +208,9 @@ class AutomationApp:
         self._reset_buttons: dict[str, tk.Button] = {}
         self._threshold_canvases: dict[str, tk.Canvas] = {}
         self._capturing_template = False
+        # 게임 창 맞춤 상태(되돌리기용 스냅샷).
+        self.fit_status_var = tk.StringVar(value="")
+        self._fit_snapshot = None
 
         self.stop_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
@@ -984,6 +988,33 @@ class AutomationApp:
                 padx=(0, 12),
             )
 
+        # ── 창 맞춤: 게임 창을 템플릿 기준 크기(1928x1048)로 맞춰 배율 보정 자체를 없앰 ──
+        fit_row = self._setting_row(settings_panel, "게임 창")
+        self.fit_button = self._button(
+            fit_row,
+            "기준 크기로 맞춤",
+            self.fit_game_window,
+            tone="ghost",
+            small=True,
+        )
+        self.fit_button.pack(side=tk.LEFT)
+        self.restore_fit_button = self._button(
+            fit_row,
+            "원래대로",
+            self.restore_game_window,
+            tone="ghost",
+            small=True,
+        )
+        self.restore_fit_button.pack(side=tk.LEFT, padx=(6, 0))
+        tk.Label(
+            fit_row,
+            textvariable=self.fit_status_var,
+            bg=c["panel"],
+            fg=c["muted"],
+            font=self._font(8),
+            anchor=tk.W,
+        ).pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+
         session_panel = self._panel(right_column, padx=18, pady=16)
         session_panel.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -1235,6 +1266,81 @@ class AutomationApp:
         else:
             self.log(f"[캡처] {name}은(는) 이미 기본 이미지를 사용하고 있습니다.")
         self._refresh_target_row(name)
+
+    # ── 게임 창 맞춤 ──
+
+    def fit_game_window(self) -> None:
+        """게임 창을 템플릿 기준 WGC 프레임 크기로 맞춥니다(전면화 없음).
+
+        기준 크기가 되면 해상도 보정 배율이 1.0이 되어 리샘플링 없이 원본 그대로
+        매칭합니다. 2560 같은 해상도에서도 보정으로 동작하지만, 맞추면 점수가 더 높습니다.
+        """
+
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.log("[창 맞춤] 자동화 실행 중에는 창 크기를 바꿀 수 없습니다. 정지 후 다시 시도하세요.")
+            self.fit_status_var.set("실행 중에는 불가")
+            return
+
+        self.fit_status_var.set("맞추는 중...")
+        self.root.update_idletasks()
+
+        manager = InactiveManager(self.window_title_var.get(), logger=self.log)
+        if not manager.find_window():
+            self.fit_status_var.set("게임 창을 찾지 못했습니다")
+            self.log("[창 맞춤] 대상 창을 찾지 못했습니다. 게임이 실행 중인지 확인하세요.")
+            return
+
+        def measure() -> Optional[tuple[int, int]]:
+            # 크기를 바꾸면 새 캡처 세션이 필요하므로 매번 새로 열어 측정합니다.
+            manager.stop_capture()
+            for _ in range(60):
+                if manager.capture_client_area(window_validated=True) is not None:
+                    return manager.capture_engine.get_frame_size()
+                time.sleep(0.1)
+            return None
+
+        try:
+            result = window_fit.fit_window_to_reference(
+                manager.hwnd,
+                measure,
+                logger=self.log,
+            )
+        except Exception as exc:  # noqa: BLE001 - UI 버튼에서 예외가 새면 안 됩니다.
+            self.fit_status_var.set("맞춤 실패")
+            self.log(f"[창 맞춤] 예기치 못한 오류: {exc}")
+            return
+        finally:
+            manager.stop_capture()
+
+        self.log(f"[창 맞춤] {result.message}")
+        if result.ok and result.changed:
+            self._fit_snapshot = result.snapshot
+            self.fit_status_var.set(f"{result.after[0]}x{result.after[1]} 맞춤 완료")
+        elif result.ok:
+            self.fit_status_var.set(f"이미 기준 크기 ({result.before[0]}x{result.before[1]})")
+        else:
+            self.fit_status_var.set("맞춤 실패 — 로그 확인")
+
+    def restore_game_window(self) -> None:
+        """창 맞춤 이전 크기·위치로 되돌립니다."""
+
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.log("[창 맞춤] 자동화 실행 중에는 창 크기를 바꿀 수 없습니다.")
+            return
+        if self._fit_snapshot is None:
+            self.fit_status_var.set("되돌릴 기록이 없습니다")
+            return
+
+        try:
+            restored = window_fit.restore_window_no_activate(self._fit_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[창 맞춤] 복원 실패: {exc}")
+            self.fit_status_var.set("복원 실패")
+            return
+
+        self._fit_snapshot = None
+        self.fit_status_var.set(f"원래 크기로 복원 ({restored.width}x{restored.height})")
+        self.log(f"[창 맞춤] 원래 크기로 되돌렸습니다 ({restored.width}x{restored.height}).")
 
     def _refresh_all_target_rows(self) -> None:
         for name in self.target_names:
@@ -3097,6 +3203,13 @@ class AutomationApp:
             self._set_accent_button_state(button, enabled=not running)
         for button in self._reset_buttons.values():
             self._set_accent_button_state(button, enabled=not running)
+        # 실행 중 창 크기를 바꾸면 캡처 세션과 좌표가 어긋나므로 잠급니다.
+        for button in (
+            getattr(self, "fit_button", None),
+            getattr(self, "restore_fit_button", None),
+        ):
+            if button is not None:
+                self._set_accent_button_state(button, enabled=not running)
 
 
 class LicenseDialog:

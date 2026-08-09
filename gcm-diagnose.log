@@ -1,0 +1,199 @@
+﻿Diagnose log at 2026-08-03T06:42:54Z
+
+AppPath: C:\Program Files\Git\mingw64\bin\git-credential-manager.exe
+InstallDir: C:\Program Files\Git\mingw64\bin\
+Version: 2.6.1+786ab03440ddc82e807a97c0e540f5247e44cec6
+
+------------
+Diagnostic: Environment
+Skipped: False
+Success: True
+Exception: None
+Log:
+OSType: Windows
+OSVersion: 10.0 (build 19045)
+Reading environment variables... OK
+ Variables:
+HOMEPATH=\Users\m
+DriverData=C:\Windows\System32\Drivers\DriverData
+COMPUTERNAME=SecHex-ILYPOZX
+GIT_TRACE2_PARENT_SID=d34227f4-44f3-4a65-94ef-0fd18c0a3920
+CommonProgramFiles(x86)=C:\Program Files (x86)\Common Files
+OneDrive=C:\Users\m\OneDrive
+CODEX_THREAD_ID=019f7d17-cebb-7850-9aae-bd9c0dfcb35c
+LOG_FORMAT=json
+TMP=C:\Users\m\AppData\Local\Temp
+PROCESSOR_REVISION=9705
+PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL
+GIT_EXEC_PATH=C:/Program Files/Git/mingw64/libexec/git-core
+TEMP=C:\Users\m\AppData\Local\Temp
+LOCALAPPDATA=C:\Users\m\AppData\Local
+MSYSTEM=MINGW64
+TERM=xterm-256color
+COLORTERM=truecolor
+JAVA_HOME=C:\Program Files\Java\jdk-21
+USERDOMAIN=SecHex-ILYPOZX
+Path=C:/Program Files/Git/mingw64/libexec/git-core;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\m\bin;C:\Users\m\.codex\tmp\arg0\codex-arg0ummFwu;C:\Users\m\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\override;C:\Program Files\Common Files\Oracle\Java\javapath;C:\Program Files (x86)\Common Files\Oracle\Java\java8path;C:\Program Files (x86)\Common Files\Oracle\Java\javapath;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Program Files\Bandizip\;C:\Program Files\nodejs\;C:\Program Files\Tailscale\;C:\Users\m\Downloads\gradle-7.6;C:\flutter\bin;C:\Program Files\Git\cmd;C:\Users\m\AppData\Local\Programs\Python\Python313;C:\Users\m\AppData\Local\Programs\Python\Python313\Scripts;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\Process Lasso\;;C:\Program Files\Sunshine;C:\Program Files\Sunshine\tools;C:\Program Files (x86)\cloudflared\;C:\Users\m\Downloads\gradle-7.6\bin;C:\Users\m\AppData\Local\Microsoft\WindowsApps;C:\Users\m\.dotnet\tools;C:\Users\m\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\m\AppData\Roaming\npm;C:\Users\m\AppData\Local\GitHubDesktop\bin;C:\Users\m\.rokit\bin;C:\Users\m\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin;C:\Users\m\AppData\Local\omp;C:\Users\m\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\fallback;C:\Users\m\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\git\cmd;C:\Users\m\AppData\Local\OpenAI\Codex\bin\3e42d49ad3e35a50;C:\Program Files\WindowsApps\OpenAI.Codex_26.727.6591.0_x64__2p2nqsd0c76g0\app\resources
+PROCESSOR_LEVEL=6
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 151 Stepping 5, GenuineIntel
+TMPDIR=C:\Users\m\AppData\Local\Temp
+GCM_GUI_PROMPT=False
+ProgramFiles(x86)=C:\Program Files (x86)
+PUBLIC=C:\Users\Public
+NUMBER_OF_PROCESSORS=12
+CommonProgramFiles=C:\Program Files (x86)\Common Files
+CODEX_PERMISSION_PROFILE=:danger-full-access
+LC_CTYPE=C.UTF-8
+GRADLE_HOME=C:\Users\m\Downloads\gradle-7.6
+BROWSER_USE_AVAILABLE_BACKENDS=chrome,iab
+PLINK_PROTOCOL=ssh
+ProgramData=C:\ProgramData
+NODE_REPL_TRUSTED_CODE_PATHS=C:\Users\m\.codex
+ProgramFiles=C:\Program Files (x86)
+ProgramW6432=C:\Program Files
+HOME=C:\Users\m
+NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S=c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e,f204d340535055781952b10ed396de20b842f00a19e430852f7e121ad1ce91f6
+CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop
+CommonProgramW6432=C:\Program Files\Common Files
+LOGONSERVER=\\SecHex-ILYPOZX
+USERPROFILE=C:\Users\m
+SystemRoot=C:\Windows
+USERDOMAIN_ROAMINGPROFILE=SecHex-ILYPOZX
+APPDATA=C:\Users\m\AppData\Roaming
+HOMEDRIVE=C:
+RUST_LOG=warn
+PSModulePath=C:\Users\m\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules
+USERNAME=m
+PROCESSOR_ARCHITEW6432=AMD64
+PROCESSOR_ARCHITECTURE=x86
+OS=Windows_NT
+ComSpec=C:\Windows\system32\cmd.exe
+DXSDK_DIR=C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\
+SystemDrive=C:
+windir=C:\Windows
+ALLUSERSPROFILE=C:\ProgramData
+
+
+------------
+Diagnostic: File system
+Skipped: False
+Success: True
+Exception: None
+Log:
+Temporary directory is 'C:\Users\m\AppData\Local\Temp\'...
+Checking basic file I/O...
+Writing to temporary file 'C:\Users\m\AppData\Local\Temp\cce341ecbb12c3611f43b458'... OK
+Reading from temporary file 'C:\Users\m\AppData\Local\Temp\cce341ecbb12c3611f43b458'... OK
+Deleting temporary file 'C:\Users\m\AppData\Local\Temp\cce341ecbb12c3611f43b458'... OK
+Testing IFileSystem instance...
+UserHomePath: C:\Users\m
+UserDataDirectoryPath: C:\Users\m\.gcm
+GetCurrentDirectory(): C:\Users\m\Documents\GitHub\macro
+
+------------
+Diagnostic: Networking
+Skipped: False
+Success: True
+Exception: None
+Log:
+Checking networking and HTTP stack...
+Creating HTTP client... OK
+IsNetworkAvailable: True
+Sending HEAD request to http://example.com...Sending HEAD request to https://example.com... OK
+ OK
+Acquiring free TCP port... OK
+Testing local HTTP loopback connections...
+Creating new HTTP listener for http://localhost:54797/... OK
+Waiting for loopback connection... OK
+Writing response... OK
+Waiting for response data... OK
+Loopback connection data OK
+
+------------
+Diagnostic: Git
+Skipped: False
+Success: True
+Exception: None
+Log:
+Getting Git version... OK
+Git version is '2.51.2.windows.1'
+Locating current repository...Git repository at 'C:/Users/m/Documents/GitHub/macro/.git'
+ OK
+Listing all Git configuration... OK
+Git configuration:
+file:C:/Program Files/Git/etc/gitconfig	diff.astextplain.textconv=astextplain
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.clean=git-lfs clean -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.smudge=git-lfs smudge -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.process=git-lfs filter-process
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.required=true
+file:C:/Program Files/Git/etc/gitconfig	http.sslbackend=schannel
+file:C:/Program Files/Git/etc/gitconfig	core.autocrlf=true
+file:C:/Program Files/Git/etc/gitconfig	core.fscache=true
+file:C:/Program Files/Git/etc/gitconfig	core.symlinks=false
+file:C:/Program Files/Git/etc/gitconfig	pull.rebase=false
+file:C:/Program Files/Git/etc/gitconfig	credential.helper=manager
+file:C:/Program Files/Git/etc/gitconfig	credential.https://dev.azure.com.usehttppath=true
+file:C:/Program Files/Git/etc/gitconfig	init.defaultbranch=master
+file:C:/Users/m/.gitconfig	user.name=maengdori
+file:C:/Users/m/.gitconfig	user.email=2025233@sungil-i.kr
+file:C:/Users/m/.gitconfig	safe.directory=C:/
+file:C:/Users/m/.gitconfig	filter.lfs.clean=git-lfs clean -- %f
+file:C:/Users/m/.gitconfig	filter.lfs.smudge=git-lfs smudge -- %f
+file:C:/Users/m/.gitconfig	filter.lfs.process=git-lfs filter-process
+file:C:/Users/m/.gitconfig	filter.lfs.required=true
+file:.git/config	core.repositoryformatversion=0
+file:.git/config	core.filemode=false
+file:.git/config	core.bare=false
+file:.git/config	core.logallrefupdates=true
+file:.git/config	core.symlinks=false
+file:.git/config	core.ignorecase=true
+file:.git/config	submodule.active=.
+file:.git/config	remote.origin.url=https://github.com/maengdori8/macro.git
+file:.git/config	remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+file:.git/config	branch.main.remote=origin
+file:.git/config	branch.main.merge=refs/heads/main
+file:.git/config	branch.main.vscode-merge-base=origin/main
+file:.git/config	branch.codex/license-vending-inventory.remote=origin
+file:.git/config	branch.codex/license-vending-inventory.merge=refs/heads/main
+file:.git/config	branch.codex/local-renewal-1.0.32.vscode-merge-base=origin/main
+file:.git/config	branch.codex/local-renewal-1.0.32.remote=origin
+file:.git/config	branch.codex/local-renewal-1.0.32.merge=refs/heads/codex/local-renewal-1.0.32
+file:.git/config	branch.codex/manager-release-1.0.34.remote=origin
+file:.git/config	branch.codex/manager-release-1.0.34.merge=refs/heads/main
+
+
+------------
+Diagnostic: Credential storage
+Skipped: False
+Success: True
+Exception: None
+Log:
+ICredentialStore instance is of type: CredentialStore
+Writing test credential... OK
+Reading test credential... OK
+Deleting test credential... OK
+
+------------
+Diagnostic: Microsoft authentication (AAD/MSA)
+Skipped: False
+Success: True
+Exception: None
+Log:
+Broker is not enabled.
+Flow type is: Auto
+Gathering MSAL token cache data... OK
+CacheDirectory: C:\Users\m\AppData\Local\.IdentityService
+CacheFileName: msal.cache
+CacheFilePath: C:\Users\m\AppData\Local\.IdentityService\msal.cache
+Creating cache helper... OK
+Verifying MSAL token cache persistence... OK
+
+------------
+Diagnostic: GitHub API
+Skipped: False
+Success: True
+Exception: None
+Log:
+Using 'https://github.com/' as API target.
+Querying '/meta' endpoint... OK
+

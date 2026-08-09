@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "artifact": "C:\\Users\\m\\Documents\\GitHub\\macro_build_1.0.70_f212ae3\\macro\\dist_local_renewal\\renewal_macro.exe",
+  "started_at_unix": 1785683279.427473,
+  "finished_at_unix": 1785683300.983486,
+  "requested_runs": 10,
+  "completed_runs": 10,
+  "failures": [],
+  "return_codes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "timing_ms": {
+    "minimum": 2095.1416000025347,
+    "median": 2123.435249995964,
+    "p95": 2284.9685000001045,
+    "p99": 2296.130659996561,
+    "maximum": 2298.921199995675
+  },
+  "passed": true
+}
