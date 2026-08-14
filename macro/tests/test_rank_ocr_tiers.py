@@ -1,3 +1,4 @@
+from macroapp import session
 from macroapp.gui import AutomationApp
 from macroapp.ocr import RankConsensus, _canon_tier, _parse_rank_text
 
@@ -58,6 +59,9 @@ def _bare_app(committed):
     app._maybe_stop_on_target = lambda *_args: None
     app.queue_log = lambda *_args: None
     app._report_status = lambda **_kwargs: None
+    # 확정은 판수 카운터에 '이 패널에서 값이 나왔다'만 알린다(세는 건 패널이 사라질 때).
+    app._match_counter = session.MatchCounter()
+    app._session_tracker = session.SessionTracker()
     return app
 
 

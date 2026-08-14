@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from macroapp import gui
+from macroapp import gui, session
 
 
 class _Consensus:
@@ -23,6 +23,9 @@ def _app():
     app._rank_ocr_cache_hits = 0
     app._gate_fail_log_at = 0.0
     app._log_to_file_only = lambda _message: None
+    # 관측은 판수 카운터도 함께 먹인다(캐시 히트에서도 호출되는지가 이 테스트의 관심사).
+    app._match_counter = session.MatchCounter()
+    app._session_tracker = session.SessionTracker()
     return app
 
 

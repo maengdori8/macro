@@ -35,6 +35,8 @@ from macroapp.config import (
     RANK_OCR_COMMIT_AFTER_GONE,
     SKIP_A_MATCH_THRESHOLD,
     SKIP_S_MATCH_THRESHOLD,
+    SKIP_A_ICON_MATCH_THRESHOLD,
+    SKIP_S_ICON_MATCH_THRESHOLD,
 )
 
 # 등수 현실 범위(거짓 양성·자릿수 폭주 차단). 0/음수/비현실값은 버린다.
@@ -383,21 +385,42 @@ class RankConsensus:
         return (rank, tier, score)
 
 
-def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
-    """이미지(또는 일부 영역)에 SKIP/스킵 글자가 보이면 True. OCR 불가/실패 시 False.
+def classify_skip_prompt(image_bgr_or_gray: np.ndarray, logger=None):
+    """Return ``(has_skip, input_hint)`` from a single OCR pass.
 
-    대소문자 무관: 인식 텍스트를 소문자화하고 공백을 제거한 뒤 'skip'/'스킵' 부분일치.
+    The hint is deliberately conservative: ``"escape"`` is returned only
+    when OCR actually contains ESC together with SKIP text.  This separates a
+    captured ESC episode from later A/S template false positives without
+    guessing from coordinates or sending input.
     """
     if winocr is None:
-        return False
+        return (False, None)
     try:
         text = _recognize_text(image_bgr_or_gray)
     except Exception as exc:  # noqa: BLE001
         if logger:
             logger(f"[SKIP OCR] 인식 중 오류: {exc}")
-        return False
+        return (False, None)
     cleaned = _normalize_ocr_text(text).lower()
-    return any(tok in cleaned for tok in _SKIP_TOKENS)
+    has_skip = any(tok in cleaned for tok in _SKIP_TOKENS)
+    if not has_skip:
+        return (False, None)
+    if "esc" in cleaned:
+        return (True, "escape")
+    # FC의 일반 프롬프트는 ``아무 키 ... (Enter 키 제외)``처럼 표시된다.
+    # 한글 OCR이 깨져도 영문 Enter는 안정적으로 남으므로 A/S 템플릿보다
+    # 우선할 수 있는 명시적 일반 프롬프트 근거로 사용한다.
+    if "enter" in cleaned or "anykey" in cleaned or "any key" in cleaned:
+        return (True, "any_key")
+    if "start" in cleaned:
+        return (True, "start")
+    return (True, None)
+
+
+def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
+    """이미지(또는 일부 영역)에 SKIP/스킵 글자가 보이면 True."""
+
+    return classify_skip_prompt(image_bgr_or_gray, logger=logger)[0]
 
 
 # '(A) SKIP'(초록 A 버튼이 붙은 스킵) 전용 템플릿. 빌드 시 gen_assets가 target_skip_a.png를
@@ -492,9 +515,28 @@ def match_skip_a(image_gray: np.ndarray, base_dir,
         _, mx, _, max_loc = cv2.minMaxLoc(res)
     except Exception:
         return (False, 0.0, None)
+    # 공통 SKIP 글자만 일치하는 일반 프롬프트를 A형으로 오인하지 않도록,
+    # 같은 위치의 왼쪽 A 아이콘도 독립적으로 검증한다.
+    icon_width = max(8, int(round(tw * 0.32)))
+    patch = image_gray[
+        max_loc[1]:max_loc[1] + th,
+        max_loc[0]:max_loc[0] + tw,
+    ]
+    try:
+        icon_score = float(cv2.matchTemplate(
+            patch[:, :icon_width],
+            tmpl[:, :icon_width],
+            cv2.TM_CCOEFF_NORMED,
+        )[0, 0])
+    except Exception:
+        icon_score = 0.0
     # 매칭 중심(이미지 좌표) — 호출부가 이 자리를 '클릭'해서 A 없이 스킵할 수 있게 반환.
     center = (int(max_loc[0] + tw // 2), int(max_loc[1] + th // 2))
-    return (float(mx) >= threshold, float(mx), center)
+    return (
+        float(mx) >= threshold and icon_score >= SKIP_A_ICON_MATCH_THRESHOLD,
+        float(mx),
+        center,
+    )
 
 
 def match_skip_s(
@@ -509,6 +551,7 @@ def match_skip_s(
     ih, iw = image_gray.shape[:2]
     best_score = 0.0
     best_center = None
+    matched = False
     for template in templates:
         th, tw = template.shape[:2]
         if th > ih or tw > iw:
@@ -528,4 +571,22 @@ def match_skip_s(
                 int(location[0] + tw // 2),
                 int(location[1] + th // 2),
             )
-    return (best_score >= float(threshold), best_score, best_center)
+        icon_width = max(8, int(round(tw * 0.40)))
+        patch = image_gray[
+            location[1]:location[1] + th,
+            location[0]:location[0] + tw,
+        ]
+        try:
+            icon_score = float(cv2.matchTemplate(
+                patch[:, :icon_width],
+                template[:, :icon_width],
+                cv2.TM_CCOEFF_NORMED,
+            )[0, 0])
+        except Exception:
+            icon_score = 0.0
+        if (
+            float(score) >= float(threshold)
+            and icon_score >= SKIP_S_ICON_MATCH_THRESHOLD
+        ):
+            matched = True
+    return (matched, best_score, best_center)

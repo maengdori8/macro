@@ -43,6 +43,7 @@ class ForegroundGuardTests(unittest.TestCase):
         self.assertFalse(result.attempted)
         self.assertFalse(called)
         self.assertEqual(result.reason, "target_already_foreground")
+        self.assertIsNone(result.action_started_at)
 
     def test_accepts_action_when_foreground_never_changes(self) -> None:
         result = run_guarded_inactive_action(
@@ -54,6 +55,7 @@ class ForegroundGuardTests(unittest.TestCase):
         self.assertTrue(result.action_ok)
         self.assertTrue(result.invariant_ok)
         self.assertEqual(result.foreground_before, result.foreground_after)
+        self.assertIsNotNone(result.action_started_at)
 
     def test_allows_user_to_switch_between_other_foreground_windows(self) -> None:
         values = itertools.chain([10, 10, 20, 30], itertools.repeat(30))
@@ -131,6 +133,27 @@ class SkipExperimentTrackerTests(unittest.TestCase):
         candidate, _ = tracker.choose(3.0)
         self.assertEqual(candidate, "winner")
 
+    def test_control_offsets_cycle_without_shortening_mandatory_control(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("control_noop", "route"),
+            result_window_seconds=1.0,
+            attempt_gap_seconds=0.0,
+            confirm_successes=3,
+            control_seconds=3.0,
+            control_offsets=(0.0, 0.17, 0.41, 0.73),
+            sham_candidate="control_noop",
+            sham_every=4,
+        )
+
+        observed = []
+        for episode in range(4):
+            started = float(episode * 10)
+            self.assertEqual(tracker.choose(started), (None, None))
+            observed.append(tracker.episode_control_seconds)
+            tracker.prompt_disappeared(started + 0.1)
+
+        self.assertEqual(observed, [3.0, 3.17, 3.41, 3.73])
+
     def test_failed_restored_candidate_is_invalidated(self) -> None:
         tracker = SkipExperimentTracker(
             ("winner", "other"),
@@ -147,7 +170,9 @@ class SkipExperimentTrackerTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "failed")
         self.assertIsNone(tracker.learned)
-        candidate, _ = tracker.choose(0.1)
+        self.assertEqual(tracker.choose(0.1), (None, None))
+        tracker.prompt_disappeared(0.2)
+        candidate, _ = tracker.choose(1.0)
         self.assertEqual(candidate, "other")
 
     def test_cycles_after_visible_prompt_timeout(self) -> None:
@@ -163,6 +188,9 @@ class SkipExperimentTrackerTests(unittest.TestCase):
 
         candidate, expired = tracker.choose(1.1)
         self.assertEqual(expired.status, "failed")
+        self.assertIsNone(candidate, "같은 프롬프트에 두 후보를 섞으면 안 됨")
+        tracker.prompt_disappeared(1.2)
+        candidate, _ = tracker.choose(2.0)
         self.assertEqual(candidate, "two")
 
     def test_learns_only_after_repeated_prompt_exits(self) -> None:
@@ -192,7 +220,9 @@ class SkipExperimentTrackerTests(unittest.TestCase):
         outcome = tracker.record_attempt(candidate, 0.0, _guard(invariant=False))
         self.assertEqual(outcome.status, "quarantined")
         self.assertIn("unsafe", tracker.quarantined)
-        next_candidate, _ = tracker.choose(0.1)
+        self.assertEqual(tracker.choose(0.1), (None, None))
+        tracker.prompt_disappeared(0.2)
+        next_candidate, _ = tracker.choose(1.0)
         self.assertEqual(next_candidate, "safe")
 
     def test_failed_action_advances_without_waiting(self) -> None:
@@ -205,7 +235,9 @@ class SkipExperimentTrackerTests(unittest.TestCase):
         candidate, _ = tracker.choose(0.0)
         outcome = tracker.record_attempt(candidate, 0.0, _guard(ok=False))
         self.assertEqual(outcome.status, "failed")
-        next_candidate, _ = tracker.choose(0.1)
+        self.assertEqual(tracker.choose(0.1), (None, None))
+        tracker.prompt_disappeared(0.2)
+        next_candidate, _ = tracker.choose(1.0)
         self.assertEqual(next_candidate, "good")
 
     def test_waits_for_no_input_control_before_candidate(self) -> None:
@@ -377,6 +409,178 @@ class SkipExperimentTrackerTests(unittest.TestCase):
         self.assertEqual(outcome.status, "success")
         self.assertEqual(outcome.learned, "one")
 
+    def test_result_deadline_uses_first_absent_frame_not_confirmation_end(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("one",),
+            result_window_seconds=1.5,
+            attempt_gap_seconds=0.0,
+            confirm_successes=1,
+            exit_confirm_seconds=0.4,
+        )
+        candidate, _ = tracker.choose(0.0)
+        tracker.record_attempt(candidate, 0.0, _guard())
+
+        self.assertIsNone(tracker.prompt_disappeared(1.4))
+        outcome = tracker.prompt_disappeared(1.8)
+
+        self.assertEqual(outcome.status, "success")
+        self.assertAlmostEqual(outcome.latency_seconds, 1.4)
+        self.assertEqual(outcome.learned, "one")
+
+    def test_first_absent_frame_after_result_deadline_still_fails(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("one",),
+            result_window_seconds=1.5,
+            attempt_gap_seconds=0.0,
+            confirm_successes=1,
+            exit_confirm_seconds=0.4,
+        )
+        candidate, _ = tracker.choose(0.0)
+        tracker.record_attempt(candidate, 0.0, _guard())
+
+        self.assertIsNone(tracker.prompt_disappeared(1.6))
+        outcome = tracker.prompt_disappeared(2.01)
+
+        self.assertEqual(outcome.status, "failed")
+        self.assertAlmostEqual(outcome.latency_seconds, 1.6)
+        self.assertEqual(outcome.detail, "late_prompt_exit")
+
+    def test_persistent_prompt_reopens_only_after_washout_and_new_control(
+        self,
+    ) -> None:
+        tracker = SkipExperimentTracker(
+            ("one", "two"),
+            result_window_seconds=1.5,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            control_seconds=3.0,
+            persistent_retry_seconds=8.0,
+        )
+
+        self.assertEqual(tracker.choose(0.0), (None, None))
+        candidate, _ = tracker.choose(3.0)
+        self.assertEqual(candidate, "one")
+        tracker.record_attempt(candidate, 3.0, _guard())
+
+        self.assertIsNone(tracker.choose(5.0)[0])
+        self.assertEqual(tracker.failure_totals["one"], 1)
+        self.assertIsNone(tracker.choose(10.99)[0])
+
+        # Eight seconds after the first action begins a fresh episode, not an
+        # immediate action. Its own full three-second control still applies.
+        self.assertEqual(tracker.choose(11.0), (None, None))
+        self.assertIsNone(tracker.choose(13.99)[0])
+        candidate, _ = tracker.choose(14.0)
+        self.assertEqual(candidate, "two")
+
+    def test_three_restored_successes_enter_confirmation_phase(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("one", "two"),
+            result_window_seconds=1.5,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            confirmation_lock_successes=3,
+            real_allocation=("explore", "exploit"),
+        )
+        for _ in range(3):
+            self.assertTrue(tracker.restore_final_outcome("one", "success", 0.5))
+
+        candidate, _ = tracker.choose(10.0)
+
+        self.assertEqual(candidate, "one")
+        self.assertEqual(tracker.selection_mode, "confirm")
+        self.assertEqual(tracker.confirmation_candidate, "one")
+
+    def test_confirmation_failure_releases_lock_and_resumes_discovery(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("one", "two"),
+            result_window_seconds=1.0,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            confirmation_lock_successes=3,
+            real_allocation=("explore",),
+        )
+        for _ in range(3):
+            tracker.restore_final_outcome("one", "success", 0.5)
+        candidate, _ = tracker.choose(10.0)
+        tracker.record_attempt(candidate, 10.0, _guard())
+        outcome = tracker.expire_pending(11.1)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIsNone(tracker.confirmation_candidate)
+        self.assertIn("one", tracker.quarantined)
+
+        tracker.reset_episode()
+        candidate, _ = tracker.choose(20.0)
+        self.assertEqual(candidate, "two")
+        self.assertEqual(tracker.selection_mode, "explore")
+
+    def test_three_trials_retire_a_mixed_success_failure_route(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("unstable", "next"),
+            result_window_seconds=1.0,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            min_family_attempts=3,
+            real_allocation=("exploit",),
+        )
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "success", 0.4)
+        )
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "success", 0.5)
+        )
+        self.assertNotIn("unstable", tracker.quarantined)
+
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "failed", 1.1)
+        )
+
+        self.assertIn("unstable", tracker.quarantined)
+        self.assertIsNone(tracker.preferred)
+        self.assertEqual(tracker._select_exploit(), "next")
+
+    def test_third_trial_success_still_retires_a_previously_failed_route(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("unstable", "next"),
+            result_window_seconds=1.0,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            min_family_attempts=3,
+            real_allocation=("exploit",),
+        )
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "failed", 1.1)
+        )
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "success", 0.4)
+        )
+        self.assertNotIn("unstable", tracker.quarantined)
+
+        self.assertTrue(
+            tracker.restore_final_outcome("unstable", "success", 0.5)
+        )
+
+        self.assertIn("unstable", tracker.quarantined)
+        self.assertIsNone(tracker.preferred)
+        self.assertEqual(tracker._select_exploit(), "next")
+
+    def test_restored_sham_is_not_a_real_candidate_failure(self) -> None:
+        tracker = SkipExperimentTracker(
+            ("control_noop", "one"),
+            result_window_seconds=1.0,
+            attempt_gap_seconds=0.0,
+            confirm_successes=30,
+            sham_candidate="control_noop",
+            sham_every=5,
+        )
+        self.assertTrue(
+            tracker.restore_final_outcome(
+                "control_noop", "failed", None
+            )
+        )
+        self.assertEqual(tracker.sham_attempts, 1)
+        self.assertEqual(tracker.failure_totals, {})
+
 
 class SkipLearningStoreTests(unittest.TestCase):
     def test_round_trip_is_scoped_by_device_and_variant(self) -> None:
@@ -389,12 +593,19 @@ class SkipLearningStoreTests(unittest.TestCase):
                 save_device_learning(path, "device-a", "a", "SPOOF_A_HOLD")
             )
             self.assertTrue(
+                save_device_learning(path, "device-a", "generic", "PM_ESC_HOLD")
+            )
+            self.assertTrue(
                 save_device_learning(path, "device-b", "s", "PM_S_HOLD")
             )
 
             self.assertEqual(
                 load_device_learning(path, "device-a"),
-                {"a": "spoof_a_hold", "s": "char_s_hold"},
+                {
+                    "a": "spoof_a_hold",
+                    "s": "char_s_hold",
+                    "generic": "pm_esc_hold",
+                },
             )
             self.assertEqual(
                 load_device_learning(path, "device-b"),
@@ -404,7 +615,7 @@ class SkipLearningStoreTests(unittest.TestCase):
             self.assertTrue(remove_device_learning(path, "device-a", "s"))
             self.assertEqual(
                 load_device_learning(path, "device-a"),
-                {"a": "spoof_a_hold"},
+                {"a": "spoof_a_hold", "generic": "pm_esc_hold"},
             )
             self.assertTrue(remove_device_learning(path, "device-a", "s"))
 

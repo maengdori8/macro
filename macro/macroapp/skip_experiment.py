@@ -16,7 +16,7 @@ from typing import Callable, Optional, Sequence
 
 
 _LEARNING_FILE_LOCK = threading.Lock()
-LEARNING_SCHEMA_VERSION = 4
+LEARNING_SCHEMA_VERSION = 5
 
 
 def load_device_learning(path: Path, device_id: str) -> dict[str, str]:
@@ -35,7 +35,7 @@ def load_device_learning(path: Path, device_id: str) -> dict[str, str]:
         if not isinstance(device, dict):
             return {}
         result = {}
-        for variant in ("a", "s"):
+        for variant in ("a", "s", "generic"):
             candidate = device.get(variant)
             if isinstance(candidate, str) and candidate.strip():
                 result[variant] = candidate.strip().lower()
@@ -55,7 +55,7 @@ def save_device_learning(
     variant = str(variant).strip().lower()
     candidate = str(candidate).strip().lower()
     device_id = str(device_id).strip()
-    if variant not in {"a", "s"} or not candidate or not device_id:
+    if variant not in {"a", "s", "generic"} or not candidate or not device_id:
         return False
 
     path = Path(path)
@@ -106,7 +106,7 @@ def remove_device_learning(
 
     variant = str(variant).strip().lower()
     device_id = str(device_id).strip()
-    if variant not in {"a", "s"} or not device_id:
+    if variant not in {"a", "s", "generic"} or not device_id:
         return False
 
     path = Path(path)
@@ -156,6 +156,7 @@ class GuardedActionResult:
     invariant_ok: bool
     reason: str
     elapsed_seconds: float
+    action_started_at: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ def run_guarded_inactive_action(
     target_hwnd: int,
     *,
     poll_seconds: float = 0.005,
+    preserve_foreground: bool = False,
 ) -> GuardedActionResult:
     """Run ``action`` only while the target is inactive and watch the invariant.
 
@@ -249,8 +251,10 @@ def run_guarded_inactive_action(
             time.monotonic() - started,
         )
     action_ok = False
+    action_started_at = None
     reason = "action_failed"
     try:
+        action_started_at = time.monotonic()
         action_ok = bool(action())
         reason = "ok" if action_ok else "action_failed"
     except Exception as exc:  # noqa: BLE001 - result must preserve the experiment loop
@@ -263,9 +267,15 @@ def run_guarded_inactive_action(
         if after != samples[-1]:
             samples.append(after)
 
-    invariant_ok = target_hwnd not in samples
-    if not invariant_ok:
+    target_stayed_inactive = target_hwnd not in samples
+    foreground_preserved = all(value == before for value in samples)
+    invariant_ok = target_stayed_inactive and (
+        foreground_preserved if preserve_foreground else True
+    )
+    if not target_stayed_inactive:
         reason = "target_became_foreground"
+    elif preserve_foreground and not foreground_preserved:
+        reason = "foreground_changed"
 
     return GuardedActionResult(
         attempted=True,
@@ -276,6 +286,7 @@ def run_guarded_inactive_action(
         invariant_ok=invariant_ok,
         reason=reason,
         elapsed_seconds=time.monotonic() - started,
+        action_started_at=action_started_at,
     )
 
 
@@ -291,9 +302,17 @@ class SkipExperimentTracker:
         confirm_successes: int,
         learned: Optional[str] = None,
         control_seconds: float = 0.0,
+        control_offsets: Sequence[float] = (),
         exit_confirm_seconds: float = 0.0,
+        persistent_retry_seconds: float = 0.0,
         progressive_control: bool = False,
         control_ramp_successes: Optional[int] = None,
+        sham_candidate: Optional[str] = None,
+        sham_every: int = 0,
+        candidate_families: Optional[dict[str, str]] = None,
+        min_family_attempts: int = 0,
+        confirmation_lock_successes: int = 3,
+        real_allocation: Sequence[str] = ("exploit",),
     ) -> None:
         normalized = tuple(dict.fromkeys(
             str(name).strip().lower() for name in candidates if str(name).strip()
@@ -305,7 +324,15 @@ class SkipExperimentTracker:
         self.attempt_gap_seconds = max(0.0, float(attempt_gap_seconds))
         self.confirm_successes = max(1, int(confirm_successes))
         self.control_seconds = max(0.0, float(control_seconds))
+        normalized_offsets = tuple(
+            max(0.0, float(offset)) for offset in control_offsets
+        )
+        self.control_offsets = normalized_offsets or (0.0,)
         self.exit_confirm_seconds = max(0.0, float(exit_confirm_seconds))
+        self.persistent_retry_seconds = max(
+            0.0,
+            float(persistent_retry_seconds),
+        )
         self.progressive_control = bool(progressive_control)
         ramp_successes = (
             self.confirm_successes
@@ -332,28 +359,242 @@ class SkipExperimentTracker:
         self.control_passed = self.control_seconds <= 0.0
         self.episode_control_seconds = self.control_seconds
         self.absence_started_at: Optional[float] = None
+        # ── 가짜 입력 대조군(sham) ──
+        # 컷신은 상대가 눌러도 양쪽 다 끝나므로, "우리가 안 눌렀을 때의 종료율"을
+        # 같은 조건에서 실측하지 않으면 성공률이 상대의 스킵과 구분되지 않는다.
+        # sham_every 에피소드마다 아무 입력도 보내지 않는 후보를 넣어 기준선을 측정한다.
+        sham = sham_candidate.strip().lower() if sham_candidate else None
+        self.sham_candidate = sham if sham in self.candidates else None
+        self.sham_every = max(0, int(sham_every))
+        self.episode_index = 0
+        self._sham_episode = False
+        family_map = candidate_families or {}
+        self.candidate_families = {
+            name: str(family_map.get(name, name)).strip().lower() or name
+            for name in self.candidates
+        }
+        self.min_family_attempts = max(0, int(min_family_attempts))
+        self.confirmation_lock_successes = max(
+            1, int(confirmation_lock_successes)
+        )
+        # Discovery keeps the requested explore/exploit mix.  Once one
+        # candidate survives enough attributable episodes consecutively, the
+        # variant enters a dedicated confirmation phase so a 30-run streak is
+        # actually measurable.  Any failure immediately releases the lock.
+        self.confirmation_candidate: Optional[str] = self.learned
+        allocation = tuple(
+            str(mode).strip().lower()
+            for mode in real_allocation
+            if str(mode).strip().lower() in {"explore", "exploit"}
+        )
+        self.real_allocation = allocation or ("exploit",)
+        self.real_episode_index = 0
+        self.selection_mode: Optional[str] = None
+        self.selected_candidate: Optional[str] = None
+        self.attempted_this_episode = False
+        self.attempt_counts: dict[str, int] = {}
+        self.success_totals: dict[str, int] = {}
+        self.failure_totals: dict[str, int] = {}
+        self.latency_totals: dict[str, float] = {}
+        self.sham_attempts = 0
+        self.sham_successes = 0
+
+    def _real_candidates(self) -> list[str]:
+        return [
+            name for name in self.candidates
+            if name != self.sham_candidate and name not in self.quarantined
+        ]
+
+    def _family_attempts(self, family: str) -> int:
+        return sum(
+            self.attempt_counts.get(name, 0)
+            for name in self._real_candidates()
+            if self.candidate_families.get(name) == family
+        )
+
+    def _family_order(self) -> list[str]:
+        return list(dict.fromkeys(
+            self.candidate_families[name]
+            for name in self._real_candidates()
+        ))
+
+    def discovery_complete(self) -> bool:
+        families = self._family_order()
+        return bool(families) and all(
+            self._family_attempts(family) >= self.min_family_attempts
+            for family in families
+        )
+
+    def _select_explore(self) -> Optional[str]:
+        candidates = self._real_candidates()
+        if not candidates:
+            return None
+        families = self._family_order()
+        family_rank = {name: rank for rank, name in enumerate(families)}
+        # A newly added hypothesis must not inherit an old family's completed
+        # sample count and become permanently starved by exploit history. Keep
+        # the family round-robin, but first bring every concrete candidate to
+        # the same minimum sample floor used for family discovery.
+        under_sampled = [
+            name for name in candidates
+            if self.attempt_counts.get(name, 0) < self.min_family_attempts
+        ]
+        if under_sampled:
+            return min(
+                under_sampled,
+                key=lambda name: (
+                    self._family_attempts(self.candidate_families[name]),
+                    self.attempt_counts.get(name, 0),
+                    family_rank[self.candidate_families[name]],
+                    self.candidates.index(name),
+                ),
+            )
+        family = min(
+            families,
+            key=lambda name: (
+                self._family_attempts(name) >= self.min_family_attempts,
+                self._family_attempts(name),
+                family_rank[name],
+            ),
+        )
+        family_candidates = [
+            name for name in candidates
+            if self.candidate_families.get(name) == family
+        ]
+        return min(
+            family_candidates,
+            key=lambda name: (
+                self.attempt_counts.get(name, 0),
+                self.candidates.index(name),
+            ),
+        )
+
+    def _beats_sham_baseline(self, name: str) -> bool:
+        """Return whether a route has reproducible lift over natural exits."""
+
+        # Until a small baseline exists, preserve the ordinary discovery
+        # behavior.  Strict installs run a sham every fifth episode, so this
+        # grace period is short and avoids starving early discovery.
+        if self.sham_candidate is None or self.sham_attempts < 3:
+            return True
+        attempts = self.attempt_counts.get(name, 0)
+        successes = self.success_totals.get(name, 0)
+        if attempts < max(3, self.min_family_attempts) or successes < 2:
+            return False
+        sham_posterior = (
+            (self.sham_successes + 1.0) / (self.sham_attempts + 2.0)
+        )
+        candidate_posterior = (successes + 1.0) / (attempts + 2.0)
+        return candidate_posterior >= sham_posterior + 0.20
+
+    def _deserves_limited_retest(self, name: str) -> bool:
+        """Give a clean 1/1 or 2/2 signal one reproduction attempt only."""
+
+        attempts = self.attempt_counts.get(name, 0)
+        successes = self.success_totals.get(name, 0)
+        if attempts not in {1, 2} or successes != attempts:
+            return False
+        if self.sham_candidate is None or self.sham_attempts < 3:
+            return True
+        sham_posterior = (
+            (self.sham_successes + 1.0) / (self.sham_attempts + 2.0)
+        )
+        candidate_posterior = (successes + 1.0) / (attempts + 2.0)
+        return candidate_posterior >= sham_posterior + 0.20
+
+    def _select_exploit(self) -> Optional[str]:
+        # A natural/opponent exit is observable even when the sham sends no
+        # input.  Do not spend the exploit share on a single lucky coincidence
+        # or on a route whose Bayesian success estimate is indistinguishable
+        # from that measured baseline.  Such routes remain available to the
+        # explore share until they collect enough independent evidence.
+        if self.sham_candidate is None or self.sham_attempts < 3:
+            candidates = [
+                name for name in self._real_candidates()
+                if self.success_totals.get(name, 0) > 0
+            ]
+        else:
+            candidates = [
+                name for name in self._real_candidates()
+                if (
+                    self._beats_sham_baseline(name)
+                    or self._deserves_limited_retest(name)
+                )
+            ]
+        if not candidates:
+            return self._select_explore()
+
+        def score(name: str) -> tuple[float, int, float, int]:
+            attempts = self.attempt_counts.get(name, 0)
+            successes = self.success_totals.get(name, 0)
+            # Beta(1,1) posterior mean avoids promoting a single lucky success
+            # too aggressively while still letting reproducible candidates rise.
+            posterior = (successes + 1.0) / (attempts + 2.0)
+            average_latency = (
+                self.latency_totals.get(name, 0.0) / max(1, successes)
+            )
+            return (
+                posterior,
+                successes,
+                -average_latency,
+                -self.candidates.index(name),
+            )
+
+        return max(candidates, key=score)
+
+    def _select_candidate(self) -> Optional[str]:
+        if self._sham_episode:
+            return self.sham_candidate
+        if (
+            self.confirmation_candidate in self._real_candidates()
+        ):
+            return self.confirmation_candidate
+        if self.selection_mode == "exploit":
+            return self._select_exploit()
+        return self._select_explore()
 
     def _priorities(self) -> list[str]:
-        priorities = []
-        for name in (self.learned, self.preferred):
-            if name and name not in priorities:
-                priorities.append(name)
-        priorities.extend(
-            self.candidates[(self.index + offset) % len(self.candidates)]
-            for offset in range(len(self.candidates))
-        )
-        return [
-            candidate
-            for candidate in priorities
-            if candidate not in self.quarantined
-        ]
+        # 대조 에피소드에는 오직 sham만 시도한다. 학습값이 있어도 마찬가지 —
+        # 기준선은 실험 내내 계속 측정돼야 비교가 유효하다.
+        if self.selected_candidate is None:
+            self.selected_candidate = self._select_candidate()
+        return [self.selected_candidate] if self.selected_candidate else []
 
     def begin_episode(self, now: float) -> None:
         """Start the no-input control period for one visible prompt."""
 
         if self.control_started_at is None:
             self.control_started_at = float(now)
+            self.episode_index += 1
+            self._sham_episode = bool(
+                self.sham_candidate
+                and self.sham_every > 0
+                and self.episode_index % self.sham_every == 0
+                and self.sham_candidate not in self.quarantined
+            )
+            self.selected_candidate = None
+            self.attempted_this_episode = False
+            if self._sham_episode:
+                self.selection_mode = "sham"
+            elif self.confirmation_candidate in self._real_candidates():
+                self.selection_mode = "confirm"
+            else:
+                mode_index = self.real_episode_index % len(self.real_allocation)
+                self.selection_mode = self.real_allocation[mode_index]
+                self.real_episode_index += 1
             self.episode_control_seconds = self.control_seconds
+            if self._sham_episode and self.episode_control_seconds > 0.0:
+                offset_index = (self.episode_index - 1) % len(
+                    self.control_offsets
+                )
+                self.episode_control_seconds += self.control_offsets[
+                    offset_index
+                ]
+            if self._sham_episode:
+                # 대조군은 항상 전체 대조 시간을 쓴다. 램프가 적용되면 관찰 구간이
+                # 짧아져 기준선이 후보 시도와 다른 조건에서 측정된다.
+                self.control_passed = self.episode_control_seconds <= 0.0
+                return
             if self.progressive_control and self.control_seconds > 0.0:
                 priorities = self._priorities()
                 candidate = priorities[0] if priorities else None
@@ -376,6 +617,16 @@ class SkipExperimentTracker:
                         * stage_fraction
                         * stage_fraction
                     )
+            if not self._sham_episode and self.episode_control_seconds > 0.0:
+                # Cycle a deterministic non-negative offset after the
+                # mandatory control. Highlight input and sham trials therefore
+                # do not always sample the same residual replay lifetime.
+                offset_index = (self.episode_index - 1) % len(
+                    self.control_offsets
+                )
+                self.episode_control_seconds += self.control_offsets[
+                    offset_index
+                ]
             self.control_passed = self.episode_control_seconds <= 0.0
 
     def _control_ready(self, now: float) -> bool:
@@ -391,11 +642,43 @@ class SkipExperimentTracker:
         return True
 
     def _advance_past(self, candidate: str) -> None:
+        # 대조군은 스윕 순서 밖에서 끼어드는 것이므로 인덱스를 옮기면 안 된다.
+        # 옮기면 대조 에피소드마다 진짜 후보 하나가 차례를 건너뛴다.
+        if candidate == self.sham_candidate:
+            return
         try:
             current = self.candidates.index(candidate)
         except ValueError:
             return
         self.index = (current + 1) % len(self.candidates)
+
+    def _retire_observed_intermittent(self, candidate: str) -> bool:
+        """Retire an exact route once enough trials prove it intermittent.
+
+        A concrete delivery/timing shape with both attributable successes and
+        failures cannot be the zero-failure winner.  Wait for the requested
+        minimum of three trials before retiring it, so a single early outcome
+        never drives the search.  Materially different timings remain separate
+        candidates and continue through discovery.
+        """
+
+        if candidate == self.sham_candidate:
+            return False
+        minimum = max(3, self.min_family_attempts)
+        if (
+            self.attempt_counts.get(candidate, 0) < minimum
+            or self.success_totals.get(candidate, 0) <= 0
+            or self.failure_totals.get(candidate, 0) <= 0
+        ):
+            return False
+        self.quarantined.add(candidate)
+        if self.confirmation_candidate == candidate:
+            self.confirmation_candidate = None
+        if self.preferred == candidate:
+            self.preferred = None
+        if self.learned == candidate:
+            self.learned = None
+        return True
 
     def expire_pending(self, now: float) -> Optional[SkipOutcome]:
         attempt = self.pending
@@ -404,7 +687,15 @@ class SkipExperimentTracker:
         if now - attempt.attempted_at <= self.result_window_seconds:
             return None
         self.pending = None
+        self._record_final(attempt.candidate, success=False, latency=None)
         self.success_counts[attempt.candidate] = 0
+        self._retire_observed_intermittent(attempt.candidate)
+        if self.confirmation_candidate == attempt.candidate:
+            # A route that reached strict confirmation but then missed cannot
+            # be the zero-failure winner. Retire this concrete timing shape so
+            # discovery advances to a materially different hypothesis.
+            self.quarantined.add(attempt.candidate)
+            self.confirmation_candidate = None
         if self.preferred == attempt.candidate and self.learned != attempt.candidate:
             self.preferred = None
         if self.learned == attempt.candidate:
@@ -424,6 +715,22 @@ class SkipExperimentTracker:
         expired = self.expire_pending(now)
         if self.pending is not None:
             return None, expired
+        # One prompt is one independent experiment. Trying a second candidate
+        # on the same cutscene would mix both inputs and make attribution false.
+        # A highlight summary can remain forever, however. After a deliberately
+        # long input-free washout, open a new episode whose own control period
+        # keeps the next action at least control+retry seconds from the prior.
+        if self.attempted_this_episode:
+            can_retry_persistent = bool(
+                expired is None
+                and self.persistent_retry_seconds > 0.0
+                and now - self.last_attempt_at
+                >= self.persistent_retry_seconds
+            )
+            if not can_retry_persistent:
+                return None, expired
+            self.reset_episode()
+            self.begin_episode(now)
         if not self._control_ready(now):
             return None, expired
         if now - self.last_attempt_at < self.attempt_gap_seconds:
@@ -446,9 +753,13 @@ class SkipExperimentTracker:
         attempt = SkipAttempt(candidate, now, guard)
         if not guard.attempted:
             return SkipOutcome("deferred", candidate, detail=guard.reason)
+        self.attempted_this_episode = True
         if not guard.invariant_ok:
+            self._record_final(candidate, success=False, latency=None)
             self.quarantined.add(candidate)
             self.success_counts[candidate] = 0
+            if self.confirmation_candidate == candidate:
+                self.confirmation_candidate = None
             if self.learned == candidate:
                 self.learned = None
             if self.preferred == candidate:
@@ -456,7 +767,12 @@ class SkipExperimentTracker:
             self._advance_past(candidate)
             return SkipOutcome("quarantined", candidate, detail=guard.reason)
         if not guard.action_ok:
+            self._record_final(candidate, success=False, latency=None)
             self.success_counts[candidate] = 0
+            self._retire_observed_intermittent(candidate)
+            if self.confirmation_candidate == candidate:
+                self.quarantined.add(candidate)
+                self.confirmation_candidate = None
             if self.learned == candidate:
                 self.learned = None
             if self.preferred == candidate:
@@ -501,9 +817,25 @@ class SkipExperimentTracker:
                 latency_seconds=latency,
                 detail=detail,
             )
-        latency = max(0.0, now - attempt.attempted_at)
+        # The result deadline applies to the first frame where the prompt is
+        # absent.  ``now`` is deliberately later because the absence must then
+        # remain stable for ``exit_confirm_seconds``.  Comparing the deadline
+        # with ``now`` incorrectly subtracts the confirmation window from the
+        # allowed response time (for example, an exit at 1.34s confirmed at
+        # 1.74s was previously rejected against a 1.50s deadline).
+        disappeared_at = (
+            float(self.absence_started_at)
+            if self.absence_started_at is not None
+            else float(now)
+        )
+        latency = max(0.0, disappeared_at - attempt.attempted_at)
         if latency > self.result_window_seconds:
+            self._record_final(attempt.candidate, success=False, latency=latency)
             self.success_counts[attempt.candidate] = 0
+            self._retire_observed_intermittent(attempt.candidate)
+            if self.confirmation_candidate == attempt.candidate:
+                self.quarantined.add(attempt.candidate)
+                self.confirmation_candidate = None
             if self.learned == attempt.candidate:
                 self.learned = None
             if self.preferred == attempt.candidate:
@@ -520,20 +852,142 @@ class SkipExperimentTracker:
 
         count = self.success_counts.get(attempt.candidate, 0) + 1
         self.success_counts[attempt.candidate] = count
-        self.preferred = attempt.candidate
+        self._record_final(attempt.candidate, success=True, latency=latency)
+        retired_intermittent = self._retire_observed_intermittent(
+            attempt.candidate
+        )
         learned = None
-        if count >= self.confirm_successes:
-            self.learned = attempt.candidate
-            learned = attempt.candidate
+        if attempt.candidate == self.sham_candidate:
+            # 대조군의 '성공'은 상대/자연 종료를 측정한 값이다. 절대 학습하거나
+            # 선호 후보로 올리면 안 된다(그러면 매크로가 아무 입력도 안 하게 된다).
+            detail = f"sham_baseline={count}"
+        else:
+            if not retired_intermittent:
+                self.preferred = attempt.candidate
+                if (
+                    count >= self.confirmation_lock_successes
+                    and self._beats_sham_baseline(attempt.candidate)
+                ):
+                    self.confirmation_candidate = attempt.candidate
+                if count >= self.confirm_successes:
+                    self.learned = attempt.candidate
+                    learned = attempt.candidate
+            detail = f"confirmation={count}/{self.confirm_successes}"
+            if retired_intermittent:
+                detail += ";intermittent_quarantined"
         outcome = SkipOutcome(
             "success",
             attempt.candidate,
             latency_seconds=latency,
             learned=learned,
-            detail=f"confirmation={count}/{self.confirm_successes}",
+            detail=detail,
         )
         self.reset_episode()
         return outcome
+
+    def _record_final(
+        self,
+        candidate: str,
+        *,
+        success: bool,
+        latency: Optional[float],
+    ) -> None:
+        if candidate == self.sham_candidate:
+            self.sham_attempts += 1
+            if success:
+                self.sham_successes += 1
+            locked = self.confirmation_candidate
+            if locked and not self._beats_sham_baseline(locked):
+                self.confirmation_candidate = None
+                self.success_counts[locked] = 0
+                if self.learned == locked:
+                    self.learned = None
+            return
+        self.attempt_counts[candidate] = self.attempt_counts.get(candidate, 0) + 1
+        bucket = self.success_totals if success else self.failure_totals
+        bucket[candidate] = bucket.get(candidate, 0) + 1
+        if success and latency is not None:
+            self.latency_totals[candidate] = (
+                self.latency_totals.get(candidate, 0.0) + float(latency)
+            )
+
+    def diagnostics(self, candidate: Optional[str] = None) -> dict[str, object]:
+        name = candidate or self.selected_candidate
+        family = self.candidate_families.get(name) if name else None
+        return {
+            "selection_mode": self.selection_mode,
+            "discovery_complete": self.discovery_complete(),
+            "selected_family": family,
+            "candidate_attempts": self.attempt_counts.get(name, 0) if name else 0,
+            "candidate_successes": self.success_totals.get(name, 0) if name else 0,
+            "candidate_failures": self.failure_totals.get(name, 0) if name else 0,
+            "candidate_streak": self.success_counts.get(name, 0) if name else 0,
+            "confirmation_candidate": self.confirmation_candidate,
+            "confirmation_lock_successes": self.confirmation_lock_successes,
+            "persistent_retry_seconds": self.persistent_retry_seconds,
+            "family_attempts": self._family_attempts(family) if family else 0,
+            "minimum_family_attempts": self.min_family_attempts,
+            "sham_attempts": self.sham_attempts,
+            "sham_successes": self.sham_successes,
+            "quarantined": sorted(self.quarantined),
+        }
+
+    def restore_final_outcome(
+        self,
+        candidate: str,
+        status: str,
+        latency: Optional[float] = None,
+    ) -> bool:
+        """Replay one prior finalized event into a fresh tracker.
+
+        Monotonic timestamps and pending episodes are intentionally not
+        restored.  Only evidence used by scheduling and confirmation survives
+        a local restart.
+        """
+
+        candidate = str(candidate).strip().lower()
+        status = str(status).strip().lower()
+        if candidate not in self.candidates:
+            return False
+        if status == "quarantined":
+            self.quarantined.add(candidate)
+            if self.confirmation_candidate == candidate:
+                self.confirmation_candidate = None
+            return True
+        if status not in {"success", "failed"}:
+            return False
+
+        success = status == "success"
+        self._record_final(candidate, success=success, latency=latency)
+        self.episode_index += 1
+        if candidate != self.sham_candidate:
+            self.real_episode_index += 1
+        if candidate == self.sham_candidate:
+            return True
+        if success:
+            count = self.success_counts.get(candidate, 0) + 1
+            self.success_counts[candidate] = count
+            if not self._retire_observed_intermittent(candidate):
+                self.preferred = candidate
+                if (
+                    count >= self.confirmation_lock_successes
+                    and self._beats_sham_baseline(candidate)
+                ):
+                    self.confirmation_candidate = candidate
+                if count >= self.confirm_successes:
+                    self.learned = candidate
+        else:
+            self.success_counts[candidate] = 0
+            self._retire_observed_intermittent(candidate)
+            if self.confirmation_candidate == candidate:
+                self.quarantined.add(candidate)
+                self.confirmation_candidate = None
+            if self.preferred == candidate:
+                self.preferred = None
+            if self.learned == candidate:
+                self.learned = None
+            self._advance_past(candidate)
+        return True
 
     def reset_episode(self) -> None:
         """Drop an unattributed pending result when capture/automation restarts."""
@@ -543,3 +997,6 @@ class SkipExperimentTracker:
         self.control_passed = self.control_seconds <= 0.0
         self.episode_control_seconds = self.control_seconds
         self.absence_started_at = None
+        self.selected_candidate = None
+        self.selection_mode = None
+        self.attempted_this_episode = False

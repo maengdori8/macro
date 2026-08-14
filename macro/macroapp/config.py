@@ -6,6 +6,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from macroapp.skip_candidates import (
+    SKIP_A_CANDIDATES,
+    SKIP_GENERIC_ANY_KEY_CANDIDATES,
+    SKIP_GENERIC_CANDIDATES,
+    SKIP_GENERIC_ESCAPE_CANDIDATES,
+    SKIP_GENERIC_HIGHLIGHT_CANDIDATES,
+    SKIP_S_CANDIDATES,
+)
+
 import cv2
 import numpy as np
 
@@ -224,6 +233,7 @@ RANK_OCR_COMMIT_AFTER_GONE = 0.35 # 패널이 사라진 뒤 이 시간 지나면
 # A(=s)와 Start를 번갈아 눌러 넘긴다.
 SKIP_ENABLED = True
 SKIP_OCR_INTERVAL_SECONDS = 0.3   # 이 간격마다 SKIP 텍스트 확인(작을수록 빨리 반응·무거움)
+SKIP_PENDING_OCR_INTERVAL_SECONDS = 0.08  # 실험 중에만 경계 시각을 더 촘촘히 관찰
 SKIP_PRESS_DELAY_SECONDS = 0.05   # A·Start 누름 사이 지연
 # '(A) SKIP' 버튼 위치 클릭 시도 — 실측 결과 이 게임은 클릭으론 스킵 안 됨 → 기본 False.
 SKIP_A_CLICK = False
@@ -252,8 +262,8 @@ SKIP_A_BUTTON = ""
 #   "si_s"    = 현재 전면인 다른 앱으로만 전역 S가 전달돼 대상 게임의 비활성 입력이 아니다.
 # 진단: 어떤 것도 안 통하면 게임 입력이 RawInput/DirectInput 포그라운드 전용이라
 # 유저모드로는 '비활성+깜빡임0+유출0'이 원리적으로 불가(로그의 창 클래스 덤프로 판별).
-# focus_child_s = 자식 창이 있을 때만 SetFocus를 시도하는 안전 후보. 현재 FC 창에서는
-# 자식 대상이 없어 action_failed로 끝나며, top-level focus_s로 폴백하지 않는다.
+# focus_child_s도 내부적으로 전역 SendInput 스캔코드를 사용하므로 엄격 모드에서
+# 제외한다. 자식 포커스가 성공하더라도 다른 앱 입력 누출 0을 증명할 수 없다.
 # 실측 확정(사용자): 컷신 스킵을 넘기는 입력은 오직 '키보드 s' 또는 '게임패드 A' 뿐이다.
 # (다른 버튼·키·pause 메뉴로는 안 넘어감.) 게다가 hold-to-skip — 전면에서 'A 홀드'로 넘어감.
 # → 스윕이 훑는 축은 '다른 동작'이 아니라 [스킵 입력=s/A] × [전달 경로] × [탭 vs 홀드].
@@ -262,92 +272,80 @@ SKIP_A_BUTTON = ""
 #   게임패드 A는 값이 배경에 도달하나 컷신은 전면 게이팅이라 실패 예상(그래도 사실 확인용 포함).
 #   si_s(SendInput 전역)·focus_s(top-level SetFocus)는 비활성 계약 위반이라 영구 제외.
 # 전달 경로: char_s=WM_CHAR 딥(CEF), attach_state_s=GetKeyState 속이기, attach_post_s=큐공유+Post,
-#   pm_s=WM_KEYDOWN 딥, focus_child_s=자식 SetFocus(무깜빡임 기대). '*_hold'=1초 홀드.
+#   pm_s=WM_KEYDOWN 딥. '*_hold'=1초 홀드.
 SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
                         "attach_state_s_hold", "attach_state_s",
                         "attach_post_s_hold", "attach_post_s",
                         "pm_s_hold", "pm_s",
-                        "focus_child_s_hold", "focus_child_s",
                         "a_hold", "a")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-skip 대응)
 # 완전 비활성 실험 모드. 후보 입력 동안 별도 감시 스레드가 전면 HWND를 연속 확인하고,
 # 대상 게임 HWND가 한 번이라도 전면이 된 후보만 해당 세션에서 즉시 격리합니다.
 SKIP_STRICT_INACTIVE_EXPERIMENT = True
-SKIP_INACTIVE_EXPERIMENT_CANDIDATES = (
-    "spoof_start_hold",
-    "start_hold",
-    "click_prompt",
-    "spoof_a_hold",
-    "a_hold",
-    "spoof_char_s_hold",
-    "spoof_pm_s_hold",
-    "sync_char_s_hold",
-    "sync_pm_s_hold",
-    "char_s_hold",
-    "attach_state_s_hold",
-    "attach_post_s_hold",
-    "pm_s_hold",
-    "focus_child_s_hold",
-    "spoof_char_s",
-    "spoof_pm_s",
-    "sync_char_s",
-    "sync_pm_s",
-    "char_s",
-    "attach_state_s",
-    "attach_post_s",
-    "pm_s",
-    "focus_child_s",
-    "spoof_start",
-    "start",
-    "a",
-)
+SKIP_INACTIVE_EXPERIMENT_CANDIDATES = SKIP_A_CANDIDATES
 # 키보드 표시 장치에서는 화면에 [S] SKIP이 뜨며, 이 경우 실제 s 전달 경로를 먼저
 # 탐색해야 합니다. A 경로도 뒤에서 사실 확인하되 우선순위를 분리합니다.
-SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES = (
-    # Test the requested Start route first. All routes remain under the exact
-    # target-HWND foreground monitor and require the final three-second control.
-    "spoof_start_hold",
-    "start_hold",
-    "click_prompt",
-    "spoof_a_hold",
-    "spoof_char_s_hold",
-    "spoof_pm_s_hold",
-    "sync_char_s_hold",
-    "sync_pm_s_hold",
-    "spoof_char_s",
-    "spoof_pm_s",
-    "sync_char_s",
-    "sync_pm_s",
-    "char_s_hold",
-    "attach_state_s_hold",
-    "attach_post_s_hold",
-    "pm_s_hold",
-    "focus_child_s_hold",
-    "char_s",
-    "attach_state_s",
-    "attach_post_s",
-    "pm_s",
-    "focus_child_s",
-    "spoof_start",
-    "start",
-    "a_hold",
-    "a",
+SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES = SKIP_S_CANDIDATES
+SKIP_GENERIC_INACTIVE_EXPERIMENT_CANDIDATES = SKIP_GENERIC_CANDIDATES
+SKIP_GENERIC_ANY_KEY_INACTIVE_EXPERIMENT_CANDIDATES = (
+    SKIP_GENERIC_ANY_KEY_CANDIDATES
+)
+SKIP_GENERIC_ESCAPE_INACTIVE_EXPERIMENT_CANDIDATES = (
+    SKIP_GENERIC_ESCAPE_CANDIDATES
+)
+SKIP_GENERIC_HIGHLIGHT_INACTIVE_EXPERIMENT_CANDIDATES = (
+    SKIP_GENERIC_HIGHLIGHT_CANDIDATES
 )
 SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS = 0.20
+SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS = 3
+# After this many attributable consecutive successes, pause discovery for the
+# variant and run the same candidate through the 30-success confirmation gate.
+# One failure immediately returns the variant to 40/40 discovery.
+SKIP_EXPERIMENT_CONFIRMATION_LOCK_SUCCESSES = 3
+# sham 20%를 제외한 실제 입력 에피소드를 탐색/재현 2:2로 배분합니다.
+# 전체 에피소드 기준으로는 탐색 40% / 재현 40% / sham 20%입니다.
+SKIP_EXPERIMENT_REAL_ALLOCATION = (
+    "explore", "explore", "exploit", "exploit",
+)
+SKIP_EXPERIMENT_PRESERVE_FOREGROUND = True
+# ── 가짜 입력 대조군 ──
+# 컷신은 상대가 눌러도 양쪽 다 끝난다. 그래서 후보의 '성공'만 세면 우리 입력의 효과와
+# 상대의 스킵을 구분할 수 없다(2026-07-28 데이터에서 실제로 문제가 됐다).
+# 아래 후보는 대조 관찰·가드·판정 창을 똑같이 거치면서 입력만 보내지 않는다.
+# 그 성공률이 곧 '우리가 안 눌렀을 때의 종료율' 실측값이며, 다른 후보와의 차이가 순수 효과다.
+# AI전처럼 상대가 없는 환경에서 이 값이 0%에 가까우면 그 모드는 깨끗한 실험장이라는 뜻이다.
+SKIP_SHAM_CANDIDATE = "control_noop"
+SKIP_SHAM_EVERY = 5          # N번째 컷신마다 대조 에피소드(0이면 끔)
+
 SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS = 1.50
-SKIP_EXPERIMENT_CONFIRM_SUCCESSES = 5
+SKIP_EXPERIMENT_CONFIRM_SUCCESSES = 30
 # 상대가 먼저 누르거나 자연 종료된 화면을 우리 입력 성공으로 오인하지 않도록 후보 입력 전에
 # 무입력 상태로 프롬프트가 유지되는지 관찰합니다. 실기기에서 일반 S 프롬프트가 약 2초 뒤
 # 자연 종료되는 사례가 확인되어, 최종 확인은 그보다 긴 3초를 사용합니다.
 SKIP_EXPERIMENT_CONTROL_SECONDS = 3.0
-# Discovery first screens at 0.11s and 0.89s, then requires three separate
-# successes after the full 3.00s no-input control before learning a candidate.
-SKIP_EXPERIMENT_PROGRESSIVE_CONTROL = True
+# The strongest highlight route was 7/7 when attempted after 3.00-3.41 seconds
+# and missed only the deliberately delayed 3.73-second sample.  Production
+# reacts at the earliest fully attributable boundary, so new candidate and
+# sham evidence now use exactly the required three-second control.
+SKIP_EXPERIMENT_HIGHLIGHT_CONTROL_OFFSETS = (0.0,)
+# The strict experiment only evaluates prompts that survive the complete
+# three-second no-input control.  Short progressive screens are intentionally
+# disabled because they cannot satisfy the attribution goal.
+SKIP_EXPERIMENT_PROGRESSIVE_CONTROL = False
 SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES = 3
 # Require sustained disappearance so animation/capture flicker cannot be
 # mistaken for either our success or an opponent/natural exit.
 SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS = 0.40
+# The post-match highlight carousel briefly hides the prompt between clips.
+# Require a much longer continuous absence there so a clip transition cannot
+# masquerade as leaving the highlight sequence. The response deadline still
+# uses the first absent frame and remains the strict 1.5 seconds above.
+SKIP_EXPERIMENT_HIGHLIGHT_EXIT_CONFIRM_SECONDS = 5.0
+# A post-match summary can remain on screen indefinitely after one failed
+# candidate. Wait this long from the prior input before opening a fresh 3 s
+# no-input control on the same persistent prompt.
+SKIP_EXPERIMENT_HIGHLIGHT_RETRY_SECONDS = 8.0
 SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS = 0.005
 SKIP_EXPERIMENT_LOG_FILENAME = "skip_experiments.jsonl"
 SKIP_EXPERIMENT_LEARNING_FILENAME = "skip_learning.json"
@@ -388,6 +386,13 @@ SKIP_OCR_BOTTOM_FRACTION = 1.0
 # 템플릿 파일이 없으면 match는 항상 False → 기존처럼 OCR 텍스트→Start로 안전 폴백.
 SKIP_A_MATCH_THRESHOLD = 0.82     # (A) SKIP 템플릿 상관도 이 값 이상이면 A형으로 판정
 SKIP_S_MATCH_THRESHOLD = 0.80     # [S] SKIP 템플릿 상관도 — 키보드 표시 장치 전용
+# 전체 템플릿은 공통 ``SKIP`` 글자만 맞아도 높은 점수가 나올 수 있다. 따라서
+# 왼쪽의 실제 A/S 키 아이콘도 같은 위치에서 별도로 일치해야 종류를 확정한다.
+SKIP_A_ICON_MATCH_THRESHOLD = 0.65
+SKIP_S_ICON_MATCH_THRESHOLD = 0.65
+# 프롬프트 분류 규칙이 바뀌면 이전 세대의 A/S 귀속 결과를 복원하지 않는다.
+# (일반 ``아무 키``/``ESC`` 프롬프트가 A/S로 섞인 과거 표본을 격리.)
+SKIP_PROMPT_CLASSIFIER_GENERATION = 7
 SKIP_TEXT_CONSENSUS = 2           # 일반 스킵(OCR 'skip')은 이만큼 연속 감지돼야 Start(단발 노이즈 차단)
 SKIP_FALLBACK_BOTH_SECONDS = 0.6  # 한 스킵이 이 시간 넘게 안 사라지면 A·Start 둘 다(템플릿 빗나가도 안 갇힘)
 

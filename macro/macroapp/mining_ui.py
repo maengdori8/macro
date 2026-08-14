@@ -32,13 +32,16 @@ class MiningDashboard(tk.Frame):
         font_factory: Callable[[int, bool], tuple],
         automation_running: Callable[[], bool],
         logger: Optional[Callable[[str], None]] = None,
+        store: Optional[MiningStore] = None,
     ):
         super().__init__(parent, bg=colors["bg"])
         self.colors = colors
         self.font_factory = font_factory
         self.automation_running = automation_running
         self.logger = logger or (lambda _message: None)
-        self.store = MiningStore(base_dir)
+        # 호출부가 이미 만든 저장소가 있으면 그대로 씁니다. 두 개를 만들면 쓰기 락이
+        # 인스턴스마다 따로라 프로세스 안 직렬화가 깨집니다.
+        self.store = store if store is not None else MiningStore(base_dir)
         self.settings = self.store.load_settings()
         self.period_days = 30
         self._summary: Optional[MiningSummary] = None
@@ -377,7 +380,11 @@ class MiningDashboard(tk.Frame):
         ).pack(side=tk.RIGHT)
         self.chart = tk.Canvas(
             chart_card,
-            height=245,
+            # 245였을 때 이 페이지가 기본 창보다 42px 커져서 하단 안내 라벨이
+            # 화면에서 통째로 사라졌다(unmapped). fill=BOTH+expand라 창이 크면
+            # 어차피 늘어나므로, 요구 높이만 낮춘다. 창이 좁아지면 아래 안내문이
+            # 두 줄로 접히므로 최소 폭에서도 남도록 여유를 둔다.
+            height=180,
             bg=c["panel"],
             highlightthickness=0,
             bd=0,

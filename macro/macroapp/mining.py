@@ -197,6 +197,17 @@ class MiningStore:
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                -- 매크로가 이 PC에서 직접 센 판수 원장. 넥슨 기록(mining_matches)과
+                -- 성격이 완전히 달라 테이블을 분리한다: 이쪽은 화면 인식 기반이라
+                -- 무승부·하위 디비전·미판정을 전부 포함하고 동기화가 필요 없다.
+                -- 판당 한 행을 남겨 두면 '한 판'의 정의가 나중에 바뀌어도 다시 셀 수 있다.
+                CREATE TABLE IF NOT EXISTS macro_matches (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id      TEXT NOT NULL,
+                    recorded_at_utc TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_macro_recorded
+                    ON macro_matches(recorded_at_utc);
                 """
             )
 
@@ -289,6 +300,28 @@ class MiningStore:
                 rows,
             )
             return connection.total_changes - before
+
+    def append_macro_match(self, session_id: str, recorded_at_utc: str) -> None:
+        """매크로가 센 판 하나를 원장에 적습니다(UTC 그대로)."""
+
+        with self._write_lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO macro_matches(session_id, recorded_at_utc) VALUES (?, ?)",
+                (str(session_id), str(recorded_at_utc)),
+            )
+
+    def count_macro_matches(self, start_utc: str, end_utc: str) -> int:
+        """[start_utc, end_utc) 구간의 판수. 날짜 경계는 호출부가 정합니다."""
+
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM macro_matches
+                WHERE recorded_at_utc >= ? AND recorded_at_utc < ?
+                """,
+                (str(start_utc), str(end_utc)),
+            ).fetchone()
+        return 0 if row is None else int(row[0] or 0)
 
     def summary(
         self,

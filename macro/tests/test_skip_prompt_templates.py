@@ -69,6 +69,28 @@ class SkipPromptTemplateTests(unittest.TestCase):
         self.assertTrue(ocr.match_skip_s(s_canvas, ROOT)[0])
         self.assertFalse(ocr.match_skip_a(s_canvas, ROOT)[0])
 
+    def test_rejects_shared_skip_text_without_a_icon(self) -> None:
+        template = cv2.imread(
+            str(ROOT / "target_skip_a.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        self.assertIsNotNone(template)
+        canvas = np.full((220, 1920), 90, dtype=np.uint8)
+        height, width = template.shape[:2]
+        icon_width = int(round(width * 0.32))
+        x, y = 1500, 150
+        # The old full-template-only check scored this synthetic generic SKIP
+        # fragment above 0.85 even though no A glyph exists.
+        canvas[
+            y:y + height,
+            x + icon_width:x + width,
+        ] = template[:, icon_width:]
+
+        matched, score, _center = ocr.match_skip_a(canvas, ROOT)
+
+        self.assertFalse(matched)
+        self.assertGreater(score, 0.82)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,15 +1,18 @@
 from __future__ import annotations
+import datetime as dt
 import io
 import json
-import os
+import hashlib
 import platform
 import queue
 import random
 import threading
 import time
 import traceback
+import uuid
 import zlib
 import tkinter as tk
+from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -26,7 +29,13 @@ except Exception:  # noqa: BLE001 - 썸네일 표시는 선택 기능이라 없�
 from macroapp import winapi
 from macroapp import input_gamepad
 from macroapp import input_message
-from macroapp.input_gamepad import _get_gamepad, send_gamepad_button, send_gamepad_trigger
+from macroapp.input_gamepad import (
+    _get_gamepad,
+    send_ds4_button,
+    send_gamepad_button,
+    send_gamepad_buttons,
+    send_gamepad_trigger,
+)
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
@@ -38,22 +47,37 @@ from macroapp.config import (
     NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
+    RANK_OCR_PANEL_GAP_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
     MATCH_GATE_TOP_FRACTION, MATCH_GATE_BOTTOM_FRACTION, MATCH_GATE_TOKENS,
-    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PRESS_DELAY_SECONDS,
+    SKIP_ENABLED, SKIP_OCR_INTERVAL_SECONDS, SKIP_PENDING_OCR_INTERVAL_SECONDS,
+    SKIP_PRESS_DELAY_SECONDS,
     SKIP_A_BUTTON, SKIP_A_SWEEP_BUTTONS, SKIP_A_TAP_SECONDS, SKIP_A_SWEEP_HOLD_SECONDS,
     SKIP_A_SENDINPUT_AFTER_SECONDS, SKIP_A_FOREGROUND, SKIP_A_HOLD_SECONDS,
     SKIP_A_FG_COOLDOWN_SECONDS, SKIP_A_ACTIVATE_SPOOF, SKIP_A_FOREGROUND_AFTER_SECONDS,
     SKIP_STRICT_INACTIVE_EXPERIMENT, SKIP_INACTIVE_EXPERIMENT_CANDIDATES,
     SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_GENERIC_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_GENERIC_ANY_KEY_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_GENERIC_ESCAPE_INACTIVE_EXPERIMENT_CANDIDATES,
+    SKIP_GENERIC_HIGHLIGHT_INACTIVE_EXPERIMENT_CANDIDATES,
     SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS, SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
     SKIP_EXPERIMENT_CONFIRM_SUCCESSES, SKIP_EXPERIMENT_CONTROL_SECONDS,
+    SKIP_EXPERIMENT_HIGHLIGHT_CONTROL_OFFSETS,
     SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
+    SKIP_EXPERIMENT_HIGHLIGHT_EXIT_CONFIRM_SECONDS,
+    SKIP_EXPERIMENT_HIGHLIGHT_RETRY_SECONDS,
     SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
     SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
     SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+    SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS,
+    SKIP_EXPERIMENT_CONFIRMATION_LOCK_SUCCESSES,
+    SKIP_EXPERIMENT_REAL_ALLOCATION,
+    SKIP_EXPERIMENT_PRESERVE_FOREGROUND,
     SKIP_EXPERIMENT_LOG_FILENAME, SKIP_EXPERIMENT_LEARNING_FILENAME,
+    SKIP_SHAM_CANDIDATE, SKIP_SHAM_EVERY,
     SKIP_A_MATCH_THRESHOLD, SKIP_S_MATCH_THRESHOLD,
+    SKIP_PROMPT_CLASSIFIER_GENERATION,
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
@@ -69,7 +93,9 @@ from macroapp.license_client import (
 )
 from macroapp.matching import find_template_center, downscale_screen, is_notification_panel_open
 from macroapp.mining_ui import MiningDashboard
-from macroapp.session import SessionTracker
+from macroapp.session import MatchCounter, SessionTracker
+from macroapp import daily_stats
+from macroapp.mining import MiningStore
 from macroapp.skip_experiment import (
     SkipExperimentTracker,
     SkipOutcome,
@@ -77,6 +103,10 @@ from macroapp.skip_experiment import (
     remove_device_learning,
     run_guarded_inactive_action,
     save_device_learning,
+)
+from macroapp.skip_candidates import (
+    get_skip_candidate_spec,
+    skip_candidate_families,
 )
 from macroapp.window import InactiveManager
 from macroapp import window_fit
@@ -97,6 +127,36 @@ def _ocr_regions_fingerprint(*regions: np.ndarray) -> tuple:
         sampled = np.ascontiguousarray(frame[::step_y, ::step_x])
         values.extend((height, width, zlib.adler32(sampled.tobytes())))
     return tuple(values)
+
+
+def _harden_background_tk_root(root: tk.Tk) -> None:
+    """Make the final TkTopLevel unable to activate and preserve foreground."""
+
+    gui = winapi.win32gui
+    if gui is None:
+        root.withdraw()
+        return
+
+    foreground_before = 0
+    try:
+        foreground_before = int(gui.GetForegroundWindow())
+    except Exception:
+        pass
+
+    root.withdraw()
+    try:
+        # AutomationApp replaces the license view's children.  Tk can recreate
+        # the native wrapper during that transition, so harden the final HWND
+        # again after the full UI has been built.
+        root.update_idletasks()
+        top_hwnd = int(gui.GetAncestor(int(root.winfo_id()), 2))  # GA_ROOT
+        if top_hwnd:
+            style = int(gui.GetWindowLong(top_hwnd, -20))  # GWL_EXSTYLE
+            gui.SetWindowLong(top_hwnd, -20, style | 0x08000000)  # NOACTIVATE
+        if foreground_before and gui.IsWindow(foreground_before):
+            gui.SetForegroundWindow(foreground_before)
+    except Exception:
+        pass
 
 
 class AutomationApp:
@@ -136,10 +196,12 @@ class AutomationApp:
         license_key: Optional[str] = None,
         *,
         preview: bool = False,
+        start_hidden: bool = False,
     ):
         self.root = root
         self.license_key = license_key
         self.preview = bool(preview)
+        self.start_hidden = bool(start_hidden)
         self.license_info: Optional[dict] = None
 
         self.root.title("mAuto")
@@ -150,8 +212,13 @@ class AutomationApp:
         window_height = min(780, max(560, screen_height - 110))
         offset_y = max(0, min(60, screen_height - window_height - 90))
         self.root.geometry(f"1320x{window_height}+60+{offset_y}")
-        # 오른쪽 설정 열이 고정폭이라, 이보다 좁히면 타겟 행 끝(기본값 버튼)이 잘립니다.
-        self.root.minsize(1280, 640)
+        # minsize는 '레이아웃이 실제로 지킬 수 있는 값'이어야 합니다. 1280x640은 그렇지
+        # 않았습니다 — 오른쪽 열이 pack_propagate(False)라 요구 높이가 1로 보고돼
+        # 아무도 부족을 눈치채지 못했고, 실제로는 세션 패널이 통째로 사라졌습니다.
+        # 폭 1287이 오른쪽 열의 실요구치라 1280은 7px 모자랐습니다.
+        # 높이는 두 페이지 중 큰 쪽(FC 채굴 현황)의 요구치가 기준입니다.
+        # tests/test_ui_layout.py가 이 값을 그대로 읽어 검증하니, 바꾸면 테스트가 따라옵니다.
+        self.root.minsize(1300, 780)
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         initial_status = "대기 중"
         self.status_var = tk.StringVar(value=initial_status)
@@ -195,11 +262,33 @@ class AutomationApp:
 
         # 타겟별 템플릿 캡처 UI 상태 (썸네일 PhotoImage는 GC 방지를 위해 보관)
         self.clock_var = tk.StringVar(value="00:00:00")
+        # 승·무·패와 예상 적립은 표시하지 않는다. 둘 다 점수 델타 추정에 기대는 값이라
+        # 신뢰할 수 없고(티어 OCR이 실패하면 승리도 0 FC로 계산된다), 정확한 값은
+        # 'FC 채굴 현황'이 넥슨 공식 기록으로 이미 보여준다.
         self.session_matches_var = tk.StringVar(value="0")
-        self.session_record_var = tk.StringVar(value="0승 · 0무 · 0패")
         self.session_rate_var = tk.StringVar(value="0.0 경기/h")
-        self.session_fc_var = tk.StringVar(value="0 FC")
         self._session_tracker = SessionTracker()
+        # 판수는 '등수 패널이 사라진 순간'에 센다. 확정마다 세면 같은 패널이
+        # 0.3초마다 재확정되므로 화면에 머무는 내내 유령 경기가 쌓인다.
+        self._match_counter = MatchCounter(gone_seconds=RANK_OCR_PANEL_GAP_SECONDS)
+        # 오늘 판수: 앱을 껐다 켜도 유지되게 원장에 남긴다. 저장소를 못 열어도
+        # 매크로 본체는 그대로 돌아야 하므로 실패는 통계 비활성화로만 처리한다.
+        self._session_id = uuid.uuid4().hex
+        self._mining_store: Optional[MiningStore] = None
+        try:
+            self._mining_store = MiningStore(self.base_dir)
+        except Exception as exc:
+            self._log_startup_warning = f"[통계] 기록 저장소를 열지 못했습니다: {exc}"
+        self._today_matches: Optional[int] = None
+        self._today_date: Optional[dt.date] = None
+        # DB 접근은 전부 이 큐 뒤에서 일어난다. OCR 워커와 UI 스레드는 put만 한다.
+        self._match_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._match_writer = threading.Thread(
+            target=self._match_writer_loop,
+            name="match-writer",
+            daemon=True,
+        )
+        self._match_writer.start()
         self._thumb_refs: dict[str, Any] = {}
         self._thumb_labels: dict[str, tk.Label] = {}
         self._target_source_vars: dict[str, tk.StringVar] = {}
@@ -238,9 +327,23 @@ class AutomationApp:
         self._skip_active_until = 0.0   # 이 시각 전까지 매칭 일시정지(SKIP 처리 중)
         self._skip_seen_since = None    # 현재 스킵이 처음 감지된 시각(안전망 타이머용)
         self._skip_text_streak = 0      # 일반 스킵(OCR) 연속 감지 횟수(단발 노이즈 차단)
+        self._skip_s_match_streak = 0   # S template must persist before control starts
         self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start" (A형은 sticky)
         self._skip_prompt_variant = None  # hold-to-skip 표시: None|"a"|"s"
+        self._skip_generic_hint = None    # OCR 확인 일반 프롬프트: escape|escape_highlight|any_key|start
+        # A generic prompt can flicker between OCR hints on a moving replay.
+        # Once its control episode starts, keep one immutable attribution key
+        # until the prompt has conclusively disappeared.
+        self._skip_generic_episode_hint = None
         self._skip_prompt_center = None   # WGC 좌표의 A/S 표시 중심(비활성 클릭 후보용)
+        self._skip_prompt_visual = None
+        self._skip_click_target = None
+        self._last_normal_action_at = float("-inf")
+        self._skip_esc_probe_at = float("-inf")
+        self._skip_esc_probe_negative_streak = 0
+        self._skip_esc_probe_allow_once = False
+        self._skip_precontrol_contaminated = False
+        self._skip_control_contaminated = False
         # (A) SKIP 자동 버튼 탐색·학습 상태 — 게임이 가상 A를 무시해서, 어떤 입력이
         # 실제로 스킵을 넘기는지 후보를 하나씩 눌러보고 성공한 것을 학습한다.
         self._skip_a_learned = None     # 학습된(또는 SKIP_A_BUTTON 지정) 입력 이름
@@ -263,6 +366,17 @@ class AutomationApp:
         )
         self._skip_experiment = self._new_skip_experiment_tracker()
         self._skip_s_experiment = self._new_skip_s_experiment_tracker()
+        self._skip_generic_experiment = self._new_skip_generic_experiment_tracker()
+        self._skip_generic_any_key_experiment = (
+            self._new_skip_generic_experiment_tracker("any_key")
+        )
+        self._skip_generic_escape_experiment = (
+            self._new_skip_generic_experiment_tracker("escape")
+        )
+        self._skip_generic_escape_highlight_experiment = (
+            self._new_skip_generic_experiment_tracker("escape_highlight")
+        )
+        self._restore_skip_experiment_history()
         # 잘못 열린 알림 패널 감지·복구 상태. 열린 동안 일반 타겟 클릭을 막아 추가 오작동을 피한다.
         self._notification_check_at = 0.0
         self._notification_streak = 0
@@ -299,7 +413,13 @@ class AutomationApp:
         self._build_ui()
         self._bind_shortcuts()
         self._set_button_state(running=False)
-        self._bring_window_to_front()
+        if self.start_hidden:
+            # Unattended experiments must not map, raise, or focus this window.
+            # The automation loop and Tk timers continue normally while the
+            # root is withdrawn.
+            _harden_background_tk_root(self.root)
+        else:
+            self._bring_window_to_front()
         self._poll_ui_queue()
         self._flush_log_periodic()
         self._tick_clock()
@@ -1015,8 +1135,11 @@ class AutomationApp:
             anchor=tk.W,
         ).pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
 
+        # 우측 열에서 부족분을 혼자 흡수하는 패널이라(아래 두 패널은 side=BOTTOM으로
+        # 자기 높이를 먼저 확정한다) 레이아웃 회귀 테스트가 여기를 직접 겨냥한다.
         session_panel = self._panel(right_column, padx=18, pady=16)
         session_panel.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.session_panel = session_panel
 
         version_row = tk.Frame(session_panel, bg=c["panel"])
         version_row.pack(fill=tk.X)
@@ -1065,9 +1188,11 @@ class AutomationApp:
 
         metrics = tk.Frame(session_panel, bg=c["panel"])
         metrics.pack(side=tk.TOP, fill=tk.X)
+        # 한 행만 쓴다. 두 행이던 시절엔 우측 열 세로 예산을 34px 초과해 아래 행의
+        # 값 라벨이 통째로 잘려 나갔다(unmapped). 여기에 카드를 더 얹으려면
+        # tests/test_ui_layout.py를 먼저 통과시킬 것.
         metric_specs = (
-            (("완료 경기", self.session_matches_var), ("승 · 무 · 패", self.session_record_var)),
-            (("경기 속도", self.session_rate_var), ("예상 적립", self.session_fc_var)),
+            (("완료 경기 · 오늘", self.session_matches_var), ("경기 속도", self.session_rate_var)),
         )
         for row_index, row_specs in enumerate(metric_specs):
             row = tk.Frame(metrics, bg=c["panel"])
@@ -1131,8 +1256,14 @@ class AutomationApp:
                 self.worker_thread is not None and self.worker_thread.is_alive()
             ),
             logger=self.queue_log,
+            # 프로세스 안에서 저장소 인스턴스를 하나로 유지합니다(쓰기 락과 종료 순서 공유).
+            store=self._mining_store,
         )
         self.mining_dashboard.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        if getattr(self, "_log_startup_warning", ""):
+            self.queue_log(self._log_startup_warning)
+        # 시작하자마자 '오늘'을 채워 둡니다(첫 판을 기다리지 않게).
+        self._match_queue.put(("refresh", ""))
         self._show_page("automation")
 
     def _tick_clock(self) -> None:
@@ -1148,15 +1279,13 @@ class AutomationApp:
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         self.clock_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-        self.session_matches_var.set(f"{snapshot.matches:,}")
-        record = f"{snapshot.wins}승 · {snapshot.draws}무 · {snapshot.losses}패"
-        if snapshot.unknown:
-            record += f" · ?{snapshot.unknown}"
-        self.session_record_var.set(record)
-        self.session_rate_var.set(f"{snapshot.matches_per_hour:.1f} 경기/h")
-        self.session_fc_var.set(
-            f"{snapshot.estimated_fc:,} FC · {snapshot.fc_per_hour:.1f}/h"
+        # 자정을 넘기면 '오늘'을 다시 센다. 캐시만 보면 어제 값에 고정된다.
+        if self._today_date != daily_stats.today_kst():
+            self._match_queue.put(("refresh", ""))
+        self.session_matches_var.set(
+            daily_stats.format_matches(snapshot.matches, self._today_matches)
         )
+        self.session_rate_var.set(f"{snapshot.matches_per_hour:.1f} 경기/h")
 
     # ── 타겟 템플릿 캡처 ──
 
@@ -1393,7 +1522,9 @@ class AutomationApp:
                 self._thumb_refs.pop(name, None)
                 label.configure(text=f"{image.width}x{image.height}", image="")
                 return
-            image.thumbnail((62, 24))
+            # thumb_holder 안쪽은 24px(26 − 테두리 1×2)이고 Label이 이미지 위아래로
+            # 2px씩 더 요구한다. 24로 줄이면 라벨 요구 높이가 28이 되어 매번 4px 잘렸다.
+            image.thumbnail((62, 20))
             photo = PILImageTk.PhotoImage(image, master=self.root)
         except Exception:
             self._thumb_refs.pop(name, None)
@@ -1510,6 +1641,8 @@ class AutomationApp:
 
         self.stop_event.clear()
         self._session_tracker.start()
+        # 직전 실행에서 보던 패널 상태가 새 세션의 첫 판으로 새지 않게 함께 비웁니다.
+        self._match_counter.reset()
         self._refresh_session_ui()
         self._set_button_state(running=True)
         self.set_status("실행 중")
@@ -1674,6 +1807,9 @@ class AutomationApp:
         """창 닫기 버튼을 눌렀을 때도 자동화 스레드를 자연스럽게 멈춥니다."""
 
         self.closing = True
+        # 저장소를 쓰는 쪽을 먼저 비웁니다. 대시보드가 취소 이벤트를 세운 뒤에 드레인하면
+        # 마지막 판이 유실될 수 있습니다.
+        self._drain_match_writer()
         mining_dashboard = getattr(self, "mining_dashboard", None)
         if mining_dashboard is not None:
             mining_dashboard.close()
@@ -1689,6 +1825,18 @@ class AutomationApp:
             return
 
         self.root.destroy()
+
+    def _drain_match_writer(self) -> None:
+        """남은 판 기록을 끝까지 쓰고 라이터를 멈춥니다.
+
+        강제 종료되면 큐에 남은 마지막 한두 건은 유실될 수 있습니다(전원 차단은 무보장).
+        """
+
+        writer = getattr(self, "_match_writer", None)
+        if writer is None or not writer.is_alive():
+            return
+        self._match_queue.put(None)
+        writer.join(timeout=2.0)
 
     def _close_log_file(self) -> None:
         """로그 파일을 안전하게 닫습니다."""
@@ -1744,6 +1892,14 @@ class AutomationApp:
                 return
 
             # ViGEm 드라이버 미설치 경고
+            # Give the OCR worker its own target_F cache. The main matcher
+            # searches the full frame while OCR searches only the lower strip;
+            # sharing one cache would make the two threads overwrite it.
+            self._skip_click_target = next(
+                (copy(target) for target in targets if target.name == "target_F"),
+                None,
+            )
+
             has_key_targets = any(t.action == "key" for t in targets)
             if has_key_targets and winapi.vg is None:
                 self.queue_log("[경고] vgamepad를 사용할 수 없어 키 입력 타겟이 작동하지 않습니다.")
@@ -1783,7 +1939,16 @@ class AutomationApp:
             self._skip_active_until = 0.0
             self._skip_seen_since = None
             self._skip_text_streak = 0
+            self._skip_s_match_streak = 0
             self._skip_kind = None
+            self._skip_generic_hint = None
+            self._skip_generic_episode_hint = None
+            self._last_normal_action_at = float("-inf")
+            self._skip_esc_probe_at = float("-inf")
+            self._skip_esc_probe_negative_streak = 0
+            self._skip_esc_probe_allow_once = False
+            self._skip_precontrol_contaminated = False
+            self._skip_control_contaminated = False
             # (A) SKIP 버튼 탐색·학습 초기화. SKIP_A_BUTTON이 지정돼 있으면 그걸 바로 사용.
             self._skip_a_learned = (SKIP_A_BUTTON or "").strip().lower() or None
             self._skip_a_sweep_idx = 0
@@ -1794,8 +1959,24 @@ class AutomationApp:
             self._skip_fg_last_at = 0.0
             self._skip_experiment = self._new_skip_experiment_tracker()
             self._skip_s_experiment = self._new_skip_s_experiment_tracker()
+            self._skip_generic_experiment = self._new_skip_generic_experiment_tracker()
+            self._skip_generic_any_key_experiment = (
+                self._new_skip_generic_experiment_tracker("any_key")
+            )
+            self._skip_generic_escape_experiment = (
+                self._new_skip_generic_experiment_tracker("escape")
+            )
+            self._skip_generic_escape_highlight_experiment = (
+                self._new_skip_generic_experiment_tracker("escape_highlight")
+            )
+            restored_skip_events = self._restore_skip_experiment_history()
+            if restored_skip_events:
+                self.queue_log(
+                    f"[SKIP 실험] 이전 귀속 결과 {restored_skip_events}건 복원"
+                )
             self._skip_prompt_variant = None
             self._skip_prompt_center = None
+            self._skip_prompt_visual = None
             self._notification_check_at = 0.0
             self._notification_streak = 0
             self._notification_visible = False
@@ -1886,6 +2067,22 @@ class AutomationApp:
                     self.interruptible_sleep(LOOP_SLEEP_SECONDS)
                     continue
 
+                # A/S prompts can also match normal target icons (notably the
+                # S-key target).  Gate those cheap templates synchronously,
+                # before normal target dispatch, while the OCR worker performs
+                # the full prompt classification and three-second control.
+                if (
+                    SKIP_STRICT_INACTIVE_EXPERIMENT
+                    and self._fast_skip_template_visible(screen_gray)
+                ):
+                    self._skip_active_until = max(
+                        self._skip_active_until,
+                        time.monotonic()
+                        + max(1.0, SKIP_OCR_INTERVAL_SECONDS * 4.0),
+                    )
+                    self.interruptible_sleep(LOOP_SLEEP_SECONDS)
+                    continue
+
                 found_any = False
 
                 # 프레임당 1회만 축소해 모든 타겟이 공유합니다(중복 축소 제거).
@@ -1911,6 +2108,20 @@ class AutomationApp:
                         f"(점수: {score:.3f}, 위치: {base_x},{base_y})"
                     )
 
+                    action_now = time.monotonic()
+                    if self._defer_escape_target_for_skip_probe(
+                        target,
+                        action_now,
+                    ):
+                        self.queue_status("SKIP ESC 확인 중")
+                        self.queue_log(
+                            "[SKIP 사전확인] 일반 ESC 입력 보류 → OCR 프롬프트 확인"
+                        )
+                        break
+
+                    self._last_normal_action_at = action_now
+                    if self._skip_seen_since is not None:
+                        self._skip_control_contaminated = True
                     if target.action == "key":
                         action_ok = self.dispatch_key_press(manager, target)
                     elif target.action == "message":
@@ -2010,7 +2221,8 @@ class AutomationApp:
                 if frame is not None:
                     seq, gray = frame
                     # SKIP: 0.3초 데드라인으로 정확히 끼어듦(입력 직결이라 우선).
-                    if SKIP_ENABLED and now - last_skip >= SKIP_OCR_INTERVAL_SECONDS:
+                    skip_interval = self._current_skip_ocr_interval()
+                    if SKIP_ENABLED and now - last_skip >= skip_interval:
                         last_skip = now
                         self._try_skip(gray, self._ocr_manager)
                         did_ocr = True
@@ -2099,6 +2311,9 @@ class AutomationApp:
             return
         # 이번 읽기(빈 결과 포함)를 투표에 반영 → 패널 소멸/경계 추적에 필요.
         self._rank_consensus.observe(info, now)
+        # 같은 관측으로 판수도 센다. 패널이 사라진 순간에만 1판이 확정된다.
+        if self._match_counter.observe(bool(info.get("has_panel")), now):
+            self._count_match()
 
     def _commit_rank(self, now: float) -> None:
         """컨센서스가 확정한 (등수/티어/점수)를 _rank_state로 반영합니다(OCR 불필요).
@@ -2107,15 +2322,20 @@ class AutomationApp:
         '패널 경계 리셋'이 진행됩니다. 확정 직후엔 투표를 비워 같은 패널 재커밋과
         다음 패널과의 표 오염을 막습니다. 단발 오인식은 다수결로 이미 걸러진 값만 옵니다.
         """
+        # 프레임이 멈춰 관측이 끊겨도 패널 소멸 판정이 진행되도록 매 사이클 시계를 흘린다.
+        if self._match_counter.tick(now):
+            self._count_match()
+
         committed = self._rank_consensus.commit(now)
         if committed is None:
             return  # 아직 확정 못 함(표 부족) 또는 보고할 게 없음
 
         # 확정 처리 완료 → 투표를 비워 같은 패널을 재커밋하지 않고 다음 패널과 분리.
         self._rank_consensus.reset()
+        # 이 패널에서 값이 나왔다는 사실만 남긴다. 같은 패널이 몇 번 재확정되든 1판이다.
+        self._match_counter.note_commit(now)
 
         rank, tier, score = committed
-        self._record_session_result(score, tier, now)
         # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
         # 정지 판정엔 '이번 패널에서 실제로 읽힌' 티어만 넘긴다(없으면 None) → 직전 매치의
         # 슈퍼챔스 티어가 다음 매치로 새서 거짓 정지하는 일을 막는다(#5). 표시용 보강은 아래에서.
@@ -2155,28 +2375,40 @@ class AutomationApp:
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 
-    def _record_session_result(
-        self,
-        score: Optional[int],
-        tier: Optional[str],
-        now: float,
-    ) -> None:
-        """같은 결과 패널의 중복 OCR을 제외하고 세션 통계를 갱신합니다."""
+    def _count_match(self) -> None:
+        """등수 패널 하나가 끝났으므로 1판을 반영합니다."""
 
         tracker = getattr(self, "_session_tracker", None)
-        if tracker is None:
-            return
-        outcome = tracker.record_result(score, tier, now=now)
-        if outcome is None:
-            return
-        outcome_label = {
-            "win": "승",
-            "draw": "무",
-            "loss": "패",
-            "unknown": "미판정",
-        }.get(outcome, outcome)
-        self.queue_log(f"[세션] 경기 결과 반영: {outcome_label}")
+        if tracker is None or not tracker.record_match():
+            return  # 자동화가 돌고 있지 않으면 세지 않는다.
+        self.queue_log(f"[세션] {tracker.snapshot().matches}판째")
+        # 여기서 DB를 만지면 OCR 워커가 동기화 워커의 쓰기에 막힐 수 있다. 큐에만 넣는다.
+        self._match_queue.put(
+            ("append", daily_stats.utc_iso(dt.datetime.now(dt.timezone.utc)))
+        )
         self.ui_queue.put(("session", ""))
+
+    def _match_writer_loop(self) -> None:
+        """판 기록과 오늘 집계를 전담하는 스레드. 인식 루프를 절대 막지 않습니다."""
+
+        while True:
+            item = self._match_queue.get()
+            if item is None:
+                return
+            action, payload = item
+            store = self._mining_store
+            if store is None:
+                continue  # 저장소가 없으면 '오늘'은 계속 미상(—)으로 둔다.
+            try:
+                if action == "append":
+                    store.append_macro_match(self._session_id, payload)
+                start, end = daily_stats.day_bounds_utc(daily_stats.today_kst())
+                self._today_matches = store.count_macro_matches(start, end)
+                self._today_date = daily_stats.today_kst()
+            except Exception as exc:
+                self._log_to_file_only(f"[통계] 판수 기록 실패: {exc}")
+                continue
+            self.ui_queue.put(("session", ""))
 
     def _new_skip_experiment_tracker(self) -> SkipExperimentTracker:
         return SkipExperimentTracker(
@@ -2188,6 +2420,16 @@ class AutomationApp:
             exit_confirm_seconds=SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
             progressive_control=SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
             control_ramp_successes=SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+            sham_candidate=SKIP_SHAM_CANDIDATE,
+            sham_every=SKIP_SHAM_EVERY,
+            candidate_families=skip_candidate_families(
+                SKIP_INACTIVE_EXPERIMENT_CANDIDATES,
+            ),
+            min_family_attempts=SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS,
+            confirmation_lock_successes=(
+                SKIP_EXPERIMENT_CONFIRMATION_LOCK_SUCCESSES
+            ),
+            real_allocation=SKIP_EXPERIMENT_REAL_ALLOCATION,
             learned=(
                 self._skip_learned_profiles.get("a")
                 or (SKIP_A_BUTTON or "").strip().lower()
@@ -2205,8 +2447,258 @@ class AutomationApp:
             exit_confirm_seconds=SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS,
             progressive_control=SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
             control_ramp_successes=SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+            sham_candidate=SKIP_SHAM_CANDIDATE,
+            sham_every=SKIP_SHAM_EVERY,
+            candidate_families=skip_candidate_families(
+                SKIP_S_INACTIVE_EXPERIMENT_CANDIDATES,
+            ),
+            min_family_attempts=SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS,
+            confirmation_lock_successes=(
+                SKIP_EXPERIMENT_CONFIRMATION_LOCK_SUCCESSES
+            ),
+            real_allocation=SKIP_EXPERIMENT_REAL_ALLOCATION,
             learned=self._skip_learned_profiles.get("s"),
         )
+
+    def _new_skip_generic_experiment_tracker(
+        self,
+        prompt_hint: Optional[str] = None,
+    ) -> SkipExperimentTracker:
+        if prompt_hint == "any_key":
+            candidates = SKIP_GENERIC_ANY_KEY_INACTIVE_EXPERIMENT_CANDIDATES
+            learning_key = "generic_any_key"
+        elif prompt_hint == "escape":
+            candidates = SKIP_GENERIC_ESCAPE_INACTIVE_EXPERIMENT_CANDIDATES
+            learning_key = "generic_escape"
+        elif prompt_hint == "escape_highlight":
+            candidates = SKIP_GENERIC_HIGHLIGHT_INACTIVE_EXPERIMENT_CANDIDATES
+            learning_key = "generic_escape_highlight"
+        else:
+            candidates = SKIP_GENERIC_INACTIVE_EXPERIMENT_CANDIDATES
+            learning_key = "generic"
+        return SkipExperimentTracker(
+            candidates,
+            result_window_seconds=SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
+            attempt_gap_seconds=SKIP_EXPERIMENT_ATTEMPT_GAP_SECONDS,
+            confirm_successes=SKIP_EXPERIMENT_CONFIRM_SUCCESSES,
+            control_seconds=SKIP_EXPERIMENT_CONTROL_SECONDS,
+            control_offsets=(
+                SKIP_EXPERIMENT_HIGHLIGHT_CONTROL_OFFSETS
+                if prompt_hint == "escape_highlight" else ()
+            ),
+            exit_confirm_seconds=(
+                SKIP_EXPERIMENT_HIGHLIGHT_EXIT_CONFIRM_SECONDS
+                if prompt_hint == "escape_highlight"
+                else SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS
+            ),
+            persistent_retry_seconds=(
+                SKIP_EXPERIMENT_HIGHLIGHT_RETRY_SECONDS
+                if prompt_hint == "escape_highlight" else 0.0
+            ),
+            progressive_control=SKIP_EXPERIMENT_PROGRESSIVE_CONTROL,
+            control_ramp_successes=SKIP_EXPERIMENT_CONTROL_RAMP_SUCCESSES,
+            sham_candidate=SKIP_SHAM_CANDIDATE,
+            sham_every=SKIP_SHAM_EVERY,
+            candidate_families=skip_candidate_families(
+                candidates,
+            ),
+            min_family_attempts=SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS,
+            confirmation_lock_successes=(
+                SKIP_EXPERIMENT_CONFIRMATION_LOCK_SUCCESSES
+            ),
+            real_allocation=SKIP_EXPERIMENT_REAL_ALLOCATION,
+            learned=(
+                None
+                if prompt_hint == "escape_highlight"
+                else self._skip_learned_profiles.get(learning_key)
+            ),
+        )
+
+    def _generic_tracker_for_hint(
+        self,
+        prompt_hint: Optional[str] = None,
+    ) -> SkipExperimentTracker:
+        hint = (
+            prompt_hint
+            if prompt_hint is not None
+            else getattr(self, "_skip_generic_episode_hint", None)
+            or self._skip_generic_hint
+        )
+        if hint == "any_key":
+            return getattr(
+                self,
+                "_skip_generic_any_key_experiment",
+                self._skip_generic_experiment,
+            )
+        if hint == "escape":
+            return getattr(
+                self,
+                "_skip_generic_escape_experiment",
+                self._skip_generic_experiment,
+            )
+        if hint == "escape_highlight":
+            return getattr(
+                self,
+                "_skip_generic_escape_highlight_experiment",
+                self._skip_generic_experiment,
+            )
+        return self._skip_generic_experiment
+
+    def _generic_hint_for_tracker(
+        self,
+        experiment: Optional[SkipExperimentTracker] = None,
+    ) -> Optional[str]:
+        """Return the immutable hint owned by a generic experiment tracker."""
+
+        if experiment is getattr(
+            self,
+            "_skip_generic_any_key_experiment",
+            None,
+        ):
+            return "any_key"
+        if experiment is getattr(
+            self,
+            "_skip_generic_escape_experiment",
+            None,
+        ):
+            return "escape"
+        if experiment is getattr(
+            self,
+            "_skip_generic_escape_highlight_experiment",
+            None,
+        ):
+            return "escape_highlight"
+        return (
+            getattr(self, "_skip_generic_episode_hint", None)
+            or self._skip_generic_hint
+        )
+
+    @staticmethod
+    def _generic_learning_key(prompt_hint: Optional[str]) -> str:
+        if prompt_hint == "any_key":
+            return "generic_any_key"
+        if prompt_hint == "escape":
+            return "generic_escape"
+        if prompt_hint == "escape_highlight":
+            return "generic_escape_highlight"
+        return "generic"
+
+    def _reset_generic_experiment_episodes(self) -> None:
+        seen: set[int] = set()
+        for tracker in (
+            self._skip_generic_experiment,
+            getattr(self, "_skip_generic_any_key_experiment", None),
+            getattr(self, "_skip_generic_escape_experiment", None),
+            getattr(self, "_skip_generic_escape_highlight_experiment", None),
+        ):
+            if tracker is not None and id(tracker) not in seen:
+                tracker.reset_episode()
+                seen.add(id(tracker))
+
+    def _generic_experiment_pending(self) -> bool:
+        return any(
+            tracker is not None and tracker.pending is not None
+            for tracker in (
+                self._skip_generic_experiment,
+                getattr(self, "_skip_generic_any_key_experiment", None),
+                getattr(self, "_skip_generic_escape_experiment", None),
+                getattr(self, "_skip_generic_escape_highlight_experiment", None),
+            )
+        )
+
+    def _current_skip_ocr_interval(self) -> float:
+        """Use finer observation during a causal control or pending result.
+
+        The three-second control used to advance only on the normal 300 ms OCR
+        cadence, so a nominal fixed boundary could actually start delivery up
+        to one full scan late. Tightening only an already-confirmed control or
+        attributable result keeps steady-state capture cost unchanged.
+        """
+
+        trackers = (
+            getattr(self, "_skip_experiment", None),
+            getattr(self, "_skip_s_experiment", None),
+            getattr(self, "_skip_generic_experiment", None),
+            getattr(self, "_skip_generic_any_key_experiment", None),
+            getattr(self, "_skip_generic_escape_experiment", None),
+            getattr(self, "_skip_generic_escape_highlight_experiment", None),
+        )
+        observing = any(
+            tracker is not None
+            and (
+                getattr(tracker, "pending", None) is not None
+                or getattr(tracker, "control_started_at", None) is not None
+            )
+            for tracker in trackers
+        )
+        if observing:
+            return min(
+                float(SKIP_OCR_INTERVAL_SECONDS),
+                float(SKIP_PENDING_OCR_INTERVAL_SECONDS),
+            )
+        return float(SKIP_OCR_INTERVAL_SECONDS)
+
+    def _restore_skip_experiment_history(self) -> int:
+        """Restore finalized local evidence after a restart or stop/start."""
+
+        trackers = {
+            "a": self._skip_experiment,
+            "s": self._skip_s_experiment,
+        }
+        path = self.base_dir / "logs" / SKIP_EXPERIMENT_LOG_FILENAME
+        restored = 0
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if str(event.get("device_id", "")) != self._skip_device_id:
+                        continue
+                    if int(event.get("classifier_generation", 0) or 0) != int(
+                        SKIP_PROMPT_CLASSIFIER_GENERATION
+                    ):
+                        continue
+                    variant = str(event.get("variant", ""))
+                    prompt_hint = event.get("prompt_hint")
+                    if prompt_hint == "escape_highlight":
+                        try:
+                            recorded_exit_confirm = float(
+                                event.get("exit_confirm_seconds", 0.0) or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            recorded_exit_confirm = 0.0
+                        if recorded_exit_confirm < float(
+                            SKIP_EXPERIMENT_HIGHLIGHT_EXIT_CONFIRM_SECONDS
+                        ):
+                            # Older highlight outcomes only proved a 0.4 s
+                            # label gap and can be clip transitions. Preserve
+                            # ordinary any-key evidence while rebuilding just
+                            # this context under the stronger destination gate.
+                            continue
+                    tracker = (
+                        self._generic_tracker_for_hint(prompt_hint)
+                        if variant == "generic"
+                        else trackers.get(variant)
+                    )
+                    candidate = event.get("candidate")
+                    if tracker is None or not isinstance(candidate, str):
+                        continue
+                    latency = event.get("latency_seconds")
+                    try:
+                        latency_value = None if latency is None else float(latency)
+                    except (TypeError, ValueError):
+                        latency_value = None
+                    if tracker.restore_final_outcome(
+                        candidate,
+                        str(event.get("status", "")),
+                        latency_value,
+                    ):
+                        restored += 1
+        except OSError:
+            return 0
+        return restored
 
     def _save_skip_learning(self, variant: str, candidate: str) -> None:
         if save_device_learning(
@@ -2234,6 +2726,64 @@ class AutomationApp:
         ):
             self._skip_learned_profiles.pop(variant, None)
 
+    def _capture_skip_prompt_visual(self, screen_gray: np.ndarray) -> None:
+        """Persist a small prompt ROI and stable binary fingerprint.
+
+        Candidate success can otherwise be compared across visually different
+        prompt presentations without any evidence.  The ROI is read from the
+        existing background capture, so this adds no focus or input action.
+        """
+
+        self._skip_prompt_visual = None
+        if not SKIP_STRICT_INACTIVE_EXPERIMENT:
+            return
+        try:
+            h, w = screen_gray.shape[:2]
+            center = getattr(self, "_skip_prompt_center", None)
+            if center is None:
+                # Generic any-key text has no clickable icon center.  Preserve
+                # the same lower-right search area used by OCR instead of a
+                # guessed 340x120 patch that can contain only replay footage.
+                x1, x2 = max(0, int(w * 0.55)), w
+                y1, y2 = max(0, int(h * 0.75)), h
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            else:
+                cx, cy = (int(center[0]), int(center[1]))
+                x1, x2 = max(0, cx - 80), min(w, cx + 260)
+                y1, y2 = max(0, cy - 60), min(h, cy + 60)
+            roi = screen_gray[y1:y2, x1:x2]
+            if roi.size == 0:
+                return
+            normalized = cv2.resize(
+                roi,
+                (192, 72),
+                interpolation=cv2.INTER_AREA,
+            )
+            _threshold, binary = cv2.threshold(
+                normalized,
+                0,
+                255,
+                cv2.THRESH_BINARY | cv2.THRESH_OTSU,
+            )
+            digest = hashlib.sha256(binary.tobytes()).hexdigest()
+            evidence_dir = self.base_dir / "logs" / "skip_evidence"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            name = (
+                f"prompt_{time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{digest[:12]}.png"
+            )
+            # Keep native pixels for auditing template false positives.  The
+            # normalized binary above remains the stable content fingerprint.
+            saved = cv2.imwrite(str(evidence_dir / name), roi)
+            self._skip_prompt_visual = {
+                "sha256": digest,
+                "file": name if saved else None,
+                "shape": [int(roi.shape[0]), int(roi.shape[1])],
+                "center": [cx, cy],
+            }
+        except Exception:
+            self._skip_prompt_visual = None
+
     def _write_skip_experiment_event(
         self,
         outcome: SkipOutcome,
@@ -2241,13 +2791,20 @@ class AutomationApp:
         guard=None,
         variant: Optional[str] = None,
         control_seconds: Optional[float] = None,
+        experiment: Optional[SkipExperimentTracker] = None,
     ) -> None:
         """Append one machine-readable SKIP experiment result without touching UI."""
 
         event = {
+            "schema_version": 2,
+            "classifier_generation": SKIP_PROMPT_CLASSIFIER_GENERATION,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "device_id": self._skip_device_id,
             "variant": variant,
+            "prompt_hint": (
+                self._generic_hint_for_tracker(experiment)
+                if variant == "generic" else self._skip_prompt_variant
+            ),
             "status": outcome.status,
             "candidate": outcome.candidate,
             "latency_seconds": outcome.latency_seconds,
@@ -2257,7 +2814,19 @@ class AutomationApp:
                 SKIP_EXPERIMENT_CONTROL_SECONDS
                 if control_seconds is None else float(control_seconds)
             ),
+            "exit_confirm_seconds": (
+                float(experiment.exit_confirm_seconds)
+                if experiment is not None
+                else float(SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS)
+            ),
             "control_policy": (
+                "jittered"
+                if (
+                    control_seconds is not None
+                    and float(control_seconds)
+                    > SKIP_EXPERIMENT_CONTROL_SECONDS + 1e-9
+                )
+                else
                 "progressive"
                 if SKIP_EXPERIMENT_PROGRESSIVE_CONTROL else "fixed"
             ),
@@ -2280,6 +2849,16 @@ class AutomationApp:
                 else None
             ),
         }
+        prompt_visual = getattr(self, "_skip_prompt_visual", None)
+        if prompt_visual is not None:
+            event["prompt_visual"] = prompt_visual
+        spec = get_skip_candidate_spec(outcome.candidate or "")
+        if spec is not None:
+            event["candidate_meta"] = spec.event_metadata()
+            if spec.input_scope == "virtual_gamepad":
+                event["gamepad"] = input_gamepad.virtual_gamepad_status()
+        if experiment is not None:
+            event["search"] = experiment.diagnostics(outcome.candidate)
         if guard is not None:
             event["guard"] = {
                 "attempted": guard.attempted,
@@ -2310,6 +2889,7 @@ class AutomationApp:
         guard=None,
         variant: Optional[str] = None,
         control_seconds: Optional[float] = None,
+        experiment: Optional[SkipExperimentTracker] = None,
     ) -> None:
         if outcome is None:
             return
@@ -2318,6 +2898,7 @@ class AutomationApp:
             guard=guard,
             variant=variant,
             control_seconds=control_seconds,
+            experiment=experiment,
         )
         candidate = (outcome.candidate or "-").upper()
         if outcome.status == "success":
@@ -2341,6 +2922,10 @@ class AutomationApp:
         ):
             self.queue_log(
                 "[SKIP 대조] 입력 전에 종료됨 → 상대 스킵/자연 종료로 분류, 학습 제외"
+            )
+        elif outcome.status == "unattributed" and outcome.detail.startswith("non_skip_action"):
+            self.queue_log(
+                "[SKIP 대조] 일반 매칭 입력과 겹침 → 오염 표본으로 제외"
             )
 
     @staticmethod
@@ -2366,6 +2951,8 @@ class AutomationApp:
         name: str,
         manager: InactiveManager,
         prompt_center: Optional[tuple[int, int]] = None,
+        *,
+        _hold_override: Optional[float] = None,
     ) -> bool:
         """(A) SKIP 후보 입력 하나를 실행합니다(전부 비활성 유지 방식 — 화면 변화 0).
 
@@ -2381,14 +2968,140 @@ class AutomationApp:
         - "a"/"start": 가상패드 버튼 / "lt"/"rt": 트리거
         - "*_hold": 위 입력을 1초 홀드(hold-to-skip 대응 — 탭으론 원리상 못 넘김)
         """
+        # 카탈로그 후보는 실제 전달 동작과 타이밍/펄스 축을 분리합니다. 같은
+        # 전달 경로를 여러 임계값으로 검증하되 각 후보의 가설과 폐기 조건은 로그에 남습니다.
+        spec = get_skip_candidate_spec(name) if _hold_override is None else None
+        if spec is not None:
+            if spec.action == SKIP_SHAM_CANDIDATE:
+                return True
+            for pulse_index in range(spec.pulses):
+                if not AutomationApp._press_skip_candidate(
+                    spec.action,
+                    manager,
+                    prompt_center,
+                    _hold_override=spec.hold_seconds,
+                ):
+                    return False
+                if pulse_index + 1 < spec.pulses and spec.pulse_gap_seconds > 0:
+                    time.sleep(spec.pulse_gap_seconds)
+            return True
+
+        # 가짜 입력 대조군: 아무것도 보내지 않고 성공한 척 반환한다.
+        # 이후 판정 경로(대조 관찰·판정 창·프롬프트 소멸 확인)를 후보와 똑같이 타므로,
+        # 이 후보의 성공률이 곧 '우리가 안 눌렀을 때 컷신이 끝날 확률' 실측값이 된다.
+        if name == SKIP_SHAM_CANDIDATE:
+            return True
+
         # '*_hold' 후보 = 같은 버튼을 길게 홀드(hold-to-skip 프롬프트 대응).
         # 이름에서 '_hold'를 떼어 실제 버튼을 얻고, 탭 대신 홀드 길이를 쓴다.
-        hold_secs = SKIP_A_TAP_SECONDS
-        if name.endswith("_hold"):
+        hold_secs = (
+            SKIP_A_TAP_SECONDS
+            if _hold_override is None else max(0.0, float(_hold_override))
+        )
+        if _hold_override is None and name.endswith("_hold"):
             name = name[:-len("_hold")]
             hold_secs = SKIP_A_SWEEP_HOLD_SECONDS
+        if SKIP_STRICT_INACTIVE_EXPERIMENT and name in {
+            "focus_child_s",
+            "focus_child_esc",
+            "focus_s",
+            "si_s",
+        }:
+            # All four routes eventually call SendInput.  Even when a target
+            # child temporarily owns the attached queue, that is still a
+            # global keyboard injection and cannot satisfy the zero-leak goal.
+            return False
+
+        if name == "process_appcommand_browser_back":
+            # WM_APPCOMMAND; APPCOMMAND_BROWSER_BACKWARD occupies the high
+            # word of lParam. Delivery stays inside FC's process HWND tree.
+            return bool(
+                manager.hwnd
+                and input_message.post_process_win32_message(
+                    manager.hwnd,
+                    0x0319,
+                    manager.hwnd,
+                    1 << 16,
+                )
+            )
+        if name == "process_command_idcancel":
+            # WM_COMMAND / IDCANCEL. This is a target-process UI command, not
+            # a global Escape keystroke.
+            return bool(
+                manager.hwnd
+                and input_message.post_process_win32_message(
+                    manager.hwnd,
+                    0x0111,
+                    2,
+                    0,
+                )
+            )
+        if name == "process_notify_appcommand_browser_back":
+            return bool(
+                manager.hwnd
+                and input_message.notify_process_win32_message(
+                    manager.hwnd,
+                    0x0319,
+                    manager.hwnd,
+                    1 << 16,
+                )
+            )
+        if name == "process_notify_command_idcancel":
+            return bool(
+                manager.hwnd
+                and input_message.notify_process_win32_message(
+                    manager.hwnd,
+                    0x0111,
+                    2,
+                    0,
+                )
+            )
+        if name == "process_cancelmode":
+            return bool(
+                manager.hwnd
+                and input_message.post_process_win32_message(
+                    manager.hwnd,
+                    0x001F,
+                    0,
+                    0,
+                )
+            )
         try:
-            if name == "click_prompt":
+            if name == "windowmsg_start_edge2":
+                if not manager.hwnd:
+                    return False
+                button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                if button is None:
+                    return False
+                for pulse_index in range(2):
+                    spoofed = input_message.spoof_window_active_component(
+                        manager.hwnd,
+                        "window",
+                        True,
+                    )
+                    try:
+                        if not spoofed:
+                            return False
+                        if not send_gamepad_button(
+                            button,
+                            press_delay=hold_secs,
+                        ):
+                            return False
+                    finally:
+                        if spoofed:
+                            input_message.spoof_window_active_component(
+                                manager.hwnd,
+                                "window",
+                                False,
+                            )
+                    if pulse_index == 0:
+                        time.sleep(0.05)
+                return True
+            if name in {
+                "click_prompt",
+                "click_prompt_sync",
+                "click_prompt_noactivate",
+            }:
                 if prompt_center is None:
                     return False
                 end_x, end_y = prompt_center
@@ -2396,12 +3109,414 @@ class AutomationApp:
                     end_x,
                     end_y,
                 )
+                if name == "click_prompt_noactivate":
+                    if not manager.hwnd or not input_message.prime_mouse_noactivate(
+                        manager.hwnd
+                    ):
+                        return False
                 return manager.post_curved_click(
                     start_x,
                     start_y,
                     end_x,
                     end_y,
+                    **(
+                        {"use_send_message": True}
+                        if name != "click_prompt"
+                        else {}
+                    ),
                 )
+            if name in {"device_start", "device_a"}:
+                if not manager.hwnd or not input_message.notify_device_rescan(
+                    manager.hwnd
+                ):
+                    return False
+                gamepad_name = name.removeprefix("device_")
+                button = input_gamepad.KEY_TO_GAMEPAD.get(gamepad_name)
+                if button is None:
+                    return False
+                return send_gamepad_button(button, press_delay=hold_secs)
+            if name == "process_device_start":
+                if not manager.hwnd or not input_message.notify_device_rescan_process(
+                    manager.hwnd
+                ):
+                    return False
+                button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                if button is None:
+                    return False
+                return send_gamepad_button(button, press_delay=hold_secs)
+            if name in {
+                "raw_device_start",
+                "raw_device_ds4_options",
+                "raw_device_ds4_circle",
+                "raw_device_ds4_share",
+            }:
+                if not manager.hwnd:
+                    return False
+                is_ds4 = name != "raw_device_start"
+                if not input_gamepad.ensure_virtual_gamepad(
+                    "ds4" if is_ds4 else "xbox"
+                ):
+                    return False
+                if not input_message.notify_raw_gamepad_arrival_process(
+                    manager.hwnd
+                ):
+                    return False
+                if is_ds4:
+                    return send_ds4_button(
+                        name.removeprefix("raw_device_ds4_"),
+                        press_delay=hold_secs,
+                    )
+                button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                if button is None:
+                    return False
+                return send_gamepad_button(button, press_delay=hold_secs)
+            if name == "sys_pm_esc":
+                if not manager.hwnd:
+                    return False
+                return input_message.post_system_key_deep(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK["esc"],
+                    press_delay=hold_secs,
+                )
+            if name in {"notify_pm_esc", "notify_pm_space"}:
+                if not manager.hwnd:
+                    return False
+                key_name = "esc" if name.endswith("_esc") else "space"
+                return input_message.send_notify_key_deep(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK[key_name],
+                    press_delay=hold_secs,
+                )
+            if name in {"callback_pm_esc", "callback_pm_space"}:
+                if not manager.hwnd:
+                    return False
+                key_name = "esc" if name.endswith("_esc") else "space"
+                return input_message.send_key_deep_callback(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK[key_name],
+                    press_delay=hold_secs,
+                )
+            if name in {"process_pm_esc", "process_sys_esc", "process_pm_space"}:
+                if not manager.hwnd:
+                    return False
+                key_name = "space" if name.endswith("_space") else "esc"
+                return input_message.post_key_process_windows(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK[key_name],
+                    system_key=name == "process_sys_esc",
+                    press_delay=hold_secs,
+                )
+            if name in {
+                "process_thread_pm_esc",
+                "process_thread_sys_esc",
+                "process_thread_pm_space",
+                "spoof_process_thread_sys_esc",
+                "spoof_process_thread_sys_esc_envelope2",
+            }:
+                if not manager.hwnd:
+                    return False
+                key_name = "space" if name.endswith("_space") else "esc"
+                system_key = name in {
+                    "process_thread_sys_esc",
+                    "spoof_process_thread_sys_esc",
+                    "spoof_process_thread_sys_esc_envelope2",
+                }
+                spoofed = False
+                if name in {
+                    "spoof_process_thread_sys_esc",
+                    "spoof_process_thread_sys_esc_envelope2",
+                }:
+                    spoofed = input_message.spoof_window_active(
+                        manager.hwnd,
+                        True,
+                    )
+                    if not spoofed:
+                        return False
+                try:
+                    pulse_count = (
+                        2
+                        if name == "spoof_process_thread_sys_esc_envelope2"
+                        else 1
+                    )
+                    for pulse_index in range(pulse_count):
+                        if not input_message.post_key_process_threads(
+                            manager.hwnd,
+                            input_message.KEY_TO_VK[key_name],
+                            system_key=system_key,
+                            press_delay=hold_secs,
+                        ):
+                            return False
+                        if pulse_index + 1 < pulse_count:
+                            time.sleep(0.06)
+                    return True
+                finally:
+                    if spoofed:
+                        input_message.spoof_window_active(
+                            manager.hwnd,
+                            False,
+                        )
+            if name in {
+                "down_pm_esc", "up_pm_esc",
+                "down_pm_space", "up_pm_space",
+            }:
+                if not manager.hwnd:
+                    return False
+                key_name = "esc" if name.endswith("_esc") else "space"
+                return input_message.post_key_transition_deep(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK[key_name],
+                    key_up=name.startswith("up_"),
+                )
+            if name in {
+                "ds4_cross", "ds4_options", "ds4_circle", "ds4_share",
+                "ds4_touchpad",
+            }:
+                return send_ds4_button(
+                    name.removeprefix("ds4_"),
+                    press_delay=hold_secs,
+                )
+            if name in {
+                "spoof_ds4_cross",
+                "spoof_ds4_options",
+                "spoof_ds4_circle",
+                "spoof_ds4_share",
+            }:
+                if not manager.hwnd:
+                    return False
+                button_name = name.removeprefix("spoof_ds4_")
+                spoofed = input_message.spoof_window_active(
+                    manager.hwnd,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    return send_ds4_button(
+                        button_name,
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    input_message.spoof_window_active(
+                        manager.hwnd,
+                        False,
+                    )
+            if name in {
+                "device_ds4_cross",
+                "device_ds4_options",
+                "device_ds4_circle",
+                "device_ds4_share",
+                "device_ds4_touchpad",
+            }:
+                if not manager.hwnd or not input_message.notify_device_rescan(
+                    manager.hwnd
+                ):
+                    return False
+                return send_ds4_button(
+                    name.removeprefix("device_ds4_"),
+                    press_delay=hold_secs,
+                )
+            if name == "device_ds4_rescan_control":
+                if not manager.hwnd or not input_gamepad.ensure_virtual_gamepad(
+                    "ds4"
+                ):
+                    return False
+                return input_message.notify_device_rescan(manager.hwnd)
+            if name in {"sync_pm_esc_delay50", "sync_pm_esc_delay150"}:
+                if not manager.hwnd:
+                    return False
+                time.sleep(
+                    0.05 if name == "sync_pm_esc_delay50" else 0.15
+                )
+                return input_message.send_key_deep_sync(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK["esc"],
+                    char_code=None,
+                    press_delay=hold_secs,
+                )
+            if name in {
+                "spoof_pm_esc_settle150",
+                "spoof_sync_pm_esc",
+            }:
+                if not manager.hwnd:
+                    return False
+                spoofed = input_message.spoof_window_active(
+                    manager.hwnd,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    if name == "spoof_pm_esc_settle150":
+                        time.sleep(0.15)
+                        return input_message.post_key_deep(
+                            manager.hwnd,
+                            input_message.KEY_TO_VK["esc"],
+                            press_delay=hold_secs,
+                        )
+                    return input_message.send_key_deep_sync(
+                        manager.hwnd,
+                        input_message.KEY_TO_VK["esc"],
+                        char_code=None,
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    input_message.spoof_window_active(
+                        manager.hwnd,
+                        False,
+                    )
+            if name in {
+                "focusmsg_pm_esc",
+                "appmsg_pm_esc",
+                "windowmsg_pm_esc",
+            }:
+                if not manager.hwnd:
+                    return False
+                component = {
+                    "focusmsg_pm_esc": "focus",
+                    "appmsg_pm_esc": "app",
+                    "windowmsg_pm_esc": "window",
+                }[name]
+                spoofed = input_message.spoof_window_active_component(
+                    manager.hwnd,
+                    component,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    return input_message.post_key_deep(
+                        manager.hwnd,
+                        input_message.KEY_TO_VK["esc"],
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    if spoofed:
+                        input_message.spoof_window_active_component(
+                            manager.hwnd,
+                            component,
+                            False,
+                        )
+            if name in {
+                "focusmsg_start_envelope2",
+                "appmsg_start_envelope2",
+                "windowmsg_start_envelope2",
+                "focusmsg_start_compact",
+                "windowmsg_start_compact",
+                "windowmsg_start_refresh2",
+                "windowmsg_start_compact_settle100",
+                "windowmsg_start_compact_settle200",
+                "focusmsg_start_spread650",
+                "windowmsg_start_spread650",
+            }:
+                if not manager.hwnd:
+                    return False
+                component = {
+                    "focusmsg_start_envelope2": "focus",
+                    "appmsg_start_envelope2": "app",
+                    "windowmsg_start_envelope2": "window",
+                    "focusmsg_start_compact": "focus",
+                    "windowmsg_start_compact": "window",
+                    "windowmsg_start_refresh2": "window",
+                    "windowmsg_start_compact_settle100": "window",
+                    "windowmsg_start_compact_settle200": "window",
+                    "focusmsg_start_spread650": "focus",
+                    "windowmsg_start_spread650": "window",
+                }[name]
+                pulse_gap = (
+                    0.05 if name in {
+                        "focusmsg_start_compact",
+                        "windowmsg_start_compact",
+                        "windowmsg_start_refresh2",
+                        "windowmsg_start_compact_settle100",
+                        "windowmsg_start_compact_settle200",
+                    }
+                    else 0.65 if name.endswith("_spread650")
+                    else 0.10
+                )
+                button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                if button is None:
+                    return False
+                spoofed = input_message.spoof_window_active_component(
+                    manager.hwnd,
+                    component,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    send_button = (
+                        input_gamepad.send_gamepad_button_refreshed
+                        if name == "windowmsg_start_refresh2"
+                        else send_gamepad_button
+                    )
+                    if not send_button(
+                        button,
+                        press_delay=hold_secs,
+                    ):
+                        return False
+                    time.sleep(pulse_gap)
+                    if not send_button(
+                        button,
+                        press_delay=hold_secs,
+                    ):
+                        return False
+                    settle_seconds = {
+                        "windowmsg_start_compact_settle100": 0.10,
+                        "windowmsg_start_compact_settle200": 0.20,
+                    }.get(name, 0.0)
+                    if settle_seconds:
+                        time.sleep(settle_seconds)
+                    return True
+                finally:
+                    if spoofed:
+                        input_message.spoof_window_active_component(
+                            manager.hwnd,
+                            component,
+                            False,
+                        )
+            if name in {
+                "focuswindow_start_envelope2",
+                "focuswindow_start_compact",
+                "focuswindow_start_spread650",
+            }:
+                if not manager.hwnd:
+                    return False
+                button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                if button is None:
+                    return False
+                pulse_gap = (
+                    0.05 if name.endswith("_compact")
+                    else 0.65 if name.endswith("_spread650")
+                    else 0.10
+                )
+                active_components: list[str] = []
+                try:
+                    for component in ("focus", "window"):
+                        spoofed = input_message.spoof_window_active_component(
+                            manager.hwnd,
+                            component,
+                            True,
+                        )
+                        if not spoofed:
+                            return False
+                        active_components.append(component)
+                    if not send_gamepad_button(
+                        button,
+                        press_delay=hold_secs,
+                    ):
+                        return False
+                    time.sleep(pulse_gap)
+                    return send_gamepad_button(
+                        button,
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    for component in reversed(active_components):
+                        input_message.spoof_window_active_component(
+                            manager.hwnd,
+                            component,
+                            False,
+                        )
             if name in {"spoof_a", "spoof_start"}:
                 if not manager.hwnd:
                     return False
@@ -2416,10 +3531,623 @@ class AutomationApp:
                     return send_gamepad_button(button, press_delay=hold_secs)
                 finally:
                     input_message.spoof_window_active(manager.hwnd, False)
-            if name in {"spoof_char_s", "spoof_pm_s"}:
+            if name in {
+                "process_device_spoof_start_a_combo2",
+                "process_device_spoof_start_b_combo2",
+                "process_device_spoof_start_back_combo2",
+            }:
                 if not manager.hwnd:
                     return False
-                vk = input_message.KEY_TO_VK.get("s")
+                secondary_name = (
+                    "back"
+                    if name == "process_device_spoof_start_back_combo2"
+                    else "a"
+                    if name == "process_device_spoof_start_a_combo2"
+                    else "b"
+                )
+                start_button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                secondary_button = input_gamepad.KEY_TO_GAMEPAD.get(secondary_name)
+                if start_button is None or secondary_button is None:
+                    return False
+                if not input_gamepad.ensure_virtual_gamepad("xbox"):
+                    return False
+                if not input_message.notify_device_rescan_process(
+                    manager.hwnd,
+                    settle_seconds=0.0,
+                ):
+                    return False
+                spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                try:
+                    if not spoofed:
+                        return False
+                    for index in range(2):
+                        if not send_gamepad_buttons(
+                            (start_button, secondary_button),
+                            press_delay=hold_secs,
+                        ):
+                            return False
+                        if index == 0:
+                            time.sleep(0.05)
+                    return True
+                finally:
+                    input_message.spoof_window_active(manager.hwnd, False)
+            if name in {
+                "process_device_spoof_a_then_start_then_a",
+                "process_device_spoof_start_then_a_single",
+                "process_device_spoof_start_then_a_single_gap0",
+                "process_device_spoof_start_wait300_a",
+                "process_device_spoof_start_then_a_pair",
+                "process_device_spoof_start_then_b_pair",
+                "process_device_spoof_start_then_back_pair",
+            }:
+                if not manager.hwnd:
+                    return False
+                secondary_name = (
+                    "back"
+                    if name == "process_device_spoof_start_then_back_pair"
+                    else "a"
+                    if name in {
+                        "process_device_spoof_start_then_a_pair",
+                        "process_device_spoof_a_then_start_then_a",
+                        "process_device_spoof_start_then_a_single",
+                        "process_device_spoof_start_then_a_single_gap0",
+                        "process_device_spoof_start_wait300_a",
+                    }
+                    else "b"
+                )
+                start_button = input_gamepad.KEY_TO_GAMEPAD.get("start")
+                secondary_button = input_gamepad.KEY_TO_GAMEPAD.get(secondary_name)
+                if start_button is None or secondary_button is None:
+                    return False
+                if not input_gamepad.ensure_virtual_gamepad("xbox"):
+                    return False
+                if not input_message.notify_device_rescan_process(
+                    manager.hwnd,
+                    settle_seconds=0.0,
+                ):
+                    return False
+                spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                try:
+                    if not spoofed:
+                        return False
+                    if name == "process_device_spoof_a_then_start_then_a":
+                        for index, button in enumerate(
+                            (secondary_button, start_button, secondary_button)
+                        ):
+                            if not send_gamepad_button(
+                                button,
+                                press_delay=hold_secs,
+                            ):
+                                return False
+                            if index < 2:
+                                time.sleep(0.05)
+                        return True
+                    if not send_gamepad_button(
+                        start_button,
+                        press_delay=hold_secs,
+                    ):
+                        return False
+                    if name == "process_device_spoof_start_wait300_a":
+                        time.sleep(0.30)
+                    elif name != "process_device_spoof_start_then_a_single_gap0":
+                        time.sleep(0.05)
+                    if name in {
+                        "process_device_spoof_start_then_a_single",
+                        "process_device_spoof_start_then_a_single_gap0",
+                        "process_device_spoof_start_wait300_a",
+                    }:
+                        return send_gamepad_button(
+                            secondary_button,
+                            press_delay=hold_secs,
+                        )
+                    for index in range(2):
+                        if not send_gamepad_button(
+                            secondary_button,
+                            press_delay=hold_secs,
+                        ):
+                            return False
+                        if index == 0:
+                            time.sleep(0.05)
+                    return True
+                finally:
+                    input_message.spoof_window_active(manager.hwnd, False)
+            if name in {
+                "process_device_spoof_ds4_options_then_cross",
+                "process_device_spoof_ds4_options_then_cross_gap0",
+            }:
+                if not manager.hwnd:
+                    return False
+                if not input_gamepad.ensure_virtual_gamepad("ds4"):
+                    return False
+                if not input_message.notify_device_rescan_process(
+                    manager.hwnd,
+                    settle_seconds=0.0,
+                ):
+                    return False
+                spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                try:
+                    if not spoofed:
+                        return False
+                    if not send_ds4_button(
+                        "options",
+                        press_delay=hold_secs,
+                    ):
+                        return False
+                    if name != "process_device_spoof_ds4_options_then_cross_gap0":
+                        time.sleep(0.05)
+                    return send_ds4_button(
+                        "cross",
+                        press_delay=hold_secs,
+                    )
+                finally:
+                    input_message.spoof_window_active(manager.hwnd, False)
+            if name in {
+                "spoof_start_envelope2",
+                "process_device_spoof_start_envelope2",
+                "process_device_spoof_start_envelope2_settle0",
+                "process_device_spoof_start_envelope2_gap50",
+                "process_device_spoof_start_envelope2_compact",
+                "process_device_spoof_start_pair_rehandshake2",
+                "process_device_spoof_start_rescan2_pair",
+                "process_device_spoof_start_activation_rearm_pair",
+                "process_device_spoof_start_preactivate150_pair",
+                "process_device_spoof_reset_start_compact",
+                "process_device_sync_spoof_start_compact",
+                "process_raw_spoof_start_compact",
+                "process_device_raw_spoof_start_compact",
+                "process_spoof_device_start_compact",
+                "process_spoof_device_sync_start_compact",
+                "process_spoof_device_raw_sync_start_compact",
+                "process_spoof_device_raw_parallel_start_compact",
+                "process_spoof_diapp_device_raw_parallel_start_compact",
+                "process_spoof_device_raw_parallel_start_compact3",
+                "process_spoof_device_raw_parallel_start_rehandshake2",
+                "process_spoof_device_raw_stagger30_start_compact",
+                "process_spoof_reset_device_raw_parallel_start_compact",
+                "process_spoof_device_raw_parallel_start_refresh2",
+                "process_device_spoof_diapp_start_compact",
+                "process_raw_sync_spoof_start_compact",
+                "process_device_spoof_start_compact4",
+                "process_device_spoof_start_compact4_gap10",
+                "process_device_spoof_start_compact3",
+                "process_device_spoof_start_compact4_hold130",
+                "process_device_spoof_start_single150",
+                "process_device_spoof_start_single180",
+                "process_device_spoof_start_wake40_finish150",
+                "process_device_spoof_start_wake60_finish150",
+                "process_device_spoof_start_edge60_pair",
+                "process_device_spoof_start_edge40_pair",
+                "process_device_spoof_start_refresh2",
+                "process_device_spoof_start_refresh650",
+                "process_device_spoof_start_fast3",
+                "spoof_start_envelope3",
+                "spoof_start_envelope2_settle150",
+                "spoof_start_envelope2_settle250",
+                "spoof_start_envelope2_settle350",
+                "spoof_start_preactivate80_burst3",
+                "spoof_start_envelope4_fast",
+                "spoof_a_envelope2",
+                "process_device_spoof_a_envelope2",
+                "spoof_a_preactivate80_burst3",
+                "spoof_envelope2_control",
+                "spoof_b_envelope2",
+                "spoof_back_envelope2",
+            }:
+                if not manager.hwnd:
+                    return False
+                control_only = name == "spoof_envelope2_control"
+                gamepad_name = (
+                    "back" if name == "spoof_back_envelope2"
+                    else "b" if name == "spoof_b_envelope2"
+                    else "a" if name in {
+                        "spoof_a_envelope2",
+                        "process_device_spoof_a_envelope2",
+                        "spoof_a_preactivate80_burst3",
+                    }
+                    else "start"
+                )
+                button = input_gamepad.KEY_TO_GAMEPAD.get(gamepad_name)
+                if button is None and not control_only:
+                    return False
+                hold_sequence = None
+                if name == "process_device_spoof_start_fast3":
+                    count, gap, preactivate = 3, 0.02, 0.0
+                elif name == "process_device_spoof_start_preactivate150_pair":
+                    count, gap, preactivate = 2, 0.05, 0.15
+                elif name == "process_device_spoof_start_compact4":
+                    count, gap, preactivate = 4, 0.05, 0.0
+                elif name == "process_device_spoof_start_compact4_gap10":
+                    count, gap, preactivate = 4, 0.01, 0.0
+                elif name == "process_device_spoof_start_compact3":
+                    count, gap, preactivate = 3, 0.05, 0.0
+                elif name == "process_device_spoof_start_compact4_hold130":
+                    count, gap, preactivate = 4, 0.05, 0.0
+                elif name == "process_spoof_device_raw_parallel_start_compact3":
+                    count, gap, preactivate = 3, 0.05, 0.0
+                elif name in {
+                    "process_device_spoof_start_envelope2_gap50",
+                    "process_device_spoof_start_envelope2_compact",
+                    "process_device_spoof_start_pair_rehandshake2",
+                    "process_device_spoof_start_rescan2_pair",
+                    "process_device_spoof_start_activation_rearm_pair",
+                    "process_device_spoof_reset_start_compact",
+                    "process_device_sync_spoof_start_compact",
+                    "process_raw_spoof_start_compact",
+                    "process_device_raw_spoof_start_compact",
+                    "process_spoof_device_start_compact",
+                    "process_spoof_device_sync_start_compact",
+                    "process_spoof_device_raw_sync_start_compact",
+                    "process_spoof_device_raw_parallel_start_compact",
+                    "process_spoof_diapp_device_raw_parallel_start_compact",
+                    "process_spoof_device_raw_parallel_start_compact3",
+                    "process_spoof_device_raw_parallel_start_rehandshake2",
+                    "process_spoof_device_raw_stagger30_start_compact",
+                    "process_spoof_reset_device_raw_parallel_start_compact",
+                    "process_spoof_device_raw_parallel_start_refresh2",
+                    "process_device_spoof_diapp_start_compact",
+                    "process_raw_sync_spoof_start_compact",
+                }:
+                    count, gap, preactivate = 2, 0.05, 0.0
+                elif name == "process_device_spoof_start_edge60_pair":
+                    count, gap, preactivate = 2, 0.02, 0.0
+                elif name == "process_device_spoof_start_edge40_pair":
+                    count, gap, preactivate = 2, 0.01, 0.0
+                elif name == "process_device_spoof_start_refresh2":
+                    count, gap, preactivate = 2, 0.05, 0.0
+                elif name == "process_device_spoof_start_refresh650":
+                    count, gap, preactivate = 1, 0.0, 0.0
+                elif name in {
+                    "process_device_spoof_start_single150",
+                    "process_device_spoof_start_single180",
+                }:
+                    count, gap, preactivate = 1, 0.0, 0.0
+                elif name == "process_device_spoof_start_wake40_finish150":
+                    count, gap, preactivate = 2, 0.01, 0.0
+                    hold_sequence = (0.04, 0.15)
+                elif name == "process_device_spoof_start_wake60_finish150":
+                    count, gap, preactivate = 2, 0.02, 0.0
+                    hold_sequence = (0.06, 0.15)
+                elif name in {
+                    "spoof_start_preactivate80_burst3",
+                    "spoof_a_preactivate80_burst3",
+                }:
+                    count, gap, preactivate = 3, 0.04, 0.08
+                elif name == "spoof_start_envelope4_fast":
+                    count, gap, preactivate = 4, 0.04, 0.0
+                else:
+                    count = 3 if name == "spoof_start_envelope3" else 2
+                    gap = 0.06 if count == 3 else 0.10
+                    preactivate = 0.0
+                active_first_rescan = name in {
+                    "process_spoof_device_start_compact",
+                    "process_spoof_device_sync_start_compact",
+                    "process_spoof_device_raw_sync_start_compact",
+                    "process_spoof_device_raw_parallel_start_compact",
+                    "process_spoof_diapp_device_raw_parallel_start_compact",
+                    "process_spoof_device_raw_parallel_start_compact3",
+                    "process_spoof_device_raw_parallel_start_rehandshake2",
+                    "process_spoof_device_raw_stagger30_start_compact",
+                    "process_spoof_reset_device_raw_parallel_start_compact",
+                    "process_spoof_device_raw_parallel_start_refresh2",
+                }
+                if active_first_rescan:
+                    if not input_gamepad.ensure_virtual_gamepad("xbox"):
+                        return False
+                    spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                    diapp_spoofed = False
+                    try:
+                        if not spoofed:
+                            return False
+                        if name == "process_spoof_diapp_device_raw_parallel_start_compact":
+                            diapp_spoofed = input_message.spoof_directinput_app_active(
+                                manager.hwnd,
+                                True,
+                                settle_seconds=0.0,
+                            )
+                            if not diapp_spoofed:
+                                return False
+                        if (
+                            name == "process_spoof_reset_device_raw_parallel_start_compact"
+                            and not input_gamepad.reset_virtual_gamepad(
+                                "xbox",
+                                settle_seconds=0.05,
+                            )
+                        ):
+                            return False
+                        def run_parallel_discovery(stagger_seconds: float = 0.0) -> bool:
+                            with ThreadPoolExecutor(
+                                max_workers=2,
+                                thread_name_prefix="skip-discovery",
+                            ) as executor:
+                                device_future = executor.submit(
+                                    input_message.notify_device_rescan_relevant_sync,
+                                    manager.hwnd,
+                                    timeout_ms=80,
+                                    settle_seconds=0.0,
+                                )
+                                if stagger_seconds > 0:
+                                    time.sleep(stagger_seconds)
+                                raw_future = executor.submit(
+                                    input_message.notify_raw_gamepad_arrival_relevant_sync,
+                                    manager.hwnd,
+                                    timeout_ms=80,
+                                    settle_seconds=0.0,
+                                )
+                                device_ok = bool(device_future.result())
+                                raw_ok = bool(raw_future.result())
+                            return device_ok and raw_ok
+
+                        if name in {
+                            "process_spoof_device_raw_parallel_start_compact",
+                            "process_spoof_diapp_device_raw_parallel_start_compact",
+                            "process_spoof_device_raw_parallel_start_compact3",
+                            "process_spoof_device_raw_parallel_start_rehandshake2",
+                            "process_spoof_device_raw_stagger30_start_compact",
+                            "process_spoof_reset_device_raw_parallel_start_compact",
+                            "process_spoof_device_raw_parallel_start_refresh2",
+                        }:
+                            # The device and Raw Input discovery calls target the
+                            # same FC-owned render/DI windows but carry independent
+                            # messages.  Their per-window SendMessageTimeout calls
+                            # are bounded, so overlap them to preserve the strict
+                            # 1.5-second result budget without changing scope.
+                            discovered = run_parallel_discovery(
+                                0.03
+                                if name
+                                == "process_spoof_device_raw_stagger30_start_compact"
+                                else 0.0
+                            )
+                        elif name in {
+                            "process_spoof_device_sync_start_compact",
+                            "process_spoof_device_raw_sync_start_compact",
+                        }:
+                            discovered = input_message.notify_device_rescan_relevant_sync(
+                                manager.hwnd,
+                                timeout_ms=80,
+                                settle_seconds=0.0,
+                            )
+                        else:
+                            discovered = input_message.notify_device_rescan_process(
+                                manager.hwnd,
+                                settle_seconds=0.05,
+                            )
+                        if not discovered:
+                            return False
+                        if (
+                            name == "process_spoof_device_raw_sync_start_compact"
+                            and not input_message.notify_raw_gamepad_arrival_relevant_sync(
+                                manager.hwnd,
+                                timeout_ms=80,
+                                settle_seconds=0.0,
+                            )
+                        ):
+                            return False
+                        handshake_rounds = (
+                            2
+                            if name
+                            == "process_spoof_device_raw_parallel_start_rehandshake2"
+                            else 1
+                        )
+                        for handshake_index in range(handshake_rounds):
+                            if handshake_index > 0:
+                                time.sleep(0.05)
+                                if not run_parallel_discovery():
+                                    return False
+                            for pulse_index in range(count):
+                                send_button = (
+                                    input_gamepad.send_gamepad_button_refreshed
+                                    if name
+                                    == "process_spoof_device_raw_parallel_start_refresh2"
+                                    else send_gamepad_button
+                                )
+                                if not send_button(
+                                    button,
+                                    press_delay=hold_secs,
+                                ):
+                                    return False
+                                if pulse_index < count - 1:
+                                    time.sleep(gap)
+                        return True
+                    finally:
+                        if diapp_spoofed:
+                            input_message.spoof_directinput_app_active(
+                                manager.hwnd,
+                                False,
+                                settle_seconds=0.0,
+                            )
+                        input_message.spoof_window_active(manager.hwnd, False)
+                process_device_rescan = (
+                    name.startswith("process_device_spoof_")
+                    or name == "process_device_raw_spoof_start_compact"
+                )
+                raw_device_arrival = name in {
+                    "process_raw_spoof_start_compact",
+                    "process_device_raw_spoof_start_compact",
+                }
+                sync_device_rescan = (
+                    name == "process_device_sync_spoof_start_compact"
+                )
+                sync_raw_arrival = (
+                    name == "process_raw_sync_spoof_start_compact"
+                )
+                if (
+                    process_device_rescan
+                    or raw_device_arrival
+                    or sync_device_rescan
+                    or sync_raw_arrival
+                ):
+                    if not input_gamepad.ensure_virtual_gamepad("xbox"):
+                        return False
+                    if (
+                        name == "process_device_spoof_reset_start_compact"
+                        and not input_gamepad.reset_virtual_gamepad(
+                            "xbox",
+                            settle_seconds=0.05,
+                        )
+                    ):
+                        return False
+                    if sync_device_rescan and not input_message.notify_device_rescan_relevant_sync(
+                        manager.hwnd,
+                        timeout_ms=80,
+                        settle_seconds=0.0,
+                    ):
+                        return False
+                    if name == "process_device_spoof_start_pair_rehandshake2":
+                        for handshake_index in range(2):
+                            if not input_message.notify_device_rescan_process(
+                                manager.hwnd,
+                                settle_seconds=0.0,
+                            ):
+                                return False
+                            spoofed = input_message.spoof_window_active(
+                                manager.hwnd,
+                                True,
+                            )
+                            try:
+                                if not spoofed:
+                                    return False
+                                for pulse_index in range(2):
+                                    if not send_gamepad_button(
+                                        button,
+                                        press_delay=hold_secs,
+                                    ):
+                                        return False
+                                    if pulse_index == 0:
+                                        time.sleep(gap)
+                            finally:
+                                input_message.spoof_window_active(
+                                    manager.hwnd,
+                                    False,
+                                )
+                            if handshake_index == 0:
+                                time.sleep(gap)
+                        return True
+                    if name == "process_device_spoof_start_rescan2_pair":
+                        for rescan_index in range(2):
+                            if not input_message.notify_device_rescan_process(
+                                manager.hwnd,
+                                settle_seconds=0.0,
+                            ):
+                                return False
+                            if rescan_index == 0:
+                                time.sleep(gap)
+                    elif process_device_rescan:
+                        if not input_message.notify_device_rescan_process(
+                            manager.hwnd,
+                            settle_seconds=0.0,
+                        ):
+                            return False
+                    if raw_device_arrival and not input_message.notify_raw_gamepad_arrival_process(
+                        manager.hwnd,
+                        settle_seconds=0.0,
+                    ):
+                        return False
+                    if sync_raw_arrival and not input_message.notify_raw_gamepad_arrival_relevant_sync(
+                        manager.hwnd,
+                        timeout_ms=80,
+                        settle_seconds=0.0,
+                    ):
+                        return False
+                    post_rescan_wait = {
+                        "process_device_spoof_start_envelope2": 0.12,
+                        "process_device_spoof_a_envelope2": 0.12,
+                    }.get(name, 0.0)
+                    if post_rescan_wait:
+                        time.sleep(post_rescan_wait)
+                    if name == "process_device_spoof_start_activation_rearm_pair":
+                        for pulse_index in range(2):
+                            spoofed = input_message.spoof_window_active(
+                                manager.hwnd,
+                                True,
+                            )
+                            try:
+                                if not spoofed:
+                                    return False
+                                if not send_gamepad_button(
+                                    button,
+                                    press_delay=hold_secs,
+                                ):
+                                    return False
+                            finally:
+                                input_message.spoof_window_active(
+                                    manager.hwnd,
+                                    False,
+                                )
+                            if pulse_index == 0:
+                                time.sleep(gap)
+                        return True
+                spoofed = input_message.spoof_window_active(manager.hwnd, True)
+                try:
+                    if not spoofed:
+                        return False
+                    if (
+                        name == "process_device_spoof_diapp_start_compact"
+                        and not input_message.spoof_directinput_app_active(
+                            manager.hwnd,
+                            True,
+                        )
+                    ):
+                        return False
+                    if preactivate:
+                        time.sleep(preactivate)
+                    if control_only:
+                        # Match two 180 ms holds, two 20 ms post-release
+                        # settles, and their 100 ms gap without emitting any
+                        # virtual-controller state.
+                        time.sleep(0.50)
+                        return True
+                    for index in range(count):
+                        send_button = (
+                            input_gamepad.send_gamepad_button_refreshed
+                            if name in {
+                                "process_device_spoof_start_refresh2",
+                                "process_device_spoof_start_refresh650",
+                            }
+                            else send_gamepad_button
+                        )
+                        if not send_button(
+                            button,
+                            press_delay=(
+                                hold_sequence[index]
+                                if hold_sequence is not None
+                                else hold_secs
+                            ),
+                        ):
+                            return False
+                        if index + 1 < count:
+                            time.sleep(gap)
+                    settle_seconds = {
+                        "spoof_start_envelope2_settle150": 0.15,
+                        "spoof_start_envelope2_settle250": 0.25,
+                        "spoof_start_envelope2_settle350": 0.35,
+                    }.get(name, 0.0)
+                    if settle_seconds:
+                        time.sleep(settle_seconds)
+                    return True
+                finally:
+                    if name == "process_device_spoof_diapp_start_compact":
+                        input_message.spoof_directinput_app_active(
+                            manager.hwnd,
+                            False,
+                        )
+                    input_message.spoof_window_active(manager.hwnd, False)
+            if name in {
+                "spoof_char_s",
+                "spoof_char_esc",
+                "spoof_pm_s",
+                "spoof_pm_esc",
+                "spoof_pm_space",
+                "spoof_pm_esc_envelope2",
+            }:
+                if not manager.hwnd:
+                    return False
+                key_name = (
+                    "esc"
+                    if name.endswith("_esc") or name == "spoof_pm_esc_envelope2"
+                    else "space" if name.endswith("_space")
+                    else "s"
+                )
+                vk = input_message.KEY_TO_VK.get(key_name)
                 if not vk:
                     return False
                 spoofed = input_message.spoof_window_active(
@@ -2429,16 +4157,87 @@ class AutomationApp:
                 try:
                     if not spoofed:
                         return False
-                    if name == "spoof_char_s":
+                    if name in {"spoof_char_s", "spoof_char_esc"}:
                         return input_message.post_char_deep(
                             manager.hwnd,
                             vk,
-                            ord("s"),
+                            0x1B if name.endswith("_esc") else ord("s"),
                             press_delay=hold_secs,
                         )
-                    return input_message.post_key_deep(
+                    pulse_count = 2 if name == "spoof_pm_esc_envelope2" else 1
+                    for pulse_index in range(pulse_count):
+                        if not input_message.post_key_deep(
+                            manager.hwnd,
+                            vk,
+                            press_delay=hold_secs,
+                        ):
+                            return False
+                        if pulse_index + 1 < pulse_count:
+                            time.sleep(0.10)
+                    return True
+                finally:
+                    input_message.spoof_window_active(
                         manager.hwnd,
-                        vk,
+                        False,
+                    )
+            if name in {
+                "sync_char_s",
+                "sync_char_esc",
+                "sync_pm_s",
+                "sync_pm_esc",
+                "sync_pm_space",
+            }:
+                if not manager.hwnd:
+                    return False
+                key_name = (
+                    "esc" if name.endswith("_esc")
+                    else "space" if name.endswith("_space")
+                    else "s"
+                )
+                vk = input_message.KEY_TO_VK.get(key_name)
+                if not vk:
+                    return False
+                return input_message.send_key_deep_sync(
+                    manager.hwnd,
+                    vk,
+                    char_code=(
+                        0x1B
+                        if name == "sync_char_esc"
+                        else ord("s") if name == "sync_char_s" else None
+                    ),
+                    press_delay=hold_secs,
+                )
+            if name in {"thread_pm_esc", "thread_char_esc", "thread_pm_space"}:
+                if not manager.hwnd:
+                    return False
+                is_space = name.endswith("_space")
+                return input_message.post_key_thread(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK["space" if is_space else "esc"],
+                    char_code=0x1B if name == "thread_char_esc" else None,
+                    press_delay=hold_secs,
+                )
+            if name == "thread_sys_esc":
+                if not manager.hwnd:
+                    return False
+                return input_message.post_system_key_thread(
+                    manager.hwnd,
+                    input_message.KEY_TO_VK["esc"],
+                    press_delay=hold_secs,
+                )
+            if name == "spoof_thread_sys_esc":
+                if not manager.hwnd:
+                    return False
+                spoofed = input_message.spoof_window_active(
+                    manager.hwnd,
+                    True,
+                )
+                try:
+                    if not spoofed:
+                        return False
+                    return input_message.post_system_key_thread(
+                        manager.hwnd,
+                        input_message.KEY_TO_VK["esc"],
                         press_delay=hold_secs,
                     )
                 finally:
@@ -2446,23 +4245,16 @@ class AutomationApp:
                         manager.hwnd,
                         False,
                     )
-            if name in {"sync_char_s", "sync_pm_s"}:
-                if not manager.hwnd:
-                    return False
-                vk = input_message.KEY_TO_VK.get("s")
-                if not vk:
-                    return False
-                return input_message.send_key_deep_sync(
-                    manager.hwnd,
-                    vk,
-                    char_code=ord("s") if name == "sync_char_s" else None,
-                    press_delay=hold_secs,
-                )
             # 스캔코드 전용(아무 키 일반화 불가 — 's' 고정).
-            if name == "focus_child_s":
+            if name in {"focus_child_s", "focus_child_esc"}:
                 if manager.hwnd:
+                    scan = (
+                        input_message.SCAN_ESC
+                        if name.endswith("_esc")
+                        else input_message.SCAN_S
+                    )
                     return input_message.send_key_focus_child(
-                        manager.hwnd, input_message.SCAN_S, hold=hold_secs)
+                        manager.hwnd, scan, hold=hold_secs)
                 return False
             if name == "focus_s":
                 if manager.hwnd:
@@ -2482,7 +4274,8 @@ class AutomationApp:
                         return input_message.post_key_deep(
                             manager.hwnd, vk, press_delay=hold_secs)
                     if method == "char":
-                        char_code = {"enter": 0x0D, "return": 0x0D,
+                        char_code = {"esc": 0x1B, "escape": 0x1B,
+                                     "enter": 0x0D, "return": 0x0D,
                                      "space": 0x20, "tab": 0x09}.get(
                             key, ord(key) if len(key) == 1 else 0)
                         if char_code:
@@ -2506,6 +4299,125 @@ class AutomationApp:
         except Exception:
             return False
 
+    def _fast_skip_template_visible(self, screen_gray) -> bool:
+        """Cheap synchronous A/S gate used before normal target dispatch."""
+
+        try:
+            h, w = screen_gray.shape[:2]
+            crop = screen_gray[
+                max(0, int(h * SKIP_OCR_TOP_FRACTION)):
+                min(h, int(h * SKIP_OCR_BOTTOM_FRACTION)),
+                max(0, int(w * SKIP_OCR_LEFT_FRACTION)):
+                min(w, int(w * SKIP_OCR_RIGHT_FRACTION)),
+            ]
+            is_a = rank_ocr.match_skip_a(crop, self.base_dir)[0]
+            if is_a:
+                return True
+            return bool(rank_ocr.match_skip_s(crop, self.base_dir)[0])
+        except Exception:
+            return False
+
+    def _confirmed_s_template_match(self, matched: bool) -> bool:
+        """Require consecutive S-template frames before starting control.
+
+        A moving player's shirt produced an isolated high score in real replay
+        footage.  A genuine prompt must survive the mandatory three-second
+        control anyway, so this short consensus gate removes that false hit
+        without discarding usable evidence.
+        """
+
+        if matched:
+            self._skip_s_match_streak = (
+                int(getattr(self, "_skip_s_match_streak", 0)) + 1
+            )
+        else:
+            self._skip_s_match_streak = 0
+        return bool(
+            matched
+            and self._skip_s_match_streak >= max(2, SKIP_TEXT_CONSENSUS)
+        )
+
+    @staticmethod
+    def _is_highlight_summary_context(screen_gray: np.ndarray) -> bool:
+        """Identify the dark match-highlight summary without touching focus.
+
+        The in-match replay and post-match summary share the same skip label
+        but accept different inactive input routes. Real captures measured a
+        central dark-pixel ratio of 0.882 for the summary, versus 0.003 for
+        gameplay and 0.156 for the ordinary tactics screen.
+        """
+
+        try:
+            frame = np.asarray(screen_gray)
+            if frame.ndim == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if frame.ndim != 2:
+                return False
+            h, w = frame.shape[:2]
+            if h < 100 or w < 100:
+                return False
+            roi = frame[
+                max(0, int(h * 0.12)):min(h, int(h * 0.86)),
+                max(0, int(w * 0.23)):min(w, int(w * 0.77)),
+            ]
+            if roi.size == 0:
+                return False
+            dark_fraction = float(np.mean(roi < 45))
+            # A fully black loading/capture placeholder is not the summary.
+            return 0.70 <= dark_fraction <= 0.95
+        except Exception:
+            return False
+
+    def _defer_escape_target_for_skip_probe(self, target, now: float) -> bool:
+        """Finish an OCR probe before a normal ESC target is sent.
+
+        The captured generic prompt contains the same ESC icon as target_F.
+        Without this probe, the normal target path can send ESC before the OCR
+        worker classifies ``ESC SKIP``.  While a probe is pending every matching
+        ESC dispatch remains blocked.  Only two consecutive OCR-negative samples
+        arm one normal ESC dispatch, so a slow OCR pass cannot contaminate the
+        three-second causal control window.
+        """
+
+        if not SKIP_STRICT_INACTIVE_EXPERIMENT:
+            return False
+        if getattr(target, "action", "") != "key":
+            return False
+        key = str(getattr(target, "key", "") or "").strip().lower()
+        if key not in {"esc", "escape"}:
+            return False
+        now = float(now)
+
+        # In strict causal experiments target_F/target_G are ambiguous: the
+        # exact same ESC glyph appears on the real SKIP prompt.  Releasing one
+        # ordinary ESC after OCR-negative frames produced a measured race on a
+        # moving replay background.  Therefore an ambiguous normal ESC is
+        # never dispatched in strict mode; OCR/candidate logic either handles
+        # the prompt or it ends naturally.  This trades an optional normal ESC
+        # action for a provably uncontaminated three-second control window.
+        if self._skip_generic_hint is None:
+            self._skip_generic_hint = "escape_probe"
+            self._skip_esc_probe_at = now
+        self._skip_esc_probe_negative_streak = 0
+        self._skip_esc_probe_allow_once = False
+        self._skip_active_until = max(
+            self._skip_active_until,
+            now + max(0.8, SKIP_OCR_INTERVAL_SECONDS * 3.0),
+        )
+        return True
+
+    @staticmethod
+    def _strict_skip_quiet_seconds() -> float:
+        """Bound normal matching for the full control and outcome window."""
+
+        return max(
+            0.5,
+            SKIP_EXPERIMENT_CONTROL_SECONDS
+            + SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS
+            + SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS
+            + SKIP_OCR_INTERVAL_SECONDS,
+        )
+
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
         """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
 
@@ -2520,6 +4432,11 @@ class AutomationApp:
             # 대상 창 없음/화면영역 모드 → 헛누름 방지로 건너뛰고 상태 초기화.
             self._skip_seen_since = None
             self._skip_text_streak = 0
+            self._skip_s_match_streak = 0
+            self._skip_generic_hint = None
+            self._skip_generic_episode_hint = None
+            self._skip_esc_probe_negative_streak = 0
+            self._skip_esc_probe_allow_once = False
             return False
         try:
             h, w = screen_gray.shape[:2]
@@ -2528,58 +4445,237 @@ class AutomationApp:
             y1 = max(0, int(h * SKIP_OCR_TOP_FRACTION))
             y2 = min(h, int(h * SKIP_OCR_BOTTOM_FRACTION))
             crop = screen_gray[y1:y2, x1:x2]   # 원본 해상도 — (A) 템플릿은 여기서 매칭
-            # 1) (A) SKIP 템플릿 우선(정밀). 매칭되면 OCR을 안 보므로 A형이 Start로 안 샌다.
-            is_a, skip_a_score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
-            is_s, skip_s_score, s_center = rank_ocr.match_skip_s(crop, self.base_dir)
-            has_text = False
-            if not is_a and not is_s:
-                # 2) 일반 스킵: OCR용으로만 폭 축소 후 텍스트 확인(글자는 크므로 인식 유지).
-                ocr_crop = crop
-                if SKIP_OCR_MAX_WIDTH and ocr_crop.shape[1] > SKIP_OCR_MAX_WIDTH:
-                    scale = SKIP_OCR_MAX_WIDTH / ocr_crop.shape[1]
-                    ocr_crop = cv2.resize(
-                        ocr_crop, (SKIP_OCR_MAX_WIDTH, max(1, int(ocr_crop.shape[0] * scale))),
-                        interpolation=cv2.INTER_AREA,
+            # OCR로 ESC가 직접 확인된 에피소드는 SKIP 텍스트가 사라질 때까지
+            # ESC형으로 유지한다. 그렇지 않으면 3초 대조 뒤 순간적인 A 템플릿
+            # 오검출이 같은 에피소드를 A 후보군으로 바꿀 수 있다.
+            generic_episode = (
+                self._skip_generic_hint in {
+                    "escape_probe", "escape", "escape_highlight",
+                    "any_key", "start"
+                }
+            )
+            if generic_episode:
+                is_a, skip_a_score, a_center = (False, 0.0, None)
+                is_s, skip_s_score, s_center = (False, 0.0, None)
+            else:
+                # 1) 명시적인 ESC형이 아닌 에피소드에서만 A/S 템플릿을 우선한다.
+                is_a, skip_a_score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
+                is_s, skip_s_score, s_center = rank_ocr.match_skip_s(crop, self.base_dir)
+            raw_is_s = bool(is_s)
+            if not generic_episode:
+                is_s = self._confirmed_s_template_match(raw_is_s)
+            else:
+                self._skip_s_match_streak = 0
+            provisional_s = raw_is_s and not is_s
+            # 2) 일반 프롬프트의 명시적 ESC/Enter/START 근거는 A/S 템플릿보다
+            # 우선한다. A/S 템플릿도 공통 SKIP 글자를 포함해 일반 프롬프트에서
+            # 경계 점수가 나올 수 있으므로 A/S가 맞은 프레임도 OCR을 생략하지 않는다.
+            ocr_crop = crop
+            if SKIP_OCR_MAX_WIDTH and ocr_crop.shape[1] > SKIP_OCR_MAX_WIDTH:
+                scale = SKIP_OCR_MAX_WIDTH / ocr_crop.shape[1]
+                ocr_crop = cv2.resize(
+                    ocr_crop, (SKIP_OCR_MAX_WIDTH, max(1, int(ocr_crop.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            has_text, text_hint = rank_ocr.classify_skip_prompt(
+                ocr_crop,
+                logger=None,
+            )
+            if provisional_s:
+                # Do not let OCR-only SKIP text turn the first S-template
+                # frame into a generic episode.  The next frame confirms S or
+                # clears this provisional match.
+                has_text, text_hint = False, None
+            if has_text:
+                # Clear the negative-release state *before* publishing the
+                # positive hint.  This ordering makes the two-thread handoff
+                # safe even if the matching loop runs between assignments.
+                self._skip_esc_probe_negative_streak = 0
+                self._skip_esc_probe_allow_once = False
+                # Generic prompts have no A/S-template center, but the captured
+                # ESC form contains target_F. Retain its WGC coordinate for the
+                # target-window-only WM_MOUSE candidate. This neither moves the
+                # physical cursor nor activates FC.
+                click_target = getattr(self, "_skip_click_target", None)
+                if click_target is not None:
+                    generic_center, _generic_score = find_template_center(
+                        crop,
+                        click_target,
+                        logger=lambda _message: None,
                     )
-                has_text = rank_ocr.contains_skip(ocr_crop, logger=None)
+                    if generic_center is not None:
+                        self._skip_prompt_center = (
+                            x1 + int(generic_center[0]),
+                            y1 + int(generic_center[1]),
+                        )
+                        # OCR sometimes reads only ``SKIP`` on the compact
+                        # ESC presentation.  The target_F template is the ESC
+                        # keycap itself, so a concurrent icon match is stronger
+                        # evidence than the generic START fallback.  Promote
+                        # before the episode hint is locked to its tracker.
+                        if text_hint in {None, "start"}:
+                            text_hint = "escape"
+                if (
+                    text_hint == "escape"
+                    and self._is_highlight_summary_context(screen_gray)
+                ):
+                    text_hint = "escape_highlight"
+            if has_text and text_hint in {
+                "escape", "escape_highlight", "any_key", "start"
+            }:
+                locked_hint = getattr(
+                    self,
+                    "_skip_generic_episode_hint",
+                    None,
+                )
+                if locked_hint is not None:
+                    # The current episode already owns its tracker. OCR may
+                    # fluctuate, but moving its outcome to another tracker
+                    # would corrupt causal attribution.
+                    text_hint = locked_hint
+                self._skip_generic_hint = text_hint
+                is_a, is_s = False, False
+                a_center = s_center = None
+            elif has_text and self._skip_generic_hint == "escape_probe":
+                # target_F itself is the ESC icon. If OCR sees SKIP but
+                # omits the three small letters, that combined evidence is
+                # still stronger than the known A-template false positive.
+                self._skip_generic_hint = (
+                    "escape_highlight"
+                    if self._is_highlight_summary_context(screen_gray)
+                    else "escape"
+                )
+                is_a, is_s = False, False
+                a_center = s_center = None
+
+            # A moving replay can make OCR miss one frame between two clear
+            # ESC-SKIP reads.  Once explicit generic evidence exists, retain it
+            # for one negative frame before input consensus.  This prevents a
+            # 1-frame hole from discarding the episode while still requiring
+            # two true negatives before a never-confirmed probe is abandoned.
+            if (
+                not has_text
+                and generic_episode
+                and self._skip_kind is None
+                and self._skip_generic_hint
+                in {"escape", "escape_highlight", "any_key", "start"}
+            ):
+                self._skip_esc_probe_negative_streak += 1
+                if self._skip_esc_probe_negative_streak < max(
+                    2, SKIP_TEXT_CONSENSUS
+                ):
+                    has_text = True
+                    text_hint = self._skip_generic_hint
         except Exception:
             return False
 
+        if provisional_s:
+            self._skip_active_until = max(
+                self._skip_active_until,
+                time.monotonic() + max(0.4, SKIP_OCR_INTERVAL_SECONDS * 2.0),
+            )
+            return True
+
         if not is_a and not is_s and not has_text:
+            # A target_F hit starts as a provisional ESC probe.  Do not clear
+            # that probe after a single stale/early OCR-negative frame: require
+            # the same consensus used for positive generic prompts.  Once the
+            # negative consensus is met, exactly one normal ESC dispatch is
+            # released and the ordinary target flow resumes.
+            if (
+                SKIP_STRICT_INACTIVE_EXPERIMENT
+                and self._skip_generic_hint == "escape_probe"
+                and self._skip_kind is None
+            ):
+                self._skip_esc_probe_negative_streak += 1
+                if self._skip_esc_probe_negative_streak < max(
+                    2, SKIP_TEXT_CONSENSUS
+                ):
+                    self._skip_active_until = max(
+                        self._skip_active_until,
+                        time.monotonic()
+                        + max(0.8, SKIP_OCR_INTERVAL_SECONDS * 3.0),
+                    )
+                    return True
+                self._skip_generic_hint = None
+                self._skip_esc_probe_negative_streak = 0
+                self._skip_esc_probe_allow_once = True
+
             # 스킵 없음 → 에피소드 종료. 엄격 실험 모드에서는 직전 입력과 소멸 시각을
             # 연결하고, 같은 후보가 반복 확인된 뒤에만 학습한다. 자연 종료는 귀속하지 않는다.
-            if self._skip_kind == "a" and SKIP_STRICT_INACTIVE_EXPERIMENT:
-                variant = "s" if self._skip_prompt_variant == "s" else "a"
+            if (
+                self._skip_kind in {"a", "start"}
+                and SKIP_STRICT_INACTIVE_EXPERIMENT
+            ):
+                variant = (
+                    "generic"
+                    if self._skip_kind == "start"
+                    else "s" if self._skip_prompt_variant == "s" else "a"
+                )
                 experiment = (
-                    self._skip_s_experiment
+                    self._generic_tracker_for_hint()
+                    if variant == "generic"
+                    else self._skip_s_experiment
                     if variant == "s"
                     else self._skip_experiment
                 )
                 episode_control_seconds = experiment.episode_control_seconds
-                outcome = experiment.prompt_disappeared(time.monotonic())
+                if self._skip_control_contaminated:
+                    experiment.reset_episode()
+                    outcome = SkipOutcome(
+                        "unattributed",
+                        None,
+                        detail="non_skip_action_during_control",
+                    )
+                else:
+                    outcome = experiment.prompt_disappeared(time.monotonic())
                 if outcome is None:
                     # Keep the episode/candidate attached while absence is only
                     # tentative. A reappearing prompt cancels it in choose().
-                    self._skip_active_until = time.monotonic() + 0.3
+                    self._skip_active_until = time.monotonic() + max(
+                        0.5,
+                        SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS
+                        + SKIP_OCR_INTERVAL_SECONDS,
+                    )
                     return True
+                if (
+                    outcome.status == "unattributed"
+                    and self._skip_precontrol_contaminated
+                ):
+                    outcome = SkipOutcome(
+                        outcome.status,
+                        outcome.candidate,
+                        latency_seconds=outcome.latency_seconds,
+                        learned=outcome.learned,
+                        detail="non_skip_action_immediately_before_control",
+                    )
                 self._report_skip_experiment_outcome(
                     outcome,
                     variant=variant,
                     control_seconds=episode_control_seconds,
+                    experiment=experiment,
                 )
-                self._reconcile_skip_learning(variant, experiment)
+                learning_variant = (
+                    self._generic_learning_key(
+                        self._generic_hint_for_tracker(experiment)
+                    )
+                    if variant == "generic" else variant
+                )
+                self._reconcile_skip_learning(learning_variant, experiment)
                 if outcome.learned:
-                    self._save_skip_learning(variant, outcome.learned)
+                    self._save_skip_learning(learning_variant, outcome.learned)
                     if variant == "a":
                         self._skip_a_learned = outcome.learned
                         self._skip_learned_fail = 0
             elif SKIP_STRICT_INACTIVE_EXPERIMENT and (
                 self._skip_experiment.pending is not None
                 or self._skip_s_experiment.pending is not None
+                or self._generic_experiment_pending()
             ):
                 # 일반 Start 에피소드 안전망에서 실행된 입력을 다음 A 에피소드에 귀속하지 않는다.
                 self._skip_experiment.reset_episode()
                 self._skip_s_experiment.reset_episode()
+                self._reset_generic_experiment_episodes()
             elif self._skip_kind == "a" and self._skip_last_press is not None:
                 # 기존 호환 모드: 마지막 입력 직후 사라졌으면 바로 학습.
                 name, t = self._skip_last_press
@@ -2592,17 +4688,30 @@ class AutomationApp:
                     )
             self._skip_seen_since = None
             self._skip_text_streak = 0
+            self._skip_s_match_streak = 0
             self._skip_kind = None
             self._skip_prompt_variant = None
+            self._skip_generic_hint = None
+            self._skip_generic_episode_hint = None
+            self._skip_esc_probe_negative_streak = 0
             self._skip_prompt_center = None
+            self._skip_prompt_visual = None
             self._skip_last_press = None
+            self._skip_precontrol_contaminated = False
+            self._skip_control_contaminated = False
             self._skip_a_dumped = False
             self._skip_a_sweep_idx = 0   # 다음 에피소드는 처음부터(학습됐으면 학습값 우선)
+            self._skip_active_until = time.monotonic() + 0.3
             return False
 
         now = time.monotonic()
         if self._skip_seen_since is None:
             self._skip_seen_since = now
+            self._capture_skip_prompt_visual(screen_gray)
+            self._skip_precontrol_contaminated = (
+                now - self._last_normal_action_at
+                <= max(1.0, SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS)
+            )
             if has_text and not is_a and not is_s:
                 self.queue_log(
                     f"[SKIP 진단] OCR 감지, A={skip_a_score:.3f}/"
@@ -2624,8 +4733,27 @@ class AutomationApp:
                     self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
             except Exception:
                 pass
-        # 감지 중엔 매칭을 잠시 멈춰 스킵 화면에서의 오클릭을 막는다(입력 여부와 무관).
-        self._skip_active_until = now + 0.5
+        if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_control_contaminated:
+            # A racing normal action invalidates the current control. Restart
+            # all trackers and require a fresh full three-second quiet period.
+            self._skip_experiment.reset_episode()
+            self._skip_s_experiment.reset_episode()
+            self._reset_generic_experiment_episodes()
+            self._skip_seen_since = now
+            self._skip_precontrol_contaminated = False
+            self._skip_control_contaminated = False
+            self._skip_active_until = now + self._strict_skip_quiet_seconds()
+            self.queue_log(
+                "[SKIP 대조] 일반 매칭 입력 감지 → 표본 제외, 3초 무입력 대조 재시작"
+            )
+            return True
+
+        # 감지 중에는 전체 대조+결과 창 동안 일반 매칭을 봉쇄한다. OCR 지연이
+        # 0.5초를 넘더라도 target_E/S 같은 입력이 대조군에 끼어들지 않는다.
+        self._skip_active_until = max(
+            self._skip_active_until,
+            now + self._strict_skip_quiet_seconds(),
+        )
 
         press_a = press_start = False
         if is_a or is_s or self._skip_kind == "a":
@@ -2645,6 +4773,8 @@ class AutomationApp:
                 and detected_variant != self._skip_prompt_variant
             ):
                 previous_variant = self._skip_prompt_variant
+                if self._skip_kind == "start":
+                    self._reset_generic_experiment_episodes()
                 if previous_variant == "a":
                     self._skip_experiment.reset_episode()
                 elif previous_variant == "s":
@@ -2668,6 +4798,14 @@ class AutomationApp:
                 self.queue_status("SKIP 넘기는 중")
                 return True   # 확정 전 — 매칭만 멈추고 입력은 보류(다음 프레임에 A로 바뀔 수도)
             self._skip_kind = "start"
+            if getattr(self, "_skip_generic_episode_hint", None) is None:
+                self._skip_generic_episode_hint = (
+                    self._skip_generic_hint
+                    if self._skip_generic_hint
+                    in {"escape", "escape_highlight", "any_key", "start"}
+                    else "start"
+                )
+            self._skip_generic_hint = self._skip_generic_episode_hint
             press_start = True
             kind = "Start"
 
@@ -2686,6 +4824,65 @@ class AutomationApp:
                 winapi.win32gui.PostMessage(manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             action_label = "입력"
+            if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_kind == "start":
+                # Generic OCR prompts include a captured "ESC SKIP" form. It
+                # must obey the same three-second control and attribution rules
+                # as A/S prompts; never fall through to unconditional input.
+                experiment = self._generic_tracker_for_hint()
+                learning_variant = self._generic_learning_key(
+                    self._generic_hint_for_tracker(experiment)
+                )
+                candidate, expired = experiment.choose(now)
+                self._report_skip_experiment_outcome(
+                    expired,
+                    variant="generic",
+                    control_seconds=experiment.episode_control_seconds,
+                    experiment=experiment,
+                )
+                self._reconcile_skip_learning(learning_variant, experiment)
+                if candidate:
+                    guard = run_guarded_inactive_action(
+                        lambda: self._press_skip_candidate(
+                            candidate,
+                            manager,
+                            self._skip_prompt_center,
+                        ),
+                        input_message.get_foreground_hwnd,
+                        manager.hwnd,
+                        poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                        preserve_foreground=SKIP_EXPERIMENT_PRESERVE_FOREGROUND,
+                    )
+                    outcome = experiment.record_attempt(
+                        candidate,
+                        (
+                            guard.action_started_at
+                            if guard.action_started_at is not None
+                            else time.monotonic()
+                        ),
+                        guard,
+                    )
+                    self._report_skip_experiment_outcome(
+                        outcome,
+                        guard=guard,
+                        variant="generic",
+                        control_seconds=experiment.episode_control_seconds,
+                        experiment=experiment,
+                    )
+                    self._reconcile_skip_learning(learning_variant, experiment)
+                    action_label = (
+                        f"inactive generic {candidate.upper()}"
+                        if guard.attempted
+                        else f"inactive generic deferred({guard.reason})"
+                    )
+                elif expired is None:
+                    action_label = "inactive generic experiment waiting"
+                self._skip_active_until = max(
+                    self._skip_active_until,
+                    time.monotonic() + self._strict_skip_quiet_seconds(),
+                )
+                self.queue_status("SKIP experiment")
+                self.queue_log(f"[SKIP] generic -> {action_label}")
+                return True
             if press_a:
                 if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_kind == "a":
                     variant = (
@@ -2701,6 +4898,7 @@ class AutomationApp:
                         expired,
                         variant=variant,
                         control_seconds=experiment.episode_control_seconds,
+                        experiment=experiment,
                     )
                     self._reconcile_skip_learning(variant, experiment)
                     if candidate:
@@ -2713,10 +4911,15 @@ class AutomationApp:
                             input_message.get_foreground_hwnd,
                             manager.hwnd,
                             poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                            preserve_foreground=SKIP_EXPERIMENT_PRESERVE_FOREGROUND,
                         )
                         outcome = experiment.record_attempt(
                             candidate,
-                            time.monotonic(),
+                            (
+                                guard.action_started_at
+                                if guard.action_started_at is not None
+                                else time.monotonic()
+                            ),
                             guard,
                         )
                         self._report_skip_experiment_outcome(
@@ -2724,6 +4927,7 @@ class AutomationApp:
                             guard=guard,
                             variant=variant,
                             control_seconds=experiment.episode_control_seconds,
+                            experiment=experiment,
                         )
                         self._reconcile_skip_learning(variant, experiment)
                         action_label = (
@@ -2733,7 +4937,10 @@ class AutomationApp:
                         )
                     elif expired is None:
                         action_label = "비활성 실험 결과 대기"
-                    self._skip_active_until = time.monotonic() + 0.3
+                    self._skip_active_until = max(
+                        self._skip_active_until,
+                        time.monotonic() + self._strict_skip_quiet_seconds(),
+                    )
                 elif SKIP_STRICT_INACTIVE_EXPERIMENT:
                     # 일반 Start 스킵의 A 안전망은 후보 학습에서 제외합니다. 전면창 감시만
                     # 적용한 단순 A 홀드로 오분류 화면이 갇히는 것만 방지합니다.
@@ -2749,6 +4956,7 @@ class AutomationApp:
                         input_message.get_foreground_hwnd,
                         manager.hwnd,
                         poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                        preserve_foreground=SKIP_EXPERIMENT_PRESERVE_FOREGROUND,
                     )
                     action_label = (
                         "Start 안전망 A홀드(비활성 유지)"
@@ -2898,6 +5106,7 @@ class AutomationApp:
                 input_message.get_foreground_hwnd,
                 manager.hwnd,
                 poll_seconds=SKIP_EXPERIMENT_FOREGROUND_POLL_SECONDS,
+                preserve_foreground=SKIP_EXPERIMENT_PRESERVE_FOREGROUND,
             )
         action_ok = bool(
             guard is not None
@@ -3215,10 +5424,24 @@ class AutomationApp:
 class LicenseDialog:
     """라이센스 키 입력/검증 다이얼로그입니다."""
 
-    def __init__(self, root: tk.Tk, base_dir: Path):
+    def __init__(
+        self,
+        root: tk.Tk,
+        base_dir: Path,
+        *,
+        autostart_experiment: bool = False,
+        background_experiment: bool = False,
+    ):
         self.root = root
         self.base_dir = base_dir
         self.result: Optional[str] = None
+        self.autostart_experiment = bool(autostart_experiment)
+        self.background_experiment = bool(background_experiment)
+
+        if self.background_experiment:
+            # Keep the root unmapped through saved-license validation.  The
+            # main app receives the same constraint in _launch_app().
+            self.root.withdraw()
 
         self.root.title("라이센스 인증")
         self.root.geometry("460x400+200+200")
@@ -3413,8 +5636,12 @@ class LicenseDialog:
         self.result = key
         for widget in self.root.winfo_children():
             widget.destroy()
-        app = AutomationApp(self.root, license_key=key)
+        app = AutomationApp(
+            self.root,
+            license_key=key,
+            start_hidden=self.background_experiment,
+        )
         # 실기 회귀 러너용 옵트인. 일반 실행에는 환경변수가 없으므로 UI 동작은 그대로이며,
         # 테스트 프로세스만 인증 직후 F8과 같은 시작 경로를 자동 호출합니다.
-        if os.environ.get("MAUTO_AUTOSTART_EXPERIMENT", "").strip() == "1":
+        if self.autostart_experiment:
             self.root.after(1200, app.start_automation)

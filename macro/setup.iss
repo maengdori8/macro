@@ -55,4 +55,28 @@ Name: "{commondesktop}\Macro"; Filename: "{app}\launcher.exe"
 ; postinstall 체크박스 대신 무조건 실행: 런처가 silent 업데이트(/VERYSILENT)로 자신을
 ; 재설치한 뒤에도 새 런처가 자동으로 다시 떠서 macro를 실행합니다.
 ; /postupdate = 이번 실행은 업데이트 확인을 건너뜀(설치 직후 재확인으로 인한 루프 방지).
-Filename: "{app}\launcher.exe"; Parameters: "/postupdate"; Flags: nowait
+Filename: "{app}\launcher.exe"; Parameters: "/postupdate"; Flags: nowait; Check: ShouldRunPostInstallLauncher
+
+[Code]
+function ShouldRunPostInstallLauncher(): Boolean;
+var
+  I: Integer;
+begin
+  { Developer-only local experiment installs set this inherited variable so }
+  { the installer cannot map a normal GUI before the no-activate launch. }
+  Result := (GetEnv('MAUTO_SKIP_POSTINSTALL_RUN') <> '1') and
+            (ExpandConstant('{param:NOAUTOSTART|0}') <> '1');
+  if not Result then
+    Exit;
+
+  { UAC can start Setup with a cached environment.  The explicit local-only }
+  { switch survives elevation and leaves normal installs entirely unchanged. }
+  for I := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(I), '/MAUTOLOCALNOPOSTRUN') = 0 then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
