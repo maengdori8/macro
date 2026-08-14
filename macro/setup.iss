@@ -28,9 +28,14 @@ ArchitecturesAllowed=x64compatible
 ; macro는 폴더형(standalone) 빌드 — macro.exe + 부품 DLL 전체를 설치폴더에 그대로 푼다.
 ; (onefile의 실시간 임시추출이 일부 PC에서 'STATUS_IN_PAGE_ERROR / 파일 액세스 불가'를
 ;  일으켜, 폴더형으로 전환함. dist\macro_app\ 안의 모든 파일을 재귀로 담는다.)
-Source: "dist\macro_app\*"; DestDir: "{app}"; Excludes: "license.key,logs\*,_update_tmp\*,_update.zip,startup_error.log"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 가상 패드 드라이버 설치본(*.msi)은 설치 폴더에 남기지 않습니다. 런타임은 client\*.dll만
+; 쓰므로(패키지 안의 어떤 코드도 msi를 참조하지 않음) 제외해도 동작에 영향이 없고,
+; 설치 폴더에 드라이버 이름이 박힌 파일이 남지 않습니다.
+Source: "dist\macro_app\*"; DestDir: "{app}"; Excludes: "license.key,logs\*,_update_tmp\*,_update.zip,startup_error.log,vgamepad\win\vigem\install\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "dist\launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
+; 설치 중에만 임시 폴더에 풀고 끝나면 지웁니다(중립적인 이름으로 배치).
+Source: "dist\macro_app\vgamepad\win\vigem\install\x64\ViGEmBusSetup_x64.msi"; DestDir: "{tmp}"; DestName: "runtime_x64.msi"; Flags: deleteafterinstall
 
 ; 감독모드 전용 설치본: 예전 통합 설치본이 남긴 갱신/테스트 실행 파일과 바로가기도 제거합니다.
 [InstallDelete]
@@ -52,12 +57,26 @@ Name: "{group}\Macro"; Filename: "{app}\launcher.exe"
 Name: "{commondesktop}\Macro"; Filename: "{app}\launcher.exe"
 
 [Run]
+; 가상 패드 드라이버를 완전 무인(/qn)으로 먼저 설치합니다. 이게 없으면 vgamepad가
+; import 단계에서 실패해 비활성 입력 경로가 통째로 죽습니다(설치 안내를 사용자에게
+; 떠넘기지 않으려고 설치본에 포함). 이미 설치돼 있으면 건너뜁니다.
+; StatusMsg는 드라이버 이름을 노출하지 않는 일반 문구를 씁니다.
+Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\runtime_x64.msi"" /qn /norestart"; StatusMsg: "필수 구성 요소를 설치하는 중..."; Flags: waituntilterminated; Check: NeedsPadRuntime
+
 ; postinstall 체크박스 대신 무조건 실행: 런처가 silent 업데이트(/VERYSILENT)로 자신을
 ; 재설치한 뒤에도 새 런처가 자동으로 다시 떠서 macro를 실행합니다.
 ; /postupdate = 이번 실행은 업데이트 확인을 건너뜀(설치 직후 재확인으로 인한 루프 방지).
 Filename: "{app}\launcher.exe"; Parameters: "/postupdate"; Flags: nowait; Check: ShouldRunPostInstallLauncher
 
 [Code]
+{ 가상 패드 드라이버가 이미 있으면 다시 설치하지 않습니다. 서비스 레지스트리 키는 }
+{ 드라이버가 실제로 등록됐을 때만 존재해서, MSI 제품코드보다 확실한 판정 기준입니다. }
+function NeedsPadRuntime(): Boolean;
+begin
+  Result := not RegKeyExists(HKEY_LOCAL_MACHINE,
+                             'SYSTEM\CurrentControlSet\Services\ViGEmBus');
+end;
+
 function ShouldRunPostInstallLauncher(): Boolean;
 var
   I: Integer;
