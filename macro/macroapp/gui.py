@@ -203,6 +203,11 @@ class AutomationApp:
         self.preview = bool(preview)
         self.start_hidden = bool(start_hidden)
         self.license_info: Optional[dict] = None
+        # 서명으로 검증된 만료 시각(wall clock). 시작 시 스냅샷해 자동화 루프가 로컬로
+        # 강제한다. 이게 없으면 '한 번 시작 후 랜선 뽑고 재시작 안 함'으로 단기 라이센스의
+        # 유효기간을 무한 연장할 수 있다(적대적 검증에서 확인된 우회). exp가 서명에 묶여
+        # 위조 불가하고, 로컬 검사라 네트워크가 없어도 정품 사용자에겐 영향이 없다.
+        self._license_deadline: Optional[float] = None
 
         self.root.title("mAuto")
         # LicenseDialog가 고정 크기로 만든 root를 재사용하므로 리사이즈를 다시 허용합니다.
@@ -1613,6 +1618,10 @@ class AutomationApp:
             self._set_button_state(running=False)
             self._starting = False
             return
+        # 서명 검증된 남은 시간으로 이번 세션의 만료 시각을 고정한다(위조 불가·오프라인 무관).
+        self.license_info = sr
+        remaining = int(sr.get("remaining_seconds", 0) or 0)
+        self._license_deadline = time.time() + remaining if remaining > 0 else None
         self._do_start()
 
     def _do_start(self) -> None:
@@ -1999,6 +2008,12 @@ class AutomationApp:
             while not self.stop_event.is_set():
                 # 주기적 상태 전송
                 now_mono = time.monotonic()
+                # 서명된 만료 시각을 세션 중에도 강제한다. 시작 시점에만 검사하면
+                # 만료 후 재시작 전까지 계속 도는 우회가 열린다(적대적 검증에서 확인).
+                if self._license_deadline is not None and time.time() > self._license_deadline:
+                    self.queue_status("라이센스 만료")
+                    self.queue_log("[라이센스] 유효기간이 만료되어 자동화를 정지합니다. 재시작 후 갱신하세요.")
+                    break
                 if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
                     last_status_report = now_mono
                     self._report_status(running=True)

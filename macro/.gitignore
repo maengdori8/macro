@@ -17,6 +17,10 @@ data/
 # 릴리스 서명 개인키 — 절대 커밋 금지 (유출 시 위조 업데이트 서명 가능)
 release_signing_key.txt
 
+# 라이센스 응답 서명 개인키 — 절대 커밋 금지 (유출 시 가짜 서버가 인증 위조 가능)
+# 실제 사용처는 Vercel 환경변수 LICENSE_SIGNING_SEED. 이 파일은 백업/재배포용 사본이다.
+license_signing_seed.txt
+
 # 파이썬
 __pycache__/
 *.pyc

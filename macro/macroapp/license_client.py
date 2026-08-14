@@ -1,18 +1,107 @@
 from __future__ import annotations
 import hashlib
 import json as _json
+import secrets
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 import uuid
 from pathlib import Path
 from typing import Optional
 
+try:
+    import ed25519_tiny
+except Exception:  # noqa: BLE001 - 서명 검증 모듈이 없으면 아래에서 fail-closed 처리합니다.
+    ed25519_tiny = None  # type: ignore
+
 STATUS_API_URL = "https://license-server-flame-eta.vercel.app/api/status"
 STATUS_REPORT_INTERVAL_SECONDS = 30
 VERIFY_SERVER_URL = "https://license-server-flame-eta.vercel.app/api/verify"
 LICENSE_FILE = "license.key"
+
+# ─── 라이센스 응답 서명 검증 (크랙/가짜서버 방지) ───
+# 왜: 서버 응답이 서명 안 돼 있으면, hosts 파일로 도메인을 127.0.0.1로 돌리고
+# {"valid": true}만 뱉는 가짜 로컬 서버를 띄우면 바이너리 패치 없이 크랙된다.
+# 대응: 서버가 (verdict|hwid|nonce|exp)를 Ed25519로 서명하고, 클라이언트가 아래 공개키로
+# 검증한다. 개인키는 서버(Vercel 환경변수)에만 있어 가짜 서버는 서명을 위조할 수 없다.
+# nonce는 매 요청 새로 생성해 서명에 묶으므로 한 번 캡처한 정상 응답의 재전송도 막힌다.
+# 이 공개키는 업데이트 서명 키(launcher)와 별개다(용도 분리 → 한쪽이 뚫려도 파급 차단).
+LICENSE_PUBKEY_HEX = "2e8a3100a9a778f9f9a2486689cc1588096a74564de9e15746e76ae7f4703ddd"
+LICENSE_MESSAGE_PREFIX = "license-v1"
+# 응답이 이 시간(초)보다 늦게 만료되면 정상으로 본다(서명된 exp 기준, 시계 왜곡 여유 없음).
+_LICENSE_MIN_REMAINING_SECONDS = 0
+
+
+def _license_message(verdict: str, hwid: str, nonce: str, exp: int) -> bytes:
+    """서버가 서명하고 클라이언트가 검증하는 정규 메시지. 필드는 전부 [0-9a-z|] 뿐이라
+    구분자 주입이 불가능하다(hwid/nonce=hex, verdict=고정어, exp=정수)."""
+    return f"{LICENSE_MESSAGE_PREFIX}|{verdict}|{hwid}|{nonce}|{int(exp)}".encode("utf-8")
+
+
+def verify_signed_response(
+    response: dict,
+    sent_nonce: str,
+    hwid: str,
+    *,
+    pubkey_hex: Optional[str] = None,
+    now: Optional[float] = None,
+) -> dict:
+    """서명·바인딩을 모두 검증해 신뢰할 수 있는 판정을 돌려준다(순수 함수, 단위검증 가능).
+
+    반환: {"valid": bool, "message": str, "remaining_seconds": int, "days": int}
+    실패는 전부 valid=False로 수렴한다(fail-closed). 하나라도 어긋나면 거부:
+      1) 공개키/서명모듈 존재      2) 서명이 공개키로 검증됨
+      3) 응답 nonce == 보낸 nonce (재전송 차단)
+      4) 응답 hwid == 내 hwid      (계정 도용 차단)
+      5) 서명된 verdict == valid 필드 (MITM 뒤집기 차단)
+      6) valid면 exp가 미래
+    """
+    key_hex = (pubkey_hex if pubkey_hex is not None else LICENSE_PUBKEY_HEX).strip()
+    reject = {"valid": False, "message": "라이센스 응답 검증 실패", "remaining_seconds": 0, "days": 0}
+
+    if ed25519_tiny is None or not key_hex:
+        # 공개키가 안 박혔거나 검증 모듈이 없으면, 서명을 확인할 방법이 없으므로 거부한다.
+        return {**reject, "message": "서명 검증을 사용할 수 없습니다(빌드 설정 오류)."}
+
+    try:
+        verdict = str(response.get("verdict", "")).strip()
+        resp_hwid = str(response.get("hwid", "")).strip()
+        resp_nonce = str(response.get("nonce", "")).strip()
+        exp = int(response.get("exp", 0))
+        sig_hex = str(response.get("sig", "")).strip()
+        message = str(response.get("message", ""))
+        pub = bytes.fromhex(key_hex)
+        sig = bytes.fromhex(sig_hex)
+    except Exception:  # noqa: BLE001 - 형식이 깨진 응답은 곧 거부다.
+        return reject
+
+    if verdict not in ("valid", "invalid"):
+        return reject
+    if not secrets.compare_digest(resp_nonce, str(sent_nonce)):
+        return {**reject, "message": "응답 nonce 불일치(재전송 의심)."}
+    if not secrets.compare_digest(resp_hwid, str(hwid)):
+        return {**reject, "message": "응답 기기 정보 불일치."}
+    if not ed25519_tiny.verify(_license_message(verdict, resp_hwid, resp_nonce, exp), sig, pub):
+        return {**reject, "message": "서명이 유효하지 않습니다."}
+
+    # 서명이 확인된 verdict가 최종 판정이다. valid 필드는 참고용일 뿐 신뢰하지 않는다.
+    if verdict != "valid":
+        return {"valid": False, "message": message or "유효하지 않은 라이센스입니다.",
+                "remaining_seconds": 0, "days": 0}
+
+    current = time.time() if now is None else now
+    remaining = int(exp - current)
+    if remaining <= _LICENSE_MIN_REMAINING_SECONDS:
+        return {"valid": False, "message": "만료된 라이센스입니다.", "remaining_seconds": 0, "days": 0}
+
+    return {
+        "valid": True,
+        "message": message or "유효한 라이센스입니다.",
+        "remaining_seconds": remaining,
+        "days": max(1, (remaining + 86399) // 86400),
+    }
 
 # HWID는 머신마다 고정이므로 1회만 계산해 캐시합니다(매 30초 WMIC 서브프로세스 제거).
 _CACHED_HWID: Optional[str] = None
@@ -153,9 +242,16 @@ def format_remaining_time(seconds: int) -> str:
 
 
 def verify_license_server(key: str, hwid: str) -> dict:
-    """서버에 라이센스 키와 HWID를 검증합니다. 서버 연결 실패 시 _offline=True 반환."""
+    """서버에 라이센스 키·HWID·nonce를 보내고, 서명된 응답을 검증합니다.
+
+    반환은 기존과 호환됩니다: 연결 실패는 {"_offline": True}, 그 외에는
+    {"valid": bool, "message": str, "remaining_seconds": int, "days": int}.
+    서명·nonce·hwid 바인딩 중 하나라도 어긋나면 valid=False로 수렴합니다(fail-closed).
+    가짜 서버는 개인키가 없어 서명을 만들 수 없으므로 여기서 걸립니다.
+    """
+    nonce = secrets.token_hex(16)
     try:
-        data = _json.dumps({"key": key, "hwid": hwid}).encode("utf-8")
+        data = _json.dumps({"key": key, "hwid": hwid, "nonce": nonce}).encode("utf-8")
         req = urllib.request.Request(
             VERIFY_SERVER_URL,
             data=data,
@@ -163,6 +259,8 @@ def verify_license_server(key: str, hwid: str) -> dict:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return _json.loads(resp.read().decode("utf-8"))
+            payload = _json.loads(resp.read().decode("utf-8"))
     except Exception:
         return {"_offline": True}
+
+    return verify_signed_response(payload, nonce, hwid)
