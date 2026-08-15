@@ -42,6 +42,14 @@ test("수동 발급·자판기용 키·사용 중인 키가 분리된다", () =>
   assert.match(html, /issueMode === "manual" \? 1/);
 });
 
+test("수동·자판기 발급 모두 1~24시간권을 선택할 수 있다", () => {
+  assert.match(html, /id="termUnitSwitch"/);
+  assert.match(html, /data-term-unit="hour"/);
+  assert.match(html, /data-unit="hour" data-value="24"/);
+  assert.match(html, /issueUnit === "hour" \? \{ hours:licenseTerm\.hours \}/);
+  assert.match(html, /item\.term/);
+});
+
 test("좁은 화면에서는 라이선스 표가 카드 목록으로 전환된다", () => {
   assert.match(html, /@media \(max-width:900px\)/);
   assert.match(html, /table,tbody \{ display:block; min-width:0; \}/);

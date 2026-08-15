@@ -13,6 +13,7 @@ const {
 const {
   LicenseInputError,
   issueLicenseBatch,
+  normalizeLicenseTerm,
   serializeLicenseForAdmin,
 } = require("../lib/license_admin");
 
@@ -35,10 +36,6 @@ const timestampFromMillis = (value) => admin.firestore.Timestamp.fromMillis(valu
 
 function unauthorized(res) {
   return res.status(401).json({ success: false, message: "인증 실패" });
-}
-
-function validDays(days) {
-  return Number.isInteger(days) && (days === UNLIMITED_DAYS || (days >= 1 && days <= 36500));
 }
 
 async function migrationTargets() {
@@ -116,23 +113,17 @@ module.exports = async function handler(req, res) {
           success: true,
           message: result.repeated
             ? "같은 요청의 기존 발급 결과를 불러왔습니다."
-            : `${result.count}개 라이센스를 발급했습니다.`,
+            : `${result.term} ${result.count}개를 발급했습니다.`,
           ...result,
           plainText: result.keys.join("\n"),
         });
       }
 
       const key = String(body.key || "").trim();
-      const days = Number(body.days);
+      const licenseTerm = normalizeLicenseTerm(body);
       const memo = body.memo === undefined ? "" : body.memo;
       if (!sec.isValidKeyFormat(key)) {
         return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
-      }
-      if (!validDays(days)) {
-        return res.status(400).json({
-          success: false,
-          message: "기간은 1~36500일 또는 무제한(99999)이어야 합니다.",
-        });
       }
       if (typeof memo !== "string" || memo.length > 200) {
         return res.status(400).json({ success: false, message: "메모는 200자 이하여야 합니다." });
@@ -141,7 +132,7 @@ module.exports = async function handler(req, res) {
       const now = Date.now();
       await col.doc(key).create(
         buildPendingLicenseDocument({
-          days,
+          ...licenseTerm,
           issuedAt: now,
           timestampFromMillis,
           memo,
@@ -150,7 +141,7 @@ module.exports = async function handler(req, res) {
       );
       return res.status(201).json({
         success: true,
-        message: `${days === UNLIMITED_DAYS ? "무제한" : `${days}일권`} 라이센스를 발급했습니다.`,
+        message: `${getLicenseLifecycle(licenseTerm).term} 라이센스를 발급했습니다.`,
       });
     } catch (err) {
       if (err.code === 6 || err.code === "already-exists") {
@@ -236,11 +227,12 @@ module.exports = async function handler(req, res) {
           return res.status(400).json({ success: false, message: "이미 무제한 라이센스입니다." });
         }
         if (lifecycle.pending) {
-          const newDays = lifecycle.days + extendDays;
-          await col.doc(key).update({ days: newDays });
+          const newDays = lifecycle.hours > 0 ? 0 : lifecycle.days + extendDays;
+          const newHours = lifecycle.hours > 0 ? lifecycle.hours + extendDays * 24 : 0;
+          await col.doc(key).update({ days: newDays, hours: newHours });
           return res.status(200).json({
             success: true,
-            message: `첫 인증 전 이용기간을 ${newDays}일로 변경했습니다.`,
+            message: `첫 인증 전 이용기간을 ${getLicenseLifecycle({ days:newDays, hours:newHours }).term}으로 변경했습니다.`,
           });
         }
 
@@ -248,9 +240,12 @@ module.exports = async function handler(req, res) {
         const base = Math.max(now, lifecycle.expiresAt);
         const newExpiry = base + extendDays * DAY_MS;
         const activationBase = lifecycle.activatedAt || now;
-        const newDays = Math.max(1, Math.round((newExpiry - activationBase) / DAY_MS));
+        const hourly = lifecycle.hours > 0;
+        const newDays = hourly ? 0 : Math.max(1, Math.round((newExpiry - activationBase) / DAY_MS));
+        const newHours = hourly ? Math.max(1, Math.round((newExpiry - activationBase) / (60 * 60 * 1000))) : 0;
         await col.doc(key).update({
           days: newDays,
+          hours: newHours,
           expiresAt: timestampFromMillis(newExpiry),
         });
         return res.status(200).json({
@@ -260,7 +255,7 @@ module.exports = async function handler(req, res) {
       }
 
       if (body.makeUnlimited === true) {
-        await col.doc(key).update({ days: UNLIMITED_DAYS, expiresAt: null });
+        await col.doc(key).update({ days: UNLIMITED_DAYS, hours: 0, expiresAt: null });
         return res.status(200).json({ success: true, message: "무제한으로 전환했습니다." });
       }
 

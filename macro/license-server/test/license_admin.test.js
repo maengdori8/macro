@@ -18,6 +18,30 @@ test("발급 입력은 기간·수량·메모 한도를 강제한다", () => {
   assert.throws(() => normalizeBatchInput({ days: 0, count: 10, requestId: "abcdefgh" }), /기간/);
   assert.throws(() => normalizeBatchInput({ days: 30, count: 10, requestId: "bad" }), /ID/);
   assert.equal(normalizeBatchInput({ days: 30, count: 100, requestId: "abcdefgh" }).count, 100);
+  assert.deepEqual(
+    normalizeBatchInput({ hours: 3, count: 10, requestId: "hourbatch001" }),
+    { days:0, hours:3, count:10, requestId:"hourbatch001", batchName:"", memo:"" }
+  );
+  assert.throws(() => normalizeBatchInput({ hours: 25, count: 1, requestId: "hourbatch002" }), /1~24시간/);
+  assert.throws(() => normalizeBatchInput({ days: 1, hours: 3, count: 1, requestId: "hourbatch003" }), /동시에/);
+});
+
+test("시간권 일괄발급도 첫 인증 대기로 저장되고 재시도 시 중복되지 않는다", async () => {
+  const db = new FakeFirestore();
+  const input = { hours:6, count:4, requestId:"hourbatch004", batchName:"6시간 자판기", memo:"" };
+  const first = await issueLicenseBatch({ db, input, now:1000, timestampFromMillis:(value) => value });
+  const second = await issueLicenseBatch({ db, input, now:9999, timestampFromMillis:(value) => value });
+  assert.equal(first.term, "6시간권");
+  assert.equal(second.term, "6시간권");
+  assert.equal(second.repeated, true);
+  assert.deepEqual(second.keys, first.keys);
+  assert.equal(db.count("licenses"), 4);
+  for (const key of first.keys) {
+    const stored = db.read(`licenses/${key}`);
+    assert.equal(stored.days, 0);
+    assert.equal(stored.hours, 6);
+    assert.equal(stored.activatedAt, null);
+  }
 });
 
 test("100개 일괄발급은 정확한 줄 수와 고유 키를 만든다", async () => {

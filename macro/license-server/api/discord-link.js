@@ -80,13 +80,12 @@ module.exports = async function handler(req, res) {
       message: alreadyLinked ? "이미 등록됨" : "인증 성공",
       alreadyLinked,
       days: lifecycle.days,
+      hours: lifecycle.hours,
+      term: lifecycle.term,
       unlimited: lifecycle.unlimited,
       pending: lifecycle.pending,
-      remainingDays: lifecycle.unlimited
-        ? null
-        : lifecycle.pending
-          ? lifecycle.days
-          : lifecycle.remainingDays,
+      remainingDays: lifecycle.remainingDays,
+      remainingText: lifecycle.remainingText,
       expiresAt: lifecycle.expiresAt || null,
     });
   } catch (err) {

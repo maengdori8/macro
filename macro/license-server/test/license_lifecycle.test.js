@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   DAY_MS,
+  HOUR_MS,
   FIRST_VERIFY_POLICY,
   buildFirstActivationUpdate,
   buildUnusedMigrationUpdate,
@@ -12,6 +13,27 @@ const {
   isCanonicalLicenseKey,
   isMigratableUnusedLicense,
 } = require("../lib/license_lifecycle");
+
+test("시간권도 발급 시점이 아니라 첫 인증 시점부터 시작한다", () => {
+  const issuedAt = Date.UTC(2026, 0, 1);
+  const activatedAt = Date.UTC(2026, 7, 15, 12);
+  const data = {
+    days: 0,
+    hours: 3,
+    createdAt: issuedAt,
+    issuedAt,
+    activationPolicy: FIRST_VERIFY_POLICY,
+    activatedAt: null,
+    expiresAt: null,
+  };
+  assert.equal(getLicenseLifecycle(data, activatedAt).status, "pending");
+  const update = buildFirstActivationUpdate(data, activatedAt, (value) => value);
+  assert.equal(update.expiresAt, activatedAt + 3 * HOUR_MS);
+  const active = getLicenseLifecycle({ ...data, ...update }, activatedAt);
+  assert.equal(active.term, "3시간권");
+  assert.equal(active.remainingText, "3시간 남음");
+  assert.equal(active.signatureExpiresAt, activatedAt + 3 * HOUR_MS);
+});
 
 test("첫 인증 전 키는 발급 후 시간이 지나도 만료되지 않는다", () => {
   const issuedAt = Date.UTC(2026, 0, 1);

@@ -54,13 +54,12 @@ module.exports = async function handler(req, res) {
       expired: lifecycle.expired,
       pending: lifecycle.pending,
       days: lifecycle.days,
+      hours: lifecycle.hours,
+      term: lifecycle.term,
       unlimited: lifecycle.unlimited,
       expiresAt: lifecycle.expiresAt || null,
-      remainingDays: lifecycle.unlimited
-        ? null
-        : lifecycle.pending
-          ? lifecycle.days
-          : lifecycle.remainingDays,
+      remainingDays: lifecycle.remainingDays,
+      remainingText: lifecycle.remainingText,
       hwidCount: (d.hwids || []).length,
       maxHwids: d.maxHwids || 3,
     });

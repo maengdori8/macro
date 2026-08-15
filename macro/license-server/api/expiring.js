@@ -43,6 +43,8 @@ module.exports = async function handler(req, res) {
         list.push({
           discordId: d.discordId,
           remainingDays: lifecycle.remainingDays,
+          remainingText: lifecycle.remainingText,
+          term: lifecycle.term,
         });
       }
     });

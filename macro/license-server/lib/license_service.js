@@ -55,21 +55,20 @@ async function verifyAndActivateLicense({
       lifecycle = getLicenseLifecycle({ ...data, ...updates }, now);
     }
 
-    const remainingDays = lifecycle.unlimited
-      ? null
-      : lifecycle.pending
-        ? lifecycle.days
-        : lifecycle.remainingDays;
     return {
       valid: true,
       message: lifecycle.unlimited
-        ? "유효한 무제한 라이센스입니다."
-        : `유효한 라이센스입니다. (${remainingDays}일 남음)`,
+        ? "유효한 라이센스입니다. (무제한)"
+        : `유효한 라이센스입니다. (${lifecycle.term}, ${lifecycle.remainingText})`,
       days: lifecycle.days,
+      hours: lifecycle.hours,
+      term: lifecycle.term,
       unlimited: lifecycle.unlimited,
       pending: lifecycle.pending,
-      remainingDays,
+      remainingDays: lifecycle.remainingDays,
+      remainingText: lifecycle.remainingText,
       expiresAt: lifecycle.expiresAt || null,
+      signatureExpiresAt: lifecycle.signatureExpiresAt || null,
       activatedAt: lifecycle.activatedAt || null,
     };
   });

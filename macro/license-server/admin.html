@@ -97,6 +97,9 @@
     input:focus,select:focus,textarea:focus { border-color:#7a7f8b; box-shadow:0 0 0 3px rgba(108,156,255,.09); }
     textarea { resize:vertical; }
     .presets { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-top:8px; }
+    .term-switch { display:flex; gap:6px; margin-bottom:8px; }
+    .term-switch .mode-button { flex:1; background:#14161a; border:1px solid #2b2e36; }
+    .term-switch .mode-button.active { background:#24272d; border-color:#454a55; }
     .btn {
       min-height:39px; padding:9px 13px; border:1px solid #30333b; border-radius:10px;
       color:#e8e9ed; background:#1b1d22; font-weight:800; transition:transform .14s ease,filter .14s ease,border-color .14s ease;
@@ -420,12 +423,21 @@
                 <div class="form-grid">
                   <div>
                     <label for="daysInput">이용기간</label>
-                    <input type="number" id="daysInput" value="30" min="1" max="99999">
-                    <div class="presets">
-                      <button class="btn btn-sm preset" data-days="1">1일</button>
-                      <button class="btn btn-sm preset" data-days="7">7일</button>
-                      <button class="btn btn-sm preset active" data-days="30">30일</button>
-                      <button class="btn btn-sm preset" data-days="99999">무제한</button>
+                    <div class="term-switch" id="termUnitSwitch">
+                      <button type="button" class="mode-button term-unit active" data-term-unit="day">일 단위</button>
+                      <button type="button" class="mode-button term-unit" data-term-unit="hour">시간 단위</button>
+                    </div>
+                    <input type="number" id="daysInput" value="30" min="1" max="36500">
+                    <div class="presets" id="termPresets">
+                      <button class="btn btn-sm preset day-preset" data-unit="day" data-value="1">1일</button>
+                      <button class="btn btn-sm preset day-preset" data-unit="day" data-value="7">7일</button>
+                      <button class="btn btn-sm preset day-preset active" data-unit="day" data-value="30">30일</button>
+                      <button class="btn btn-sm preset day-preset" data-unit="day" data-value="99999">무제한</button>
+                      <button class="btn btn-sm preset hour-preset field-hidden" data-unit="hour" data-value="1">1시간</button>
+                      <button class="btn btn-sm preset hour-preset field-hidden" data-unit="hour" data-value="3">3시간</button>
+                      <button class="btn btn-sm preset hour-preset field-hidden" data-unit="hour" data-value="6">6시간</button>
+                      <button class="btn btn-sm preset hour-preset field-hidden" data-unit="hour" data-value="12">12시간</button>
+                      <button class="btn btn-sm preset hour-preset field-hidden" data-unit="hour" data-value="24">24시간</button>
                     </div>
                   </div>
                   <div id="countField"><label for="countInput">발급 수량</label><input type="number" id="countInput" value="10" min="1" max="100"></div>
@@ -566,6 +578,7 @@
     let pendingRequestSignature = "";
     let migrationEligible = 0;
     let issueMode = "vending";
+    let issueUnit = "day";
     let licenseScope = "all";
 
     const $ = (id) => document.getElementById(id);
@@ -679,7 +692,7 @@
       const recent = licenses.filter(matchesLicenseScope).sort((a,b) => (b.issuedAt || 0) - (a.issuedAt || 0)).slice(0,4);
       $("recentKeys").innerHTML = recent.map((item) => `
         <button type="button" class="recent-key" data-key="${escapeHtml(item.key)}">
-          <span><code>${escapeHtml(item.key)}</code><small>${escapeHtml(item.batchName || "기존 단건 키")} · ${statusLabel(item.status)}</small></span>
+          <span><code>${escapeHtml(item.key)}</code><small>${escapeHtml(item.batchName || "기존 단건 키")} · ${escapeHtml(item.term || `${item.days}일권`)} · ${statusLabel(item.status)}</small></span>
           <span class="copy-mark">복사</span>
         </button>`).join("") || '<span class="hint">발급된 키가 없습니다.</span>';
     }
@@ -691,7 +704,7 @@
         return `<tr>
           <td data-label="라이선스 키"><code>${escapeHtml(item.key)}</code></td>
           <td data-label="상태"><span class="badge ${item.status}">${statusLabel(item.status)}</span></td>
-          <td data-label="기간">${item.unlimited ? "무제한" : `${item.days}일`}</td>
+          <td data-label="기간">${escapeHtml(item.term || (item.unlimited ? "무제한" : `${item.days}일권`))}</td>
           <td data-label="배치">${escapeHtml(item.batchName || "기존 단건")}</td><td data-label="활성화 / 만료">${dateText}</td>
           <td data-label="기기">${item.hwids.length}/${item.maxHwids}</td><td data-label="디스코드">${escapeHtml(item.discordId || "-")}</td>
           <td data-label="메모">${escapeHtml(item.memo || "-")}</td>
@@ -716,22 +729,40 @@
         document.body.appendChild(field); field.select(); document.execCommand("copy"); field.remove();
       }
     }
+    function getIssueTerm() {
+      const value = Number($("daysInput").value);
+      return issueUnit === "hour"
+        ? { value, hours:value, days:0, valid:Number.isInteger(value) && value >= 1 && value <= 24,
+            text:`${value}시간권`, short:`${value}h` }
+        : { value, days:value, hours:0, valid:Number.isInteger(value) && (value === 99999 || (value >= 1 && value <= 36500)),
+            text:value === 99999 ? "무제한" : `${value}일권`, short:value === 99999 ? "unlimited" : `${value}d` };
+    }
     function updateIssuePreview() {
-      const days = Number($("daysInput").value);
+      const licenseTerm = getIssueTerm();
       const count = issueMode === "manual" ? 1 : Number($("countInput").value);
-      const unlimited = days === 99999;
-      const validDays = Number.isInteger(days) && days > 0;
+      const unlimited = issueUnit === "day" && licenseTerm.days === 99999;
       const validCount = Number.isInteger(count) && count > 0;
-      $("issuePreviewDays").textContent = unlimited ? "∞" : (validDays ? days : "-");
-      $("issuePreviewUnit").textContent = unlimited ? "무제한" : "일권";
+      $("issuePreviewDays").textContent = unlimited ? "∞" : (licenseTerm.valid ? licenseTerm.value : "-");
+      $("issuePreviewUnit").textContent = unlimited ? "무제한" : (issueUnit === "hour" ? "시간권" : "일권");
       $("issuePreviewCount").textContent = `${validCount ? count : 0}개`;
       $("issuePreviewName").textContent = issueMode === "manual" ? "수동 발급" : ($("batchNameInput").value.trim() || "이름 없는 배치");
       $("issueButtonText").textContent = issueMode === "manual"
-        ? `${unlimited ? "무제한" : `${validDays ? days : "-"}일권`} 1개 수동 발급`
-        : `${unlimited ? "무제한" : `${validDays ? days : "-"}일권`} ${validCount ? count : 0}개 발급하기`;
+        ? `${licenseTerm.valid ? licenseTerm.text : "기간 확인"} 1개 수동 발급`
+        : `${licenseTerm.valid ? licenseTerm.text : "기간 확인"} ${validCount ? count : 0}개 발급하기`;
       document.querySelectorAll(".preset").forEach((button) => {
-        button.classList.toggle("active", Number(button.dataset.days) === days);
+        button.classList.toggle("active", button.dataset.unit === issueUnit && Number(button.dataset.value) === licenseTerm.value);
       });
+    }
+    function setIssueUnit(unit) {
+      issueUnit = unit === "hour" ? "hour" : "day";
+      $("daysInput").value = issueUnit === "hour" ? 3 : 30;
+      $("daysInput").max = issueUnit === "hour" ? "24" : "36500";
+      document.querySelectorAll(".term-unit").forEach((button) => button.classList.toggle("active", button.dataset.termUnit === issueUnit));
+      document.querySelectorAll(".day-preset").forEach((button) => button.classList.toggle("field-hidden", issueUnit !== "day"));
+      document.querySelectorAll(".hour-preset").forEach((button) => button.classList.toggle("field-hidden", issueUnit !== "hour"));
+      pendingRequestId = "";
+      pendingRequestSignature = "";
+      updateIssuePreview();
     }
     function setIssueMode(mode) {
       issueMode = mode === "manual" ? "manual" : "vending";
@@ -767,19 +798,20 @@
       renderTable();
     }
     async function issueBatch() {
-      const days = Number($("daysInput").value), count = issueMode === "manual" ? 1 : Number($("countInput").value);
-      if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) return toast("기간을 확인하세요.", "error");
+      const licenseTerm = getIssueTerm(), count = issueMode === "manual" ? 1 : Number($("countInput").value);
+      if (!licenseTerm.valid) return toast(issueUnit === "hour" ? "시간권은 1~24시간입니다." : "기간을 확인하세요.", "error");
       if (!Number.isInteger(count) || count < 1 || count > 100) return toast("수량은 1~100개입니다.", "error");
       const batchName = issueMode === "manual" ? "수동 발급" : $("batchNameInput").value.trim();
       const memo = $("memoInput").value.trim();
-      const requestSignature = JSON.stringify({ days, count, batchName, memo });
+      const termPayload = issueUnit === "hour" ? { hours:licenseTerm.hours } : { days:licenseTerm.days };
+      const requestSignature = JSON.stringify({ ...termPayload, count, batchName, memo });
       if (!pendingRequestId || pendingRequestSignature !== requestSignature) {
         pendingRequestId = makeRequestId();
         pendingRequestSignature = requestSignature;
       }
       $("batchIssueButton").disabled = true;
       try {
-        const data = await api("POST", { action:"batchIssue", requestId:pendingRequestId, days, count,
+        const data = await api("POST", { action:"batchIssue", requestId:pendingRequestId, ...termPayload, count,
           batchName, memo });
         const lines = data.plainText.split(/\r?\n/).filter(Boolean);
         if (lines.length !== count || new Set(lines).size !== count ||
@@ -797,7 +829,7 @@
     function showBatchResult() {
       if (!lastBatch) return;
       $("resultText").value = lastBatch.plainText;
-      $("resultMeta").textContent = `${lastBatch.batchName || "이름 없는 배치"} · ${lastBatch.count}개 · ${lastBatch.days === 99999 ? "무제한" : `${lastBatch.days}일권`}`;
+      $("resultMeta").textContent = `${lastBatch.batchName || "이름 없는 배치"} · ${lastBatch.count}개 · ${lastBatch.term || (lastBatch.days === 99999 ? "무제한" : `${lastBatch.days}일권`)}`;
       $("resultModal").classList.add("show");
     }
     async function copyResult() {
@@ -806,7 +838,8 @@
     }
     function downloadResult() {
       const stamp = new Date().toISOString().slice(0,16).replaceAll(/[-:T]/g,"");
-      const name = `mauto-${lastBatch.days === 99999 ? "unlimited" : `${lastBatch.days}d`}-${stamp}.txt`;
+      const termName = lastBatch.hours > 0 ? `${lastBatch.hours}h` : (lastBatch.days === 99999 ? "unlimited" : `${lastBatch.days}d`);
+      const name = `mauto-${termName}-${stamp}.txt`;
       const url = URL.createObjectURL(new Blob([lastBatch.plainText], { type:"text/plain;charset=utf-8" }));
       const a = document.createElement("a"); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
     }
@@ -885,9 +918,14 @@
       $("passwordToggle").textContent = show ? "숨기기" : "보기";
     });
     document.querySelectorAll(".preset").forEach((b) => b.addEventListener("click", () => {
-      $("daysInput").value=b.dataset.days;
+      if (b.dataset.unit !== issueUnit) setIssueUnit(b.dataset.unit);
+      $("daysInput").value=b.dataset.value;
       updateIssuePreview();
     }));
+    $("termUnitSwitch").addEventListener("click", (event) => {
+      const button = event.target.closest(".term-unit");
+      if (button) setIssueUnit(button.dataset.termUnit);
+    });
     $("issueModeSwitch").addEventListener("click", (event) => {
       const button = event.target.closest(".mode-button");
       if (button) setIssueMode(button.dataset.mode);

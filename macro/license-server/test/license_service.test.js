@@ -57,6 +57,21 @@ test("재인증은 만료 시각을 다시 시작하지 않는다", async () => 
   assert.equal(db.read(`licenses/${KEY}`).expiresAt, now + 30 * DAY_MS);
 });
 
+test("3시간권은 첫 인증 후 정확히 3시간이며 서명 만료값도 동일하다", async () => {
+  const now = Date.UTC(2026, 7, 15, 12);
+  const db = new FakeFirestore({
+    [`licenses/${KEY}`]: { ...pendingLicense(now - 100000), days:0, hours:3 },
+  });
+  const result = await verifyAndActivateLicense({
+    db, key:KEY, hwid:HWID, now, timestampFromMillis:(value) => value,
+  });
+  assert.equal(result.valid, true);
+  assert.equal(result.term, "3시간권");
+  assert.equal(result.expiresAt, now + 3 * 60 * 60 * 1000);
+  assert.equal(result.signatureExpiresAt, result.expiresAt);
+  assert.match(result.message, /3시간권/);
+});
+
 test("기기 한도를 넘긴 인증은 거부하고 활성 시각을 변경하지 않는다", async () => {
   const now = Date.UTC(2026, 6, 25);
   const data = {

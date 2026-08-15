@@ -2,6 +2,7 @@
 
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const { sendSignedVerdict } = require("../lib/licenseSign");
 const { verifyAndActivateLicense } = require("../lib/license_service");
 
 if (!admin.apps.length) {
@@ -34,13 +35,19 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  const { key, hwid } = req.body || {};
+  const { key, hwid, nonce } = req.body || {};
   if (!sec.isValidKeyFormat(key)) {
     return res.status(400).json({ valid: false, message: "키 형식이 올바르지 않습니다." });
   }
   if (!sec.isValidHwidFormat(hwid)) {
     return res.status(400).json({ valid: false, message: "기기 정보가 올바르지 않습니다." });
   }
+  if (typeof nonce !== "string" || !/^[0-9a-f]{8,64}$/.test(nonce)) {
+    return res.status(400).json({ valid: false, message: "요청 형식이 올바르지 않습니다." });
+  }
+
+  const denied = (message) =>
+    sendSignedVerdict(res, { verdict: "invalid", hwid, nonce, exp: 0, message });
 
   try {
     const result = await verifyAndActivateLicense({
@@ -49,7 +56,14 @@ module.exports = async function handler(req, res) {
       hwid,
       timestampFromMillis,
     });
-    return res.status(200).json(result);
+    if (!result.valid) return denied(result.message);
+    return sendSignedVerdict(res, {
+      verdict: "valid",
+      hwid,
+      nonce,
+      exp: Math.floor(result.signatureExpiresAt / 1000),
+      message: result.message,
+    });
   } catch (err) {
     console.error("License verify error:", err);
     return res.status(500).json({ valid: false, message: "서버 오류가 발생했습니다." });
