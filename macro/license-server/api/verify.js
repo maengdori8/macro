@@ -1,6 +1,7 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
 const { sendSignedVerdict } = require("../lib/licenseSign");
+const term = require("../lib/licenseTerm");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -65,11 +66,10 @@ module.exports = async function handler(req, res) {
     }
 
     const now = Date.now();
-    const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
-    const days = data.days || 0;
-    const expiresAt = createdAt + days * 86400000;
+    // 일권/시간권/무제한을 한 함수로 판정한다(계산 중복 제거 → 경로별 불일치 방지).
+    const expiresAt = term.expiresAt(data);
 
-    if (now > expiresAt) {
+    if (term.isExpired(data, now)) {
       return denied("만료된 라이센스 키입니다.");
     }
 
@@ -100,9 +100,6 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const remainingMs = expiresAt - now;
-    const remainingDays = Math.ceil(remainingMs / 86400000);
-
     // exp는 초 단위(클라이언트가 exp-now>0을 초로 판정). 이 값이 서명에 묶여
     // 만료일 조작(exp만 늘리기)이 불가능하다.
     return sendSignedVerdict(res, {
@@ -110,7 +107,7 @@ module.exports = async function handler(req, res) {
       hwid,
       nonce,
       exp: Math.floor(expiresAt / 1000),
-      message: `유효한 라이센스입니다. (${days}일권, ${remainingDays}일 남음)`,
+      message: `유효한 라이센스입니다. (${term.termText(data)}, ${term.remainingText(data, now)})`,
     });
   } catch (err) {
     if (err.code === "HWID_LIMIT") {

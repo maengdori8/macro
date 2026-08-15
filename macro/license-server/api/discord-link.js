@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const term = require("../lib/licenseTerm");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -56,9 +57,9 @@ module.exports = async function handler(req, res) {
 
     const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
     const days = data.days || 0;
-    const expiresAt = createdAt + days * 86400000;
+    const expiresAt = term.expiresAt(data);
     const now = Date.now();
-    if (days !== 99999 && now > expiresAt) {
+    if (term.isExpired(data, now)) {
       return res.status(200).json({ success: false, message: "만료된 라이센스입니다." });
     }
 

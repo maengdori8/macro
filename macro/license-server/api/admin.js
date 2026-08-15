@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const term = require("../lib/licenseTerm");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -58,11 +59,13 @@ module.exports = async function handler(req, res) {
         const data = doc.data();
         const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
         const days = data.days || 0;
-        const expiresAt = createdAt + days * 86400000;
+        const expiresAt = term.expiresAt(data);
         const now = Date.now();
         licenses.push({
           key: doc.id,
           days,
+          hours: Number(data.hours || 0),
+          term: term.termText(data),
           createdAt,
           expiresAt,
           disabled: data.disabled || false,
@@ -81,12 +84,28 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const { key, days, memo } = req.body || {};
+    const { key, days, hours, memo } = req.body || {};
     if (!sec.isValidKeyFormat(key)) {
       return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
-    // 기간(일): 1~36500 사이 정수 또는 무제한(99999).
-    if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) {
+
+    // 시간권(1~24시간)과 일권 중 하나만 지정한다. 둘 다 오면 어느 쪽이 진짜인지
+    // 알 수 없어 만료가 어긋나므로 거부한다.
+    const wantsHours = hours !== undefined && hours !== null && hours !== "";
+    if (wantsHours) {
+      if (!Number.isInteger(hours) || hours < 1 || hours > term.MAX_ISSUE_HOURS) {
+        return res.status(400).json({
+          success: false,
+          message: `기간(시간)은 1~${term.MAX_ISSUE_HOURS} 사이 정수여야 합니다.`,
+        });
+      }
+      if (days !== undefined && days !== null && days !== "" && Number(days) !== 0) {
+        return res.status(400).json({
+          success: false,
+          message: "시간권과 일권은 동시에 지정할 수 없습니다.",
+        });
+      }
+    } else if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) {
       return res.status(400).json({ success: false, message: "기간(일)은 1~36500 사이 정수 또는 무제한(99999)이어야 합니다." });
     }
     if (memo !== undefined && (typeof memo !== "string" || memo.length > 200)) {
@@ -99,13 +118,21 @@ module.exports = async function handler(req, res) {
         return res.status(409).json({ success: false, message: "이미 존재하는 키입니다." });
       }
 
+      // 시간권은 days=0으로 저장한다. 만료 계산은 hours가 0보다 크면 hours를 쓰고,
+      // 기존 문서에는 hours 필드가 없어 undefined→0으로 떨어지므로 일권은 그대로 동작한다.
+      const doc = wantsHours
+        ? { days: 0, hours }
+        : { days, hours: 0 };
       await col.doc(key).set({
-        days,
+        ...doc,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         disabled: false,
         memo: memo || "",
       });
-      return res.status(201).json({ success: true, message: `${days}일권 라이센스가 발급되었습니다.` });
+      return res.status(201).json({
+        success: true,
+        message: `${term.termText(doc)} 라이센스가 발급되었습니다.`,
+      });
     } catch (err) {
       console.error("Admin create error:", err);
       return res.status(500).json({ success: false, message: "발급 실패" });
@@ -161,12 +188,14 @@ module.exports = async function handler(req, res) {
           return res.status(400).json({ success: false, message: "이미 무제한 라이센스입니다." });
         }
         const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
-        const currentExpiry = createdAt + curDays * 86400000;
+        const currentExpiry = term.expiresAt(data);
         // 아직 유효하면 만료일에서, 이미 만료됐으면 지금부터 연장.
         const base = Math.max(Date.now(), currentExpiry);
         const newExpiry = base + extendDays * 86400000;
         const newDays = Math.max(1, Math.round((newExpiry - createdAt) / 86400000));
-        await col.doc(key).update({ days: newDays });
+        // hours를 0으로 함께 비운다. 남겨두면 hours가 days보다 우선해서
+        // 시간권을 연장해도 만료가 그대로인 버그가 된다.
+        await col.doc(key).update({ days: newDays, hours: 0 });
         const remainDays = Math.ceil((newExpiry - Date.now()) / 86400000);
         return res.status(200).json({ success: true, message: `${extendDays}일 연장되었습니다. (남은 약 ${remainDays}일)` });
       }
@@ -174,7 +203,8 @@ module.exports = async function handler(req, res) {
       // 무제한으로 전환.
       const { makeUnlimited } = req.body;
       if (makeUnlimited) {
-        await col.doc(key).update({ days: 99999 });
+        // hours가 남아 있으면 우선순위 때문에 무제한이 안 먹으므로 함께 비운다.
+        await col.doc(key).update({ days: 99999, hours: 0 });
         return res.status(200).json({ success: true, message: "무제한으로 전환되었습니다." });
       }
 

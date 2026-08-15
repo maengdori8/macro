@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const term = require("../lib/licenseTerm");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -45,10 +46,11 @@ module.exports = async function handler(req, res) {
     const d = snap.docs[0].data();
     const createdAt = d.createdAt?.toMillis?.() || d.createdAt || 0;
     const days = d.days || 0;
-    const unlimited = days === 99999;
-    const expiresAt = createdAt + days * 86400000;
+    const unlimited = term.isUnlimited(d);
+    const expiresAt = term.expiresAt(d);
     const now = Date.now();
     const remainingDays = unlimited ? null : Math.max(0, Math.ceil((expiresAt - now) / 86400000));
+    const remainingText = term.remainingText(d, now);
 
     return res.status(200).json({
       success: true,

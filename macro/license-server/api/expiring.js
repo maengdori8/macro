@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const term = require("../lib/licenseTerm");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -37,10 +38,8 @@ module.exports = async function handler(req, res) {
     snap.forEach((doc) => {
       const d = doc.data();
       if (d.disabled === true) return;
-      const dd = d.days || 0;
-      if (dd === 99999) return; // 무제한 제외
-      const createdAt = d.createdAt?.toMillis?.() || d.createdAt || 0;
-      const expiresAt = createdAt + dd * 86400000;
+      if (term.isUnlimited(d)) return; // 무제한 제외
+      const expiresAt = term.expiresAt(d);
       if (expiresAt > now && expiresAt <= horizon) {
         list.push({
           discordId: d.discordId,
