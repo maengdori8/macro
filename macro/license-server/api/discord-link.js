@@ -1,6 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
-const term = require("../lib/licenseTerm");
+const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -55,11 +55,9 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ success: false, message: "비활성화된 라이센스입니다." });
     }
 
-    const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
-    const days = data.days || 0;
-    const expiresAt = term.expiresAt(data);
     const now = Date.now();
-    if (term.isExpired(data, now)) {
+    const lifecycle = getLicenseLifecycle(data, now);
+    if (lifecycle.expired) {
       return res.status(200).json({ success: false, message: "만료된 라이센스입니다." });
     }
 
@@ -77,15 +75,19 @@ module.exports = async function handler(req, res) {
       await ref.update({ discordId });
     }
 
-    const remainingDays = days === 99999 ? null : Math.max(0, Math.ceil((expiresAt - now) / 86400000));
     return res.status(200).json({
       success: true,
       message: alreadyLinked ? "이미 등록됨" : "인증 성공",
       alreadyLinked,
-      days,
-      unlimited: days === 99999,
-      remainingDays,
-      expiresAt: days === 99999 ? null : expiresAt,
+      days: lifecycle.days,
+      unlimited: lifecycle.unlimited,
+      pending: lifecycle.pending,
+      remainingDays: lifecycle.unlimited
+        ? null
+        : lifecycle.pending
+          ? lifecycle.days
+          : lifecycle.remainingDays,
+      expiresAt: lifecycle.expiresAt || null,
     });
   } catch (err) {
     console.error("discord-link error:", err);

@@ -31,7 +31,16 @@ function applyCors(req, res, allowedOrigins) {
 
   if (!origin) return true; // 브라우저가 아닌 클라이언트(앱)
   if (allowedOrigins && allowedOrigins.length > 0) {
-    if (allowedOrigins.includes(origin)) {
+    let sameOrigin = false;
+    try {
+      const requestHost = String(
+        req.headers["x-forwarded-host"] || req.headers.host || ""
+      ).toLowerCase();
+      sameOrigin = requestHost !== "" && new URL(origin).host.toLowerCase() === requestHost;
+    } catch {
+      sameOrigin = false;
+    }
+    if (sameOrigin || allowedOrigins.includes(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       return true;
     }

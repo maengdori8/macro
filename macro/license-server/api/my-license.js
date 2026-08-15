@@ -1,6 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
-const term = require("../lib/licenseTerm");
+const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -44,23 +44,23 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ success: true, registered: false });
     }
     const d = snap.docs[0].data();
-    const createdAt = d.createdAt?.toMillis?.() || d.createdAt || 0;
-    const days = d.days || 0;
-    const unlimited = term.isUnlimited(d);
-    const expiresAt = term.expiresAt(d);
     const now = Date.now();
-    const remainingDays = unlimited ? null : Math.max(0, Math.ceil((expiresAt - now) / 86400000));
-    const remainingText = term.remainingText(d, now);
+    const lifecycle = getLicenseLifecycle(d, now);
 
     return res.status(200).json({
       success: true,
       registered: true,
-      disabled: d.disabled === true,
-      expired: !unlimited && now > expiresAt,
-      days,
-      unlimited,
-      expiresAt: unlimited ? null : expiresAt,
-      remainingDays,
+      disabled: lifecycle.disabled,
+      expired: lifecycle.expired,
+      pending: lifecycle.pending,
+      days: lifecycle.days,
+      unlimited: lifecycle.unlimited,
+      expiresAt: lifecycle.expiresAt || null,
+      remainingDays: lifecycle.unlimited
+        ? null
+        : lifecycle.pending
+          ? lifecycle.days
+          : lifecycle.remainingDays,
       hwidCount: (d.hwids || []).length,
       maxHwids: d.maxHwids || 3,
     });

@@ -1,6 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
-const term = require("../lib/licenseTerm");
+const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -37,13 +37,12 @@ module.exports = async function handler(req, res) {
     const list = [];
     snap.forEach((doc) => {
       const d = doc.data();
-      if (d.disabled === true) return;
-      if (term.isUnlimited(d)) return; // 무제한 제외
-      const expiresAt = term.expiresAt(d);
-      if (expiresAt > now && expiresAt <= horizon) {
+      const lifecycle = getLicenseLifecycle(d, now);
+      if (lifecycle.disabled || lifecycle.pending || lifecycle.unlimited) return;
+      if (lifecycle.expiresAt > now && lifecycle.expiresAt <= horizon) {
         list.push({
           discordId: d.discordId,
-          remainingDays: Math.max(0, Math.ceil((expiresAt - now) / 86400000)),
+          remainingDays: lifecycle.remainingDays,
         });
       }
     });

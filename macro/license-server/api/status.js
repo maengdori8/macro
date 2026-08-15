@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
+const { getLicenseLifecycle } = require("../lib/license_lifecycle");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -52,6 +53,10 @@ module.exports = async function handler(req, res) {
       const licData = licDoc.data();
       if (licData.disabled === true) {
         return res.status(403).json({ success: false, message: "비활성화된 라이센스입니다." });
+      }
+      const lifecycle = getLicenseLifecycle(licData);
+      if (lifecycle.pending || lifecycle.expired) {
+        return res.status(403).json({ success: false, message: "유효하지 않은 라이센스입니다." });
       }
       const hwids = licData.hwids || [];
       if (!hwids.includes(hwid)) {

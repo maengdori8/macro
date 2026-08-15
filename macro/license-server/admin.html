@@ -1,252 +1,416 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>라이센스 관리자 패널</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; }
-  .container { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
-  h1 { font-size: 22px; color: #7AB7FF; margin-bottom: 20px; }
-
-  .login-box, .panel { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; padding: 24px; margin-bottom: 20px; }
-  .panel { display: none; }
-
-  label { display: block; font-size: 13px; color: #999; margin-bottom: 6px; }
-  input, select { width: 100%; padding: 10px 12px; background: #111; border: 1px solid #333; border-radius: 6px; color: #e0e0e0; font-size: 14px; margin-bottom: 14px; outline: none; }
-  input:focus, select:focus { border-color: #7AB7FF; }
-
-  .btn { padding: 10px 20px; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
-  .btn:hover { opacity: 0.85; }
-  .btn-primary { background: #7AB7FF; color: #000; }
-  .btn-danger { background: #FF6B6B; color: #fff; }
-  .btn-warning { background: #FFA94D; color: #000; }
-  .btn-sm { padding: 6px 12px; font-size: 12px; }
-  .btn-group { display: flex; gap: 6px; }
-
-  .issue-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 20px; }
-  .issue-form > div { flex: 1; min-width: 140px; }
-  .issue-form .btn { margin-bottom: 14px; white-space: nowrap; }
-
-  .toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; z-index: 999; opacity: 0; transition: opacity 0.3s; }
-  .toast.show { opacity: 1; }
-  .toast.success { background: #2d5a27; color: #69DB7C; border: 1px solid #3a7a32; }
-  .toast.error { background: #5a2727; color: #FF6B6B; border: 1px solid #7a3232; }
-
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 10px 12px; font-size: 12px; color: #666; border-bottom: 1px solid #2a2a2a; text-transform: uppercase; }
-  td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #1f1f1f; }
-  tr:hover td { background: #1f1f1f; }
-
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-  .badge-active { background: #1a3a1a; color: #69DB7C; }
-  .badge-expired { background: #3a1a1a; color: #FF6B6B; }
-  .badge-disabled { background: #3a3a1a; color: #FFA94D; }
-
-  .key-text { font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; word-break: break-all; }
-  .memo-text { color: #888; font-size: 12px; }
-  .empty-state { text-align: center; padding: 40px; color: #555; }
-  .stats { display: flex; gap: 16px; margin-bottom: 20px; }
-  .stat-card { flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; text-align: center; }
-  .stat-num { font-size: 28px; font-weight: 700; color: #7AB7FF; }
-  .stat-label { font-size: 12px; color: #666; margin-top: 4px; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>mAuto 라이선스·자판기 관리</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#08090b; --panel:#101216; --panel2:#17191f; --line:#282c35;
+      --text:#f3f4f6; --muted:#9298a7; --red:#ff4d3f; --green:#56d88b;
+      --amber:#ffbd59; --blue:#65a7ff;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 20% 0,#191116 0,#08090b 34%);
+      color:var(--text); font:14px/1.45 Inter, Pretendard, "Segoe UI", sans-serif; }
+    button,input,select,textarea { font:inherit; }
+    button { cursor:pointer; }
+    .shell { width:min(1500px,calc(100% - 32px)); margin:32px auto 80px; }
+    .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:22px; }
+    .brand h1 { margin:0; font-size:25px; }
+    .brand p { margin:5px 0 0; color:var(--muted); }
+    .card { background:rgba(16,18,22,.96); border:1px solid var(--line); border-radius:16px;
+      padding:20px; box-shadow:0 16px 50px rgba(0,0,0,.22); }
+    .login { width:min(500px,100%); margin:100px auto; }
+    .grid { display:grid; grid-template-columns:1.25fr .75fr; gap:16px; }
+    .grid > * { min-width:0; }
+    .stack { display:grid; gap:16px; align-content:start; min-width:0; }
+    h2 { font-size:17px; margin:0 0 16px; }
+    h3 { font-size:14px; margin:20px 0 10px; color:#d9dde7; }
+    label { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
+    input,select,textarea { width:100%; color:var(--text); background:var(--panel2);
+      border:1px solid var(--line); border-radius:10px; padding:11px 12px; outline:none; }
+    input:focus,select:focus,textarea:focus { border-color:#626a7d; box-shadow:0 0 0 3px rgba(101,167,255,.1); }
+    textarea { resize:vertical; }
+    .form-grid { display:grid; grid-template-columns:1fr 110px 1fr; gap:12px; }
+    .form-grid .wide { grid-column:span 2; }
+    .presets { display:flex; gap:6px; margin-top:7px; }
+    .btn { border:1px solid var(--line); color:var(--text); background:#1b1e24;
+      border-radius:10px; padding:10px 14px; font-weight:700; }
+    .btn:hover { filter:brightness(1.15); }
+    .btn:disabled { cursor:not-allowed; opacity:.42; }
+    .btn-primary { background:var(--red); border-color:transparent; color:#fff; }
+    .btn-green { background:#1e693d; border-color:#2f8b55; }
+    .btn-danger { background:#49201f; border-color:#73302c; color:#ffaaa3; }
+    .btn-sm { padding:6px 9px; border-radius:7px; font-size:12px; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; }
+    .issue-action { margin-top:14px; display:flex; align-items:center; gap:12px; }
+    .hint { color:var(--muted); font-size:12px; }
+    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:16px 0; }
+    .stat { padding:15px; border-radius:12px; background:var(--panel2); border:1px solid var(--line); }
+    .stat b { display:block; font-size:25px; margin-top:3px; }
+    .stat span { color:var(--muted); font-size:12px; }
+    .pending { color:var(--amber); } .active { color:var(--green); }
+    .expired,.disabled { color:#ff756b; }
+    .toolbar { display:grid; grid-template-columns:2fr 150px 220px auto; gap:8px; margin-bottom:12px; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:12px; }
+    table { width:100%; border-collapse:collapse; min-width:1100px; }
+    th,td { text-align:left; padding:11px 12px; border-bottom:1px solid #23262e; vertical-align:middle; }
+    th { position:sticky; top:0; background:#15171c; color:var(--muted); font-size:11px; z-index:1; }
+    tr:last-child td { border-bottom:0; }
+    code { color:#e9edf7; font-family:"Cascadia Mono",Consolas,monospace; font-size:12px; }
+    .badge { display:inline-flex; padding:4px 8px; border-radius:99px; font-size:11px; font-weight:800;
+      background:#262a33; }
+    .badge.pending { background:#42341c; } .badge.active { background:#173725; }
+    .badge.expired,.badge.disabled { background:#41201f; }
+    .batch-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; max-height:245px; overflow:auto; }
+    .batch-item { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:11px; }
+    .batch-item strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .batch-counts { color:var(--muted); font-size:11px; margin-top:6px; }
+    .notice { border:1px solid #443a28; background:#211d15; color:#e8cf99; border-radius:10px; padding:11px; }
+    .modal { position:fixed; inset:0; display:none; place-items:center; background:rgba(0,0,0,.76); z-index:20; padding:20px; }
+    .modal.show { display:grid; }
+    .modal-card { width:min(720px,100%); background:#0f1115; border:1px solid #30343d; border-radius:18px; padding:22px; }
+    .modal-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:13px; }
+    .modal textarea { height:340px; font:13px/1.6 "Cascadia Mono",Consolas,monospace; }
+    .toast { position:fixed; right:22px; bottom:22px; z-index:40; background:#232730;
+      border:1px solid #3d424e; border-radius:11px; padding:12px 16px; opacity:0; transform:translateY(12px);
+      pointer-events:none; transition:.2s; }
+    .toast.show { opacity:1; transform:translateY(0); }
+    .toast.error { border-color:#7a322d; color:#ffaaa3; }
+    .hidden { display:none!important; }
+    @media (max-width:900px) {
+      .grid { grid-template-columns:1fr; } .form-grid { grid-template-columns:1fr 100px; }
+      .form-grid .wide { grid-column:span 2; } .stats { grid-template-columns:repeat(2,1fr); }
+      .toolbar { grid-template-columns:1fr 1fr; } .batch-grid { grid-template-columns:1fr; }
+    }
+  </style>
 </head>
 <body>
-<div class="container">
-  <h1>라이센스 관리자 패널</h1>
+  <main class="shell">
+    <section id="loginView" class="card login">
+      <h2>mAuto 관리자 로그인</h2>
+      <label for="adminKeyInput">관리자 키</label>
+      <input type="password" id="adminKeyInput" autocomplete="current-password" placeholder="ADMIN_KEY">
+      <button class="btn btn-primary" id="loginButton" style="width:100%;margin-top:12px">로그인</button>
+      <p class="hint">관리자 키는 브라우저 저장소에 저장하지 않습니다.</p>
+    </section>
 
-  <div class="login-box" id="loginBox">
-    <label>관리자 키</label>
-    <input type="password" id="adminKeyInput" placeholder="ADMIN_KEY를 입력하세요" />
-    <button class="btn btn-primary" onclick="login()">로그인</button>
-  </div>
-
-  <div class="panel" id="panel">
-    <div class="stats" id="stats"></div>
-
-    <div class="panel" id="issuePanel" style="display:block; padding:0; border:none; background:none; margin-bottom:20px;">
-      <h3 style="font-size:15px; margin-bottom:12px; color:#ccc;">라이센스 발급</h3>
-      <div class="issue-form">
-        <div>
-          <label>라이센스 키</label>
-          <input type="text" id="newKey" placeholder="키 입력 또는 자동 생성" />
-        </div>
-        <div style="min-width:100px; flex:0.5;">
-          <label>기간</label>
-          <select id="newDays">
-            <option value="h1">1시간</option>
-            <option value="h3">3시간</option>
-            <option value="h6">6시간</option>
-            <option value="h12">12시간</option>
-            <option value="h24">24시간</option>
-            <option value="1">1일</option>
-            <option value="7">7일</option>
-            <option value="30" selected>30일</option>
-            <option value="99999">무제한</option>
-          </select>
-        </div>
-        <div>
-          <label>메모</label>
-          <input type="text" id="newMemo" placeholder="선택사항" />
-        </div>
-        <button class="btn btn-primary" onclick="issueKey()" style="margin-bottom:14px;">발급</button>
-        <button class="btn btn-warning" onclick="generateRandomKey()" style="margin-bottom:14px;">자동생성</button>
+    <section id="appView" class="hidden">
+      <div class="top">
+        <div class="brand"><h1>📦 라이선스·자판기 관리</h1><p>발급이 아닌 첫 프로그램 인증부터 이용기간이 시작됩니다.</p></div>
+        <div class="actions"><button class="btn" id="showLastButton" disabled>마지막 발급 다시 보기</button><button class="btn" id="reloadButton">새로고침</button></div>
       </div>
+
+      <div class="grid">
+        <div class="stack">
+          <section class="card">
+            <h2>자판기용 일괄 발급</h2>
+            <div class="form-grid">
+              <div>
+                <label for="daysInput">이용기간</label>
+                <input type="number" id="daysInput" value="30" min="1" max="99999">
+                <div class="presets"><button class="btn btn-sm preset" data-days="1">1일</button><button class="btn btn-sm preset" data-days="7">7일</button><button class="btn btn-sm preset" data-days="30">30일</button><button class="btn btn-sm preset" data-days="99999">무제한</button></div>
+              </div>
+              <div><label for="countInput">수량</label><input type="number" id="countInput" value="10" min="1" max="100"></div>
+              <div><label for="batchNameInput">배치명</label><input id="batchNameInput" maxlength="80" placeholder="예: 7월 30일권 재고"></div>
+              <div class="wide"><label for="memoInput">공통 메모</label><input id="memoInput" maxlength="200" placeholder="선택사항"></div>
+            </div>
+            <div class="issue-action">
+              <button class="btn btn-primary" id="batchIssueButton">발급하고 자판기 목록 만들기</button>
+              <span class="hint">최대 100개 · 한 줄에 한 키 · 중복 발급 방지</span>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>전체 라이선스</h2>
+            <div class="stats">
+              <div class="stat"><span>전체</span><b id="statTotal">0</b></div>
+              <div class="stat"><span>첫 인증 전</span><b class="pending" id="statPending">0</b></div>
+              <div class="stat"><span>사용 중</span><b class="active" id="statActive">0</b></div>
+              <div class="stat"><span>만료·비활성</span><b class="expired" id="statInactive">0</b></div>
+            </div>
+            <div class="toolbar">
+              <input id="searchInput" placeholder="키·배치·디스코드·메모 검색">
+              <select id="statusFilter"><option value="">모든 상태</option><option value="pending">첫 인증 전</option><option value="active">사용 중</option><option value="expired">만료</option><option value="disabled">비활성</option></select>
+              <select id="batchFilter"><option value="">모든 배치</option></select>
+              <button class="btn" id="clearFilterButton">초기화</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>키</th><th>상태</th><th>기간</th><th>배치</th><th>첫 인증/만료</th><th>기기</th><th>디스코드</th><th>메모</th><th>관리</th></tr></thead>
+                <tbody id="licenseTable"></tbody>
+              </table>
+            </div>
+            <p class="hint" id="resultCount"></p>
+          </section>
+        </div>
+
+        <aside class="stack">
+          <section class="card">
+            <h2>배치 요약</h2>
+            <div id="batchSummary" class="batch-grid"></div>
+            <p class="hint">미활성 수는 자판기 실시간 재고가 아니라 아직 프로그램에 등록되지 않은 키 수입니다.</p>
+          </section>
+
+          <section class="card">
+            <h2>기존 미사용 키 전환</h2>
+            <div class="notice">HWID가 없는 기존 키만 첫 인증 대기로 전환합니다. 사용 중인 고객 키의 만료일과 HWID는 변경하지 않습니다.</div>
+            <div class="actions" style="margin-top:12px">
+              <button class="btn" id="migrationPreviewButton">대상 미리보기</button>
+              <button class="btn btn-danger" id="migrationApplyButton" disabled>확인 후 전환</button>
+            </div>
+            <p class="hint" id="migrationInfo">먼저 미리보기를 실행하세요.</p>
+          </section>
+
+          <section class="card">
+            <h2>버전 관리</h2>
+            <label for="versionInput">버전</label><input id="versionInput" placeholder="1.0.24">
+            <label for="urlInput" style="margin-top:9px">다운로드 URL</label><input id="urlInput" placeholder="https://...">
+            <label for="shaInput" style="margin-top:9px">SHA-256</label><input id="shaInput">
+            <label for="sigInput" style="margin-top:9px">서명</label><input id="sigInput">
+            <label for="changelogInput" style="margin-top:9px">변경사항</label><textarea id="changelogInput" rows="3"></textarea>
+            <button class="btn" id="versionSaveButton" style="margin-top:10px">버전 저장</button>
+          </section>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal" id="resultModal">
+    <div class="modal-card">
+      <div class="modal-head"><div><h2 style="margin:0">자판기 재고 목록</h2><span class="hint" id="resultMeta"></span></div><button class="btn btn-sm" id="closeResultButton">닫기</button></div>
+      <textarea id="resultText" readonly spellcheck="false"></textarea>
+      <div class="actions" style="margin-top:12px"><button class="btn btn-primary" id="copyResultButton">전체 복사</button><button class="btn" id="downloadResultButton">TXT 저장</button></div>
     </div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>키</th>
-          <th>기간</th>
-          <th>상태</th>
-          <th>만료일</th>
-          <th>메모</th>
-          <th>관리</th>
-        </tr>
-      </thead>
-      <tbody id="licenseTable"></tbody>
-    </table>
-    <div class="empty-state" id="emptyState" style="display:none;">등록된 라이센스가 없습니다.</div>
   </div>
-</div>
+  <div class="toast" id="toast"></div>
 
-<div class="toast" id="toast"></div>
+  <script>
+    "use strict";
+    const ADMIN_API = "/api/admin";
+    const LICENSE_KEY_PATTERN = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}(?:-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}){4}$/;
+    let adminKey = "";
+    let licenses = [];
+    let lastBatch = null;
+    let pendingRequestId = "";
+    let pendingRequestSignature = "";
+    let migrationEligible = 0;
 
-<script>
-let adminKey = '';
-const API = '/api/admin';
+    const $ = (id) => document.getElementById(id);
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    })[ch]);
+    const fmtDate = (value) => value ? new Date(value).toLocaleString("ko-KR", { hour12:false }) : "-";
+    const makeRequestId = () => (crypto.randomUUID ? crypto.randomUUID().replaceAll("-","") :
+      `${Date.now()}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`);
+    const headers = () => ({ "Content-Type":"application/json", "X-Admin-Key":adminKey });
 
-function login() {
-  adminKey = document.getElementById('adminKeyInput').value.trim();
-  if (!adminKey) return showToast('관리자 키를 입력하세요.', 'error');
-  loadLicenses();
-}
+    function toast(message, type="") {
+      const el = $("toast"); el.textContent = message; el.className = `toast ${type} show`;
+      clearTimeout(toast.timer); toast.timer = setTimeout(() => el.className = "toast", 3200);
+    }
+    async function api(method, body) {
+      const response = await fetch(ADMIN_API, { method, headers:headers(), body:body ? JSON.stringify(body) : undefined });
+      const data = await response.json().catch(() => ({ success:false, message:"잘못된 서버 응답" }));
+      if (!response.ok || data.success === false) throw new Error(data.message || `HTTP ${response.status}`);
+      return data;
+    }
+    async function login() {
+      adminKey = $("adminKeyInput").value.trim();
+      if (!adminKey) return toast("관리자 키를 입력하세요.", "error");
+      $("loginButton").disabled = true;
+      try {
+        await loadLicenses();
+        $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden");
+        await loadVersion();
+      } catch (error) {
+        adminKey = ""; toast(error.message, "error");
+      } finally { $("loginButton").disabled = false; }
+    }
+    async function loadLicenses() {
+      const data = await api("GET");
+      licenses = data.licenses || [];
+      renderAll();
+    }
+    function renderAll() {
+      const counts = licenses.reduce((out, item) => (out[item.status] = (out[item.status] || 0) + 1, out), {});
+      $("statTotal").textContent = licenses.length;
+      $("statPending").textContent = counts.pending || 0;
+      $("statActive").textContent = counts.active || 0;
+      $("statInactive").textContent = (counts.expired || 0) + (counts.disabled || 0);
+      renderBatchFilter(); renderBatchSummary(); renderTable();
+    }
+    function renderBatchFilter() {
+      const selected = $("batchFilter").value;
+      const batches = [...new Map(licenses.filter((l) => l.batchId || l.batchName)
+        .map((l) => [l.batchId || l.batchName, l.batchName || l.batchId])).entries()];
+      $("batchFilter").innerHTML = '<option value="">모든 배치</option>' +
+        batches.map(([id,name]) => `<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join("");
+      if (batches.some(([id]) => id === selected)) $("batchFilter").value = selected;
+    }
+    function renderBatchSummary() {
+      const map = new Map();
+      for (const item of licenses) {
+        const id = item.batchId || "legacy";
+        if (!map.has(id)) map.set(id, { name:item.batchName || (id === "legacy" ? "기존 단건 키" : id), total:0, pending:0, active:0, expired:0, disabled:0 });
+        const row = map.get(id); row.total += 1; row[item.status] += 1;
+      }
+      $("batchSummary").innerHTML = [...map.values()].map((b) => `
+        <div class="batch-item"><strong title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</strong>
+        <div class="batch-counts">전체 ${b.total} · 미활성 ${b.pending} · 사용 ${b.active} · 만료 ${b.expired} · 비활성 ${b.disabled}</div></div>`).join("") ||
+        '<span class="hint">발급된 배치가 없습니다.</span>';
+    }
+    function statusLabel(status) {
+      return ({ pending:"첫 인증 전", active:"사용 중", expired:"만료", disabled:"비활성" })[status] || status;
+    }
+    function renderTable() {
+      const query = $("searchInput").value.trim().toLowerCase();
+      const status = $("statusFilter").value;
+      const batch = $("batchFilter").value;
+      const filtered = licenses.filter((item) => {
+        const haystack = [item.key,item.batchId,item.batchName,item.discordId,item.memo].join(" ").toLowerCase();
+        return (!query || haystack.includes(query)) && (!status || item.status === status) &&
+          (!batch || (item.batchId || item.batchName) === batch);
+      });
+      $("licenseTable").innerHTML = filtered.map((item) => {
+        const dateText = item.pending ? `발급 ${fmtDate(item.issuedAt)}<br><span class="pending">첫 인증 대기</span>` :
+          `인증 ${fmtDate(item.activatedAt)}<br>만료 ${item.unlimited ? "무제한" : fmtDate(item.expiresAt)}`;
+        return `<tr>
+          <td><code>${escapeHtml(item.key)}</code></td>
+          <td><span class="badge ${item.status}">${statusLabel(item.status)}</span></td>
+          <td>${item.unlimited ? "무제한" : `${item.days}일`}</td>
+          <td>${escapeHtml(item.batchName || "-")}</td><td>${dateText}</td>
+          <td>${item.hwids.length}/${item.maxHwids}</td><td>${escapeHtml(item.discordId || "-")}</td>
+          <td>${escapeHtml(item.memo || "-")}</td>
+          <td><div class="actions">
+            <button class="btn btn-sm row-action" data-action="copy" data-key="${item.key}">복사</button>
+            <button class="btn btn-sm row-action" data-action="extend" data-key="${item.key}">연장</button>
+            <button class="btn btn-sm row-action" data-action="reset" data-key="${item.key}" ${item.hwids.length ? "" : "disabled"}>HWID</button>
+            <button class="btn btn-sm row-action" data-action="discord" data-key="${item.key}">디스코드</button>
+            <button class="btn btn-sm ${item.disabled ? "btn-green" : "btn-danger"} row-action" data-action="toggle" data-key="${item.key}">${item.disabled ? "활성" : "비활성"}</button>
+            <button class="btn btn-sm btn-danger row-action" data-action="delete" data-key="${item.key}">삭제</button>
+          </div></td></tr>`;
+      }).join("");
+      $("resultCount").textContent = `${filtered.length}개 표시 / 전체 ${licenses.length}개`;
+    }
+    async function issueBatch() {
+      const days = Number($("daysInput").value), count = Number($("countInput").value);
+      if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) return toast("기간을 확인하세요.", "error");
+      if (!Number.isInteger(count) || count < 1 || count > 100) return toast("수량은 1~100개입니다.", "error");
+      const batchName = $("batchNameInput").value.trim();
+      const memo = $("memoInput").value.trim();
+      const requestSignature = JSON.stringify({ days, count, batchName, memo });
+      if (!pendingRequestId || pendingRequestSignature !== requestSignature) {
+        pendingRequestId = makeRequestId();
+        pendingRequestSignature = requestSignature;
+      }
+      $("batchIssueButton").disabled = true;
+      try {
+        const data = await api("POST", { action:"batchIssue", requestId:pendingRequestId, days, count,
+          batchName, memo });
+        const lines = data.plainText.split(/\r?\n/).filter(Boolean);
+        if (lines.length !== count || new Set(lines).size !== count ||
+            lines.some((key) => !LICENSE_KEY_PATTERN.test(key))) {
+          throw new Error("서버 발급 목록 검증에 실패했습니다.");
+        }
+        lastBatch = { ...data, plainText:lines.join("\n") };
+        pendingRequestId = "";
+        pendingRequestSignature = "";
+        $("showLastButton").disabled = false;
+        showBatchResult(); await loadLicenses(); toast(data.message);
+      } catch (error) { toast(`${error.message} · 다시 누르면 같은 요청으로 재시도합니다.`, "error"); }
+      finally { $("batchIssueButton").disabled = false; }
+    }
+    function showBatchResult() {
+      if (!lastBatch) return;
+      $("resultText").value = lastBatch.plainText;
+      $("resultMeta").textContent = `${lastBatch.batchName || "이름 없는 배치"} · ${lastBatch.count}개 · ${lastBatch.days === 99999 ? "무제한" : `${lastBatch.days}일권`}`;
+      $("resultModal").classList.add("show");
+    }
+    async function copyResult() {
+      try { await navigator.clipboard.writeText($("resultText").value); toast(`${lastBatch.count}개 키를 복사했습니다.`); }
+      catch { $("resultText").select(); document.execCommand("copy"); toast(`${lastBatch.count}개 키를 복사했습니다.`); }
+    }
+    function downloadResult() {
+      const stamp = new Date().toISOString().slice(0,16).replaceAll(/[-:T]/g,"");
+      const name = `mauto-${lastBatch.days === 99999 ? "unlimited" : `${lastBatch.days}d`}-${stamp}.txt`;
+      const url = URL.createObjectURL(new Blob([lastBatch.plainText], { type:"text/plain;charset=utf-8" }));
+      const a = document.createElement("a"); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
+    }
+    async function handleRowAction(event) {
+      const button = event.target.closest(".row-action"); if (!button) return;
+      const key = button.dataset.key, action = button.dataset.action;
+      const item = licenses.find((row) => row.key === key); if (!item) return;
+      try {
+        if (action === "copy") { await navigator.clipboard.writeText(key); return toast("키를 복사했습니다."); }
+        if (action === "extend") {
+          const value = prompt(`"${key}"를 며칠 연장할까요?`, "30"); if (value === null) return;
+          await api("PATCH", { key, extendDays:Number(value) });
+        } else if (action === "reset") {
+          if (!confirm(`"${key}"의 HWID를 초기화할까요?`)) return;
+          await api("PATCH", { key, resetHwids:true });
+        } else if (action === "discord") {
+          const value = prompt("디스코드 ID (비우면 연결 해제)", item.discordId || ""); if (value === null) return;
+          await api("PATCH", { key, discordId:value.trim() });
+        } else if (action === "toggle") {
+          await api("PATCH", { key, disabled:!item.disabled });
+        } else if (action === "delete") {
+          if (!confirm(`"${key}"를 영구 삭제할까요?`)) return;
+          await api("DELETE", { key });
+        }
+        await loadLicenses(); toast("처리했습니다.");
+      } catch (error) { toast(error.message, "error"); }
+    }
+    async function previewMigration() {
+      try {
+        const data = await api("PATCH", { action:"previewUnusedMigration" });
+        migrationEligible = data.eligible;
+        $("migrationInfo").textContent = `전체 ${data.total}개 중 전환 대상 ${data.eligible}개 · 보호되는 키 ${data.protectedUsed}개`;
+        $("migrationApplyButton").disabled = data.eligible === 0;
+      } catch (error) { toast(error.message, "error"); }
+    }
+    async function applyMigration() {
+      if (!migrationEligible || !confirm(`미사용 키 ${migrationEligible}개를 첫 인증 대기로 전환할까요? 사용 중인 키는 변경하지 않습니다.`)) return;
+      $("migrationApplyButton").disabled = true;
+      try {
+        const data = await api("PATCH", { action:"migrateUnused", confirm:true });
+        toast(data.message); migrationEligible = 0; await loadLicenses(); await previewMigration();
+      } catch (error) { toast(error.message, "error"); }
+    }
+    async function loadVersion() {
+      try {
+        const d = await fetch("/api/version").then((r) => r.json());
+        $("versionInput").value=d.version||""; $("urlInput").value=d.url||""; $("shaInput").value=d.sha256||"";
+        $("sigInput").value=d.sig||""; $("changelogInput").value=d.changelog||"";
+      } catch { toast("버전 정보를 불러오지 못했습니다.", "error"); }
+    }
+    async function saveVersion() {
+      try {
+        const r = await fetch("/api/version", { method:"POST", headers:headers(), body:JSON.stringify({
+          version:$("versionInput").value.trim(), url:$("urlInput").value.trim(),
+          sha256:$("shaInput").value.trim(), sig:$("sigInput").value.trim(), changelog:$("changelogInput").value
+        }) });
+        const d=await r.json(); if (!r.ok || !d.success) throw new Error(d.message||"저장 실패"); toast(d.message);
+      } catch (error) { toast(error.message,"error"); }
+    }
 
-function headers() {
-  return { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey };
-}
-
-async function loadLicenses() {
-  try {
-    const res = await fetch(API, { headers: headers() });
-    const data = await res.json();
-    if (!data.success) return showToast(data.message, 'error');
-
-    document.getElementById('loginBox').style.display = 'none';
-    document.getElementById('panel').style.display = 'block';
-    renderStats(data.licenses);
-    renderTable(data.licenses);
-  } catch (e) {
-    showToast('서버 연결 실패', 'error');
-  }
-}
-
-function renderStats(list) {
-  const total = list.length;
-  const active = list.filter(l => !l.expired && !l.disabled).length;
-  const expired = list.filter(l => l.expired).length;
-  const disabled = list.filter(l => l.disabled).length;
-  document.getElementById('stats').innerHTML = `
-    <div class="stat-card"><div class="stat-num">${total}</div><div class="stat-label">전체</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:#69DB7C">${active}</div><div class="stat-label">활성</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:#FF6B6B">${expired}</div><div class="stat-label">만료</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:#FFA94D">${disabled}</div><div class="stat-label">비활성</div></div>
-  `;
-}
-
-function renderTable(list) {
-  const tbody = document.getElementById('licenseTable');
-  const empty = document.getElementById('emptyState');
-  if (!list.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
-  empty.style.display = 'none';
-
-  tbody.innerHTML = list.map(l => {
-    let badge;
-    if (l.disabled) badge = '<span class="badge badge-disabled">비활성</span>';
-    else if (l.expired) badge = '<span class="badge badge-expired">만료</span>';
-    else badge = '<span class="badge badge-active">활성</span>';
-
-    // 시간권은 날짜만 찍으면 언제 끝나는지 알 수 없어 시:분까지 보여준다.
-    const isHourly = Number(l.hours || 0) > 0;
-    const exp = isHourly
-      ? new Date(l.expiresAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-      : new Date(l.expiresAt).toLocaleDateString('ko-KR');
-    const toggleLabel = l.disabled ? '활성화' : '비활성화';
-    const toggleClass = l.disabled ? 'btn-primary' : 'btn-warning';
-
-    return `<tr>
-      <td class="key-text">${l.key}</td>
-      <td>${l.term || (l.days === 99999 ? '무제한' : l.days + '일')}</td>
-      <td>${badge}</td>
-      <td>${l.days === 99999 ? '-' : exp}</td>
-      <td class="memo-text">${l.memo || '-'}</td>
-      <td class="btn-group">
-        <button class="btn ${toggleClass} btn-sm" onclick="toggleKey('${l.key}', ${!l.disabled})">${toggleLabel}</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteKey('${l.key}')">삭제</button>
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-async function issueKey() {
-  const key = document.getElementById('newKey').value.trim();
-  // 'h' 접두사면 시간권(hours), 아니면 기존처럼 일권(days). 서버는 둘 중 하나만 받는다.
-  const raw = document.getElementById('newDays').value;
-  const body = raw.startsWith('h')
-    ? { hours: parseInt(raw.slice(1), 10) }
-    : { days: parseInt(raw, 10) };
-  const memo = document.getElementById('newMemo').value.trim();
-  if (!key) return showToast('라이센스 키를 입력하세요.', 'error');
-
-  try {
-    const res = await fetch(API, { method: 'POST', headers: headers(), body: JSON.stringify({ key, ...body, memo }) });
-    const data = await res.json();
-    showToast(data.message, data.success ? 'success' : 'error');
-    if (data.success) { document.getElementById('newKey').value = ''; document.getElementById('newMemo').value = ''; loadLicenses(); }
-  } catch (e) { showToast('발급 실패', 'error'); }
-}
-
-async function deleteKey(key) {
-  if (!confirm(`"${key}" 키를 삭제하시겠습니까?`)) return;
-  try {
-    const res = await fetch(API, { method: 'DELETE', headers: headers(), body: JSON.stringify({ key }) });
-    const data = await res.json();
-    showToast(data.message, data.success ? 'success' : 'error');
-    if (data.success) loadLicenses();
-  } catch (e) { showToast('삭제 실패', 'error'); }
-}
-
-async function toggleKey(key, disabled) {
-  try {
-    const res = await fetch(API, { method: 'PATCH', headers: headers(), body: JSON.stringify({ key, disabled }) });
-    const data = await res.json();
-    showToast(data.message, data.success ? 'success' : 'error');
-    if (data.success) loadLicenses();
-  } catch (e) { showToast('수정 실패', 'error'); }
-}
-
-function generateRandomKey() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const parts = [];
-  for (let p = 0; p < 5; p++) {
-    let s = '';
-    for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    parts.push(s);
-  }
-  document.getElementById('newKey').value = parts.join('-');
-}
-
-function showToast(msg, type) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = `toast ${type} show`;
-  setTimeout(() => t.classList.remove('show'), 3000);
-}
-
-document.getElementById('adminKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
-</script>
+    $("loginButton").addEventListener("click", login);
+    $("adminKeyInput").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+    $("reloadButton").addEventListener("click", () => loadLicenses().catch((e) => toast(e.message,"error")));
+    document.querySelectorAll(".preset").forEach((b) => b.addEventListener("click", () => $("daysInput").value=b.dataset.days));
+    $("batchIssueButton").addEventListener("click", issueBatch);
+    $("showLastButton").addEventListener("click", showBatchResult);
+    $("closeResultButton").addEventListener("click", () => $("resultModal").classList.remove("show"));
+    $("copyResultButton").addEventListener("click", copyResult);
+    $("downloadResultButton").addEventListener("click", downloadResult);
+    $("licenseTable").addEventListener("click", handleRowAction);
+    ["searchInput","statusFilter","batchFilter"].forEach((id) => $(id).addEventListener(id === "searchInput" ? "input" : "change", renderTable));
+    $("clearFilterButton").addEventListener("click", () => { $("searchInput").value=""; $("statusFilter").value=""; $("batchFilter").value=""; renderTable(); });
+    $("migrationPreviewButton").addEventListener("click", previewMigration);
+    $("migrationApplyButton").addEventListener("click", applyMigration);
+    $("versionSaveButton").addEventListener("click", saveVersion);
+  </script>
 </body>
 </html>

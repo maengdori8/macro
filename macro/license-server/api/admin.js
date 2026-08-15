@@ -1,6 +1,20 @@
+"use strict";
+
 const admin = require("firebase-admin");
 const sec = require("../lib/security");
-const term = require("../lib/licenseTerm");
+const {
+  DAY_MS,
+  UNLIMITED_DAYS,
+  buildPendingLicenseDocument,
+  buildUnusedMigrationUpdate,
+  getLicenseLifecycle,
+  isMigratableUnusedLicense,
+} = require("../lib/license_lifecycle");
+const {
+  LicenseInputError,
+  issueLicenseBatch,
+  serializeLicenseForAdmin,
+} = require("../lib/license_admin");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -13,15 +27,43 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-
-// 허용된 관리자 패널 출처 (환경변수로 추가 가능)
 const ALLOWED_ORIGINS = [
   "https://license-server-flame-eta.vercel.app",
   ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : []),
 ];
+const timestampFromMillis = (value) => admin.firestore.Timestamp.fromMillis(value);
 
 function unauthorized(res) {
   return res.status(401).json({ success: false, message: "인증 실패" });
+}
+
+function validDays(days) {
+  return Number.isInteger(days) && (days === UNLIMITED_DAYS || (days >= 1 && days <= 36500));
+}
+
+async function migrationTargets() {
+  const snapshot = await db.collection("licenses").get();
+  return {
+    snapshot,
+    targets: snapshot.docs.filter((doc) => isMigratableUnusedLicense(doc.data())),
+  };
+}
+
+async function applyUnusedMigration(targets, now) {
+  let migrated = 0;
+  for (let index = 0; index < targets.length; index += 400) {
+    const batch = db.batch();
+    for (const doc of targets.slice(index, index + 400)) {
+      batch.set(
+        doc.ref,
+        buildUnusedMigrationUpdate(doc.data(), now, timestampFromMillis),
+        { merge: true }
+      );
+    }
+    await batch.commit();
+    migrated += Math.min(400, targets.length - index);
+  }
+  return migrated;
 }
 
 module.exports = async function handler(req, res) {
@@ -32,50 +74,28 @@ module.exports = async function handler(req, res) {
     return res.status(403).json({ success: false, message: "허용되지 않은 출처입니다." });
   }
 
-  // 관리자 키 브루트포스 방지: IP당 분당 10회
   const ip = sec.getClientIp(req);
   const rl = await sec.rateLimit(db, {
     bucket: "admin",
     ip,
-    max: 10,
+    max: 30,
     windowMs: 60000,
     failClosed: true,
   });
   if (!rl.allowed) {
     return res.status(429).json({ success: false, message: "요청이 너무 많습니다." });
   }
-
-  if (!sec.verifyAdminKey(req)) {
-    return unauthorized(res);
-  }
+  if (!sec.verifyAdminKey(req)) return unauthorized(res);
 
   const col = db.collection("licenses");
 
   if (req.method === "GET") {
     try {
       const snapshot = await col.orderBy("createdAt", "desc").get();
-      const licenses = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
-        const days = data.days || 0;
-        const expiresAt = term.expiresAt(data);
-        const now = Date.now();
-        licenses.push({
-          key: doc.id,
-          days,
-          hours: Number(data.hours || 0),
-          term: term.termText(data),
-          createdAt,
-          expiresAt,
-          disabled: data.disabled || false,
-          expired: now > expiresAt,
-          memo: data.memo || "",
-          hwids: data.hwids || [],
-          maxHwids: data.maxHwids || 3,
-          discordId: data.discordId || "",
-        });
-      });
+      const now = Date.now();
+      const licenses = snapshot.docs.map((doc) =>
+        serializeLicenseForAdmin(doc.id, doc.data(), now)
+      );
       return res.status(200).json({ success: true, licenses });
     } catch (err) {
       console.error("Admin list error:", err);
@@ -84,56 +104,61 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const { key, days, hours, memo } = req.body || {};
-    if (!sec.isValidKeyFormat(key)) {
-      return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
-    }
-
-    // 시간권(1~24시간)과 일권 중 하나만 지정한다. 둘 다 오면 어느 쪽이 진짜인지
-    // 알 수 없어 만료가 어긋나므로 거부한다.
-    const wantsHours = hours !== undefined && hours !== null && hours !== "";
-    if (wantsHours) {
-      if (!Number.isInteger(hours) || hours < 1 || hours > term.MAX_ISSUE_HOURS) {
-        return res.status(400).json({
-          success: false,
-          message: `기간(시간)은 1~${term.MAX_ISSUE_HOURS} 사이 정수여야 합니다.`,
-        });
-      }
-      if (days !== undefined && days !== null && days !== "" && Number(days) !== 0) {
-        return res.status(400).json({
-          success: false,
-          message: "시간권과 일권은 동시에 지정할 수 없습니다.",
-        });
-      }
-    } else if (!Number.isInteger(days) || (days !== 99999 && (days < 1 || days > 36500))) {
-      return res.status(400).json({ success: false, message: "기간(일)은 1~36500 사이 정수 또는 무제한(99999)이어야 합니다." });
-    }
-    if (memo !== undefined && (typeof memo !== "string" || memo.length > 200)) {
-      return res.status(400).json({ success: false, message: "메모는 200자 이하 문자열이어야 합니다." });
-    }
-
+    const body = req.body || {};
     try {
-      const existing = await col.doc(key).get();
-      if (existing.exists) {
-        return res.status(409).json({ success: false, message: "이미 존재하는 키입니다." });
+      if (body.action === "batchIssue") {
+        const result = await issueLicenseBatch({
+          db,
+          input: body,
+          timestampFromMillis,
+        });
+        return res.status(result.repeated ? 200 : 201).json({
+          success: true,
+          message: result.repeated
+            ? "같은 요청의 기존 발급 결과를 불러왔습니다."
+            : `${result.count}개 라이센스를 발급했습니다.`,
+          ...result,
+          plainText: result.keys.join("\n"),
+        });
       }
 
-      // 시간권은 days=0으로 저장한다. 만료 계산은 hours가 0보다 크면 hours를 쓰고,
-      // 기존 문서에는 hours 필드가 없어 undefined→0으로 떨어지므로 일권은 그대로 동작한다.
-      const doc = wantsHours
-        ? { days: 0, hours }
-        : { days, hours: 0 };
-      await col.doc(key).set({
-        ...doc,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        disabled: false,
-        memo: memo || "",
-      });
+      const key = String(body.key || "").trim();
+      const days = Number(body.days);
+      const memo = body.memo === undefined ? "" : body.memo;
+      if (!sec.isValidKeyFormat(key)) {
+        return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
+      }
+      if (!validDays(days)) {
+        return res.status(400).json({
+          success: false,
+          message: "기간은 1~36500일 또는 무제한(99999)이어야 합니다.",
+        });
+      }
+      if (typeof memo !== "string" || memo.length > 200) {
+        return res.status(400).json({ success: false, message: "메모는 200자 이하여야 합니다." });
+      }
+
+      const now = Date.now();
+      await col.doc(key).create(
+        buildPendingLicenseDocument({
+          days,
+          issuedAt: now,
+          timestampFromMillis,
+          memo,
+          batchName: "단건 발급",
+        })
+      );
       return res.status(201).json({
         success: true,
-        message: `${term.termText(doc)} 라이센스가 발급되었습니다.`,
+        message: `${days === UNLIMITED_DAYS ? "무제한" : `${days}일권`} 라이센스를 발급했습니다.`,
       });
     } catch (err) {
+      if (err.code === 6 || err.code === "already-exists") {
+        return res.status(409).json({ success: false, message: "이미 존재하는 키입니다." });
+      }
+      if (err instanceof LicenseInputError) {
+        return res.status(400).json({ success: false, message: err.message });
+      }
       console.error("Admin create error:", err);
       return res.status(500).json({ success: false, message: "발급 실패" });
     }
@@ -144,7 +169,6 @@ module.exports = async function handler(req, res) {
     if (!sec.isValidKeyFormat(key)) {
       return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
     }
-
     try {
       const doc = await col.doc(key).get();
       if (!doc.exists) {
@@ -152,7 +176,7 @@ module.exports = async function handler(req, res) {
       }
       await col.doc(key).delete();
       await db.collection("status").doc(key).delete().catch(() => {});
-      return res.status(200).json({ success: true, message: "라이센스가 삭제되었습니다." });
+      return res.status(200).json({ success: true, message: "라이센스를 삭제했습니다." });
     } catch (err) {
       console.error("Admin delete error:", err);
       return res.status(500).json({ success: false, message: "삭제 실패" });
@@ -160,66 +184,99 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "PATCH") {
-    const { key, disabled, resetHwids } = req.body || {};
-    if (!sec.isValidKeyFormat(key)) {
-      return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
-    }
-
+    const body = req.body || {};
     try {
+      if (body.action === "previewUnusedMigration") {
+        const { snapshot, targets } = await migrationTargets();
+        return res.status(200).json({
+          success: true,
+          total: snapshot.size,
+          eligible: targets.length,
+          protectedUsed: snapshot.size - targets.length,
+          sample: targets.slice(0, 5).map((doc) => doc.id),
+        });
+      }
+      if (body.action === "migrateUnused") {
+        if (body.confirm !== true) {
+          return res.status(400).json({ success: false, message: "마이그레이션 확인값이 필요합니다." });
+        }
+        const { snapshot, targets } = await migrationTargets();
+        const migrated = await applyUnusedMigration(targets, Date.now());
+        return res.status(200).json({
+          success: true,
+          message: `미사용 키 ${migrated}개를 첫 인증 대기로 전환했습니다.`,
+          total: snapshot.size,
+          migrated,
+          protectedUsed: snapshot.size - targets.length,
+        });
+      }
+
+      const { key } = body;
+      if (!sec.isValidKeyFormat(key)) {
+        return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
+      }
       const doc = await col.doc(key).get();
       if (!doc.exists) {
         return res.status(404).json({ success: false, message: "존재하지 않는 키입니다." });
       }
 
-      if (resetHwids) {
+      if (body.resetHwids === true) {
         await col.doc(key).update({ hwids: [] });
-        return res.status(200).json({ success: true, message: "HWID가 초기화되었습니다." });
+        return res.status(200).json({ success: true, message: "HWID를 초기화했습니다." });
       }
 
-      // 기간 연장: 현재 만료(또는 지금) 기준으로 N일 추가.
-      const { extendDays } = req.body;
-      if (extendDays !== undefined) {
+      if (body.extendDays !== undefined) {
+        const extendDays = Number(body.extendDays);
         if (!Number.isInteger(extendDays) || extendDays < 1 || extendDays > 36500) {
-          return res.status(400).json({ success: false, message: "연장 일수는 1~36500 사이 정수여야 합니다." });
+          return res.status(400).json({ success: false, message: "연장 일수는 1~36500일이어야 합니다." });
         }
         const data = doc.data();
-        const curDays = data.days || 0;
-        if (curDays === 99999) {
+        const lifecycle = getLicenseLifecycle(data);
+        if (lifecycle.unlimited) {
           return res.status(400).json({ success: false, message: "이미 무제한 라이센스입니다." });
         }
-        const createdAt = data.createdAt?.toMillis?.() || data.createdAt || 0;
-        const currentExpiry = term.expiresAt(data);
-        // 아직 유효하면 만료일에서, 이미 만료됐으면 지금부터 연장.
-        const base = Math.max(Date.now(), currentExpiry);
-        const newExpiry = base + extendDays * 86400000;
-        const newDays = Math.max(1, Math.round((newExpiry - createdAt) / 86400000));
-        // hours를 0으로 함께 비운다. 남겨두면 hours가 days보다 우선해서
-        // 시간권을 연장해도 만료가 그대로인 버그가 된다.
-        await col.doc(key).update({ days: newDays, hours: 0 });
-        const remainDays = Math.ceil((newExpiry - Date.now()) / 86400000);
-        return res.status(200).json({ success: true, message: `${extendDays}일 연장되었습니다. (남은 약 ${remainDays}일)` });
-      }
-
-      // 무제한으로 전환.
-      const { makeUnlimited } = req.body;
-      if (makeUnlimited) {
-        // hours가 남아 있으면 우선순위 때문에 무제한이 안 먹으므로 함께 비운다.
-        await col.doc(key).update({ days: 99999, hours: 0 });
-        return res.status(200).json({ success: true, message: "무제한으로 전환되었습니다." });
-      }
-
-      const { discordId } = req.body;
-      if (discordId !== undefined) {
-        if (!sec.isValidDiscordId(discordId)) {
-          return res.status(400).json({ success: false, message: "디스코드 ID 형식이 올바르지 않습니다. (숫자 17~20자)" });
+        if (lifecycle.pending) {
+          const newDays = lifecycle.days + extendDays;
+          await col.doc(key).update({ days: newDays });
+          return res.status(200).json({
+            success: true,
+            message: `첫 인증 전 이용기간을 ${newDays}일로 변경했습니다.`,
+          });
         }
-        await col.doc(key).update({ discordId: discordId || "" });
-        return res.status(200).json({ success: true, message: "디스코드 ID가 업데이트되었습니다." });
+
+        const now = Date.now();
+        const base = Math.max(now, lifecycle.expiresAt);
+        const newExpiry = base + extendDays * DAY_MS;
+        const activationBase = lifecycle.activatedAt || now;
+        const newDays = Math.max(1, Math.round((newExpiry - activationBase) / DAY_MS));
+        await col.doc(key).update({
+          days: newDays,
+          expiresAt: timestampFromMillis(newExpiry),
+        });
+        return res.status(200).json({
+          success: true,
+          message: `${extendDays}일 연장했습니다. (잔여 약 ${Math.ceil((newExpiry - now) / DAY_MS)}일)`,
+        });
       }
 
-      await col.doc(key).update({ disabled: !!disabled });
-      const action = disabled ? "비활성화" : "활성화";
-      return res.status(200).json({ success: true, message: `라이센스가 ${action}되었습니다.` });
+      if (body.makeUnlimited === true) {
+        await col.doc(key).update({ days: UNLIMITED_DAYS, expiresAt: null });
+        return res.status(200).json({ success: true, message: "무제한으로 전환했습니다." });
+      }
+
+      if (body.discordId !== undefined) {
+        if (!sec.isValidDiscordId(body.discordId)) {
+          return res.status(400).json({ success: false, message: "디스코드 ID 형식이 올바르지 않습니다." });
+        }
+        await col.doc(key).update({ discordId: body.discordId || "" });
+        return res.status(200).json({ success: true, message: "디스코드 ID를 수정했습니다." });
+      }
+
+      await col.doc(key).update({ disabled: body.disabled === true });
+      return res.status(200).json({
+        success: true,
+        message: body.disabled ? "라이센스를 비활성화했습니다." : "라이센스를 활성화했습니다.",
+      });
     } catch (err) {
       console.error("Admin update error:", err);
       return res.status(500).json({ success: false, message: "수정 실패" });
