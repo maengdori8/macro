@@ -107,7 +107,9 @@ module.exports = async function handler(req, res) {
       hwid,
       nonce,
       exp: Math.floor(expiresAt / 1000),
-      message: `유효한 라이센스입니다. (${term.termText(data)}, ${term.remainingText(data, now)})`,
+      message: term.isUnlimited(data)
+        ? "유효한 라이센스입니다. (무제한)"
+        : `유효한 라이센스입니다. (${term.termText(data)}, ${term.remainingText(data, now)})`,
     });
   } catch (err) {
     if (err.code === "HWID_LIMIT") {
