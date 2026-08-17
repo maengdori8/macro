@@ -280,6 +280,18 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 - **winocr/vgamepad/WGC는 Mac에서 못 돌린다.** → ocr.py처럼 **순수 로직(정규식·투표·전처리)을 winocr 호출과 분리**해 Mac에서 단위 검증. 인식 정확도/타이밍 실측은 항상 사용자가 Windows에서.
 - **다운스케일은 화면·템플릿 둘 다 같은 보간(INTER_AREA)**이어야 함. 한쪽만 스트라이드 슬라이싱하면 얇은 템플릿이 1차에서 누락(8개 중 6개 실패) 버그.
 - **cmd는 글롭을 안 펼침** → `py_compile macroapp\*.py` 실패("문법검사 실패"). `compileall`(디렉터리 처리) 사용.
+- **`taskkill` 은 즉시 반환하지만 파일 핸들 해제는 늦다.** 바로 이어진 `rmdir /s /q` 가
+  "Access is denied" 로 **일부만** 지우고, 남은 껍데기 폴더가 `ren` 을 조용히 실패시킨다
+  (`ren` 은 대상이 있으면 에러 없이 아무 일도 안 한다). 그러면 새 빌드는
+  `*_main.dist` 에 남고 잔해 폴더의 **옛 exe** 가 기존 가드(`if exist ...\x.exe`)를
+  통과해 버린다 → 2026-08-17 실측: 프로 설치본이 ISCC 에서 죽었는데 종료코드를 안 봐서
+  "빌드 완료" 로 끝났다. **교훈 세 줄:** ① 삭제 후엔 exe 가 아니라 **폴더 자체**가
+  사라졌는지 본다 ② `ren` 뒤에 원본 폴더가 남았는지 확인한다 ③ 외부 도구(ISCC 등)는
+  호출마다 `if %errorlevel% neq 0` 로 받는다. 성공 메시지는 **모든** 산출물이 있을 때만.
+- **빌드 산출물의 '신선도'는 타임스탬프로 판단하면 안 된다.** Nuitka standalone 은
+  의존성(Tcl/Tk·numpy·cv2)을 원본 mtime 그대로 복사해서 1500여 개가 '옛 파일'로 보인다.
+  대신 **새 상수/심볼이 exe 바이트에 있는지**로 확인한다
+  (예: `grep -c AUTO_EXIT_DEFICIT_GOALS dist\macro_pro_app\macro_pro.exe`, 옛 상수는 0 이어야 함).
 - **vgamepad는 `import`만 해도 ViGEm 없으면 크래시** → 빌드 점검은 `import` 말고 `importlib.util.find_spec`.
 - **GIL이 보호하는 것에 헛수정 금지:** 단일 참조/튜플 대입은 원자적. 동시성 리뷰의 오탐 다수가 여기. 진짜 경합은 "공유 가변 객체를 두 스레드가 동시 수정"하는 경우(예: 가상패드 리포트, 컨센서스 객체 공유).
 - **'비활성 키보드 입력'은 원리적으로 불가.** RawInput 게임은 포커스 창에만 키가 가서 PostMessage 키(WM_KEYDOWN)를 무시한다 — 그래서 배경 입력의 근거가 전역 XInput(vgamepad)이다. "가상 버튼이 안 먹는다"는 증상은 (1) hold-to-skip인데 탭만 함(롱홀드부터 의심) (2) 게임이 그 버튼만 무시 순으로 가르고, 최후수단은 전면 순간전환+SendInput 스캔코드(sizeof(INPUT)=40, x64).

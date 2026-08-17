@@ -181,6 +181,37 @@ def test_any_two_goal_deficit_counts():
         assert tracker.feed(0.0, losing) is True, f"{losing} 이 확정되지 않았다"
 
 
+def test_three_goal_scores_are_readable_now():
+    """숫자 3 글리프가 추가돼 0:3 / 1:3 같은 스코어도 판정된다(2026-08-17 실측 2:3 화면)."""
+    from macroapp.score_glyphs import GLYPH_PNGS_B64
+    assert "3" in GLYPH_PNGS_B64, "숫자 3 템플릿이 사라졌다"
+    tracker = with_prior(make_tracker(confirm_count=1))
+    assert tracker.feed(0.0, (0, 3)) is True
+
+
+def test_glyph_templates_do_not_collide():
+    """서로 다른 숫자의 IoU 가 임계값(0.65) 아래여야 한다.
+
+    숫자를 추가할 때마다 교차 IoU 가 올라간다 - '3' 이 들어오면서 최악값이
+    0.51 → 0.606 이 됐다. 여기서 더 붙었다가는 오인식이 시작되므로 고정해 둔다.
+    """
+    from macroapp.auto_exit import _load_glyphs, _GLYPH_IOU_THRESHOLD
+    glyphs = _load_glyphs()
+    worst, pair = 0.0, None
+    for a, masks_a in glyphs.items():
+        for b, masks_b in glyphs.items():
+            if a >= b:
+                continue
+            for ma in masks_a:
+                for mb in masks_b:
+                    inter = (ma & mb).sum()
+                    union = (ma | mb).sum() or 1
+                    score = inter / union
+                    if score > worst:
+                        worst, pair = score, (a, b)
+    assert worst < _GLYPH_IOU_THRESHOLD, f"{pair} 가 임계값을 넘었다: {worst:.3f}"
+
+
 def test_leading_or_close_scores_never_trigger():
     """내가 이기거나(2:0) 1점차 열세(1:2)는 절대 확정되면 안 된다."""
     tracker = with_prior(make_tracker(confirm_count=1))

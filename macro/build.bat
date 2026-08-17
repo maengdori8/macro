@@ -93,22 +93,29 @@ taskkill /f /im macro_pro.exe >nul 2>&1
 taskkill /f /im launcher_pro.exe >nul 2>&1
 taskkill /f /im launcher.exe >nul 2>&1
 taskkill /f /im gamepad_test.exe >nul 2>&1
-if exist "dist\macro_app" rmdir /s /q "dist\macro_app"
-if exist "dist\macro_pro_app" rmdir /s /q "dist\macro_pro_app"
-if exist "dist\macro_pro_main.dist" rmdir /s /q "dist\macro_pro_main.dist"
-if exist "dist\macro_pro_setup.exe" del /f /q "dist\macro_pro_setup.exe"
-if exist "dist\launcher_pro.exe" del /f /q "dist\launcher_pro.exe"
-if exist "dist\macro_main.dist" rmdir /s /q "dist\macro_main.dist"
-if exist "dist\macro" rmdir /s /q "dist\macro"
-if exist "dist\macro.exe" del /f /q "dist\macro.exe"
-if exist "dist\macro_app\macro.exe" (
-    echo [오류] 이전 macro 빌드 폴더 삭제 불가 - 실행 중이거나 잠겨 있습니다. 빌드를 중단합니다.
-    echo        실행 중인 macro.exe 를 관리자 권한으로 종료한 뒤 다시 빌드하세요.
+rem ⚠️ 삭제를 **검증**해야 뒤의 "if exist = 이번 빌드가 만들었다" 가 성립한다.
+rem 잠긴 잔해가 남으면 폴더는 ren 이 조용히 실패하고, exe 는 컴파일러가 못 덮어써서
+rem 옛 산출물이 그대로 설치본에 실린다 - 둘 다 실측된 사고다.
+rem ⚠️ del 은 잠긴 파일에도 errorlevel 0 을 돌려준다(실측). 종료코드로는 못 잡는다.
+set "LOCKED="
+call :purge_dir "dist\macro_app"
+call :purge_dir "dist\macro_pro_app"
+call :purge_dir "dist\macro_main.dist"
+call :purge_dir "dist\macro_pro_main.dist"
+call :purge_dir "dist\macro"
+call :purge_file "dist\macro.exe"
+call :purge_file "dist\launcher.exe"
+call :purge_file "dist\launcher_pro.exe"
+call :purge_file "dist\gamepad_test.exe"
+call :purge_file "dist\macro_setup.exe"
+call :purge_file "dist\macro_pro_setup.exe"
+if defined LOCKED (
+    echo [오류] 이전 빌드 산출물을 지울 수 없습니다:%LOCKED%
+    echo        해당 파일을 쓰고 있는 프로그램^(실행 중인 macro/launcher, 백신, 탐색기^)을
+    echo        닫은 뒤 다시 빌드하세요. 빌드를 중단합니다.
     pause
     exit /b 1
 )
-if exist "dist\launcher.exe" del /f /q "dist\launcher.exe"
-if exist "dist\macro_setup.exe" del /f /q "dist\macro_setup.exe"
 
 echo.
 echo [1/3] macro 빌드 중 (폴더형/standalone)... (첫 빌드는 5~10분 걸릴 수 있습니다)
@@ -149,6 +156,14 @@ if not exist "dist\macro_main.dist\macro.exe" (
 rem 어느 도구가 만들었든 출력 폴더 이름을 dist\macro_app 으로 통일한다.
 if exist "dist\macro_main.dist\macro.exe" ren "dist\macro_main.dist" "macro_app"
 if not exist "dist\macro_app\macro.exe" if exist "dist\macro\macro.exe" ren "dist\macro" "macro_app"
+rem 위 정리 구간에서 삭제를 검증했으므로, 여기서 macro_app 이 없으면 Nuitka·PyInstaller
+rem 둘 다 실패한 것이다(옛 잔해가 통과할 여지가 없다). 뒤로 끌지 말고 여기서 끊는다.
+if not exist "dist\macro_app\macro.exe" (
+    echo [오류] macro 빌드 실패 - Nuitka 와 PyInstaller 모두 macro.exe 를 만들지 못했습니다.
+    echo        위 컴파일 로그의 마지막 오류를 확인하세요.
+    pause
+    exit /b 1
+)
 
 echo.
 echo [2/5] 프로 빌드 준비 중 (런처 상수 주입)...
@@ -182,8 +197,31 @@ python -m nuitka --standalone --assume-yes-for-downloads ^
   --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" ^
   macro_pro_main.py
 if exist "dist\macro_pro_main.dist\macro_pro.exe" ren "dist\macro_pro_main.dist" "macro_pro_app"
+rem 실패 원인을 갈라서 안내한다. 컴파일 실패(출력에 exe 자체가 없음)를 '잔해 잠김' 으로
+rem 오진하면 있지도 않은 프로세스를 찾게 된다(적대적 리뷰 확정 - Nuitka 는 컴파일 전에
+rem 빈 .dist 폴더를 먼저 만들어 두므로 실패해도 폴더만 남는다).
+if not exist "dist\macro_pro_app\macro_pro.exe" if not exist "dist\macro_pro_main.dist\macro_pro.exe" (
+    echo [오류] macro_pro 빌드 실패 - Nuitka 가 macro_pro.exe 를 만들지 못했습니다.
+    echo        위 컴파일 로그의 마지막 오류를 확인하세요.
+    pause
+    exit /b 1
+)
+rem 여기까지 왔으면 exe 는 만들어졌다. .dist 가 남아 있다 = ren 이 잠김으로 막힌 것이다.
+if exist "dist\macro_pro_main.dist" (
+    echo [오류] macro_pro 출력 폴더 이름 변경 실패 - dist\macro_pro_app 이 잠겨 있습니다.
+    echo        실행 중인 macro_pro.exe 나 그 폴더를 연 탐색기를 닫고 다시 빌드하세요.
+    pause
+    exit /b 1
+)
 if not exist "dist\macro_pro_app\macro_pro.exe" (
     echo macro_pro 빌드 실패!
+    pause
+    exit /b 1
+)
+rem setup_pro.iss 가 요구하는 ViGEm 설치 파일까지 확인한다. 빠지면 ISCC 가 죽는데,
+rem 예전엔 그 실패를 아무도 안 봐서 "빌드 완료" 로 끝났다.
+if not exist "dist\macro_pro_app\vgamepad\win\vigem\install\x64\ViGEmBusSetup_x64.msi" (
+    echo [오류] macro_pro 빌드에 ViGEm 설치 파일이 없습니다. 빌드를 중단합니다.
     pause
     exit /b 1
 )
@@ -210,6 +248,13 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
 if not exist "dist\launcher_pro.exe" (
     echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
     python -m PyInstaller --onefile --noconsole --uac-admin --name launcher_pro --hidden-import ed25519_tiny launcher_pro.py
+)
+rem ⚠️ launcher_pro.exe 는 원래 어디서도 검사되지 않았다. 삭제 검증이 없던 시절엔
+rem 잠긴 옛 런처가 그대로 프로 설치본에 실릴 수 있었다(적대적 리뷰 확정 critical).
+if not exist "dist\launcher_pro.exe" (
+    echo [오류] launcher_pro.exe 빌드 실패. 빌드를 중단합니다.
+    pause
+    exit /b 1
 )
 
 echo.
@@ -261,28 +306,97 @@ if not defined ISCC_PATH (
     echo        https://jrsoftware.org/isdl.php 에서 설치 후 다시 실행하세요.
     echo.
     echo        EXE 빌드는 완료되었습니다:
-    echo        - dist\macro.exe
-    echo        - dist\launcher.exe
+    echo        - dist\macro_app\macro.exe
+    echo        - dist\macro_pro_app\macro_pro.exe
+    echo        - dist\launcher.exe / dist\launcher_pro.exe
+    echo.
+    echo        설치 파일은 만들어지지 않았습니다 - 미완성 빌드입니다.
     pause
-    exit /b 0
+    exit /b 1
 )
 
 "%ISCC_PATH%" setup.iss
-"%ISCC_PATH%" setup_pro.iss
-
-if exist "dist\macro_setup.exe" (
-    echo.
-    echo ===== 빌드 완료 =====
-    echo 설치 파일: dist\macro_setup.exe ^(일반^)
-    if exist "dist\macro_pro_setup.exe" echo             dist\macro_pro_setup.exe ^(프로^)
-    for %%A in ("dist\macro_setup.exe") do echo 크기: %%~zA bytes
-    echo.
-    echo [배포 절차] GitHub Release에 dist\macro_setup.exe 업로드 후:
-    echo    python sign_release.py "<일반 다운로드 URL>"
-    echo    python sign_release.py --product macro_pro "<프로 다운로드 URL>"
-    echo 출력된 version/url/sha256/sig 네 값을 admin 패널에 등록하세요.
-    echo ^(ADMIN_KEY 환경변수 설정 시 --post 옵션으로 자동 등록 가능^)
-) else (
-    echo 설치 파일 생성 실패!
+if %errorlevel% neq 0 (
+    echo [오류] 일반 설치 파일 생성 실패^(ISCC^). 빌드를 중단합니다.
+    pause
+    exit /b 1
 )
+"%ISCC_PATH%" setup_pro.iss
+if %errorlevel% neq 0 (
+    echo [오류] 프로 설치 파일 생성 실패^(ISCC^). 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+
+rem launcher_pro.exe 는 원래 build.bat 어디에서도 검사되지 않았다 - 잠긴 옛 런처가
+rem 그대로 프로 설치본에 실릴 수 있었다(적대적 리뷰 확정). 정리 구간에서 삭제를
+rem 검증했으므로, 여기서 존재한다 = 이번 빌드가 만들었다 가 성립한다.
+if not exist "dist\launcher.exe" (
+    echo [오류] launcher.exe 가 없습니다. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+if not exist "dist\launcher_pro.exe" (
+    echo [오류] launcher_pro.exe 가 없습니다. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+if not exist "dist\macro_setup.exe" (
+    echo [오류] 일반 설치 파일이 만들어지지 않았습니다.
+    pause
+    exit /b 1
+)
+if not exist "dist\macro_pro_setup.exe" (
+    echo [오류] 프로 설치 파일이 만들어지지 않았습니다.
+    pause
+    exit /b 1
+)
+echo.
+echo ===== 빌드 완료 =====
+echo 설치 파일: dist\macro_setup.exe ^(일반^)
+echo             dist\macro_pro_setup.exe ^(프로^)
+for %%A in ("dist\macro_setup.exe") do echo 일반 크기: %%~zA bytes
+for %%A in ("dist\macro_pro_setup.exe") do echo 프로 크기: %%~zA bytes
+echo.
+echo [배포 절차] GitHub Release에 두 설치 파일 업로드 후:
+echo    python sign_release.py "<일반 다운로드 URL>"
+echo    python sign_release.py --product macro_pro "<프로 다운로드 URL>"
+echo 출력된 version/url/sha256/sig 네 값을 admin 패널에 등록하세요.
+echo ^(ADMIN_KEY 환경변수 설정 시 --post 옵션으로 자동 등록 가능^)
 pause
+exit /b 0
+
+rem ── 잠긴 폴더 지우기 ──────────────────────────────────────────────────────
+rem taskkill 은 즉시 반환하지만 OS 가 파일 핸들을 놓는 데 잠깐 걸린다. 곧바로
+rem rmdir 하면 "Access is denied" 로 **일부만** 지워지고, 남은 껍데기 폴더가
+rem 뒤의 ren 을 막아 이전 빌드가 그대로 패키징된다(2026-08-17 실측 사고).
+rem 그래서 간격을 두고 세 번까지 재시도한다. 그래도 남으면 호출부가 중단시킨다.
+:purge_dir
+if not exist %1 goto :eof
+rmdir /s /q %1 >nul 2>&1
+if not exist %1 goto :eof
+ping -n 3 127.0.0.1 >nul 2>&1
+rmdir /s /q %1 >nul 2>&1
+if not exist %1 goto :eof
+ping -n 4 127.0.0.1 >nul 2>&1
+rmdir /s /q %1 >nul 2>&1
+if not exist %1 goto :eof
+set "LOCKED=%LOCKED% %~1"
+goto :eof
+
+rem ── 잠긴 파일 지우기 ──────────────────────────────────────────────────────
+rem ⚠️ del 은 잠긴 파일에 대해서도 **errorlevel 0** 을 돌려준다(실측 확인). 그래서
+rem 종료코드로는 절대 못 잡고, '지운 뒤에도 남아 있는가' 로만 판정해야 한다.
+rem 남으면 LOCKED 에 적어 두고 호출부가 모아서 한 번에 중단시킨다.
+:purge_file
+if not exist %1 goto :eof
+del /f /q %1 >nul 2>&1
+if not exist %1 goto :eof
+ping -n 3 127.0.0.1 >nul 2>&1
+del /f /q %1 >nul 2>&1
+if not exist %1 goto :eof
+ping -n 4 127.0.0.1 >nul 2>&1
+del /f /q %1 >nul 2>&1
+if not exist %1 goto :eof
+set "LOCKED=%LOCKED% %~1"
+goto :eof
