@@ -27,6 +27,11 @@ except Exception:  # noqa: BLE001 - 썸네일 표시는 선택 기능이라 없�
     PILImageTk = None
 
 from macroapp import winapi
+from macroapp import auto_exit
+from macroapp import edition
+from macroapp import exit_core
+from macroapp import exit_followup
+from macroapp import exit_runner
 from macroapp import input_gamepad
 from macroapp import input_message
 from macroapp.input_gamepad import (
@@ -46,6 +51,9 @@ from macroapp.config import (
     NOTIFICATION_PANEL_GUARD_ENABLED, NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS,
     NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
+    AUTO_EXIT_CONFIRM_COUNT, AUTO_EXIT_ENABLED, AUTO_EXIT_LOSING_SCORE,
+    AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
+    AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
     RANK_OCR_PANEL_GAP_SECONDS,
     MATCH_GATE_ENABLED, MATCH_GATE_LEFT_FRACTION, MATCH_GATE_RIGHT_FRACTION,
@@ -197,17 +205,44 @@ class AutomationApp:
         *,
         preview: bool = False,
         start_hidden: bool = False,
+        license_info: Optional[dict] = None,
     ):
         self.root = root
         self.license_key = license_key
         self.preview = bool(preview)
         self.start_hidden = bool(start_hidden)
-        self.license_info: Optional[dict] = None
+        # 인증 화면이 넘겨 준 서명 검증 결과(없으면 None). 시작을 누르기 전에도
+        # 티어와 남은 기간을 알기 위해 받는다.
+        self.license_info: Optional[dict] = license_info
         # 서명으로 검증된 만료 시각(wall clock). 시작 시 스냅샷해 자동화 루프가 로컬로
         # 강제한다. 이게 없으면 '한 번 시작 후 랜선 뽑고 재시작 안 함'으로 단기 라이센스의
         # 유효기간을 무한 연장할 수 있다(적대적 검증에서 확인된 우회). exp가 서명에 묶여
         # 위조 불가하고, 로컬 검사라 네트워크가 없어도 정품 사용자에겐 영향이 없다.
         self._license_deadline: Optional[float] = None
+        # 티어는 **서명으로 확인된 제품**에서만 온다(license_client.verify_signed_response).
+        # 응답 필드를 믿으면 프로 기능이 그대로 열린다.
+        self._is_pro = False
+        # 즉시 종료가 도는 동안 자동화 루프를 잠깐 재운다. 같은 화면을 둘이 동시에
+        # 건드리면(정지된 화면 재매칭, 재개 직후 확인 버튼 이중 입력) 사고가 난다.
+        self._exit_gate = threading.Event()
+        self._exit_runner = None
+        # 0:2 패배 자동 종료(프로): 쿼터는 **앱 세션 전체**로 이어진다 — 시작/정지를
+        # 반복해도 '20판 중 8판' 비율이 유지되게 러너가 아니라 여기에 둔다.
+        # 판별 상태(tracker)는 실행마다 새로 만든다(_automation_loop).
+        self._exit_quota = auto_exit.ExitQuota(AUTO_EXIT_RATIO)
+        # 트래커도 세션 수명이다. 실행(run)마다 새로 만들면 0:2 로 확정(방치 결정)된
+        # 경기 도중 정지→재시작하는 것만으로 같은 경기가 두 번 세어진다(리뷰 확정).
+        # 실행마다 바뀌는 건 '이번 실행에 관측을 공급할지'(_auto_exit_active)뿐이다.
+        self._loss_tracker = auto_exit.LossTracker(
+            target=AUTO_EXIT_LOSING_SCORE,
+            confirm_count=AUTO_EXIT_CONFIRM_COUNT,
+            reset_seconds=AUTO_EXIT_MATCH_RESET_SECONDS,
+        )
+        self._auto_exit_active = False
+        self._last_match_score = None
+        # join 타임아웃으로 살아남은 좀비 OCR 워커가 재시작 후 부활해 트래커를
+        # 이중 공급하지 않게, 워커마다 세대 번호를 준다(불일치 시 즉시 종료).
+        self._ocr_generation = 0
 
         self.root.title("mAuto")
         # LicenseDialog가 고정 크기로 만든 root를 재사용하므로 리사이즈를 다시 허용합니다.
@@ -223,6 +258,8 @@ class AutomationApp:
         # 폭 1287이 오른쪽 열의 실요구치라 1280은 7px 모자랐습니다.
         # 높이는 두 페이지 중 큰 쪽(FC 채굴 현황)의 요구치가 기준입니다.
         # tests/test_ui_layout.py가 이 값을 그대로 읽어 검증하니, 바꾸면 테스트가 따라옵니다.
+        # ⚠️ 이 값을 **올려서** 새 위젯을 넣지 말 것: 1366x768 노트북에서 창이 화면보다
+        # 커집니다. 즉시 종료 버튼도 별도 안내 라벨 없이 기존 예산 안에 넣었습니다.
         self.root.minsize(1300, 780)
         self.window_title_var = tk.StringVar(value=WINDOW_TITLE)
         initial_status = "대기 중"
@@ -441,6 +478,15 @@ class AutomationApp:
         if self.license_info:
             remaining = format_remaining_time(self.license_info["remaining_seconds"])
             self.log(f"[라이센스] {self.license_info['days']}일권 인증됨 - {remaining}")
+            # 인증 화면이 넘겨 준 **서명 검증된** 결과로 티어와 만료를 세운다.
+            # 시작을 눌러야만 티어가 정해지면, 프로 고객이 시작 전에 버튼을 눌러
+            # '프로 키가 필요합니다'를 보게 된다.
+            self._license_deadline = (
+                time.time() + int(self.license_info.get("remaining_seconds", 0) or 0)
+                if int(self.license_info.get("remaining_seconds", 0) or 0) > 0
+                else None
+            )
+            self._apply_tier(self.license_info)
         self.log("F8: 시작, F9 또는 ESC: 중지")
         self.log("대상 창은 백그라운드에 있어도 되지만 최소화되어 있으면 안 됩니다.")
 
@@ -1070,6 +1116,23 @@ class AutomationApp:
         )
         self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
+        # 프로 전용 — 경기 도중 한 번에 정리하고 다음 경기로 넘어간다.
+        # ⚠️ **프로 빌드에만 만든다.** 일반 빌드에는 버튼이 아예 없다(있는데 잠근 게
+        # 아니라 없다). 일반 프로그램에는 이 기능이 들어가지 않는 게 제품 구분의 핵심이다.
+        #
+        # ⚠️ **같은 줄에** 넣는다. 오른쪽 열의 세로 예산이 빠듯해서 줄을 하나 더
+        # 쓰면(버튼이든 안내 라벨이든) 세션 패널이 그만큼 눌려 값 라벨이 잘린다
+        # (실측: 한 줄 = 32px, 세션 패널 여유 = 17px). 창을 키워 해결하면 안 된다 —
+        # 1366x768 노트북에서 창이 화면보다 커진다. 상태는 버튼 글자와 로그로 알린다.
+        self.exit_button = None
+        if edition.is_pro():
+            self.exit_button = self._button(
+                button_row, "즉시 종료", self.run_quick_exit, tone="ghost"
+            )
+            self.exit_button.pack(side=tk.LEFT, padx=(5, 0))
+            # 라이센스 확인 전에는 잠근 상태로 태어난다(fail-closed).
+            self._set_accent_button_state(self.exit_button, enabled=False)
+
         settings_panel = self._panel(right_column, "기본 설정")
         settings_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
 
@@ -1610,18 +1673,23 @@ class AutomationApp:
             self.log("[라이센스] 서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.")
             self.set_status("서버 연결 실패")
             self._set_button_state(running=False)
+            # 확인하지 못했으면 프로 기능도 잠근다(fail-closed). 잠그지 않으면
+            # 한 번 켠 티어가 되돌릴 방법 없이 남는다.
+            self._apply_tier({})
             self._starting = False
             return
         if not sr.get("valid", False):
             self.log(f"[라이센스] {sr.get('message', '인증 실패')} 프로그램을 재시작하고 새 키를 입력하세요.")
             self.set_status("라이센스 만료")
             self._set_button_state(running=False)
+            self._apply_tier({})
             self._starting = False
             return
         # 서명 검증된 남은 시간으로 이번 세션의 만료 시각을 고정한다(위조 불가·오프라인 무관).
         self.license_info = sr
         remaining = int(sr.get("remaining_seconds", 0) or 0)
         self._license_deadline = time.time() + remaining if remaining > 0 else None
+        self._apply_tier(sr)
         self._do_start()
 
     def _do_start(self) -> None:
@@ -1816,6 +1884,16 @@ class AutomationApp:
         """창 닫기 버튼을 눌렀을 때도 자동화 스레드를 자연스럽게 멈춥니다."""
 
         self.closing = True
+        # 즉시 종료가 돌고 있으면 **가장 먼저** 세우고 재개를 기다립니다.
+        # 여기서 안 세우면 워커가 창이 사라진 뒤에도 새로 정지를 걸 수 있고,
+        # 아래 _destroy_when_worker_stops 경로로 빠지면 destroy 까지 그대로 갑니다.
+        # (재개 보장 3중 방어의 2층 — shutdown 이 취소·join·되살리기를 여기서 마칩니다.)
+        exit_runner_instance = getattr(self, "_exit_runner", None)
+        if exit_runner_instance is not None:
+            try:
+                exit_runner_instance.shutdown(timeout=5.0)
+            except Exception:
+                pass
         # 저장소를 쓰는 쪽을 먼저 비웁니다. 대시보드가 취소 이벤트를 세운 뒤에 드레인하면
         # 마지막 판이 유실될 수 있습니다.
         self._drain_match_writer()
@@ -1938,6 +2016,12 @@ class AutomationApp:
             # 새 객체로 교체(reset 아님): 혹시 직전 run의 워커가 join 타임아웃으로 살아있어도
             # 옛 객체를 만지게 분리해, 새 워커의 투표 상태와 절대 안 섞이게 한다.
             self._rank_consensus = rank_ocr.RankConsensus()
+            # 0:2 자동 종료 활성 판정. 트래커·쿼터는 세션 수명(__init__)이고,
+            # 여기서는 이번 실행에 관측을 공급할지와 관측 상태 리셋만 한다
+            # (래치는 유지 — 정지→재시작으로 같은 경기가 두 번 세어지면 안 된다).
+            self._auto_exit_active = self._auto_exit_allowed(capture_mode)
+            self._loss_tracker.resume_observation()
+            self._last_match_score = None
             self._rank_ocr_cache_key = None
             self._rank_ocr_cache_info = None
             self._rank_ocr_cache_at = 0.0
@@ -1993,7 +2077,14 @@ class AutomationApp:
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
             if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
-                self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
+                # 세대 번호를 넘긴다 — join 타임아웃으로 살아남은 이전 워커가 재시작
+                # 후 부활해 같은 트래커·컨센서스를 이중 공급하지 않게(불일치 즉시 종료).
+                self._ocr_generation += 1
+                self._ocr_thread = threading.Thread(
+                    target=self._ocr_worker_loop,
+                    args=(self._ocr_generation,),
+                    daemon=True,
+                )
                 self._ocr_thread.start()
 
             # 상태 전송 타이머
@@ -2014,6 +2105,13 @@ class AutomationApp:
                     self.queue_status("라이센스 만료")
                     self.queue_log("[라이센스] 유효기간이 만료되어 자동화를 정지합니다. 재시작 후 갱신하세요.")
                     break
+                # 즉시 종료가 도는 동안에는 **캡처보다 먼저** 빠진다.
+                # 캡처를 계속하면 (1) 단일 소비자 WGC 엔진의 프레임을 마무리 단계와
+                # 나눠 갖게 되고 (2) 정지된 화면을 OCR 워커에 계속 공개하게 된다.
+                # 정지가 아니라 건너뛰기라, 끝나면 저절로 이어진다.
+                if self._exit_gate.is_set():
+                    self.interruptible_sleep(LOOP_SLEEP_SECONDS)
+                    continue
                 if self.license_key and now_mono - last_status_report >= STATUS_REPORT_INTERVAL_SECONDS:
                     last_status_report = now_mono
                     self._report_status(running=True)
@@ -2215,7 +2313,7 @@ class AutomationApp:
         except Exception:
             pass
 
-    def _ocr_worker_loop(self) -> None:
+    def _ocr_worker_loop(self, generation: Optional[int] = None) -> None:
         """별도 스레드: 매칭 루프를 막지 않고 SKIP/등수 OCR을 처리합니다.
 
         매칭 루프가 self._latest_frame에 올려둔 (seq, gray)를 가져와 OCR합니다.
@@ -2228,7 +2326,26 @@ class AutomationApp:
         last_rank_seq = -1
         last_rank_time = 0.0
         last_skip = 0.0
-        while not self.stop_event.is_set():
+        last_score_seq = -1
+        last_score_time = 0.0
+        # generation 불일치 = 나는 이전 실행의 좀비다(join 타임아웃 생존) → 즉시 종료.
+        # None 은 검사 생략(테스트가 직접 부르는 경우).
+        while not self.stop_event.is_set() and (
+            generation is None or generation == self._ocr_generation
+        ):
+            # 즉시 종료가 도는 동안에는 이 워커도 멈춘다.
+            # ⚠️ 매칭 루프만 막는 걸로는 부족하다 — **입력을 실제로 내보내는 쪽이 여기**다.
+            # SKIP 판정은 프레임 신선도 게이팅이 없어서, 새 프레임이 안 와도 마지막
+            # 프레임으로 0.3초마다 계속 A/START 를 누른다. 그 입력이 마무리 단계의
+            # 확인 입력과 겹치면 다음 화면까지 눌러 버린다.
+            if self._exit_gate.is_set():
+                # 다시 깨어났을 때 정지 구간에 쌓인 판정으로 오동작하지 않게 비운다.
+                self._skip_seen_since = None
+                self._skip_text_streak = 0
+                self._skip_s_match_streak = 0
+                if self.stop_event.wait(0.05):
+                    break
+                continue
             frame = self._latest_frame
             now = time.monotonic()
             did_ocr = False
@@ -2248,6 +2365,17 @@ class AutomationApp:
                         last_rank_seq = seq
                         last_rank_time = now
                         self._observe_rank(gray, now)
+                        did_ocr = True
+                    # 0:2 자동 종료(프로): 새 프레임에서만 스코어를 읽는다.
+                    # ⚠️ seq 게이팅이 필수다 — 같은 프레임을 반복해서 읽으면 정지
+                    # 화면 한 장이 '연속 N회 확인'을 채워 오독 방어가 무너진다.
+                    if (self._auto_exit_active and seq != last_score_seq
+                            and now - last_score_time >= AUTO_EXIT_OCR_INTERVAL_SECONDS):
+                        last_score_seq = seq
+                        self._observe_match_score(gray, now)
+                        # 호출 **후** 시각으로 기록한다 — 호출 소요가 길어도 다음 관측이
+                        # 곧바로 이어져 워커를 연속 점유하지 않게(리뷰 확정).
+                        last_score_time = time.monotonic()
                         did_ocr = True
                 # 확정은 '벽시계'로 매 사이클 폴링 — WGC가 정적 화면에서 프레임 공급을 멈춰
                 # seq가 동결돼도 패널 소멸-후-커밋(graceful)·패널 경계 리셋이 진행되게 한다.
@@ -5384,7 +5512,9 @@ class AutomationApp:
             except queue.Empty:
                 break
 
-            if kind == "status":
+            if kind == "auto_exit":
+                self._run_auto_exit()
+            elif kind == "status":
                 self.set_status(message)
             elif kind == "session":
                 self._refresh_session_ui()
@@ -5406,6 +5536,192 @@ class AutomationApp:
                     pass
         if not self.closing:
             self.root.after(1000, self._flush_log_periodic)
+
+    # ── 프로 전용: 즉시 종료 ──────────────────────────────────────────────
+
+    def _apply_tier(self, sr: dict) -> None:
+        """서명으로 확인된 티어를 UI 에 반영합니다.
+
+        ⚠️ sr["pro"] 는 **서명이 검증된 제품**에서만 채워집니다. 응답 본문의
+        product 필드로 판단하면 가짜 서버 없이도 프로 기능이 열립니다.
+        """
+
+        # 프로 빌드가 아니면 이 기능 자체가 없다(버튼도 없다).
+        self._is_pro = bool(sr.get("pro")) and edition.is_pro()
+        if self.exit_button is not None:
+            self._set_accent_button_state(self.exit_button, enabled=self._is_pro)
+        self._apply_auto_exit_ratio(sr)
+
+    def _apply_auto_exit_ratio(self, sr: dict) -> None:
+        """서버 운영 설정(0:2 자동 종료 비율)을 쿼터에 반영한다.
+
+        비율은 서명에 안 묶인 운영값이다 — 위조해 봐야 자기 종료 비율이 바뀔 뿐이라
+        신뢰 판정에는 안 쓰고, 범위 밖 값은 license_client 가 이미 버렸다(None).
+        값이 없으면(구버전 서버·읽기 실패·일반 티어) 마지막 값(없으면 내장 40%)을
+        유지한다. 쿼터 카운트는 건드리지 않는다(set_ratio 주석 참고).
+        UI 스레드에서 워커 시작 전에만 값이 바뀌므로 락이 필요 없다(happens-before).
+        """
+
+        ratio = sr.get("auto_exit_ratio")
+        if ratio is None or not self._is_pro:
+            return
+        quota = self._exit_quota
+        try:
+            if float(ratio) != quota.ratio:
+                quota.set_ratio(float(ratio))
+                self._log_to_file_only(
+                    f"[자동 종료] 서버 설정 비율 적용: {quota.ratio:.0%}"
+                )
+        except (TypeError, ValueError):
+            return
+
+    def _auto_exit_allowed(self, capture_mode: str) -> bool:
+        """이번 실행에서 0:2 자동 종료를 켤 수 있는가.
+
+        ⚠️ WGC 전용이다. '화면 영역 캡처' 모드는 (1) 프레임이 게임 클라이언트가
+        아니라 사용자가 지정한 임의 사각형이라 실측 좌표의 근거가 사라지고,
+        (2) 정지 화면에서도 매번 새 seq 를 받아 '연속 3회 확인'이 같은 픽셀
+        재판독으로 채워진다 — 오탐 방어 두 축이 동시에 무너진다(리뷰 확정).
+        """
+
+        return (
+            AUTO_EXIT_ENABLED
+            and edition.is_pro()
+            and self._is_pro
+            and capture_mode == "wgc"
+        )
+
+    def _observe_match_score(self, gray, now: float) -> None:
+        """OCR 워커에서 매 새 프레임마다 부른다 — 0:2 패배를 세고 종료를 결정한다.
+
+        판정(경기당 1회·연속 확인·40% 쿼터)은 전부 auto_exit 의 순수 로직이 한다.
+        여기는 프레임을 읽어 넣고, '나가라'는 답이 오면 UI 스레드로 넘길 뿐이다.
+        """
+
+        tracker = self._loss_tracker
+        if not self._auto_exit_active or tracker is None or self._exit_gate.is_set():
+            return
+
+        # 글리프 템플릿 매칭(~1ms) — winocr 가 아니다. winocr 는 실전 '1 2' 를
+        # 완벽한 크롭에서도 못 읽었다(auto_exit 모듈 docstring 참고).
+        reading = auto_exit.read_score_from_frame(gray, AUTO_EXIT_SCORE_REGION)
+        # 읽힌 값이 바뀔 때만 파일 로그에 남긴다 — 좌표·템플릿을 실측으로 맞출 때
+        # 이 로그가 유일한 근거다(화면 로그를 어지럽히지 않게 파일에만).
+        if reading != self._last_match_score:
+            self._last_match_score = reading
+            if isinstance(reading, tuple):
+                self._log_to_file_only(f"[자동 종료] 스코어 읽음: {reading[0]}:{reading[1]}")
+            elif reading == auto_exit.SCORE_UNKNOWN:
+                self._log_to_file_only("[자동 종료] 스코어 박스는 보이는데 숫자 미상")
+
+        if not tracker.feed(now, reading):
+            return
+
+        # winocr 호출(수백 ms) 사이에 사용자가 정지를 눌렀을 수 있다 — 정지 뒤에
+        # 종료 요청을 큐에 남기면 '정지 후 입력 0' 기대가 깨진다(리뷰 확정).
+        if self.stop_event.is_set():
+            return
+
+        quota = self._exit_quota
+        if quota.register_loss():
+            self.queue_log(
+                f"[자동 종료] 0:2 패배 {quota.lost_games}번째 — 즉시 종료를 실행합니다 "
+                f"(종료 {quota.exits_done}회 / 목표 비율 {quota.ratio:.0%})"
+            )
+            # tkinter 는 UI 스레드에서만 만져야 한다 → 큐로 넘긴다.
+            self.ui_queue.put(("auto_exit", ""))
+        else:
+            self.queue_log(
+                f"[자동 종료] 0:2 패배 {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
+                f"(종료 {quota.exits_done}/{quota.lost_games}, 비매너 분산)"
+            )
+
+    def _run_auto_exit(self) -> None:
+        """UI 스레드: 자동 종료 요청을 실행한다(수동 버튼과 같은 경로).
+
+        자동화가 살아 있을 때만 실행한다. 큐에 남은 요청이 정지 완료 **후에**
+        소비되면, 사용자가 수동 조작을 하려는 순간 게임에 예고 없는 종료 입력이
+        나간다(리뷰 확정). 수동 버튼(run_quick_exit 직접 호출)은 이 검사를 안
+        거치므로 정지 중에도 쓸 수 있다 — 그건 사용자의 명시적 클릭이다.
+        """
+
+        if not self._is_pro or self._exit_gate.is_set():
+            return
+        if self.stop_event.is_set():
+            return
+        worker = self.worker_thread
+        if worker is None or not worker.is_alive():
+            return
+        self.run_quick_exit()
+
+    def run_quick_exit(self) -> None:
+        """즉시 종료 1회 실행 (프로 전용)."""
+
+        if not self._is_pro:
+            self.log("[안내] 이 기능은 프로 버전 키에서만 사용할 수 있습니다.")
+            return
+        # 자동화 루프와 **같은 검사**를 여기서도 한다. 이게 없으면 시간권 프로 키로
+        # 한 번 켠 뒤 앱을 안 끄는 것만으로 기간이 무한 연장된다(자동화는 멈추는데
+        # 프로 기능만 계속 열려 있는 상태). exp 는 서명에 묶여 있어 로컬 검사로 충분하다.
+        if self._license_deadline is not None and time.time() > self._license_deadline:
+            self.log("[라이센스] 이용 기간이 끝났습니다. 프로그램을 다시 실행해 인증하세요.")
+            self._apply_tier({})
+            return
+        if self._exit_runner is not None and self._exit_runner.busy:
+            return
+
+        if self._exit_runner is None:
+            self._exit_runner = exit_runner.PauseRunner(
+                prepare=self._exit_prepare,
+                after_resume=exit_followup.after_resume,
+            )
+        # 자동화 루프를 재운다. 여기서 세우지 않으면 정지된 화면을 계속 재매칭하고,
+        # 재개 직후 확인 버튼을 자동화와 마무리 단계가 동시에 누른다.
+        self._exit_gate.set()
+        if self.exit_button is not None:
+            self._set_accent_button_state(self.exit_button, enabled=False)
+        if not self._exit_runner.start():
+            self._exit_gate.clear()
+            if self.exit_button is not None:
+                self._set_accent_button_state(self.exit_button, enabled=True)
+            return
+        self._poll_exit_events()
+
+    def _exit_prepare(self, cancel):
+        """정지 전에 창을 찾아 둔다. 자동화가 돌고 있으면 그 창 관리자를 빌려 쓴다."""
+
+        return exit_followup.prepare(
+            cancel, logger=self.queue_log, manager=self._ocr_manager
+        )
+
+    def _poll_exit_events(self) -> None:
+        """워커 이벤트를 UI 스레드에서 꺼내 상태 문구로 옮긴다."""
+
+        runner = self._exit_runner
+        if runner is None:
+            return
+        finished = False
+
+        def handle(event) -> None:
+            nonlocal finished
+            if event.kind in (exit_runner.EVT_DONE, exit_runner.EVT_ERROR):
+                self.log(f"[종료] {event.text}")
+            if event.kind == exit_runner.EVT_STATE and event.text:
+                self.set_status(event.text)
+            if event.kind == exit_runner.EVT_STATE and event.state in (
+                exit_core.STATE_DONE,
+                exit_core.STATE_FAILED,
+            ):
+                finished = True
+
+        runner.drain(handle)
+        if finished:
+            # 자동화 루프를 다시 깨운다. 사용자가 시작을 다시 누를 필요가 없다.
+            self._exit_gate.clear()
+            if self.exit_button is not None:
+                self._set_accent_button_state(self.exit_button, enabled=self._is_pro)
+            return
+        self.root.after(100, self._poll_exit_events)
 
     def _set_accent_button_state(self, button: tk.Button, enabled: bool) -> None:
         """버튼의 활성/비활성 상태와 색을 함께 바꿉니다(원래 톤으로 복원)."""
@@ -5619,6 +5935,8 @@ class LicenseDialog:
         msg = server_result.get("message", "유효한 라이센스입니다.")
         self.message_var.set(f"저장된 라이센스가 유효합니다. {msg}")
         self.message_label.configure(fg=self._success_color)
+        # 저장된 키로 들어오는 경로에서도 티어를 넘겨 준다(위 활성화 경로와 동일).
+        self._verified = server_result
         self.root.after(800, lambda: self._launch_app(key))
 
     def _activate(self) -> None:
@@ -5645,16 +5963,23 @@ class LicenseDialog:
         self.message_var.set(f"인증 성공! {msg}")
         self.message_label.configure(fg=self._success_color)
         save_license_key(self.base_dir, key)
+        # 서명 검증된 결과를 그대로 넘겨 준다(티어·남은 기간). 여기서 버리면 본 화면이
+        # '시작'을 누를 때까지 티어를 모른다.
+        self._verified = server_result
         self.root.after(600, lambda: self._launch_app(key))
 
     def _launch_app(self, key: str) -> None:
         self.result = key
+        verified = getattr(self, "_verified", None)
         for widget in self.root.winfo_children():
             widget.destroy()
         app = AutomationApp(
             self.root,
             license_key=key,
             start_hidden=self.background_experiment,
+            # 인증 화면이 이미 서명 검증된 결과를 쥐고 있다. 그냥 버리면 프로 고객이
+            # '시작'을 누르기 전까지 자기 키가 프로가 아니라는 안내를 보게 된다.
+            license_info=verified,
         )
         # 실기 회귀 러너용 옵트인. 일반 실행에는 환경변수가 없으므로 UI 동작은 그대로이며,
         # 테스트 프로세스만 인증 직후 F8과 같은 시작 경로를 자동 호출합니다.

@@ -30,6 +30,14 @@ import ed25519_tiny
 
 VERSION_CHECK_URL = "https://license-server-flame-eta.vercel.app/api/version"
 
+# 이 런처가 어느 제품을 돌보는지. 빌드할 때 프로용으로 바꿔 넣는다(build.bat).
+# ⚠️ 일반은 값을 비워 둔다 — 이미 배포된 런처와 **같은 요청**이 되어야 서버가
+# 지금 쓰던 기록을 그대로 돌려주고, 기존 사용자 업데이트가 안 끊긴다.
+LAUNCHER_PRODUCT = ""
+
+# 실행할 프로그램. 프로 빌드는 같은 폴더의 다른 exe 를 띄운다.
+TARGET_EXE = "macro.exe"
+
 # 업데이트 매니페스트 서명 검증용 공개키. 개인키는 release_signing_key.txt(미배포)로
 # 보관하며 sign_release.py가 서명을 만듭니다. 키를 바꾸면 기존 배포본은 업데이트를
 # 거부하므로 재배포 전에는 절대 바꾸지 마세요.
@@ -123,7 +131,10 @@ def _verify_manifest_signature(version: str, url: str, sha256_hex: str, sig_hex:
 def check_update():
     """검증을 모두 통과한 업데이트 정보만 반환합니다. 아니면 None."""
     try:
-        req = urllib.request.Request(VERSION_CHECK_URL, method="GET")
+        check_url = VERSION_CHECK_URL
+        if LAUNCHER_PRODUCT:
+            check_url = f"{VERSION_CHECK_URL}?product={LAUNCHER_PRODUCT}"
+        req = urllib.request.Request(check_url, method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         remote_ver = (data.get("version") or "").strip()
@@ -207,7 +218,7 @@ def download_and_install(url, expected_sha256):
 
 
 def launch_macro(app_dir):
-    macro_exe = os.path.join(app_dir, "macro.exe")
+    macro_exe = os.path.join(app_dir, TARGET_EXE)
     if not os.path.exists(macro_exe):
         show_error(
             "macro.exe를 찾을 수 없습니다.\n\n"

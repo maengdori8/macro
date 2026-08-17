@@ -16,6 +16,17 @@ const {
   normalizeLicenseTerm,
   serializeLicenseForAdmin,
 } = require("../lib/license_admin");
+const {
+  DEFAULT_PRODUCT,
+  ISSUABLE_PRODUCTS,
+  isIssuableProduct,
+  normalizeProduct,
+} = require("../lib/product");
+const {
+  normalizeAutoExitRatio,
+  readAutoExitRatio,
+  writeAutoExitRatio,
+} = require("../lib/pro_settings");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -93,7 +104,15 @@ module.exports = async function handler(req, res) {
       const licenses = snapshot.docs.map((doc) =>
         serializeLicenseForAdmin(doc.id, doc.data(), now)
       );
-      return res.status(200).json({ success: true, licenses });
+      // 프로 운영 설정도 함께 내려 관리 화면이 별도 왕복 없이 패널을 채운다.
+      // 읽기 실패는 목록 조회를 막지 않는다(패널만 비고 목록은 뜬다).
+      let proSettings = null;
+      try {
+        proSettings = { autoExitRatio: await readAutoExitRatio(db) };
+      } catch (err) {
+        console.error("Pro settings read error:", err);
+      }
+      return res.status(200).json({ success: true, licenses, proSettings });
     } catch (err) {
       console.error("Admin list error:", err);
       return res.status(500).json({ success: false, message: "목록 조회 실패" });
@@ -122,11 +141,22 @@ module.exports = async function handler(req, res) {
       const key = String(body.key || "").trim();
       const licenseTerm = normalizeLicenseTerm(body);
       const memo = body.memo === undefined ? "" : body.memo;
+      // 단건 발급도 제품을 지정할 수 있어야 한다. 빠지면 관리 화면에서 mPause 를
+      // 골라도 조용히 macro 키가 나가고, 고객은 "인증이 안 된다"만 겪는다.
+      const product = normalizeProduct(body.product) || DEFAULT_PRODUCT;
       if (!sec.isValidKeyFormat(key)) {
         return res.status(400).json({ success: false, message: "키 형식이 올바르지 않습니다." });
       }
       if (typeof memo !== "string" || memo.length > 200) {
         return res.status(400).json({ success: false, message: "메모는 200자 이하여야 합니다." });
+      }
+      // 발급은 아는 제품만 허용한다. 오타로 만든 키는 어느 앱에서도 안 열리는데,
+      // 그 사실이 고객 손에 들어가기 전까지 드러나지 않는다.
+      if (!isIssuableProduct(product)) {
+        return res.status(400).json({
+          success: false,
+          message: `발급할 수 없는 제품입니다. (${ISSUABLE_PRODUCTS.join(", ")})`,
+        });
       }
 
       const now = Date.now();
@@ -137,6 +167,7 @@ module.exports = async function handler(req, res) {
           timestampFromMillis,
           memo,
           batchName: "단건 발급",
+          product,
         })
       );
       return res.status(201).json({
@@ -199,6 +230,22 @@ module.exports = async function handler(req, res) {
           total: snapshot.size,
           migrated,
           protectedUsed: snapshot.size - targets.length,
+        });
+      }
+
+      if (body.action === "setProSettings") {
+        // 0:2 자동 종료 비율 — 모든 mAuto Pro 클라이언트에 공통 적용되는 운영값.
+        // 잘못된 값이 저장되면 클라이언트가 조용히 기본값으로 돌아가 조절이 안 되는
+        // 것처럼 보이므로, 여기서 확실히 거부해 관리자에게 알린다.
+        const ratio = normalizeAutoExitRatio(body.autoExitRatio);
+        if (ratio === null) {
+          return res.status(400).json({ success: false, message: "자동 종료 비율은 0~1 사이 숫자여야 합니다." });
+        }
+        await writeAutoExitRatio(db, ratio, admin.firestore.FieldValue.serverTimestamp());
+        return res.status(200).json({
+          success: true,
+          message: `0:2 자동 종료 비율을 ${Math.round(ratio * 100)}%로 저장했습니다.`,
+          proSettings: { autoExitRatio: ratio },
         });
       }
 

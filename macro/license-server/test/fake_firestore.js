@@ -23,6 +23,16 @@ class FakeDocumentReference {
   async get() {
     return new FakeSnapshot(this, this.db._docs.get(this.path));
   }
+
+  // 트랜잭션 밖 단건 쓰기(실서버의 DocumentReference.set 대응).
+  async set(value, options = {}) {
+    const current = this.db._docs.get(this.path);
+    if (options.merge && current !== undefined) {
+      this.db._docs.set(this.path, { ...current, ...structuredClone(value) });
+    } else {
+      this.db._docs.set(this.path, structuredClone(value));
+    }
+  }
 }
 
 class FakeCollectionReference {

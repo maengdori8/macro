@@ -421,6 +421,16 @@
             <div class="issue-layout">
               <div>
                 <div class="form-grid">
+                  <div class="wide">
+                    <label for="productInput">제품</label>
+                    <select id="productInput">
+                      <option value="macro" selected>mAuto — FC 감독모드 매크로</option>
+                      <option value="macro_pro">mAuto Pro — 종료 기능 포함</option>
+                      <option value="mpause">mPause — 프로세스 일시정지</option>
+                    </select>
+                    <div class="hint">여기서 고른 제품에서만 열리는 키가 발급됩니다. 다른 앱에서는 인증되지 않습니다.</div>
+                    <div class="hint" id="productWarning"></div>
+                  </div>
                   <div>
                     <label for="daysInput">이용기간</label>
                     <div class="term-switch" id="termUnitSwitch">
@@ -464,6 +474,7 @@
             <div class="section-head">
               <div><div class="eyebrow">INVENTORY</div><h2>판매 대기 재고</h2><p>아직 프로그램에서 인증되지 않은 키입니다.</p></div>
             </div>
+            <div class="hint" id="inventoryScopeText">전체 제품 기준</div>
             <div class="inventory-main"><strong class="pending" id="inventoryPending">0</strong><span>개</span></div>
             <div class="stock-meter"><span id="inventoryMeter"></span></div>
             <div class="stock-copy"><span>첫 인증 전</span><span id="inventoryRatio">전체의 0%</span></div>
@@ -491,6 +502,12 @@
             <div class="stat"><span>만료·비활성</span><b class="expired" id="statInactive">0</b></div>
           </div>
           <div class="filter-row">
+            <div class="status-tabs" id="productTabs">
+              <button class="status-tab active" data-product="all">전체 제품</button>
+              <button class="status-tab" data-product="macro">mAuto</button>
+              <button class="status-tab" data-product="macro_pro">mAuto Pro</button>
+              <button class="status-tab" data-product="mpause">mPause</button>
+            </div>
             <div class="status-tabs" id="statusTabs">
               <button class="status-tab active" data-scope="all">전체</button>
               <button class="status-tab" data-scope="vending">자판기용 키</button>
@@ -538,12 +555,32 @@
             <details class="card card-flat" style="margin-top:18px">
               <summary class="details-title"><div><div class="eyebrow">UPDATES</div><h2>프로그램 버전 관리</h2></div></summary>
               <div class="details-body field-stack">
+                <div>
+                  <label for="versionProductInput">제품</label>
+                  <select id="versionProductInput">
+                    <option value="macro" selected>mAuto — 일반</option>
+                    <option value="macro_pro">mAuto Pro</option>
+                  </select>
+                  <div class="hint">제품마다 업데이트 기록이 따로입니다. 잘못 고르면 그 제품 사용자에게 다른 설치본이 내려갑니다.</div>
+                </div>
                 <div><label for="versionInput">버전</label><input id="versionInput" placeholder="1.0.24"></div>
                 <div><label for="urlInput">다운로드 URL</label><input id="urlInput" placeholder="https://..."></div>
                 <div><label for="shaInput">SHA-256</label><input id="shaInput"></div>
                 <div><label for="sigInput">서명</label><input id="sigInput"></div>
                 <div><label for="changelogInput">변경사항</label><textarea id="changelogInput" rows="3"></textarea></div>
                 <button class="btn" id="versionSaveButton">버전 정보 저장</button>
+              </div>
+            </details>
+
+            <details class="card card-flat" style="margin-top:18px" open>
+              <summary class="details-title"><div><div class="eyebrow">PRO</div><h2>프로 운영 설정</h2></div></summary>
+              <div class="details-body field-stack">
+                <div>
+                  <label for="autoExitRatioInput">0:2 자동 종료 비율 (%)</label>
+                  <input id="autoExitRatioInput" type="number" min="0" max="100" step="1" placeholder="40">
+                  <div class="hint">0:2 패배 중 이 비율만 자동으로 나갑니다(나머지는 방치 — 비매너 점수 분산). 모든 mAuto Pro 사용자에게 공통 적용되고, 각 프로그램은 다음 실행(재인증) 때 새 값을 받습니다.</div>
+                </div>
+                <button class="btn" id="proSettingsSaveButton">프로 설정 저장</button>
               </div>
             </details>
           </div>
@@ -580,6 +617,7 @@
     let issueMode = "vending";
     let issueUnit = "day";
     let licenseScope = "all";
+    let productScope = "all";
 
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -617,30 +655,50 @@
     async function loadLicenses() {
       const data = await api("GET");
       licenses = data.licenses || [];
+      renderProSettings(data.proSettings);
       renderAll();
       $("lastSyncText").textContent = `${new Date().toLocaleTimeString("ko-KR", { hour:"2-digit", minute:"2-digit" })} 동기화`;
     }
+    function renderProSettings(settings) {
+      // 서버가 준 비율(0~1)을 % 로 보여 준다. 값이 없거나 깨졌으면 입력칸을 비워
+      // 두는 대신 건드리지 않는다 — 관리자가 입력 중일 수 있다.
+      if (!settings || !Number.isFinite(settings.autoExitRatio)) return;
+      $("autoExitRatioInput").value = Math.round(settings.autoExitRatio * 100);
+    }
+    async function saveProSettings() {
+      const raw = String($("autoExitRatioInput").value).trim();
+      const percent = Number(raw);
+      // Number("") 는 0 이라, 빈 입력을 그냥 넘기면 '0% 저장'이 조용히 나간다.
+      if (raw === "" || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+        return toast("비율은 0~100 사이 숫자여야 합니다.", "error");
+      }
+      const data = await api("PATCH", { action:"setProSettings", autoExitRatio: percent / 100 });
+      renderProSettings(data.proSettings); toast(data.message);
+    }
     function renderAll() {
-      const counts = licenses.reduce((out, item) => (out[item.status] = (out[item.status] || 0) + 1, out), {});
+      // 통계·재고는 **지금 보고 있는 제품 기준**이다. 전체 합계를 보여 주면
+      // "자판기에 넣을 mAuto 재고가 몇 개인가"를 알 수 없다(제품이 섞여 세어진다).
+      const scoped = scopedLicenses();
+      const counts = scoped.reduce((out, item) => (out[item.status] = (out[item.status] || 0) + 1, out), {});
       const pending = counts.pending || 0;
       const active = counts.active || 0;
       const inactive = (counts.expired || 0) + (counts.disabled || 0);
-      const pendingRatio = licenses.length ? Math.round((pending / licenses.length) * 100) : 0;
-      $("statTotal").textContent = licenses.length;
+      const pendingRatio = scoped.length ? Math.round((pending / scoped.length) * 100) : 0;
+      $("statTotal").textContent = scoped.length;
       $("statPending").textContent = pending;
       $("statActive").textContent = active;
       $("statInactive").textContent = inactive;
       $("inventoryPending").textContent = pending;
       $("inventoryMeter").style.width = `${pendingRatio}%`;
       $("inventoryRatio").textContent = `전체의 ${pendingRatio}%`;
-      $("miniTotal").textContent = licenses.length;
+      $("miniTotal").textContent = scoped.length;
       $("miniActive").textContent = active;
       $("miniInactive").textContent = inactive;
       renderBatchFilter(); renderBatchSummary(); renderRecentKeys(); renderTable();
     }
     function renderBatchFilter() {
       const selected = $("batchFilter").value;
-      const batches = [...new Map(licenses
+      const batches = [...new Map(scopedLicenses()
         .map((item) => [batchKey(item), item.batchName || (batchKey(item) === "legacy" ? "기존 단건 키" : batchKey(item))])).entries()];
       $("batchFilter").innerHTML = '<option value="">모든 배치</option>' +
         batches.map(([id,name]) => `<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join("");
@@ -648,15 +706,20 @@
     }
     function renderBatchSummary() {
       const map = new Map();
-      for (const item of licenses) {
+      for (const item of scopedLicenses()) {
         const id = batchKey(item);
-        if (!map.has(id)) map.set(id, { name:item.batchName || (id === "legacy" ? "기존 단건 키" : id), total:0, pending:0, active:0, expired:0, disabled:0 });
+        if (!map.has(id)) map.set(id, { name:item.batchName || (id === "legacy" ? "기존 단건 키" : id),
+          products:new Set(), total:0, pending:0, active:0, expired:0, disabled:0 });
         const row = map.get(id); row.total += 1; row[item.status] += 1;
+        row.products.add(licenseProduct(item));
       }
       $("batchSummary").innerHTML = [...map.entries()].map(([id,b]) => {
         const stockRatio = b.total ? Math.round((b.pending / b.total) * 100) : 0;
+        // 배치는 발급할 때 제품을 하나만 고르므로 보통 한 종류다. 여러 개면
+        // 옛날에 섞여 들어간 배치라는 뜻이라 그대로 보여 준다(숨기면 못 찾는다).
+        const products = [...b.products].map(productLabel).join(" + ");
         return `<div class="batch-item" data-batch-filter="${escapeHtml(id)}" style="--stock:${stockRatio}%">
-          <button type="button" class="batch-top batch-action" data-action="filter"><strong title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</strong><span>${b.pending}개 대기</span></button>
+          <button type="button" class="batch-top batch-action" data-action="filter"><strong title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</strong><span>${escapeHtml(products)} · ${b.pending}개 대기</span></button>
           <span class="batch-bar"><i></i></span>
           <span class="batch-counts">전체 ${b.total} · 사용 ${b.active} · 만료 ${b.expired} · 비활성 ${b.disabled}</span>
           <span class="batch-actions">
@@ -685,16 +748,48 @@
       return licenses.filter((item) => {
         const haystack = [item.key,item.batchId,item.batchName,item.discordId,item.memo].join(" ").toLowerCase();
         return (!query || haystack.includes(query)) && matchesLicenseScope(item) &&
-          (!batch || batchKey(item) === batch);
+          matchesProductScope(item) && (!batch || batchKey(item) === batch);
       });
     }
     function renderRecentKeys() {
-      const recent = licenses.filter(matchesLicenseScope).sort((a,b) => (b.issuedAt || 0) - (a.issuedAt || 0)).slice(0,4);
+      const recent = licenses.filter((item) => matchesLicenseScope(item) && matchesProductScope(item))
+        .sort((a,b) => (b.issuedAt || 0) - (a.issuedAt || 0)).slice(0,4);
       $("recentKeys").innerHTML = recent.map((item) => `
         <button type="button" class="recent-key" data-key="${escapeHtml(item.key)}">
-          <span><code>${escapeHtml(item.key)}</code><small>${escapeHtml(item.batchName || "기존 단건 키")} · ${escapeHtml(item.term || `${item.days}일권`)} · ${statusLabel(item.status)}</small></span>
+          <span><code>${escapeHtml(item.key)}</code><small>${escapeHtml(productLabel(item.product))} · ${escapeHtml(item.batchName || "기존 단건 키")} · ${escapeHtml(item.term || `${item.days}일권`)} · ${statusLabel(item.status)}</small></span>
           <span class="copy-mark">복사</span>
         </button>`).join("") || '<span class="hint">발급된 키가 없습니다.</span>';
+    }
+    // product 필드가 없는 기존 키는 mAuto 용이다(서버 licenseProductOf 와 같은 규칙).
+    // Object.create(null): 평범한 객체로 두면 product 가 "constructor"/"toString" 일 때
+    // 프로토타입 체인의 함수가 잡혀 표에 함수 소스가 통째로 찍힌다.
+    const PRODUCT_LABELS = Object.assign(Object.create(null),
+      { macro:"mAuto", macro_pro:"mAuto Pro", mpause:"mPause" });
+    // 발급은 되지만 아직 그 제품의 프로그램이 없어서 인증이 안 되는 것들.
+    // 클라이언트를 배포하면 여기서 지운다(그때까지는 판매 금지 경고를 띄운다).
+    const PENDING_PRODUCTS = ["macro_pro"];
+    const productLabel = (value) => {
+      const key = value || "macro";
+      return typeof PRODUCT_LABELS[key] === "string" ? PRODUCT_LABELS[key] : key;
+    };
+    // 자판기에 넣을 재고는 제품이 섞이면 안 된다. mPause 키를 mAuto 자판기에 넣으면
+    // 고객은 "인증이 안 된다"만 겪고, 우리는 어느 키가 잘못 나갔는지 알 수 없다.
+    // 그래서 목록·재고·배치·복사 버튼이 전부 이 필터를 함께 본다.
+    const licenseProduct = (item) => item.product || "macro";
+    function matchesProductScope(item) {
+      return productScope === "all" || licenseProduct(item) === productScope;
+    }
+    function scopedLicenses() {
+      return licenses.filter(matchesProductScope);
+    }
+    function setProductScope(product) {
+      const known = product === "all" || typeof PRODUCT_LABELS[product] === "string";
+      productScope = known ? product : "all";
+      document.querySelectorAll("#productTabs .status-tab").forEach((tab) =>
+        tab.classList.toggle("active", tab.dataset.product === productScope));
+      $("inventoryScopeText").textContent =
+        productScope === "all" ? "전체 제품 기준" : `${productLabel(productScope)} 기준`;
+      renderAll();
     }
     function renderTable() {
       const filtered = getFilteredLicenses();
@@ -704,7 +799,7 @@
         return `<tr>
           <td data-label="라이선스 키"><code>${escapeHtml(item.key)}</code></td>
           <td data-label="상태"><span class="badge ${item.status}">${statusLabel(item.status)}</span></td>
-          <td data-label="기간">${escapeHtml(item.term || (item.unlimited ? "무제한" : `${item.days}일권`))}</td>
+          <td data-label="기간">${escapeHtml(productLabel(item.product))} · ${escapeHtml(item.term || (item.unlimited ? "무제한" : `${item.days}일권`))}</td>
           <td data-label="배치">${escapeHtml(item.batchName || "기존 단건")}</td><td data-label="활성화 / 만료">${dateText}</td>
           <td data-label="기기">${item.hwids.length}/${item.maxHwids}</td><td data-label="디스코드">${escapeHtml(item.discordId || "-")}</td>
           <td data-label="메모">${escapeHtml(item.memo || "-")}</td>
@@ -718,7 +813,9 @@
           </div></td></tr>`;
       }).join("");
       $("licenseTable").innerHTML = rows || '<tr><td class="empty-row" colspan="9">조건에 맞는 라이선스가 없습니다.</td></tr>';
-      $("resultCount").textContent = `${filtered.length}개 표시 / 전체 ${licenses.length}개`;
+      // 모수도 제품 스코프를 따른다. 상단 통계는 제품 기준인데 여기만 전수를 쓰면
+      // 한 화면에 '전체 20'과 '전체 60'이 동시에 떠서 어느 게 재고인지 알 수 없다.
+      $("resultCount").textContent = `${filtered.length}개 표시 / 전체 ${scopedLicenses().length}개`;
     }
     async function copyText(text) {
       if (!text) throw new Error("복사할 키가 없습니다.");
@@ -745,7 +842,16 @@
       $("issuePreviewDays").textContent = unlimited ? "∞" : (licenseTerm.valid ? licenseTerm.value : "-");
       $("issuePreviewUnit").textContent = unlimited ? "무제한" : (issueUnit === "hour" ? "시간권" : "일권");
       $("issuePreviewCount").textContent = `${validCount ? count : 0}개`;
-      $("issuePreviewName").textContent = issueMode === "manual" ? "수동 발급" : ($("batchNameInput").value.trim() || "이름 없는 배치");
+      // 프로그램이 아직 배포되지 않은 제품 안내. 상위 포함 규칙 덕에 프로 키는
+      // 지금 팔아도 막히지 않고 **일반으로 동작**하다가, 새 빌드를 설치하면 같은
+      // 키가 그대로 프로가 된다(키 재발급 불필요). 그래도 구매자가 프로 기능을
+      // 바로 기대할 수 있으므로 판매 전에 알고는 있어야 한다.
+      $("productWarning").textContent = PENDING_PRODUCTS.includes($("productInput").value)
+        ? "⚠ 프로 기능이 포함된 프로그램이 아직 배포 전입니다. 지금 발급한 키는 새 빌드를 설치하기 전까지 일반으로 동작합니다."
+        : "";
+      $("issuePreviewName").textContent =
+        `${productLabel($("productInput").value)} · ` +
+        (issueMode === "manual" ? "수동 발급" : ($("batchNameInput").value.trim() || "이름 없는 배치"));
       $("issueButtonText").textContent = issueMode === "manual"
         ? `${licenseTerm.valid ? licenseTerm.text : "기간 확인"} 1개 수동 발급`
         : `${licenseTerm.valid ? licenseTerm.text : "기간 확인"} ${validCount ? count : 0}개 발급하기`;
@@ -793,7 +899,9 @@
       }[licenseScope];
       $("licenseListTitle").textContent = copy[0];
       $("licenseListDescription").textContent = copy[1];
-      document.querySelectorAll(".status-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.scope === licenseScope));
+      // #statusTabs 안으로 한정한다. 제품 탭도 같은 클래스를 쓰므로 전체를 훑으면
+      // 상태 탭을 누를 때마다 제품 탭의 선택 표시가 통째로 지워진다.
+      document.querySelectorAll("#statusTabs .status-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.scope === licenseScope));
       renderRecentKeys();
       renderTable();
     }
@@ -804,7 +912,10 @@
       const batchName = issueMode === "manual" ? "수동 발급" : $("batchNameInput").value.trim();
       const memo = $("memoInput").value.trim();
       const termPayload = issueUnit === "hour" ? { hours:licenseTerm.hours } : { days:licenseTerm.days };
-      const requestSignature = JSON.stringify({ ...termPayload, count, batchName, memo });
+      const product = $("productInput").value;
+      // 제품도 서명에 넣어야, 제품만 바꿔 다시 누를 때 새 requestId 가 만들어진다.
+      // 안 넣으면 재시도 방지 로직이 앞의 배치를 그대로 돌려줘 엉뚱한 제품 키가 나간다.
+      const requestSignature = JSON.stringify({ ...termPayload, count, batchName, memo, product });
       if (!pendingRequestId || pendingRequestSignature !== requestSignature) {
         pendingRequestId = makeRequestId();
         pendingRequestSignature = requestSignature;
@@ -812,7 +923,7 @@
       $("batchIssueButton").disabled = true;
       try {
         const data = await api("POST", { action:"batchIssue", requestId:pendingRequestId, ...termPayload, count,
-          batchName, memo });
+          batchName, memo, product });
         const lines = data.plainText.split(/\r?\n/).filter(Boolean);
         if (lines.length !== count || new Set(lines).size !== count ||
             lines.some((key) => !LICENSE_KEY_PATTERN.test(key))) {
@@ -829,7 +940,11 @@
     function showBatchResult() {
       if (!lastBatch) return;
       $("resultText").value = lastBatch.plainText;
-      $("resultMeta").textContent = `${lastBatch.batchName || "이름 없는 배치"} · ${lastBatch.count}개 · ${lastBatch.term || (lastBatch.days === 99999 ? "무제한" : `${lastBatch.days}일권`)}`;
+      // 이 모달이 키가 시스템 밖으로 나가는 **유일한 출구**다(복사·TXT 저장).
+      // 여기에 제품이 안 적히면 목록·재고에 필터를 아무리 걸어도 소용없다 —
+      // 자판기에 넣기 직전 화면에서 어느 제품인지 보여야 한다.
+      $("resultTitle").textContent = `${productLabel(lastBatch.product)} 자판기 재고 목록`;
+      $("resultMeta").textContent = `${productLabel(lastBatch.product)} · ${lastBatch.batchName || "이름 없는 배치"} · ${lastBatch.count}개 · ${lastBatch.term || (lastBatch.days === 99999 ? "무제한" : `${lastBatch.days}일권`)}`;
       $("resultModal").classList.add("show");
     }
     async function copyResult() {
@@ -839,7 +954,10 @@
     function downloadResult() {
       const stamp = new Date().toISOString().slice(0,16).replaceAll(/[-:T]/g,"");
       const termName = lastBatch.hours > 0 ? `${lastBatch.hours}h` : (lastBatch.days === 99999 ? "unlimited" : `${lastBatch.days}d`);
-      const name = `mauto-${termName}-${stamp}.txt`;
+      // ⚠️ 접두사를 제품에서 만든다. 예전엔 전부 mAuto 라 "mauto-" 하드코딩이
+      // 맞는 말이었지만, 이제는 mPause 키가 담긴 파일에 mAuto 라고 **틀린 이름**을
+      // 붙이게 된다. 다운로드 폴더에 며칠 쌓이면 파일명 말고는 구분할 방법이 없다.
+      const name = `${lastBatch.product || "macro"}-${termName}-${stamp}.txt`;
       const url = URL.createObjectURL(new Blob([lastBatch.plainText], { type:"text/plain;charset=utf-8" }));
       const a = document.createElement("a"); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
     }
@@ -885,7 +1003,8 @@
     }
     async function loadVersion() {
       try {
-        const d = await fetch("/api/version").then((r) => r.json());
+        const product = $("versionProductInput").value;
+        const d = await fetch(`/api/version?product=${encodeURIComponent(product)}`).then((r) => r.json());
         $("versionInput").value=d.version||""; $("urlInput").value=d.url||""; $("shaInput").value=d.sha256||"";
         $("sigInput").value=d.sig||""; $("changelogInput").value=d.changelog||"";
       } catch { toast("버전 정보를 불러오지 못했습니다.", "error"); }
@@ -894,7 +1013,9 @@
       try {
         const r = await fetch("/api/version", { method:"POST", headers:headers(), body:JSON.stringify({
           version:$("versionInput").value.trim(), url:$("urlInput").value.trim(),
-          sha256:$("shaInput").value.trim(), sig:$("sigInput").value.trim(), changelog:$("changelogInput").value
+          sha256:$("shaInput").value.trim(), sig:$("sigInput").value.trim(), changelog:$("changelogInput").value,
+          // 제품을 안 보내면 일반 기록을 덮어써서 일반 사용자에게 프로 설치본이 내려간다.
+          product:$("versionProductInput").value
         }) });
         const d=await r.json(); if (!r.ok || !d.success) throw new Error(d.message||"저장 실패"); toast(d.message);
       } catch (error) { toast(error.message,"error"); }
@@ -931,6 +1052,7 @@
       if (button) setIssueMode(button.dataset.mode);
     });
     ["daysInput","countInput","batchNameInput"].forEach((id) => $(id).addEventListener("input", updateIssuePreview));
+    $("productInput").addEventListener("change", updateIssuePreview);
     $("batchIssueButton").addEventListener("click", issueBatch);
     $("showLastButton").addEventListener("click", showBatchResult);
     $("closeResultButton").addEventListener("click", () => $("resultModal").classList.remove("show"));
@@ -938,6 +1060,11 @@
     $("downloadResultButton").addEventListener("click", downloadResult);
     $("licenseTable").addEventListener("click", handleRowAction);
     ["searchInput","statusFilter","batchFilter"].forEach((id) => $(id).addEventListener(id === "searchInput" ? "input" : "change", renderTable));
+    $("productTabs").addEventListener("click", (event) => {
+      const button = event.target.closest(".status-tab");
+      if (!button) return;
+      setProductScope(button.dataset.product);
+    });
     $("statusTabs").addEventListener("click", (event) => {
       const button = event.target.closest(".status-tab");
       if (!button) return;
@@ -960,7 +1087,13 @@
       if (!action || !item) return;
       const id = item.dataset.batchFilter;
       if (action.dataset.action === "copy") {
-        const keys = licenses.filter((license) => batchKey(license) === id && license.status === "pending").map((license) => license.key);
+        // ⚠️ 제품 필터를 반드시 함께 본다. batchKey 는 batchId 가 없으면 배치명으로
+        // 떨어지는데, 단건 발급은 배치명이 전부 같아서 제품이 다른 키까지 한 덩어리가
+        // 된다 → 자판기에 mAuto 재고를 넣는다고 복사했는데 mPause 키가 섞여 나간다.
+        // 요약 카드의 개수도 같은 필터로 세므로 '보이는 수 = 복사되는 수'가 유지된다.
+        const keys = licenses.filter((license) =>
+          batchKey(license) === id && license.status === "pending" && matchesProductScope(license)
+        ).map((license) => license.key);
         try { await copyText(keys.join("\n")); toast(`${keys.length}개 대기 키를 복사했습니다.`); }
         catch (error) { toast(error.message, "error"); }
         return;
@@ -972,11 +1105,17 @@
     });
     $("clearFilterButton").addEventListener("click", () => {
       $("searchInput").value=""; $("statusFilter").value=""; $("batchFilter").value="";
+      // 제품 탭도 함께 되돌린다. 한쪽만 풀면 제목은 "전체 라이선스"인데 목록과
+      // '현재 목록 키 복사'는 한 제품만 나오는 상태가 된다(전체 백업인 줄 알고 복사).
+      setProductScope("all");
       setLicenseScope("all");
     });
     $("migrationPreviewButton").addEventListener("click", previewMigration);
     $("migrationApplyButton").addEventListener("click", applyMigration);
     $("versionSaveButton").addEventListener("click", saveVersion);
+    $("proSettingsSaveButton").addEventListener("click", () => saveProSettings().catch((e) => toast(e.message,"error")));
+    // 제품을 바꾸면 그 제품의 현재 등록값을 다시 불러온다(다른 제품 값을 보고 덮어쓰지 않게).
+    $("versionProductInput").addEventListener("change", () => loadVersion().catch(() => {}));
     $("resultModal").addEventListener("click", (event) => {
       if (event.target === $("resultModal")) $("resultModal").classList.remove("show");
     });

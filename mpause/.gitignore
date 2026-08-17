@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.build/
+*.dist/
+*.onefile-build/
+license.key
+startup_error.log
+.pytest_cache/

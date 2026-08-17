@@ -269,6 +269,19 @@ def main() -> None:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
+    # 지난 실행이 비정상으로 끝나(작업 관리자 강제 종료·크래시·설치 프로그램의 강제
+    # 닫기) 정지된 채 남은 게 있으면 **UI 를 만들기 전에** 되살린다. 프로세스 안의
+    # 방어(워커 finally / 창 닫기 / atexit)는 그 경로들에서 하나도 돌지 않는다.
+    # 권한을 먼저 켜는 순서가 중요하다 — 그래야 되살릴 수 있는 범위가 정지시킬 때와 같다.
+    try:
+        from macroapp import ledger, winproc
+
+        winproc.enable_debug_privilege()
+        ledger.recover()
+    except Exception:
+        # 복구가 시작을 막으면 안 된다(막히면 사용자는 손쓸 방법이 없다).
+        pass
+
     background_experiment = background_experiment_requested()
     foreground_before = 0
     if background_experiment and win32gui is not None:

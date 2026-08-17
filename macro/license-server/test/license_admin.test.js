@@ -20,7 +20,28 @@ test("발급 입력은 기간·수량·메모 한도를 강제한다", () => {
   assert.equal(normalizeBatchInput({ days: 30, count: 100, requestId: "abcdefgh" }).count, 100);
   assert.deepEqual(
     normalizeBatchInput({ hours: 3, count: 10, requestId: "hourbatch001" }),
-    { days:0, hours:3, count:10, requestId:"hourbatch001", batchName:"", memo:"" }
+    { days:0, hours:3, count:10, requestId:"hourbatch001", batchName:"", memo:"", product:"macro" }
+  );
+  // 제품을 지정하지 않으면 기존과 같이 mAuto("macro") 키가 나온다(하위 호환).
+  assert.equal(normalizeBatchInput({ days: 30, count: 1, requestId: "prodbatch001" }).product, "macro");
+  assert.equal(
+    normalizeBatchInput({ days: 30, count: 1, requestId: "prodbatch002", product: "mPause" }).product,
+    "mpause"
+  );
+  // 구분자 주입은 물론이고, 형식은 맞지만 **아는 제품이 아닌 값**도 막아야 한다.
+  // 오타로 발급된 키는 어느 앱에서도 안 열리는데 그걸 고객이 먼저 발견하게 된다.
+  assert.throws(
+    () => normalizeBatchInput({ days: 30, count: 1, requestId: "prodbatch003", product: "bad|inject" }),
+    /발급할 수 없는 제품/
+  );
+  assert.throws(
+    () => normalizeBatchInput({ days: 30, count: 1, requestId: "prodbatch004", product: "macropro" }),
+    /발급할 수 없는 제품/
+  );
+  // 프로는 아직 클라이언트가 없지만 재고를 미리 만들 수 있어야 한다.
+  assert.equal(
+    normalizeBatchInput({ days: 30, count: 1, requestId: "prodbatch005", product: "macro_pro" }).product,
+    "macro_pro"
   );
   assert.throws(() => normalizeBatchInput({ hours: 25, count: 1, requestId: "hourbatch002" }), /1~24시간/);
   assert.throws(() => normalizeBatchInput({ days: 1, hours: 3, count: 1, requestId: "hourbatch003" }), /동시에/);

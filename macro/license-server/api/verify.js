@@ -4,6 +4,8 @@ const admin = require("firebase-admin");
 const sec = require("../lib/security");
 const { sendSignedVerdict } = require("../lib/licenseSign");
 const { verifyAndActivateLicense } = require("../lib/license_service");
+const { isValidProduct, normalizeProduct } = require("../lib/product");
+const { autoExitRatioAppliesTo, readAutoExitRatio } = require("../lib/pro_settings");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -38,6 +40,12 @@ module.exports = async function handler(req, res) {
   if (typeof nonce !== "string" || !/^[0-9a-f]{8,64}$/.test(nonce)) {
     return res.status(400).json({ valid: false, message: "요청 형식이 올바르지 않습니다." });
   }
+  // product가 없으면 구버전 mAuto 클라이언트다 → v1 서명 + product "macro"로 취급.
+  // 있으면 v2 서명에 묶어, 다른 제품 키로의 교차 사용을 차단한다.
+  const product = normalizeProduct(req.body && req.body.product);
+  if (product && !isValidProduct(product)) {
+    return res.status(400).json({ valid: false, message: "요청 형식이 올바르지 않습니다." });
+  }
 
   const ip = sec.getClientIp(req);
   const rl = await sec.rateLimit(db, { bucket: "verify", ip, max: 20, windowMs: 60000 });
@@ -49,7 +57,7 @@ module.exports = async function handler(req, res) {
   }
 
   const denied = (message) =>
-    sendSignedVerdict(res, { verdict: "invalid", hwid, nonce, exp: 0, message });
+    sendSignedVerdict(res, { verdict: "invalid", hwid, nonce, exp: 0, message, product });
 
   try {
     // Firestore가 할당량 소진 등으로 멈추면 무한 재시도로 함수가 300초 행이 된다
@@ -60,19 +68,42 @@ module.exports = async function handler(req, res) {
         db,
         key,
         hwid,
+        product,
         timestampFromMillis,
       }),
       VERIFY_DB_TIMEOUT_MS,
       "license verification"
     );
     if (!result.valid) return denied(result.message);
+    // 프로 문서면 운영 설정(0:2 자동 종료 비율)을 실어 보낸다. 서명 밖 참고값이라
+    // 읽기 실패가 인증을 막으면 안 된다 — 필드가 없으면 클라이언트가 내장 기본값
+    // (40%)으로 동작한다(fail-safe). 판정 기준은 요청이 아니라 **문서의 제품**이다.
+    let extra;
+    if (autoExitRatioAppliesTo(result.product)) {
+      try {
+        extra = {
+          auto_exit_ratio: await sec.withTimeout(
+            readAutoExitRatio(db),
+            2000,
+            "pro settings read"
+          ),
+        };
+      } catch (err) {
+        console.error("Pro settings read error:", err);
+      }
+    }
     return sendSignedVerdict(res, {
       verdict: "valid",
       hwid,
       nonce,
       exp: Math.floor(result.signatureExpiresAt / 1000),
       message: result.message,
-    });
+      // ⚠️ v1/v2 는 **요청에 product 가 있었는지**로 갈린다(구버전 클라이언트 보호).
+      // v2 로 서명할 때는 요청한 제품이 아니라 **문서의 제품**을 넣는다 — 그래야
+      // 프로 키로 일반 요청을 만족시킨 경우 클라이언트가 티어를 읽을 수 있고,
+      // 그 티어가 서명에 묶여 위조가 불가능해진다.
+      product: product ? result.product || product : "",
+    }, extra);
   } catch (err) {
     console.error("License verify error:", err);
     if (sec.isTransientStoreError(err)) {

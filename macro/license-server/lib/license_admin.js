@@ -7,6 +7,13 @@ const {
   getLicenseLifecycle,
   isCanonicalLicenseKey,
 } = require("./license_lifecycle");
+const {
+  DEFAULT_PRODUCT,
+  ISSUABLE_PRODUCTS,
+  isIssuableProduct,
+  licenseProductOf,
+  normalizeProduct,
+} = require("./product");
 
 const MAX_BATCH_COUNT = 100;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -45,6 +52,8 @@ function normalizeBatchInput(body) {
   const requestId = String(body?.requestId || "").trim();
   const batchName = String(body?.batchName || "").trim();
   const memo = String(body?.memo || "").trim();
+  // 어느 앱 전용 키인지. 지정하지 않으면 기존과 같이 mAuto("macro") 키가 나온다.
+  const product = normalizeProduct(body?.product) || DEFAULT_PRODUCT;
 
   if (!Number.isInteger(count) || count < 1 || count > MAX_BATCH_COUNT) {
     throw new LicenseInputError(`발급 수량은 1~${MAX_BATCH_COUNT}개여야 합니다.`);
@@ -54,7 +63,14 @@ function normalizeBatchInput(body) {
   }
   if (batchName.length > 80) throw new LicenseInputError("배치명은 80자 이하여야 합니다.");
   if (memo.length > 200) throw new LicenseInputError("메모는 200자 이하여야 합니다.");
-  return { days, hours, count, requestId, batchName, memo };
+  // 발급은 아는 제품만. 오타(예: "macropro")로 만든 키는 어느 앱에서도 안 열리는데,
+  // 그 사실이 고객 손에 들어가기 전까지 드러나지 않는다.
+  if (!isIssuableProduct(product)) {
+    throw new LicenseInputError(
+      `발급할 수 없는 제품입니다. (${ISSUABLE_PRODUCTS.join(", ")})`
+    );
+  }
+  return { days, hours, count, requestId, batchName, memo, product };
 }
 
 async function issueLicenseBatch({
@@ -80,6 +96,7 @@ async function issueLicenseBatch({
         term: term.termText({ days, hours }),
         count: data.count,
         batchName: data.batchName || "",
+        product: normalizeProduct(data.product) || DEFAULT_PRODUCT,
         keys: Array.isArray(data.keys) ? data.keys : [],
         repeated: true,
       };
@@ -106,6 +123,7 @@ async function issueLicenseBatch({
           memo: normalized.memo,
           batchId: normalized.requestId,
           batchName: normalized.batchName,
+          product: normalized.product,
         })
       );
     }
@@ -115,6 +133,7 @@ async function issueLicenseBatch({
       count: keys.length,
       batchName: normalized.batchName,
       memo: normalized.memo,
+      product: normalized.product,
       keys,
       createdAt: issuedAt,
     });
@@ -126,6 +145,7 @@ async function issueLicenseBatch({
       term: term.termText(normalized),
       count: keys.length,
       batchName: normalized.batchName,
+      product: normalized.product,
       keys,
       repeated: false,
     };
@@ -155,6 +175,7 @@ function serializeLicenseForAdmin(key, data, now = Date.now()) {
     discordId: data.discordId || "",
     batchId: data.batchId || "",
     batchName: data.batchName || "",
+    product: licenseProductOf(data),
   };
 }
 

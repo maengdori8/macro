@@ -106,6 +106,10 @@ def _report_startup_failure(exc: BaseException) -> None:
 
 def main() -> None:
     try:
+        # ⚠️ 라이센스 확인·UI 보다 **먼저** 제품을 정한다(macroapp/edition.py).
+        from macroapp import edition
+        edition.set_product(edition.PRODUCT_STANDARD)
+
         from macroapp.app import main as app_main
         app_main()
     except SystemExit:

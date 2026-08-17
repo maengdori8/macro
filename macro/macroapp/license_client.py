@@ -11,6 +11,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from macroapp import edition
+
 try:
     import ed25519_tiny
 except Exception:  # noqa: BLE001 - 서명 검증 모듈이 없으면 아래에서 fail-closed 처리합니다.
@@ -30,14 +32,48 @@ LICENSE_FILE = "license.key"
 # 이 공개키는 업데이트 서명 키(launcher)와 별개다(용도 분리 → 한쪽이 뚫려도 파급 차단).
 LICENSE_PUBKEY_HEX = "2e8a3100a9a778f9f9a2486689cc1588096a74564de9e15746e76ae7f4703ddd"
 LICENSE_MESSAGE_PREFIX = "license-v1"
+LICENSE_MESSAGE_PREFIX_V2 = "license-v2"
 # 응답이 이 시간(초)보다 늦게 만료되면 정상으로 본다(서명된 exp 기준, 시계 왜곡 여유 없음).
 _LICENSE_MIN_REMAINING_SECONDS = 0
 
+# ─── 제품 ───
+# 이 실행 파일이 어느 제품인지는 진입점이 정한다(macroapp/edition.py).
+# 일반 빌드는 "macro", 프로 빌드는 "macro_pro" 로 요청하고, 그에 맞는 후보로만
+# 서명을 검증한다. 값을 여기 상수로 박으면 두 빌드가 같은 제품이 돼 버린다.
+TIER_PRO = edition.PRODUCT_PRO
 
-def _license_message(verdict: str, hwid: str, nonce: str, exp: int) -> bytes:
-    """서버가 서명하고 클라이언트가 검증하는 정규 메시지. 필드는 전부 [0-9a-z|] 뿐이라
-    구분자 주입이 불가능하다(hwid/nonce=hex, verdict=고정어, exp=정수)."""
+
+def _license_message(
+    verdict: str, hwid: str, nonce: str, exp: int, product: str = ""
+) -> bytes:
+    """서버가 서명하고 클라이언트가 검증하는 정규 메시지.
+
+    product 가 있으면 v2, 없으면 v1(구버전 서버 호환). 필드는 전부 [0-9a-z|_-] 뿐이라
+    구분자 주입이 불가능하다(hwid/nonce=hex, verdict=고정어, exp=정수, product=제한 문자).
+    """
+    if product:
+        return (
+            f"{LICENSE_MESSAGE_PREFIX_V2}|{product}|{verdict}|{hwid}|{nonce}|{int(exp)}"
+        ).encode("utf-8")
     return f"{LICENSE_MESSAGE_PREFIX}|{verdict}|{hwid}|{nonce}|{int(exp)}".encode("utf-8")
+
+
+def _parse_auto_exit_ratio(value) -> Optional[float]:
+    """서버가 내려준 0:2 자동 종료 비율(운영값). 불량이면 None(내장 기본값 유지).
+
+    ⚠️ 이 필드는 서명에 **안 묶인다**. v2 메시지에 필드를 추가하면 배포된 클라이언트가
+    전부 검증에 실패해서다. 위조로 얻는 것도 '자기 종료 비율 조절'뿐이라 신뢰 판정과
+    무관하다 — 대신 범위 밖 값은 버리고(fail-safe), 티어가 서명으로 확인된 프로 응답
+    에서만 읽는다(verify_signed_response 참고).
+    """
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    # NaN/inf 는 비교가 False 라 여기서 함께 걸린다.
+    if not (0.0 <= ratio <= 1.0):
+        return None
+    return ratio
 
 
 def verify_signed_response(
@@ -83,24 +119,46 @@ def verify_signed_response(
         return {**reject, "message": "응답 nonce 불일치(재전송 의심)."}
     if not secrets.compare_digest(resp_hwid, str(hwid)):
         return {**reject, "message": "응답 기기 정보 불일치."}
-    if not ed25519_tiny.verify(_license_message(verdict, resp_hwid, resp_nonce, exp), sig, pub):
+    # 어느 제품(=티어)으로 서명됐는지 맞춰 본다. 상위 티어부터 시도하고, 마지막에
+    # v1(제품 없음)까지 본다 — 서버를 롤백해도 정품 사용자가 막히지 않게.
+    # ⚠️ 변수 이름을 message 로 쓰면 안 된다 — 위에서 읽어 둔 서버 문구를 가려서
+    # 사용자에게 서명 바이트가 그대로 보인다.
+    matched_product = None
+    for candidate in edition.signature_candidates():
+        signed = _license_message(verdict, resp_hwid, resp_nonce, exp, candidate)
+        if ed25519_tiny.verify(signed, sig, pub):
+            # 빈 후보(v1)로 검증됐다면 제품 정보가 없는 옛 서명이다 → 이 빌드의 제품으로 본다.
+            matched_product = candidate or edition.product_id()
+            break
+    if matched_product is None:
         return {**reject, "message": "서명이 유효하지 않습니다."}
 
     # 서명이 확인된 verdict가 최종 판정이다. valid 필드는 참고용일 뿐 신뢰하지 않는다.
     if verdict != "valid":
         return {"valid": False, "message": message or "유효하지 않은 라이센스입니다.",
-                "remaining_seconds": 0, "days": 0}
+                "remaining_seconds": 0, "days": 0, "product": matched_product,
+                "pro": False}
 
     current = time.time() if now is None else now
     remaining = int(exp - current)
     if remaining <= _LICENSE_MIN_REMAINING_SECONDS:
-        return {"valid": False, "message": "만료된 라이센스입니다.", "remaining_seconds": 0, "days": 0}
+        return {"valid": False, "message": "만료된 라이센스입니다.", "remaining_seconds": 0,
+                "days": 0, "product": matched_product, "pro": False}
 
+    pro = matched_product == TIER_PRO
     return {
         "valid": True,
         "message": message or "유효한 라이센스입니다.",
         "remaining_seconds": remaining,
         "days": max(1, (remaining + 86399) // 86400),
+        # 티어는 **서명으로 확인된 제품**에서만 나온다(응답 필드는 안 본다).
+        "product": matched_product,
+        "pro": pro,
+        # 운영값(서명 밖) — 티어가 서명으로 프로임이 확인됐을 때만 읽는다.
+        # 일반 티어 응답에 끼워 넣어도 무시된다.
+        "auto_exit_ratio": (
+            _parse_auto_exit_ratio(response.get("auto_exit_ratio")) if pro else None
+        ),
     }
 
 # HWID는 머신마다 고정이므로 1회만 계산해 캐시합니다(매 30초 WMIC 서브프로세스 제거).
@@ -251,7 +309,11 @@ def verify_license_server(key: str, hwid: str) -> dict:
     """
     nonce = secrets.token_hex(16)
     try:
-        data = _json.dumps({"key": key, "hwid": hwid, "nonce": nonce}).encode("utf-8")
+        # product 를 보내면 서버가 v2(제품이 묶인) 서명을 준다. 프로 키는 이 요청도
+        # 만족시키고, 서명에는 문서의 실제 제품이 들어와 티어를 알 수 있다.
+        data = _json.dumps(
+            {"key": key, "hwid": hwid, "nonce": nonce, "product": edition.product_id()}
+        ).encode("utf-8")
         req = urllib.request.Request(
             VERIFY_SERVER_URL,
             data=data,

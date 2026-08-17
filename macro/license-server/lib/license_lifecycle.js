@@ -2,6 +2,7 @@
 
 const crypto = require("crypto");
 const term = require("./licenseTerm");
+const { DEFAULT_PRODUCT, normalizeProduct } = require("./product");
 
 const DAY_MS = term.MS_PER_DAY;
 const HOUR_MS = term.MS_PER_HOUR;
@@ -114,6 +115,7 @@ function buildPendingLicenseDocument({
   batchId = "",
   batchName = "",
   maxHwids = 3,
+  product = DEFAULT_PRODUCT,
 }) {
   const issuedTimestamp = timestampFromMillis(issuedAt);
   return {
@@ -131,6 +133,8 @@ function buildPendingLicenseDocument({
     hwids: [],
     maxHwids,
     discordId: "",
+    // 어느 앱 전용 키인지. 값이 없는 기존 문서는 "macro"(mAuto)로 해석된다.
+    product: normalizeProduct(product) || DEFAULT_PRODUCT,
   };
 }
 

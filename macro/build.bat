@@ -76,7 +76,7 @@ rem Syntax gate before the slow compile. cmd does not expand wildcards,
 rem so use compileall (handles directories) instead of py_compile.
 rem (NOTE: keep this comment ASCII - cmd misparses some UTF-8 Korean in :: comments)
 echo 문법 검사 중...
-python -m compileall -q macroapp macro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py check_cv2_headless.py
+python -m compileall -q macroapp macro_main.py macro_pro_main.py launcher.py gamepad_test.py ed25519_tiny.py sign_release.py check_cv2_headless.py
 if %errorlevel% neq 0 (
     echo [오류] 문법 검사 실패. 빌드를 중단합니다.
     pause
@@ -89,9 +89,15 @@ rem running it LOCKS the file, del fails, Nuitka cannot overwrite, and the old e
 rem passes the "if exist" checks below -> stale (e.g. pre-headless cv2) gets shipped.
 rem So: try to kill it, then ABORT LOUDLY if it still cannot be removed.
 taskkill /f /im macro.exe >nul 2>&1
+taskkill /f /im macro_pro.exe >nul 2>&1
+taskkill /f /im launcher_pro.exe >nul 2>&1
 taskkill /f /im launcher.exe >nul 2>&1
 taskkill /f /im gamepad_test.exe >nul 2>&1
 if exist "dist\macro_app" rmdir /s /q "dist\macro_app"
+if exist "dist\macro_pro_app" rmdir /s /q "dist\macro_pro_app"
+if exist "dist\macro_pro_main.dist" rmdir /s /q "dist\macro_pro_main.dist"
+if exist "dist\macro_pro_setup.exe" del /f /q "dist\macro_pro_setup.exe"
+if exist "dist\launcher_pro.exe" del /f /q "dist\launcher_pro.exe"
 if exist "dist\macro_main.dist" rmdir /s /q "dist\macro_main.dist"
 if exist "dist\macro" rmdir /s /q "dist\macro"
 if exist "dist\macro.exe" del /f /q "dist\macro.exe"
@@ -145,7 +151,45 @@ if exist "dist\macro_main.dist\macro.exe" ren "dist\macro_main.dist" "macro_app"
 if not exist "dist\macro_app\macro.exe" if exist "dist\macro\macro.exe" ren "dist\macro" "macro_app"
 
 echo.
-echo [2/3] launcher.exe 빌드 중...
+echo [2/5] 프로 빌드 준비 중 (런처 상수 주입)...
+rem 런처는 소스가 하나다. 프로용은 제품 식별자와 실행 대상만 바꿔 생성한다.
+rem 이렇게 해야 업데이트 확인이 제품별 기록을 보고, 프로 런처가 프로 exe 를 띄운다.
+python -c "import pathlib; t=pathlib.Path('launcher.py').read_text(encoding='utf-8'); t=t.replace('LAUNCHER_PRODUCT = \"\"','LAUNCHER_PRODUCT = \"macro_pro\"').replace('TARGET_EXE = \"macro.exe\"','TARGET_EXE = \"macro_pro.exe\"'); pathlib.Path('launcher_pro.py').write_text(t,encoding='utf-8')"
+if %errorlevel% neq 0 (
+    echo [오류] 프로 런처 생성 실패. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+python -c "import sys,pathlib; t=pathlib.Path('launcher_pro.py').read_text(encoding='utf-8'); sys.exit(0 if 'LAUNCHER_PRODUCT = \"macro_pro\"' in t and 'TARGET_EXE = \"macro_pro.exe\"' in t else 1)"
+if %errorlevel% neq 0 (
+    echo [오류] 프로 런처에 상수가 주입되지 않았습니다. 빌드를 중단합니다.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [3/5] macro_pro 빌드 중 (프로 전용 기능 포함)...
+python -m nuitka --standalone --assume-yes-for-downloads ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --output-dir=dist --output-filename=macro_pro.exe ^
+  --windows-console-mode=disable --windows-uac-admin ^
+  --enable-plugin=tk-inter ^
+  --include-package=macroapp ^
+  --include-module=winocr ^
+  --include-package=winrt ^
+  --include-data-dir="%VGAMEPAD_DIR%\win=vgamepad\win" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x64\ViGEmClient.dll=vgamepad\win\vigem\client\x64\ViGEmClient.dll" ^
+  --include-data-files="%VGAMEPAD_DIR%\win\vigem\client\x86\ViGEmClient.dll=vgamepad\win\vigem\client\x86\ViGEmClient.dll" ^
+  macro_pro_main.py
+if exist "dist\macro_pro_main.dist\macro_pro.exe" ren "dist\macro_pro_main.dist" "macro_pro_app"
+if not exist "dist\macro_pro_app\macro_pro.exe" (
+    echo macro_pro 빌드 실패!
+    pause
+    exit /b 1
+)
+
+echo.
+echo [4/5] launcher.exe 빌드 중...
 python -m nuitka --onefile --assume-yes-for-downloads ^
   --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
   --output-dir=dist --output-filename=launcher.exe ^
@@ -155,6 +199,17 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
 if not exist "dist\launcher.exe" (
     echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
     python -m PyInstaller --onefile --noconsole --uac-admin --name launcher --hidden-import ed25519_tiny launcher.py
+)
+
+python -m nuitka --onefile --assume-yes-for-downloads ^
+  --lto=no --jobs=%NUMBER_OF_PROCESSORS% --remove-output --python-flag=-OO ^
+  --output-dir=dist --output-filename=launcher_pro.exe ^
+  --windows-console-mode=disable --windows-uac-admin ^
+  --include-module=ed25519_tiny ^
+  launcher_pro.py
+if not exist "dist\launcher_pro.exe" (
+    echo [경고] Nuitka 빌드 실패 - PyInstaller로 폴백합니다.
+    python -m PyInstaller --onefile --noconsole --uac-admin --name launcher_pro --hidden-import ed25519_tiny launcher_pro.py
 )
 
 echo.
@@ -192,7 +247,7 @@ if not exist "dist\launcher.exe" (
 )
 
 echo.
-echo [3/3] 설치 파일 생성 중...
+echo [5/5] 설치 파일 생성 중...
 :: 경로에 (x86) 같은 괄호가 있으면 if-블록 안에서 cmd가 오파싱하므로
 :: 괄호 블록을 쓰지 않고 한 줄 if로 처리합니다.
 set "ISCC_PATH="
@@ -213,15 +268,18 @@ if not defined ISCC_PATH (
 )
 
 "%ISCC_PATH%" setup.iss
+"%ISCC_PATH%" setup_pro.iss
 
 if exist "dist\macro_setup.exe" (
     echo.
     echo ===== 빌드 완료 =====
-    echo 설치 파일: dist\macro_setup.exe
+    echo 설치 파일: dist\macro_setup.exe ^(일반^)
+    if exist "dist\macro_pro_setup.exe" echo             dist\macro_pro_setup.exe ^(프로^)
     for %%A in ("dist\macro_setup.exe") do echo 크기: %%~zA bytes
     echo.
     echo [배포 절차] GitHub Release에 dist\macro_setup.exe 업로드 후:
-    echo    python sign_release.py "<업로드된 다운로드 URL>"
+    echo    python sign_release.py "<일반 다운로드 URL>"
+    echo    python sign_release.py --product macro_pro "<프로 다운로드 URL>"
     echo 출력된 version/url/sha256/sig 네 값을 admin 패널에 등록하세요.
     echo ^(ADMIN_KEY 환경변수 설정 시 --post 옵션으로 자동 등록 가능^)
 ) else (
