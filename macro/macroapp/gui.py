@@ -188,6 +188,7 @@ class AutomationApp:
         "accent_active": "#4F46E5",
         "accent_hover": "#7169FF",
         "accent_soft": "#7CD9F5",   # 수치·링크용 보조 강조
+        "accent_fg": "#FFFFFF",     # 강조색 면 위에 올라가는 글자색
         "disabled": "#1C2230",
         "disabled_text": "#4E5769",
         "ok": "#34D399",
@@ -197,6 +198,27 @@ class AutomationApp:
         "warn": "#FBBF24",
         "warn_bg": "#2E2410",
     }
+
+    # 프로 전용 팔레트 — 같은 뉴트럴 다크 위에 강조색만 샴페인 골드로 바꾼다.
+    # 레이아웃·구조는 일반과 동일하게 두고 색으로만 '상위 제품'을 구분한다
+    # (구조가 갈리면 두 빌드의 레이아웃 테스트·유지보수가 두 배가 된다).
+    # ⚠️ 골드 면 위의 흰 글자는 대비가 무너진다 → accent_fg 를 진한 색으로 함께 바꾼다.
+    PRO_COLORS = {
+        "accent": "#D2A64A",
+        "accent_active": "#B8893A",
+        "accent_hover": "#E0B95F",
+        "accent_soft": "#E9D3A0",
+        "accent_fg": "#171204",
+    }
+
+    @classmethod
+    def palette(cls) -> dict:
+        """이 빌드(에디션)의 팔레트. LicenseDialog 도 이걸 써서 첫인상을 통일한다."""
+
+        colors = dict(cls.COLORS)
+        if edition.is_pro():
+            colors.update(cls.PRO_COLORS)
+        return colors
 
     def __init__(
         self,
@@ -208,6 +230,9 @@ class AutomationApp:
         license_info: Optional[dict] = None,
     ):
         self.root = root
+        # 에디션 팔레트를 인스턴스에 고정한다(프로=골드). 클래스 속성을 직접 바꾸면
+        # 한 프로세스에서 두 에디션을 만드는 테스트가 서로를 오염시킨다.
+        self.COLORS = self.palette()
         self.license_key = license_key
         self.preview = bool(preview)
         self.start_hidden = bool(start_hidden)
@@ -244,7 +269,7 @@ class AutomationApp:
         # 이중 공급하지 않게, 워커마다 세대 번호를 준다(불일치 시 즉시 종료).
         self._ocr_generation = 0
 
-        self.root.title("mAuto")
+        self.root.title(edition.display_name())
         # LicenseDialog가 고정 크기로 만든 root를 재사용하므로 리사이즈를 다시 허용합니다.
         self.root.resizable(True, True)
         # 1366x768 같은 작은 화면에서도 하단 시작/정지 버튼이 잘리지 않게 높이를 화면에 맞춥니다.
@@ -575,7 +600,7 @@ class AutomationApp:
 
         c = self.COLORS
         palettes = {
-            "primary": (c["accent"], c["accent_hover"], "#FFFFFF"),
+            "primary": (c["accent"], c["accent_hover"], c["accent_fg"]),
             "ghost": (c["input"], c["row_hover"], c["text"]),
             "danger": (c["input"], c["danger_bg"], c["danger"]),
         }
@@ -635,7 +660,7 @@ class AutomationApp:
                 selected = value == current
                 label.configure(
                     bg=c["accent"] if selected else c["input"],
-                    fg="#FFFFFF" if selected else c["muted"],
+                    fg=c["accent_fg"] if selected else c["muted"],
                 )
 
         def choose(value: str) -> None:
@@ -898,17 +923,27 @@ class AutomationApp:
         )
         mark.pack(side=tk.LEFT)
         self._round_rect(mark, 1, 1, 33, 33, 10, fill=c["accent"], outline="")
-        mark.create_text(17, 17, text="M", fill="#FFFFFF", font=self._font(13, bold=True))
+        mark.create_text(17, 17, text="M", fill=c["accent_fg"], font=self._font(13, bold=True))
         brand_text = tk.Frame(brand, bg=c["sidebar"])
         brand_text.pack(side=tk.LEFT, padx=(11, 0))
+        name_row = tk.Frame(brand_text, bg=c["sidebar"])
+        name_row.pack(anchor=tk.W)
         tk.Label(
-            brand_text,
+            name_row,
             text="mAuto",
             bg=c["sidebar"],
             fg=c["text"],
             font=self._font(13, bold=True),
-            anchor=tk.W,
-        ).pack(anchor=tk.W)
+        ).pack(side=tk.LEFT)
+        if edition.is_pro():
+            # 골드 외곽선 칩 — 면을 채우지 않아야 배지가 아니라 각인처럼 보인다.
+            chip = tk.Canvas(
+                name_row, width=36, height=17,
+                bg=c["sidebar"], highlightthickness=0, bd=0,
+            )
+            chip.pack(side=tk.LEFT, padx=(8, 0), pady=(2, 0))
+            self._round_rect(chip, 1, 1, 35, 16, 7, fill="", outline=c["accent"])
+            chip.create_text(18, 9, text="PRO", fill=c["accent"], font=self._font(7, bold=True))
         tk.Label(
             brand_text,
             text="FC ONLINE",
@@ -1116,22 +1151,11 @@ class AutomationApp:
         )
         self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        # 프로 전용 — 경기 도중 한 번에 정리하고 다음 경기로 넘어간다.
-        # ⚠️ **프로 빌드에만 만든다.** 일반 빌드에는 버튼이 아예 없다(있는데 잠근 게
-        # 아니라 없다). 일반 프로그램에는 이 기능이 들어가지 않는 게 제품 구분의 핵심이다.
-        #
-        # ⚠️ **같은 줄에** 넣는다. 오른쪽 열의 세로 예산이 빠듯해서 줄을 하나 더
-        # 쓰면(버튼이든 안내 라벨이든) 세션 패널이 그만큼 눌려 값 라벨이 잘린다
-        # (실측: 한 줄 = 32px, 세션 패널 여유 = 17px). 창을 키워 해결하면 안 된다 —
-        # 1366x768 노트북에서 창이 화면보다 커진다. 상태는 버튼 글자와 로그로 알린다.
+        # 즉시 종료 **버튼은 없다** — 2점차 자동 종료가 이 기능의 유일한 트리거다
+        # (사용자 결정: 자동화됐으니 수동 버튼 제거). run_quick_exit 는 자동 경로가
+        # 그대로 쓰므로 남긴다. exit_button 속성은 '항상 None' 으로 유지한다 —
+        # 티어 테스트들이 "버튼이 없다"를 이 속성으로 확인한다.
         self.exit_button = None
-        if edition.is_pro():
-            self.exit_button = self._button(
-                button_row, "즉시 종료", self.run_quick_exit, tone="ghost"
-            )
-            self.exit_button.pack(side=tk.LEFT, padx=(5, 0))
-            # 라이센스 확인 전에는 잠근 상태로 태어난다(fail-closed).
-            self._set_accent_button_state(self.exit_button, enabled=False)
 
         settings_panel = self._panel(right_column, "기본 설정")
         settings_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
@@ -5548,8 +5572,6 @@ class AutomationApp:
 
         # 프로 빌드가 아니면 이 기능 자체가 없다(버튼도 없다).
         self._is_pro = bool(sr.get("pro")) and edition.is_pro()
-        if self.exit_button is not None:
-            self._set_accent_button_state(self.exit_button, enabled=self._is_pro)
         self._apply_auto_exit_ratio(sr)
 
     def _apply_auto_exit_ratio(self, sr: dict) -> None:
@@ -5678,12 +5700,8 @@ class AutomationApp:
         # 자동화 루프를 재운다. 여기서 세우지 않으면 정지된 화면을 계속 재매칭하고,
         # 재개 직후 확인 버튼을 자동화와 마무리 단계가 동시에 누른다.
         self._exit_gate.set()
-        if self.exit_button is not None:
-            self._set_accent_button_state(self.exit_button, enabled=False)
         if not self._exit_runner.start():
             self._exit_gate.clear()
-            if self.exit_button is not None:
-                self._set_accent_button_state(self.exit_button, enabled=True)
             return
         self._poll_exit_events()
 
@@ -5718,8 +5736,6 @@ class AutomationApp:
         if finished:
             # 자동화 루프를 다시 깨운다. 사용자가 시작을 다시 누를 필요가 없다.
             self._exit_gate.clear()
-            if self.exit_button is not None:
-                self._set_accent_button_state(self.exit_button, enabled=self._is_pro)
             return
         self.root.after(100, self._poll_exit_events)
 
@@ -5779,7 +5795,7 @@ class LicenseDialog:
         self.root.resizable(False, False)
 
         # 본 화면(AutomationApp)과 같은 팔레트를 써서 첫인상을 통일합니다.
-        palette = AutomationApp.COLORS
+        palette = AutomationApp.palette()
         bg = palette["bg"]
         panel = palette["panel"]
         border = palette["border"]

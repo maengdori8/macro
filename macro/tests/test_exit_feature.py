@@ -86,13 +86,11 @@ def test_pro_key_in_standard_build_still_unlocks_nothing():
 def test_standard_key_leaves_the_feature_locked(app):
     app._apply_tier({"valid": True, "pro": False})
     assert app._is_pro is False
-    assert str(app.exit_button["state"]) == tk.DISABLED
 
 
 def test_pro_key_unlocks_the_feature(app):
     app._apply_tier({"valid": True, "pro": True})
     assert app._is_pro is True
-    assert str(app.exit_button["state"]) == tk.NORMAL
 
 
 def test_missing_pro_flag_is_treated_as_standard(app):
@@ -145,9 +143,13 @@ def test_response_field_alone_cannot_unlock(app):
 
 
 def test_button_is_locked_before_any_verification(app):
-    """확인 전에는 잠겨 있어야 한다 — 주석만 그렇고 실제로는 열려 있던 적이 있다."""
+    """확인 전에는 잠겨 있어야 하고, 수동 버튼은 프로 빌드에도 **없다**.
+
+    즉시 종료는 2점차 자동 종료로만 실행된다(사용자 결정, 2026-08-17). 버튼이
+    되살아나면 이 테스트가 막는다 — UI 를 고치다 무심코 다시 넣는 사고 방지.
+    """
     assert app._is_pro is False
-    assert str(app.exit_button["state"]) == tk.DISABLED
+    assert app.exit_button is None, "즉시 종료 버튼은 제거됐다(자동 전용)"
 
 
 def test_verified_pro_key_unlocks_without_pressing_start():
@@ -158,7 +160,6 @@ def test_verified_pro_key_unlocks_without_pressing_start():
     )
     try:
         assert instance._is_pro is True
-        assert str(instance.exit_button["state"]) == tk.NORMAL
     finally:
         root.destroy()
 
@@ -172,7 +173,6 @@ def test_expired_license_locks_the_feature(app):
     app.run_quick_exit()
     assert app._exit_runner is None, "만료됐는데 워커가 시작됐다"
     assert app._is_pro is False, "만료 뒤에도 프로가 켜져 있다"
-    assert str(app.exit_button["state"]) == tk.DISABLED
 
 
 @pytest.mark.parametrize(
@@ -183,7 +183,6 @@ def test_failed_reverification_locks_the_tier(app, result):
     app._apply_tier({"valid": True, "pro": True})
     app._after_verify(result)
     assert app._is_pro is False
-    assert str(app.exit_button["state"]) == tk.DISABLED
 
 
 # ─── 0:2 자동 종료 배선 ────────────────────────────────────────────────────
@@ -428,7 +427,6 @@ def test_gate_pauses_the_automation_loop(app, monkeypatch):
     assert started.is_set()
     # drain 이 종료 상태를 올렸으므로 게이트가 풀려 있어야 한다.
     assert not app._exit_gate.is_set(), "끝났는데 자동화 루프가 계속 멈춰 있다"
-    assert str(app.exit_button["state"]) == tk.NORMAL
 
 
 def test_both_threads_check_the_gate():
