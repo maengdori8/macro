@@ -182,38 +182,42 @@ def read_score_from_frame(gray, region_fractions, glyphs=None) -> Reading:
 
 
 class LossTracker:
-    """'0:2 로 지고 있는 경기'를 **경기당 한 번만** 세는 상태 머신.
+    """'상대에게 deficit 점차 이상으로 지고 있는 경기'를 **경기당 한 번만** 세는 상태 머신.
 
     feed(now, reading) 로 관측을 넣으면 이번 관측으로 새 패배가 확정됐을 때만
-    True 를 돌려준다. reading 은 (a,b) / SCORE_UNKNOWN / None. 규칙:
+    True 를 돌려준다. reading 은 (내 점수, 상대 점수) / SCORE_UNKNOWN / None. 규칙:
 
-      * 대상 스코어가 confirm_count 번 **연속** 읽혀야 확정한다.
+      * 열세 스코어(상대−나 >= deficit, 예: 0:2, 0:3, 1:3)가 confirm_count 번
+        **연속** 읽혀야 확정한다. 0:2→0:3 처럼 값이 바뀌어도 열세이기만 하면
+        연속으로 친다(같은 경기가 더 나빠진 것뿐이다).
       * None(스코어보드 없음)과 SCORE_UNKNOWN 은 연속 판정을 깨지 않는다 —
-        리플레이·오버레이로 한두 프레임 가려지는 것은 정상이다. **다른 스코어**가
-        읽히면 그때 깬다.
-      * 같은 경기에서 0:2 가 아닌 스코어(0:0/0:1)가 먼저 읽힌 적이 있어야
-        확정한다. 스코어는 단조 증가라 진짜 0:2 는 반드시 0:0 구간을 지나고,
-        글리프 매칭이 결정적이므로 이 조건이 '정적 화면 하나의 일관 오독'을
-        차단하는 핵심 방어다(적대적 리뷰 확정). 대가: 경기 도중(이미 0:2)에
-        자동화를 켜면 그 경기는 못 센다 — 보수적 방향.
+        리플레이·오버레이로 한두 프레임 가려지는 것은 정상이다. **열세가 아닌
+        스코어**가 읽히면 그때 깬다.
+      * 같은 경기에서 열세가 아닌 스코어(0:0/0:1/1:2)가 먼저 읽힌 적이 있어야
+        확정한다. 스코어는 단조 증가라 진짜 2점차 열세는 반드시 0점차 구간을
+        지나고, 글리프 매칭이 결정적이므로 이 조건이 '정적 화면 하나의 일관
+        오독'을 차단하는 핵심 방어다(적대적 리뷰 확정). 대가: 경기 도중(이미
+        열세)에 자동화를 켜면 그 경기는 못 센다 — 보수적 방향.
       * 한 번 확정하면 그 경기에서는 다시 세지 않는다(래치).
       * 아무것도(박스조차) 안 보이는 상태가 reset_seconds 지속돼야 경기 종료로
         간주해 래치·연속 판정·선행 관측을 푼다. SCORE_UNKNOWN 은 '진행 중'
-        증거라 이 타이머를 리셋한다 — 3:1 같은 미상 스코어 화면이 오래 이어져도
+        증거라 이 타이머를 리셋한다 — 미상 스코어 화면이 오래 이어져도
         래치가 풀리면 안 된다.
     """
 
     def __init__(
         self,
         *,
-        target: tuple[int, int] = (0, 2),
+        deficit: int = 2,
         confirm_count: int = 3,
         reset_seconds: float = 60.0,
         require_prior_score: bool = True,
     ) -> None:
         if confirm_count < 1:
             raise ValueError("confirm_count 는 1 이상이어야 합니다.")
-        self.target = (int(target[0]), int(target[1]))
+        if int(deficit) < 1:
+            raise ValueError("deficit 는 1 이상이어야 합니다.")
+        self.deficit = int(deficit)
         self.confirm_count = int(confirm_count)
         self.reset_seconds = float(reset_seconds)
         self.require_prior_score = bool(require_prior_score)
@@ -221,7 +225,7 @@ class LossTracker:
         self._streak = 0
         self._latched = False
         self._last_seen_at: Optional[float] = None   # 뭔가 보인 마지막 시각
-        self._seen_other = False                     # 이 경기에서 0:2 아닌 스코어를 봤나
+        self._seen_other = False                     # 이 경기에서 열세 아닌 스코어를 봤나
 
     def resume_observation(self) -> None:
         """자동화를 정지했다 재시작할 때 부른다 — **래치는 유지**하고 관측만 비운다.
@@ -254,7 +258,10 @@ class LossTracker:
         if reading == SCORE_UNKNOWN:
             return False
 
-        if tuple(reading) != self.target:
+        mine, theirs = int(reading[0]), int(reading[1])
+        if theirs - mine < self.deficit:
+            # 열세가 아니다(동점·근소한 열세·우세 전부) → 연속 판정을 깨고,
+            # '이 경기의 정상 스코어를 봤다'는 선행 증거로 기록한다.
             self._streak = 0
             self._seen_other = True
             return False

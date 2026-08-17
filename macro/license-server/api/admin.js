@@ -234,7 +234,7 @@ module.exports = async function handler(req, res) {
       }
 
       if (body.action === "setProSettings") {
-        // 0:2 자동 종료 비율 — 모든 mAuto Pro 클라이언트에 공통 적용되는 운영값.
+        // 2점차 자동 종료 비율 — 모든 mAuto Pro 클라이언트에 공통 적용되는 운영값.
         // 잘못된 값이 저장되면 클라이언트가 조용히 기본값으로 돌아가 조절이 안 되는
         // 것처럼 보이므로, 여기서 확실히 거부해 관리자에게 알린다.
         const ratio = normalizeAutoExitRatio(body.autoExitRatio);
@@ -244,7 +244,7 @@ module.exports = async function handler(req, res) {
         await writeAutoExitRatio(db, ratio, admin.firestore.FieldValue.serverTimestamp());
         return res.status(200).json({
           success: true,
-          message: `0:2 자동 종료 비율을 ${Math.round(ratio * 100)}%로 저장했습니다.`,
+          message: `2점차 자동 종료 비율을 ${Math.round(ratio * 100)}%로 저장했습니다.`,
           proSettings: { autoExitRatio: ratio },
         });
       }

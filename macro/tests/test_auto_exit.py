@@ -33,7 +33,7 @@ from macroapp.auto_exit import (  # noqa: E402
 
 
 def make_tracker(**kw):
-    options = dict(target=(0, 2), confirm_count=3, reset_seconds=60.0)
+    options = dict(deficit=2, confirm_count=3, reset_seconds=60.0)
     options.update(kw)
     return LossTracker(**options)
 
@@ -172,6 +172,28 @@ def test_unknown_does_not_count_as_prior():
     tracker = make_tracker(confirm_count=1)
     tracker.feed(0.0, SCORE_UNKNOWN)
     assert tracker.feed(1.0, (0, 2)) is False
+
+
+def test_any_two_goal_deficit_counts():
+    """0:2 만이 아니라 점수차 2 이상 열세 전부가 대상이다(0:3, 1:3, 2:4…)."""
+    for losing in ((0, 2), (0, 3), (1, 3), (2, 4)):
+        tracker = with_prior(make_tracker(confirm_count=1))
+        assert tracker.feed(0.0, losing) is True, f"{losing} 이 확정되지 않았다"
+
+
+def test_leading_or_close_scores_never_trigger():
+    """내가 이기거나(2:0) 1점차 열세(1:2)는 절대 확정되면 안 된다."""
+    tracker = with_prior(make_tracker(confirm_count=1))
+    for safe in ((0, 0), (2, 0), (3, 1), (1, 2), (2, 3)):
+        assert tracker.feed(0.0, safe) is False, f"{safe} 에서 나가 버렸다"
+
+
+def test_worsening_deficit_keeps_the_streak():
+    """0:2 → 0:3 처럼 열세가 깊어져도 연속 판정이 이어진다(같은 경기다)."""
+    tracker = with_prior(make_tracker(confirm_count=3))
+    tracker.feed(0.0, (0, 2))
+    tracker.feed(1.0, (0, 3))
+    assert tracker.feed(2.0, (1, 3)) is True
 
 
 # ─── 40% 쿼터 ──────────────────────────────────────────────────────────────

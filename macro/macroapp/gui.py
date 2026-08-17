@@ -51,7 +51,7 @@ from macroapp.config import (
     NOTIFICATION_PANEL_GUARD_ENABLED, NOTIFICATION_PANEL_CHECK_INTERVAL_SECONDS,
     NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
-    AUTO_EXIT_CONFIRM_COUNT, AUTO_EXIT_ENABLED, AUTO_EXIT_LOSING_SCORE,
+    AUTO_EXIT_CONFIRM_COUNT, AUTO_EXIT_DEFICIT_GOALS, AUTO_EXIT_ENABLED,
     AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
@@ -234,7 +234,7 @@ class AutomationApp:
         # 경기 도중 정지→재시작하는 것만으로 같은 경기가 두 번 세어진다(리뷰 확정).
         # 실행마다 바뀌는 건 '이번 실행에 관측을 공급할지'(_auto_exit_active)뿐이다.
         self._loss_tracker = auto_exit.LossTracker(
-            target=AUTO_EXIT_LOSING_SCORE,
+            deficit=AUTO_EXIT_DEFICIT_GOALS,
             confirm_count=AUTO_EXIT_CONFIRM_COUNT,
             reset_seconds=AUTO_EXIT_MATCH_RESET_SECONDS,
         )
@@ -5592,9 +5592,9 @@ class AutomationApp:
         )
 
     def _observe_match_score(self, gray, now: float) -> None:
-        """OCR 워커에서 매 새 프레임마다 부른다 — 0:2 패배를 세고 종료를 결정한다.
+        """OCR 워커에서 매 새 프레임마다 부른다 — 2점차 이상 열세를 세고 종료를 결정한다.
 
-        판정(경기당 1회·연속 확인·40% 쿼터)은 전부 auto_exit 의 순수 로직이 한다.
+        판정(경기당 1회·연속 확인·쿼터)은 전부 auto_exit 의 순수 로직이 한다.
         여기는 프레임을 읽어 넣고, '나가라'는 답이 오면 UI 스레드로 넘길 뿐이다.
         """
 
@@ -5625,14 +5625,14 @@ class AutomationApp:
         quota = self._exit_quota
         if quota.register_loss():
             self.queue_log(
-                f"[자동 종료] 0:2 패배 {quota.lost_games}번째 — 즉시 종료를 실행합니다 "
+                f"[자동 종료] 2점차 패배 {quota.lost_games}번째 — 즉시 종료를 실행합니다 "
                 f"(종료 {quota.exits_done}회 / 목표 비율 {quota.ratio:.0%})"
             )
             # tkinter 는 UI 스레드에서만 만져야 한다 → 큐로 넘긴다.
             self.ui_queue.put(("auto_exit", ""))
         else:
             self.queue_log(
-                f"[자동 종료] 0:2 패배 {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
+                f"[자동 종료] 2점차 패배 {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
                 f"(종료 {quota.exits_done}/{quota.lost_games}, 비매너 분산)"
             )
 
