@@ -342,6 +342,67 @@ def test_runner_uses_the_fixed_target_and_hold():
     assert exit_runner.HOLD_SECONDS == EXIT_HOLD_SECONDS
 
 
+def test_followup_passes_every_timing_to_the_sequence(monkeypatch):
+    """ConfirmSequence 에 넘기는 타이밍 인자를 고정한다.
+
+    ⚠️ 이 테스트가 있는 이유: first_press_delay_seconds 를 **안 넘기면 기본값 0**
+    이라 그림을 보자마자 눌러 버린다. mPause 에는 있던 배선이 macro 로 옮길 때
+    조용히 빠져 있었고(2026-08-17 실측), 인자 하나가 사라져도 아무 데서도 안 터졌다.
+    """
+    from macroapp import exit_core, exit_followup
+    from macroapp.config import (
+        EXIT_FIRST_PRESS_DELAY_SECONDS,
+        EXIT_OPEN_DELAY_SECONDS,
+        EXIT_OPEN_RETRY_SECONDS,
+        EXIT_SETTLE_SECONDS,
+        EXIT_VERIFY_SECONDS,
+    )
+
+    captured = {}
+    real = exit_core.ConfirmSequence
+
+    def spy(started_at, **kwargs):
+        captured.update(kwargs)
+        return real(started_at, **kwargs)
+
+    monkeypatch.setattr(exit_core, "ConfirmSequence", spy)
+
+    class _Target:
+        name = "target_H"
+        threshold = 0.8
+        image_gray = None
+        _last_match = None
+        _last_match_misses = 0
+
+    class _Manager:
+        def find_window(self):
+            return True
+
+        def capture_client_area(self):
+            return None
+
+        def stop_capture(self):
+            pass
+
+    cancel = threading.Event()
+    cancel.set()   # 첫 판정 직전에 빠져나온다 - 입력은 한 번도 나가지 않는다
+    exit_followup.run(cancel, manager=_Manager(), targets=[_Target()])
+
+    assert captured.get("first_press_delay_seconds") == EXIT_FIRST_PRESS_DELAY_SECONDS
+    assert captured.get("open_delay_seconds") == EXIT_OPEN_DELAY_SECONDS
+    assert captured.get("open_retry_seconds") == EXIT_OPEN_RETRY_SECONDS
+    assert captured.get("verify_seconds") == EXIT_VERIFY_SECONDS
+    assert captured.get("settle_seconds") == EXIT_SETTLE_SECONDS
+
+
+def test_exit_timings_match_the_user_spec():
+    """사용자 실측 요구: 되살아나면 곧바로 열고, 그림을 본 뒤 3초 기다렸다 누른다."""
+    from macroapp.config import EXIT_FIRST_PRESS_DELAY_SECONDS, EXIT_OPEN_DELAY_SECONDS
+
+    assert EXIT_OPEN_DELAY_SECONDS == 0.0, "재개 직후 바로 눌러야 한다"
+    assert EXIT_FIRST_PRESS_DELAY_SECONDS == 3.0, "그림을 본 뒤 3초 대기"
+
+
 # ─── 자동화 루프와의 배타 ──────────────────────────────────────────────────
 
 

@@ -20,6 +20,7 @@ from macroapp import exit_core, input_gamepad, winapi
 from macroapp.config import (
     EXIT_LOOP_SLEEP_SECONDS,
     EXIT_MATCH_THRESHOLD,
+    EXIT_FIRST_PRESS_DELAY_SECONDS,
     EXIT_MAX_OPENS,
     EXIT_MAX_PRESSES,
     EXIT_METHODS,
@@ -137,6 +138,9 @@ def run(
         open_delay_seconds=EXIT_OPEN_DELAY_SECONDS,
         open_retry_seconds=EXIT_OPEN_RETRY_SECONDS,
         max_opens=max_opens,
+        # ⚠️ 이 인자를 빠뜨리면 기본값 0 이라 그림을 보자마자 누른다. mPause 에는
+        # 있었는데 이 앱으로 옮길 때 누락됐던 배선이다(실측으로 드러남).
+        first_press_delay_seconds=EXIT_FIRST_PRESS_DELAY_SECONDS,
     )
 
     # 새 프레임이 없으면(=화면이 그대로) 직전 판정을 유지한다. '안 보임'으로

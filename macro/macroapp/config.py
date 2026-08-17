@@ -199,8 +199,13 @@ EXIT_PAD_BUTTON = "a"
 #: ⚠️ XUSB↔DInput 번호가 어긋나 START 가 RT 로 받힌 이력이 있습니다.
 #: 이 화면에서 start 가 안 먹으면 그 어긋남 기준의 다른 버튼부터 실측하세요.
 EXIT_OPEN_BUTTON = "start"
-#: 재개 후 첫 열기 입력까지의 지연(초).
-EXIT_OPEN_DELAY_SECONDS = 1.0
+#: 재개 후 첫 열기 입력까지의 지연(초). 0 = 되살아나자마자 바로 누릅니다(사용자 요구).
+EXIT_OPEN_DELAY_SECONDS = 0.0
+#: 찾는 그림을 **처음 본 뒤** 누르기까지 기다리는 시간(초).
+#: ⚠️ 이 값은 mPause(FOLLOWUP_FIRST_PRESS_DELAY_SECONDS=3.0)에 있던 것인데
+#: macro 로 옮길 때 ConfirmSequence 에 넘기는 배선이 빠져 0 으로 동작했다.
+#: 그림이 뜬 직후는 화면이 자리 잡는 중이라 입력이 안 먹거나 엉뚱하게 들어간다.
+EXIT_FIRST_PRESS_DELAY_SECONDS = 3.0
 #: 열기 입력 뒤에도 안 뜨면 다시 누르는 간격(초). 너무 짧으면 이미 열린 화면을
 #: 두 번째 입력이 도로 닫습니다(토글).
 EXIT_OPEN_RETRY_SECONDS = 5.0

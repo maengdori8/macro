@@ -111,6 +111,18 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 
 ## 📝 결정 로그 (왜 이렇게 했는지 — 최신순)
 
+- `2026-08-17` **종료 마무리 타이밍: 재개 즉시 열고, 그림을 본 뒤 3초 기다렸다 누른다.**
+  `EXIT_OPEN_DELAY_SECONDS` 1.0 → **0.0**(되살아나자마자 start), 그리고
+  `EXIT_FIRST_PRESS_DELAY_SECONDS = 3.0` 을 새로 세워 `ConfirmSequence` 에 넘긴다.
+  ⚠️ **후자는 새 기능이 아니라 포팅 누락 복구다.** mPause 에는 처음부터
+  `FOLLOWUP_FIRST_PRESS_DELAY_SECONDS=3.0` 이 있었는데, macro 로 옮길 때
+  `first_press_delay_seconds` 인자를 안 넘겨 **기본값 0 으로 동작**하고 있었다 —
+  그림이 뜬 순간 바로 눌러서 화면이 자리 잡기 전에 입력이 들어갔다. 인자 하나가
+  빠져도 아무 테스트도 안 터졌다는 게 진짜 문제라, `ConfirmSequence` 에 넘어가는
+  타이밍 인자 다섯 개를 통째로 고정하는 테스트를 넣었다(`tests/test_exit_feature.py`).
+  ⚠️ mPause 는 여전히 열기 지연 1.0 초다 — 같은 게임의 같은 동작이므로, 0 초가
+  실전에서 더 낫다고 확인되면 그쪽도 맞춰야 한다(제품이 달라 자동 반영 안 됨).
+
 - `2026-08-17` **자동 종료 조건을 '정확히 0:2' → '2점차 이상 열세'로 일반화.**
   판정이 `상대−나 >= AUTO_EXIT_DEFICIT_GOALS(=2)` 라 0:2 뿐 아니라 0:3, 1:3, 2:4 도
   대상이다. 0:2→0:3 처럼 열세가 깊어져도 연속 판정이 이어지고(같은 경기), 선행
