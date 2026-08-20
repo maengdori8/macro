@@ -516,20 +516,32 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
         "key_target": "all",
     },
     {
+        # ▷ SKIP 화면(구매자 실측: START 로 넘어감). key 는 게임패드 START 다.
+        # ⚠️ "esc" 로 두면 안 된다 — esc/start 는 같은 버튼(16)이지만, 이름이
+        # esc 면 SKIP 실험의 ESC 보류 게이트에 걸려 엄격 모드(기본값)에서 입력이
+        # 영구 억류된다. OCR 이 안 되는 PC 에선 이 화면에서 완전히 멈춘다(실사고).
+        # wait 0.5초: 전환 중 무한 연타(과거 6회/초)를 절반 이하로 누르되, 펄스가
+        # 한 번 안 먹었을 때 3초 안에 5~6회 재시도할 여력은 남긴다(실측 29/30 통과는
+        # 연타 조건에서 나온 통계 — 재시도를 너무 줄이면 이상치 복구력이 떨어진다).
         "name": "target_F",
         "filename": "target_F.png",
         "action": "key",
-        "key": "esc",
+        "key": "start",
         "key_mode": "sendinput",
         "key_target": "all",
+        "wait_after_action": 0.5,
     },
     {
+        # target_F 다음에 오는 프롬프트(같은 하단 우측 계열). target_F 와 같은 이유로
+        # key 는 "start" 다 — esc 이름이면 ESC 보류 게이트에 걸려 여기서 또 멈춘다.
+        # (2026-07-28 로그: 이 프롬프트 53회 전부 버튼 16 입력으로 즉시 통과 실측.)
         "name": "target_G",
         "filename": "target_G.png",
         "action": "key",
-        "key": "esc",
+        "key": "start",
         "key_mode": "sendinput",
         "key_target": "all",
+        "wait_after_action": 0.5,
     },
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
     {"name": "target_I", "filename": "target_I.png", "action": "click"},

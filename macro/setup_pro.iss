@@ -42,6 +42,11 @@ Source: "dist\macro_pro_app\vgamepad\win\vigem\install\x64\ViGEmBusSetup_x64.msi
 
 ; 감독모드 전용 설치본: 예전 통합 설치본이 남긴 갱신/테스트 실행 파일과 바로가기도 제거합니다.
 [InstallDelete]
+; 초기 버전(4a812342)은 targets.json/target_*.png 를 설치 폴더에 배포했다.
+; 느슨한 파일이 내장 설정보다 우선하므로, 남아 있으면 업데이트를 해도
+; 옛 키 설정(esc)이 계속 쓰여 SKIP 화면에서 멈춘다 — 반드시 지운다.
+Type: files; Name: "{app}	argets.json"
+Type: files; Name: "{app}	arget_*.png"
 Type: files; Name: "{app}\renewal_macro.exe"
 Type: files; Name: "{app}\gamepad_test.exe"
 Type: files; Name: "{group}\mAuto Pro 갱신.lnk"
