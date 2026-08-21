@@ -20,9 +20,11 @@ const {
   DEFAULT_PRODUCT,
   ISSUABLE_PRODUCTS,
   isIssuableProduct,
+  licenseProductOf,
   normalizeProduct,
 } = require("../lib/product");
 const {
+  autoExitRatioAppliesTo,
   normalizeAutoExitRatio,
   readAutoExitRatio,
   writeAutoExitRatio,
@@ -256,6 +258,36 @@ module.exports = async function handler(req, res) {
       const doc = await col.doc(key).get();
       if (!doc.exists) {
         return res.status(404).json({ success: false, message: "존재하지 않는 키입니다." });
+      }
+
+      if (body.autoExitRatio !== undefined) {
+        // 키별 2점차 자동 종료 비율 — 구매자 한 명에게만 다른 비율을 준다. null 이면
+        // 해제(전역값을 따른다). 프로 키에만 받는다: 일반·mPause 문서에 저장되면 아무
+        // 효과 없이 관리자만 "왜 안 바뀌지"를 겪는다.
+        if (!autoExitRatioAppliesTo(licenseProductOf(doc.data()))) {
+          return res.status(400).json({
+            success: false,
+            message: "키별 자동 종료 비율은 mAuto Pro 키에만 설정할 수 있습니다.",
+          });
+        }
+        if (body.autoExitRatio === null) {
+          await col.doc(key).update({ autoExitRatio: null });
+          return res.status(200).json({
+            success: true,
+            message: "키별 비율을 해제했습니다. 이제 전역값을 따릅니다.",
+            autoExitRatio: null,
+          });
+        }
+        const ratio = normalizeAutoExitRatio(body.autoExitRatio);
+        if (ratio === null) {
+          return res.status(400).json({ success: false, message: "자동 종료 비율은 0~1 사이 숫자여야 합니다." });
+        }
+        await col.doc(key).update({ autoExitRatio: ratio });
+        return res.status(200).json({
+          success: true,
+          message: `이 키의 2점차 자동 종료 비율을 ${Math.round(ratio * 100)}%로 저장했습니다.`,
+          autoExitRatio: ratio,
+        });
       }
 
       if (body.resetHwids === true) {

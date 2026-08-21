@@ -14,6 +14,7 @@ const {
   licenseProductOf,
   normalizeProduct,
 } = require("./product");
+const { normalizeAutoExitRatio } = require("./pro_settings");
 
 const MAX_BATCH_COUNT = 100;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -176,6 +177,9 @@ function serializeLicenseForAdmin(key, data, now = Date.now()) {
     batchId: data.batchId || "",
     batchName: data.batchName || "",
     product: licenseProductOf(data),
+    // 키별 2점차 자동 종료 비율(0~1). null = 전역값 사용. 깨진 값도 null 로 보여
+    // 관리 화면이 '전역'으로 표시한다(서버 verify 도 같은 규칙으로 전역을 쓴다).
+    autoExitRatio: normalizeAutoExitRatio(data.autoExitRatio),
   };
 }
 

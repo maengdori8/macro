@@ -326,3 +326,80 @@ test("목록 동기화가 프로 설정 패널을 채운다", async () => {
   await vm.runInContext("loadLicenses()", context);
   assert.equal(byId("autoExitRatioInput").value, 60, "값 없는 응답이 입력칸을 지웠다");
 });
+
+// ─── 키별 2점차 자동 종료 비율 ─────────────────────────────────────────────
+
+test("프로 키 행에는 키별 비율(없으면 전역값)과 '종료율' 버튼이 뜨고, 일반 키 행에는 없다", async () => {
+  const { context, byId } = makeContext();
+  // 전역값을 먼저 알아야 '전역 40%' 문구가 나온다(목록 동기화가 채운다).
+  context.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      success: true,
+      proSettings: { autoExitRatio: 0.4 },
+      licenses: [
+        license({ key: "PRO11-PRO11-PRO11-PRO11-PRO11", product: "macro_pro", autoExitRatio: 0.6 }),
+        license({ key: "PRO22-PRO22-PRO22-PRO22-PRO22", product: "macro_pro", autoExitRatio: null }),
+        license({ key: "BASIC-BASIC-BASIC-BASIC-BASIC", product: "macro", autoExitRatio: 0.2 }),
+      ],
+    }),
+  });
+  await vm.runInContext("loadLicenses()", context);
+  const html = byId("licenseTable").innerHTML;
+
+  assert.match(html, /종료 60% \(키별\)/, "키별 비율이 표시되지 않았다");
+  assert.match(html, /종료 40% \(전역\)/, "키별 값 없는 프로 키가 전역값을 보여 주지 않았다");
+  // 일반 키는 문서에 값이 적혀 있어도 표시하지 않는다(기능이 없는 제품이다).
+  assert.equal((html.match(/data-action="exitratio"/g) || []).length, 2, "종료율 버튼은 프로 키 두 개에만 있어야 한다");
+  assert.equal(html.includes('data-action="exitratio" data-key="BASIC-BASIC-BASIC-BASIC-BASIC"'), false);
+  assert.equal(html.includes("종료 20%"), false, "일반 키 행에 비율이 새어 나왔다");
+});
+
+test("종료율 입력은 % → 비율로, 빈 값은 해제(null)로 보내고, 범위 밖은 요청 자체를 막는다", () => {
+  const { context } = makeContext();
+  // vm 컨텍스트의 객체는 프로토타입이 달라 deepStrictEqual 이 거짓 실패한다 → 평문으로 비교.
+  const build = (raw) =>
+    JSON.parse(JSON.stringify(vm.runInContext(`buildExitRatioPatch("K", ${JSON.stringify(raw)})`, context)));
+  assert.deepEqual(build("60"), { key: "K", autoExitRatio: 0.6 });
+  assert.deepEqual(build(" 0 "), { key: "K", autoExitRatio: 0 });
+  assert.deepEqual(build("100"), { key: "K", autoExitRatio: 1 });
+  assert.deepEqual(build(""), { key: "K", autoExitRatio: null });
+  assert.deepEqual(build("   "), { key: "K", autoExitRatio: null });
+  for (const bad of ["abc", "-5", "120", "1e9"]) {
+    assert.throws(() => build(bad), /0~100/, `통과되면 안 되는 입력: ${bad}`);
+  }
+});
+
+test("'종료율' 행 동작이 프롬프트 값을 PATCH 로 보낸다(리스너·배선이 살아 있다)", async () => {
+  const { context } = makeContext();
+  const key = "PRO11-PRO11-PRO11-PRO11-PRO11";
+  const rows = [license({ key, product: "macro_pro", autoExitRatio: null })];
+  const calls = [];
+  // 행 동작은 처리 뒤 목록을 다시 불러온다 — 그때도 같은 키가 있어야 다음 동작이 돈다.
+  context.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({ success: true, licenses: rows }) };
+  };
+  load(context, rows);
+  context.__event = { target: { closest: () => ({ dataset: { key, action: "exitratio" } }) } };
+  const patches = () => calls.filter((c) => c.opts && c.opts.method === "PATCH");
+
+  context.prompt = () => "60";
+  await vm.runInContext("handleRowAction(__event)", context);
+  assert.equal(patches().length, 1, "PATCH 요청이 나가지 않았다");
+  assert.deepEqual(JSON.parse(patches()[0].opts.body), { key, autoExitRatio: 0.6 });
+
+  // 빈 값 = 해제.
+  calls.length = 0;
+  context.prompt = () => "";
+  await vm.runInContext("handleRowAction(__event)", context);
+  assert.deepEqual(JSON.parse(patches()[0].opts.body), { key, autoExitRatio: null });
+
+  // 취소(null) 와 범위 밖은 요청이 없다.
+  for (const answer of [null, "abc", "150"]) {
+    calls.length = 0;
+    context.prompt = () => answer;
+    await vm.runInContext("handleRowAction(__event)", context);
+    assert.equal(patches().length, 0, `요청이 나가면 안 되는 입력: ${answer}`);
+  }
+});

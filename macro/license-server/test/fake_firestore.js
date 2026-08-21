@@ -24,6 +24,13 @@ class FakeDocumentReference {
     return new FakeSnapshot(this, this.db._docs.get(this.path));
   }
 
+  // 트랜잭션 밖 단건 부분 갱신(실서버의 DocumentReference.update 대응). 없는 문서는 실패.
+  async update(value) {
+    const current = this.db._docs.get(this.path);
+    if (current === undefined) throw new Error(`missing: ${this.path}`);
+    this.db._docs.set(this.path, { ...current, ...structuredClone(value) });
+  }
+
   // 트랜잭션 밖 단건 쓰기(실서버의 DocumentReference.set 대응).
   async set(value, options = {}) {
     const current = this.db._docs.get(this.path);

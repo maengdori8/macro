@@ -16,6 +16,7 @@ const {
   autoExitRatioAppliesTo,
   normalizeAutoExitRatio,
   readAutoExitRatio,
+  resolveAutoExitRatio,
   writeAutoExitRatio,
 } = require("../lib/pro_settings");
 const { FakeFirestore } = require("./fake_firestore");
@@ -66,6 +67,33 @@ test("읽기는 TTL 캐시를 쓴다 — verify 마다 Firestore 를 읽지 않�
 
   // TTL 이 지나면 새 값을 읽는다.
   assert.equal(await readAutoExitRatio(db, t0 + 61 * 1000), 0.9);
+});
+
+// ─── 키별 비율 → 전역 폴백 ─────────────────────────────────────────────────
+
+test("라이센스 문서에 키별 비율이 있으면 그것이 전역값을 이긴다", async () => {
+  const db = new FakeFirestore({ "config/pro_settings": { autoExitRatio: 0.7 } });
+  assert.equal(await resolveAutoExitRatio(db, { autoExitRatio: 0.25 }), 0.25);
+  assert.equal(await resolveAutoExitRatio(db, { autoExitRatio: 0 }), 0, "0% 도 유효한 키별 값이다");
+  assert.equal(await resolveAutoExitRatio(db, { autoExitRatio: "0.1" }), 0.1);
+});
+
+test("키별 값이 없거나(null) 깨졌으면 전역값으로 떨어진다", async () => {
+  const db = new FakeFirestore({ "config/pro_settings": { autoExitRatio: 0.7 } });
+  for (const missing of [undefined, null, 7, -1, "abc", "", NaN]) {
+    assert.equal(
+      await resolveAutoExitRatio(db, { autoExitRatio: missing }),
+      0.7,
+      `전역으로 안 떨어짐: ${String(missing)}`
+    );
+  }
+  assert.equal(await resolveAutoExitRatio(db, {}), 0.7);
+  assert.equal(await resolveAutoExitRatio(db, null), 0.7);
+});
+
+test("전역 문서도 없으면 내장 기본값이다", async () => {
+  const db = new FakeFirestore();
+  assert.equal(await resolveAutoExitRatio(db, { autoExitRatio: null }), DEFAULT_AUTO_EXIT_RATIO);
 });
 
 // ─── 쓰기 ──────────────────────────────────────────────────────────────────

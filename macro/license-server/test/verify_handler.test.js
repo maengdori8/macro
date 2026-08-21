@@ -122,6 +122,38 @@ test("구버전 클라이언트(v1, product 없음) 응답도 오염되지 않�
   assert.equal("auto_exit_ratio" in res.body, false);
 });
 
+test("라이센스 문서의 키별 비율이 전역값보다 우선해 실린다", async () => {
+  const key = "EEEEE-EEEEE-EEEEE-EEEEE-EEEEE";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro", autoExitRatio: 0.15 }));
+  await writeAutoExitRatio(db, 0.3);
+
+  const res = await callVerify({ key, hwid: HWID, nonce: NONCE, product: "macro_pro" });
+  assert.equal(res.body.verdict, "valid", res.body.message);
+  assert.equal(res.body.auto_exit_ratio, 0.15, "키별 비율이 아니라 전역값이 실렸다");
+  // 서명 대상 필드는 그대로다.
+  assert.equal(res.body.product, "macro_pro");
+  assert.match(res.body.sig, /^[0-9a-f]{128}$/);
+});
+
+test("키별 비율이 깨져 있으면 전역값으로 떨어진다(인증은 막히지 않는다)", async () => {
+  const key = "FFFFF-FFFFF-FFFFF-FFFFF-FFFFF";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro", autoExitRatio: 7 }));
+  await writeAutoExitRatio(db, 0.3);
+
+  const res = await callVerify({ key, hwid: HWID, nonce: NONCE, product: "macro_pro" });
+  assert.equal(res.body.verdict, "valid", res.body.message);
+  assert.equal(res.body.auto_exit_ratio, 0.3);
+});
+
+test("일반 키에 키별 비율이 적혀 있어도 응답에 새지 않는다", async () => {
+  const key = "GGGGG-GGGGG-GGGGG-GGGGG-GGGGG";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro", autoExitRatio: 0.2 }));
+
+  const res = await callVerify({ key, hwid: HWID, nonce: NONCE, product: "macro" });
+  assert.equal(res.body.verdict, "valid", res.body.message);
+  assert.equal("auto_exit_ratio" in res.body, false);
+});
+
 test("프로 키를 일반 요청으로 써도(하위 포함) 비율이 실린다 — 문서 기준이다", async () => {
   const key = "DDDDD-DDDDD-DDDDD-DDDDD-DDDDD";
   db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro" }));

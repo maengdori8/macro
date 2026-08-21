@@ -92,6 +92,9 @@ async function verifyAndActivateLicense({
       expiresAt: lifecycle.expiresAt || null,
       signatureExpiresAt: lifecycle.signatureExpiresAt || null,
       activatedAt: lifecycle.activatedAt || null,
+      // 키별 운영값(2점차 자동 종료 비율). 원값 그대로 넘기고 검증·전역 폴백은
+      // pro_settings.resolveAutoExitRatio 가 한다 — 규칙을 한 곳에 둔다.
+      autoExitRatio: data.autoExitRatio === undefined ? null : data.autoExitRatio,
     };
   }, { maxAttempts: 3 });
 }

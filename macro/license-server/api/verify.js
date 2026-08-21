@@ -5,7 +5,7 @@ const sec = require("../lib/security");
 const { sendSignedVerdict } = require("../lib/licenseSign");
 const { verifyAndActivateLicense } = require("../lib/license_service");
 const { isValidProduct, normalizeProduct } = require("../lib/product");
-const { autoExitRatioAppliesTo, readAutoExitRatio } = require("../lib/pro_settings");
+const { autoExitRatioAppliesTo, resolveAutoExitRatio } = require("../lib/pro_settings");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -75,15 +75,16 @@ module.exports = async function handler(req, res) {
       "license verification"
     );
     if (!result.valid) return denied(result.message);
-    // 프로 문서면 운영 설정(0:2 자동 종료 비율)을 실어 보낸다. 서명 밖 참고값이라
+    // 프로 문서면 운영 설정(2점차 자동 종료 비율)을 실어 보낸다. 서명 밖 참고값이라
     // 읽기 실패가 인증을 막으면 안 된다 — 필드가 없으면 클라이언트가 내장 기본값
     // (40%)으로 동작한다(fail-safe). 판정 기준은 요청이 아니라 **문서의 제품**이다.
+    // 값은 키별(라이센스 문서) → 전역(config/pro_settings) 순으로 정해진다.
     let extra;
     if (autoExitRatioAppliesTo(result.product)) {
       try {
         extra = {
           auto_exit_ratio: await sec.withTimeout(
-            readAutoExitRatio(db),
+            resolveAutoExitRatio(db, { autoExitRatio: result.autoExitRatio }),
             2000,
             "pro settings read"
           ),

@@ -48,6 +48,20 @@ async function readAutoExitRatio(db, now = Date.now()) {
   return value;
 }
 
+// 라이센스 문서에 키별 비율을 두는 필드. 없거나(null) 깨졌으면 전역값을 쓴다.
+const LICENSE_RATIO_FIELD = "autoExitRatio";
+
+// 구매자 한 명에게 줄 최종 비율: **키별 값이 있으면 그것, 없으면 전역값.**
+// 키별 값은 라이센스 문서 안에 있어서 verify 가 이미 읽은 문서에서 그냥 꺼낸다 —
+// 추가 Firestore 읽기 0. 전역값은 기존 TTL 캐시 경로 그대로.
+async function resolveAutoExitRatio(db, licenseData, now = Date.now()) {
+  const own = normalizeAutoExitRatio(
+    licenseData ? licenseData[LICENSE_RATIO_FIELD] : undefined
+  );
+  if (own !== null) return own;
+  return readAutoExitRatio(db, now);
+}
+
 async function writeAutoExitRatio(db, value, updatedAt) {
   const ratio = normalizeAutoExitRatio(value);
   if (ratio === null) {
@@ -71,8 +85,10 @@ async function writeAutoExitRatio(db, value, updatedAt) {
 
 module.exports = {
   DEFAULT_AUTO_EXIT_RATIO,
+  LICENSE_RATIO_FIELD,
   normalizeAutoExitRatio,
   autoExitRatioAppliesTo,
   readAutoExitRatio,
+  resolveAutoExitRatio,
   writeAutoExitRatio,
 };
