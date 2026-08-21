@@ -1146,6 +1146,60 @@ def send_key_attach_state(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
                 pass
 
 
+def run_attached_to_window(hwnd: int, action, *, activate: bool = False) -> bool:
+    """게임 입력 스레드 큐에 AttachThreadInput 으로 붙어 있는 **동안** action 을 돌린다.
+
+    2026-08-22 리서치(H1)가 남긴 마지막 미검증 지렛대다. 인매치 엔진이 가상패드 A 를 배경에서
+    버리는 게이트가 (a) 전역 GetForegroundWindow 인지 (b) 스레드 큐 로컬 값
+    (GetActiveWindow/GetFocus) 인지는 아직 모른다. 메시지 스푸핑(WM_ACTIVATE*)은 (b) 의 값 자체를
+    바꾸지 못하지만, 붙은 큐에서 부르는 SetActiveWindow 는 바꾼다 — 그리고 붙은 두 스레드 어느
+    쪽도 전면 큐가 아니면 전면창(전역)은 그대로다(문서: 앱이 전면일 때만 전면으로 올라옴).
+
+    - activate=False: 큐만 공유한 채 action(A 홀드). 부작용 0 — 대조용.
+    - activate=True : SetActiveWindow(hwnd) 후 action. **우리 프로세스가 전면이면 시도하지 않는다**
+      — 그때는 큐 공유가 전면 큐와 합쳐져 게임이 전면으로 올라올 수 있다(깜빡임). 게임이 이미
+      전면이어도 의미가 없어 False. 호출부(run_guarded_inactive_action)가 전면 불변을 한 번 더 지킨다.
+    """
+    if winapi.win32gui is None or not hasattr(ctypes, "windll"):
+        return False
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    tid_cur = 0
+    tid_target = 0
+    attached = False
+    try:
+        hwnd = int(hwnd)
+        if not hwnd or not winapi.win32gui.IsWindow(hwnd):
+            return False
+        _setup_user32_sigs()
+        foreground = get_foreground_hwnd()
+        if foreground == hwnd:
+            return False
+        if activate and foreground:
+            fg_pid = wintypes.DWORD(0)
+            u.GetWindowThreadProcessId(wintypes.HWND(foreground), ctypes.byref(fg_pid))
+            if int(fg_pid.value) == int(k.GetCurrentProcessId()):
+                return False
+        tid_cur = k.GetCurrentThreadId()
+        tid_target = u.GetWindowThreadProcessId(wintypes.HWND(hwnd), None)
+        if not tid_target or tid_target == tid_cur:
+            return False
+        attached = bool(u.AttachThreadInput(tid_cur, tid_target, True))
+        if not attached:
+            return False
+        if activate:
+            u.SetActiveWindow(wintypes.HWND(hwnd))
+        return bool(action())
+    except Exception:
+        return False
+    finally:
+        if attached and tid_target:
+            try:
+                u.AttachThreadInput(tid_cur, tid_target, False)
+            except Exception:
+                pass
+
+
 def send_key_attach_post(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
     """AttachThreadInput으로 큐만 공유(SetFocus 없음)한 뒤, 게임이 이미 자기 포커스로
     여기는 창(GUITHREADINFO.hwndFocus)에 WM_KEYDOWN/UP을 PostMessage.

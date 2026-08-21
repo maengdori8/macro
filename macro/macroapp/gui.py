@@ -3397,6 +3397,17 @@ class AutomationApp:
                         else {}
                     ),
                 )
+            if name in {"attach_a", "attach_active_a"}:
+                # 게임 큐에 붙어 있는 동안 A 홀드(+활성 창 세우기). 전면 불변은 헬퍼와
+                # run_guarded_inactive_action 이 이중으로 지킨다.
+                button = input_gamepad.KEY_TO_GAMEPAD.get("a")
+                if button is None or not manager.hwnd:
+                    return False
+                return input_message.run_attached_to_window(
+                    int(manager.hwnd),
+                    lambda: send_gamepad_button(button, press_delay=hold_secs),
+                    activate=(name == "attach_active_a"),
+                )
             if name in {"device_start", "device_a"}:
                 if not manager.hwnd or not input_message.notify_device_rescan(
                     manager.hwnd

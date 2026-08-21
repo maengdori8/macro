@@ -79,6 +79,11 @@ _SPECS = (
 
     # XInput/DirectInput values can be visible to a background game.  Test the
     # threshold and repeat axes separately instead of assuming one 1s hold.
+    # 2026-08-22 리서치 H1: 게이트가 전역 전면창이 아니라 스레드 큐 로컬 활성 값이라면,
+    # 게임 큐에 붙어(AttachThreadInput) 있는 동안의 A 홀드(+SetActiveWindow)가 통한다.
+    # attach_hold_a 는 대조(큐 공유만), attach_active_hold_a 가 진짜 가설. 둘 다 전면 불변.
+    _spec("attach_hold_a", "attach_a", "gamepad_attach", "게임 큐에 붙은 채 A 장홀드(대조 — 큐 공유만으로는 변화 없을 것)", hold=1.25, input_scope="virtual_gamepad"),
+    _spec("attach_active_hold_a", "attach_active_a", "gamepad_attach_activate", "붙은 큐에서 SetActiveWindow 로 스레드 로컬 활성 창을 세운 뒤 A 장홀드(게이트가 GetActiveWindow/GetFocus 면 통과)", hold=1.25, input_scope="virtual_gamepad"),
     _spec("a", "a", "gamepad", "게임패드 A 탭 경로", input_scope="virtual_gamepad"),
     _spec("a_hold_500", "a", "gamepad", "A 홀드 임계값이 0.5초 부근일 가능성", hold=0.50, input_scope="virtual_gamepad"),
     _spec("a_hold", "a", "gamepad", "기존 1.0초 A 홀드 경로", hold=1.00, input_scope="virtual_gamepad"),

@@ -3009,3 +3009,54 @@ def test_strict_skip_quiet_gate_covers_control_and_result_windows() -> None:
         + gui.SKIP_OCR_INTERVAL_SECONDS
     )
     assert gui.AutomationApp._strict_skip_quiet_seconds() >= expected
+
+
+# ─── 2026-08-22 리서치 H1: 게임 큐에 붙은 채 A 홀드(+SetActiveWindow) ─────────────────
+
+
+def test_attach_candidates_are_registered_and_in_the_a_sweep() -> None:
+    from macroapp.skip_candidates import SKIP_A_CANDIDATES, get_skip_candidate_spec
+
+    plain = get_skip_candidate_spec("attach_hold_a")
+    active = get_skip_candidate_spec("attach_active_hold_a")
+    assert plain is not None and active is not None
+    assert plain.action == "attach_a" and active.action == "attach_active_a"
+    assert plain.family != active.family, "대조와 가설이 같은 가족이면 스케줄러가 한 자리로 센다"
+    assert plain.hold_seconds == 1.25 and active.hold_seconds == 1.25
+    assert "attach_hold_a" in SKIP_A_CANDIDATES and "attach_active_hold_a" in SKIP_A_CANDIDATES
+
+
+def test_attach_dispatch_passes_the_activate_flag() -> None:
+    manager = SimpleNamespace(hwnd=123)
+    calls = []
+
+    def fake_run(hwnd, action, *, activate=False):
+        calls.append((hwnd, activate))
+        return action()
+
+    with (
+        patch.dict(gui.input_gamepad.KEY_TO_GAMEPAD, {"a": 4096}, clear=False),
+        patch.object(gui.input_message, "run_attached_to_window", side_effect=fake_run),
+        patch.object(gui, "send_gamepad_button", return_value=True) as send,
+    ):
+        assert gui.AutomationApp._press_skip_candidate("attach_hold_a", manager)
+        assert gui.AutomationApp._press_skip_candidate("attach_active_hold_a", manager)
+    assert calls == [(123, False), (123, True)]
+    assert send.call_count == 2
+    assert all(c.kwargs["press_delay"] == 1.25 for c in send.call_args_list)
+
+
+def test_run_attached_refuses_without_a_window_or_when_game_is_foreground() -> None:
+    from macroapp import input_message
+
+    # 창이 없으면 action 을 부르지 않는다.
+    called = []
+    assert input_message.run_attached_to_window(0, lambda: called.append(1) or True) is False
+    assert called == []
+    # 게임이 이미 전면이면 실험 의미가 없다(그리고 가드가 막는다).
+    with (
+        patch.object(input_message.winapi, "win32gui", SimpleNamespace(IsWindow=lambda h: True)),
+        patch.object(input_message, "get_foreground_hwnd", return_value=777),
+        patch.object(input_message, "_setup_user32_sigs", lambda: None),
+    ):
+        assert input_message.run_attached_to_window(777, lambda: True, activate=True) is False
