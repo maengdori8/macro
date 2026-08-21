@@ -164,3 +164,27 @@ test("프로 키를 일반 요청으로 써도(하위 포함) 비율이 실린�
   // 일반 빌드는 이 값을 안 쓰지만(무해), 판정 기준이 요청이 아니라 문서임을 고정한다.
   assert.equal(res.body.auto_exit_ratio, 0.3);
 });
+
+
+test("프로 응답에 규칙 전부(auto_exit_settings)가 실리고 키별 필드가 전역을 이긴다", async () => {
+  const key = "HHHHH-HHHHH-HHHHH-HHHHH-HHHHH";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro", autoExitHardDeficit: 4, autoExitLateRatio: 1 }));
+  await writeAutoExitRatio(db, 0.3);
+
+  const res = await callVerify({ key, hwid: HWID, nonce: NONCE, product: "macro_pro" });
+  assert.equal(res.body.verdict, "valid", res.body.message);
+  assert.deepEqual(res.body.auto_exit_settings, {
+    ratio: 0.3, base_deficit: 2, hard_deficit: 4, late_minute: 70, late_deficit: 1, late_ratio: 1,
+  });
+  // 구버전 클라이언트용 비율 필드도 같은 값이다.
+  assert.equal(res.body.auto_exit_ratio, 0.3);
+  assert.match(res.body.sig, /^[0-9a-f]{128}$/);
+});
+
+test("일반 키 응답에는 규칙도 실리지 않는다", async () => {
+  const key = "IIIII-IIIII-IIIII-IIIII-IIIII";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro", autoExitHardDeficit: 9 }));
+  const res = await callVerify({ key, hwid: HWID, nonce: NONCE, product: "macro" });
+  assert.equal(res.body.verdict, "valid", res.body.message);
+  assert.equal("auto_exit_settings" in res.body, false);
+});

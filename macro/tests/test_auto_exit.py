@@ -414,3 +414,198 @@ def test_unknown_score_crops_are_saved_with_cap_and_interval(tmp_path):
     app._score_unknown_dumped = gui.AUTO_EXIT_UNKNOWN_DUMP_LIMIT
     app._save_score_unknown_crop(gray, 9999.0, fresh=True)
     assert len(list((tmp_path / "logs" / "score_unknown").glob("score_*.png"))) == 2
+
+
+# ---------------------------------------------------------------------------
+# 종료 규칙 세 개(기본·대량 실점·후반) + 구매자별 설정 파싱
+# ---------------------------------------------------------------------------
+
+
+def _rules(**over):
+    from macroapp.auto_exit import ExitRules
+
+    base = dict(base_deficit=2, hard_deficit=3, late_minute=70, late_deficit=1)
+    base.update(over)
+    return ExitRules(**base)
+
+
+def test_rules_classify_priority_and_minute_gate():
+    from macroapp.auto_exit import KIND_BASE, KIND_HARD, KIND_LATE
+
+    r = _rules()
+    assert r.classify(0, 3, None) == KIND_HARD       # 3점차 → 무조건(분 무관)
+    assert r.classify(1, 4, 10) == KIND_HARD
+    assert r.classify(0, 2, None) == KIND_BASE       # 2점차 → 기본(비율)
+    assert r.classify(0, 2, 80) == KIND_BASE         # 후반이어도 2점차는 base 가 먼저
+    assert r.classify(0, 1, 70) == KIND_LATE         # 70분 1점차 → 후반
+    assert r.classify(0, 1, 69) is None              # 69분은 아직
+    assert r.classify(0, 1, None) is None            # 시계를 모르면 후반 규칙 없음
+    assert r.classify(1, 1, 90) is None              # 동점
+    assert r.classify(2, 0, 90) is None              # 내가 앞섬
+    # 끄기: 0 이면 그 규칙은 없다.
+    assert _rules(hard_deficit=0).classify(0, 5, None) == KIND_BASE
+    assert _rules(late_minute=0).classify(0, 1, 89) is None
+
+
+def test_tracker_without_rules_behaves_like_before():
+    """rules 를 안 주면 기본 규칙 하나 — hard/late 는 꺼져 있다(기존 테스트의 의미 보존)."""
+    from macroapp.auto_exit import LossTracker
+
+    t = LossTracker(deficit=2, confirm_count=1, reset_seconds=60)
+    assert t.rules.hard_deficit == 0 and t.rules.late_minute == 0
+    t.feed(0.0, (0, 0))
+    assert t.observe(1.0, (0, 1), 80) is None        # late 꺼짐
+    assert t.observe(2.0, (0, 2)) == "base"
+
+
+def test_hard_rule_fires_even_after_base_decided_to_stay():
+    """0:2 로 '방치' 결정된 판이 0:3 으로 벌어지면 비율 무관하게 hard 가 한 번 더 확정된다."""
+    from macroapp.auto_exit import KIND_BASE, KIND_HARD, LossTracker
+
+    t = LossTracker(confirm_count=3, reset_seconds=60, rules=_rules())
+    t.feed(0.0, (0, 0))                               # 선행 스코어
+    assert [t.observe(1.0 + i, (0, 2)) for i in range(3)] == [None, None, KIND_BASE]
+    assert t.observe(5.0, (0, 2)) is None             # 같은 경기 재확정 없음(래치)
+    assert [t.observe(6.0 + i, (0, 3)) for i in range(3)] == [None, None, KIND_HARD]
+    assert t.observe(10.0, (0, 3)) is None            # hard 도 한 번만
+    assert t.observe(11.0, (0, 4)) is None
+
+
+def test_hard_first_latches_quota_rules_too():
+    from macroapp.auto_exit import KIND_HARD, LossTracker
+
+    t = LossTracker(confirm_count=2, reset_seconds=60, rules=_rules())
+    t.feed(0.0, (0, 1))
+    assert [t.observe(1.0, (0, 3)), t.observe(2.0, (0, 3))] == [None, KIND_HARD]
+    # 같은 경기에서 뒤늦게 2점차로 읽혀도 쿼터 규칙이 다시 서지 않는다.
+    assert t.observe(3.0, (0, 2)) is None
+    assert t.observe(4.0, (0, 2)) is None
+
+
+def test_late_rule_needs_minute_and_shares_the_quota_latch():
+    from macroapp.auto_exit import KIND_LATE, LossTracker
+
+    t = LossTracker(confirm_count=2, reset_seconds=60, rules=_rules())
+    t.feed(0.0, (0, 1), 30)                           # 전반 0:1 — 규칙 없음 → 선행 증거
+    assert t.observe(1.0, (0, 1), 71) is None
+    assert t.observe(2.0, (0, 1), 71) == KIND_LATE
+    assert t.observe(3.0, (0, 1), 80) is None         # 래치
+    # 같은 경기에서 0:2(base)가 돼도 쿼터 규칙은 이미 확정됐으므로 다시 안 선다.
+    assert t.observe(4.0, (0, 2), 85) is None
+    assert t.observe(5.0, (0, 2), 85) is None
+
+
+def test_minute_none_keeps_late_rule_silent_but_base_still_works():
+    from macroapp.auto_exit import KIND_BASE, LossTracker
+
+    t = LossTracker(confirm_count=1, reset_seconds=60, rules=_rules())
+    t.feed(0.0, (0, 0))
+    assert t.observe(1.0, (0, 1), None) is None
+    assert t.observe(2.0, (0, 2), None) == KIND_BASE
+
+
+def test_match_end_releases_both_latches():
+    from macroapp.auto_exit import KIND_HARD, LossTracker
+
+    t = LossTracker(confirm_count=1, reset_seconds=60, rules=_rules())
+    t.feed(0.0, (0, 0))
+    assert t.observe(1.0, (0, 3)) == KIND_HARD
+    t.feed(2.0, None)
+    t.feed(70.0, None)                                # 60초 부재 → 새 경기
+    t.feed(71.0, (0, 0))
+    assert t.observe(72.0, (0, 3)) == KIND_HARD
+
+
+def test_parse_exit_settings_is_field_level_fail_safe():
+    from macroapp.auto_exit import ExitRules, ExitSettings, parse_exit_settings
+
+    defaults = ExitSettings(rules=ExitRules(2, 3, 70, 1), ratio=0.4)
+    got = parse_exit_settings(
+        {"ratio": 0.6, "base_deficit": 2, "hard_deficit": 4, "late_minute": 75,
+         "late_deficit": 1, "late_ratio": 1.0},
+        defaults,
+    )
+    assert got.rules == ExitRules(2, 4, 75, 1)
+    assert got.ratio == 0.6 and got.late_ratio == 1.0
+
+    # 깨진 필드만 기본값으로 남고 나머지는 반영된다.
+    got = parse_exit_settings(
+        {"ratio": 7, "base_deficit": "x", "hard_deficit": 0, "late_minute": 999,
+         "late_deficit": 2.5, "late_ratio": "abc"},
+        defaults,
+    )
+    assert got.rules == ExitRules(2, 0, 70, 1)       # hard 0 = 끔(유효), late_minute 999 = 기본
+    assert got.ratio == 0.4 and got.late_ratio is None
+
+    # dict 가 아니면 전부 기본값.
+    assert parse_exit_settings(None, defaults) == defaults
+    assert parse_exit_settings("junk", defaults) == defaults
+    # bool 은 숫자로 받지 않는다(True→1 같은 조용한 변환 금지).
+    assert parse_exit_settings({"hard_deficit": True}, defaults).rules.hard_deficit == 3
+
+
+# ---------------------------------------------------------------------------
+# 경기 시계
+# ---------------------------------------------------------------------------
+
+
+def test_parse_clock_text_accepts_real_ocr_shapes():
+    from macroapp.auto_exit import parse_clock_text
+
+    assert parse_clock_text("84:10") == (84, 10)
+    assert parse_clock_text("62•.04") == (62, 4)
+    assert parse_clock_text("6454") == (64, 54)
+    assert parse_clock_text("2211") == (22, 11)
+    assert parse_clock_text("03:26") == (3, 26)
+    assert parse_clock_text("90:oo") == (90, 0)
+    assert parse_clock_text("90:00+3") == (90, 0)
+    assert parse_clock_text("") is None
+    assert parse_clock_text(None) is None
+    assert parse_clock_text("84:70") is None          # 초 60 이상
+    assert parse_clock_text("999:00") is None         # 분 130 초과
+    assert parse_clock_text("12") is None
+    assert parse_clock_text("12345") is None
+
+
+def test_clock_tracker_confirms_on_consensus_and_resets_on_regression():
+    from macroapp.auto_exit import ClockTracker
+
+    c = ClockTracker(consensus=2, reset_seconds=60)
+    assert c.feed(0.0, (70, 5)) is None               # 1회 — 아직
+    assert c.feed(5.0, (70, 40)) == 70                # 2회 연속 비역행 → 확정
+    assert c.feed(10.0, (71, 10)) == 71
+    assert c.feed(15.0, None) == 71                   # 잠깐 못 읽어도 유지
+    assert c.feed(20.0, (3, 0)) is None               # 크게 역행 → 새 경기/오독, 확정 해제
+    assert c.feed(25.0, (3, 30)) == 3
+    c.feed(30.0, None)
+    assert c.feed(100.0, None) is None                # 60초 부재 → 비움
+    assert c.minute is None
+
+
+def test_find_clock_box_picks_the_wide_white_box_not_the_score_squares():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    from macroapp.auto_exit import find_clock_box
+
+    frame = np.full((1056, 1936), 40, dtype=np.uint8)
+    frame[93:128, 300:335] = 235                      # 스코어 박스(정사각형) — 영역 안에 있어도 제외
+    frame[93:128, 592:686] = 235                      # 시계 박스(가로 94x35)
+    box = find_clock_box(frame, (0.22, 0.05, 0.45, 0.13))
+    assert box is not None and box.shape == (35, 94)
+    assert find_clock_box(np.full((1056, 1936), 40, dtype=np.uint8), (0.22, 0.05, 0.45, 0.13)) is None
+
+
+def test_find_clock_box_on_saved_real_frames_if_present():
+    """저장된 실전 프레임(dist/fc_state_*.png)이 있으면 전부에서 같은 자리의 박스를 찾는다."""
+    pytest.importorskip("numpy")
+    cv2 = pytest.importorskip("cv2")
+    from macroapp.auto_exit import find_clock_box
+
+    frames = sorted(Path("dist").glob("fc_state_*.png")) if Path("dist").exists() else []
+    if not frames:
+        pytest.skip("실전 프레임 없음")
+    for path in frames:
+        gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        box = find_clock_box(gray, (0.22, 0.05, 0.45, 0.13))
+        assert box is not None, path.name
+        assert 30 <= box.shape[0] <= 40 and 80 <= box.shape[1] <= 110, (path.name, box.shape)

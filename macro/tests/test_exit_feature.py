@@ -490,3 +490,53 @@ def test_second_press_is_ignored_while_busy(app):
     app.run_quick_exit()
     app.run_quick_exit()
     assert BusyRunner.started == 0, "이미 도는데 또 시작했다"
+
+
+# ─── 서버 구매자별 종료 규칙(auto_exit_settings) 반영 ─────────────────────────
+# 규칙은 트래커에, 비율은 쿼터에, late 비율은 별도 쿼터에 닿는지(배선)와
+# 프로 아님·불량 필드에서 기본값이 유지되는지를 고정한다.
+
+
+def test_verified_settings_reach_tracker_and_quotas(app):
+    app._apply_tier({
+        "valid": True, "pro": True,
+        "auto_exit_settings": {
+            "ratio": 0.5, "base_deficit": 2, "hard_deficit": 4,
+            "late_minute": 75, "late_deficit": 1, "late_ratio": 1.0,
+        },
+    })
+    rules = app._loss_tracker.rules
+    assert (rules.base_deficit, rules.hard_deficit, rules.late_minute, rules.late_deficit) == (2, 4, 75, 1)
+    assert app._exit_quota.ratio == 0.5
+    assert app._late_quota is not None and app._late_quota.ratio == 1.0
+
+    # late_ratio 를 빼면 별도 쿼터가 사라지고 base 쿼터를 같이 쓴다.
+    app._apply_tier({"valid": True, "pro": True, "auto_exit_settings": {"ratio": 0.5}})
+    assert app._late_quota is None
+    # 보내지 않은 필드는 직전 값을 유지한다(필드 단위 fail-safe).
+    assert app._loss_tracker.rules.hard_deficit == 4
+
+
+def test_settings_without_pro_tier_are_ignored(app):
+    app._apply_tier({"valid": True, "pro": False, "auto_exit_settings": {"hard_deficit": 9}})
+    assert app._loss_tracker.rules.hard_deficit == 3
+
+
+def test_bad_settings_keep_defaults_and_do_not_break_tier(app):
+    app._apply_tier({"valid": True, "pro": True, "auto_exit_settings": {"hard_deficit": "x", "late_minute": -5}})
+    assert app._is_pro is True
+    assert app._loss_tracker.rules.hard_deficit == 3
+    assert app._loss_tracker.rules.late_minute == 70
+    app._apply_tier({"valid": True, "pro": True, "auto_exit_settings": "junk"})
+    assert app._loss_tracker.rules.hard_deficit == 3
+
+
+def test_default_rules_match_config(app):
+    from macroapp import config
+
+    rules = app._loss_tracker.rules
+    assert rules.base_deficit == config.AUTO_EXIT_DEFICIT_GOALS
+    assert rules.hard_deficit == config.AUTO_EXIT_HARD_DEFICIT_GOALS
+    assert rules.late_minute == config.AUTO_EXIT_LATE_MINUTE
+    assert rules.late_deficit == config.AUTO_EXIT_LATE_DEFICIT_GOALS
+    assert app._late_quota is None

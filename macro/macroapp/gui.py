@@ -53,6 +53,8 @@ from macroapp.config import (
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
     AUTO_EXIT_CONFIRM_COUNT, AUTO_EXIT_DEFICIT_GOALS, AUTO_EXIT_ENABLED,
     AUTO_EXIT_UNKNOWN_DUMP_LIMIT, AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS,
+    AUTO_EXIT_HARD_DEFICIT_GOALS, AUTO_EXIT_LATE_MINUTE, AUTO_EXIT_LATE_DEFICIT_GOALS,
+    AUTO_EXIT_CLOCK_REGION, AUTO_EXIT_CLOCK_INTERVAL_SECONDS, AUTO_EXIT_CLOCK_CONSENSUS,
     AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
@@ -261,11 +263,31 @@ class AutomationApp:
         # 트래커도 세션 수명이다. 실행(run)마다 새로 만들면 0:2 로 확정(방치 결정)된
         # 경기 도중 정지→재시작하는 것만으로 같은 경기가 두 번 세어진다(리뷰 확정).
         # 실행마다 바뀌는 건 '이번 실행에 관측을 공급할지'(_auto_exit_active)뿐이다.
+        # 종료 규칙(기본·대량 실점·후반)은 서버가 구매자별로 내려준다 — 내장값은 서버가
+        # 안 줄 때의 기본값이다. 쿼터는 base 가 쓰고, late 는 자기 비율이 있을 때만 따로 센다.
+        self._exit_settings = auto_exit.ExitSettings(
+            rules=auto_exit.ExitRules(
+                base_deficit=AUTO_EXIT_DEFICIT_GOALS,
+                hard_deficit=AUTO_EXIT_HARD_DEFICIT_GOALS,
+                late_minute=AUTO_EXIT_LATE_MINUTE,
+                late_deficit=AUTO_EXIT_LATE_DEFICIT_GOALS,
+            ),
+            ratio=AUTO_EXIT_RATIO,
+        )
+        self._late_quota = None                  # None = base 쿼터를 같이 쓴다
         self._loss_tracker = auto_exit.LossTracker(
             deficit=AUTO_EXIT_DEFICIT_GOALS,
             confirm_count=AUTO_EXIT_CONFIRM_COUNT,
             reset_seconds=AUTO_EXIT_MATCH_RESET_SECONDS,
+            rules=self._exit_settings.rules,
         )
+        # '70분 이후' 규칙의 재료 — 경기 시계(winocr). 스코어와 달리 읽힌다(실측).
+        self._clock_tracker = auto_exit.ClockTracker(
+            consensus=AUTO_EXIT_CLOCK_CONSENSUS,
+            reset_seconds=AUTO_EXIT_MATCH_RESET_SECONDS,
+        )
+        self._clock_last_ocr_at = float("-inf")
+        self._last_clock_minute = None
         self._auto_exit_active = False
         self._last_match_score = None
         self._score_unknown_dumped = 0              # '숫자 미상' 표본 저장 수(세션 상한)
@@ -2055,6 +2077,8 @@ class AutomationApp:
             # (래치는 유지 — 정지→재시작으로 같은 경기가 두 번 세어지면 안 된다).
             self._auto_exit_active = self._auto_exit_allowed(capture_mode)
             self._loss_tracker.resume_observation()
+            self._clock_last_ocr_at = float("-inf")
+            self._last_clock_minute = None
             self._last_match_score = None
             self._score_unknown_dumped = 0
             self._score_unknown_dumped_at = float("-inf")
@@ -5649,6 +5673,42 @@ class AutomationApp:
         # 프로 빌드가 아니면 이 기능 자체가 없다(버튼도 없다).
         self._is_pro = bool(sr.get("pro")) and edition.is_pro()
         self._apply_auto_exit_ratio(sr)
+        self._apply_auto_exit_settings(sr)
+
+    def _apply_auto_exit_settings(self, sr: dict) -> None:
+        """서버가 내려준 구매자별 종료 규칙(auto_exit_settings)을 반영한다.
+
+        필드 단위 fail-safe(parse_exit_settings): 깨진 필드만 직전 값을 유지한다.
+        규칙은 트래커에(경기 상태 보존), 비율은 쿼터에(카운트 보존) 넣는다. late 비율이
+        따로 오면 별도 쿼터를 두고, 없으면(None) base 쿼터를 같이 쓴다 — '진 판 중
+        N%' 라는 뜻이 한 카운트 위에서 유지된다. 티어가 프로가 아니면 무시한다.
+        """
+
+        payload = sr.get("auto_exit_settings")
+        if payload is None or not self._is_pro:
+            return
+        try:
+            settings = auto_exit.parse_exit_settings(payload, self._exit_settings)
+            self._exit_settings = settings
+            self._loss_tracker.set_rules(settings.rules)
+            if settings.ratio != self._exit_quota.ratio:
+                self._exit_quota.set_ratio(settings.ratio)
+            if settings.late_ratio is None:
+                self._late_quota = None
+            elif self._late_quota is None:
+                self._late_quota = auto_exit.ExitQuota(settings.late_ratio)
+            elif settings.late_ratio != self._late_quota.ratio:
+                self._late_quota.set_ratio(settings.late_ratio)
+            rules = settings.rules
+            self._log_to_file_only(
+                "[자동 종료] 서버 규칙 적용: "
+                f"기본 {rules.base_deficit}점차 {settings.ratio:.0%} / "
+                f"대량 실점 {rules.hard_deficit}점차(무조건) / "
+                f"후반 {rules.late_minute}분 {rules.late_deficit}점차"
+                + (f" {settings.late_ratio:.0%}" if settings.late_ratio is not None else "")
+            )
+        except Exception as exc:  # noqa: BLE001 - 운영값 반영 실패가 인증·자동화를 막으면 안 된다
+            self._log_to_file_only(f"[자동 종료] 서버 규칙 반영 실패(기본값 유지): {exc}")
 
     def _apply_auto_exit_ratio(self, sr: dict) -> None:
         """서버 운영 설정(0:2 자동 종료 비율)을 쿼터에 반영한다.
@@ -5745,10 +5805,12 @@ class AutomationApp:
             elif reading == auto_exit.SCORE_UNKNOWN:
                 self._log_to_file_only("[자동 종료] 스코어 박스는 보이는데 숫자 미상")
         if reading == auto_exit.SCORE_UNKNOWN:
-            # 템플릿 없는 숫자(4~9)의 실전 표본을 남긴다 — 다음 빌드에서 글리프를 넓힐 재료.
+            # 템플릿 없는 숫자(5~9)의 실전 표본을 남긴다 — 다음 빌드에서 글리프를 넓힐 재료.
             self._save_score_unknown_crop(gray, now, fresh)
 
-        if not tracker.feed(now, reading):
+        minute = self._read_match_clock(gray, now, reading)
+        kind = tracker.observe(now, reading, minute)
+        if kind is None:
             return
 
         # winocr 호출(수백 ms) 사이에 사용자가 정지를 눌렀을 수 있다 — 정지 뒤에
@@ -5756,19 +5818,67 @@ class AutomationApp:
         if self.stop_event.is_set():
             return
 
-        quota = self._exit_quota
+        rules = tracker.rules
+        if kind == auto_exit.KIND_HARD:
+            # 대량 실점 — 비율과 무관하게 무조건 나간다(구매자별 설정).
+            self.queue_log(
+                f"[자동 종료] {rules.hard_deficit}점차 이상 대량 실점 — 비율과 무관하게 "
+                "즉시 종료를 실행합니다"
+            )
+            self.ui_queue.put(("auto_exit", ""))
+            return
+
+        if kind == auto_exit.KIND_LATE:
+            label = f"{rules.late_minute}분 이후 {rules.late_deficit}점차 열세"
+            quota = self._late_quota if self._late_quota is not None else self._exit_quota
+        else:
+            label = f"{rules.base_deficit}점차 패배"
+            quota = self._exit_quota
         if quota.register_loss():
             self.queue_log(
-                f"[자동 종료] 2점차 패배 {quota.lost_games}번째 — 즉시 종료를 실행합니다 "
+                f"[자동 종료] {label} {quota.lost_games}번째 — 즉시 종료를 실행합니다 "
                 f"(종료 {quota.exits_done}회 / 목표 비율 {quota.ratio:.0%})"
             )
             # tkinter 는 UI 스레드에서만 만져야 한다 → 큐로 넘긴다.
             self.ui_queue.put(("auto_exit", ""))
         else:
             self.queue_log(
-                f"[자동 종료] 2점차 패배 {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
+                f"[자동 종료] {label} {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
                 f"(종료 {quota.exits_done}/{quota.lost_games}, 비매너 분산)"
             )
+
+    def _read_match_clock(self, gray, now: float, reading) -> Optional[int]:
+        """'70분 이후' 규칙의 재료 — 경기 시계를 읽어 확정 분을 돌려준다(없으면 None).
+
+        스코어보드가 없으면(reading None) 시계도 없다 — 부재 타이머만 돌린다. 후반 규칙이
+        꺼져 있거나 winocr 가 없으면 아예 읽지 않는다(None → late 규칙 비활성). 읽기는
+        AUTO_EXIT_CLOCK_INTERVAL_SECONDS 마다 한 번 — SKIP·등수 OCR 과 같은 워커라서.
+        """
+
+        tracker = self._clock_tracker
+        if reading is None:
+            return tracker.feed(now, None)
+        if self._loss_tracker.rules.late_minute <= 0 or not rank_ocr.ocr_available():
+            return None
+        if now - self._clock_last_ocr_at < AUTO_EXIT_CLOCK_INTERVAL_SECONDS:
+            return tracker.minute
+        self._clock_last_ocr_at = now
+        try:
+            box = auto_exit.find_clock_box(gray, AUTO_EXIT_CLOCK_REGION)
+            parsed = (
+                auto_exit.parse_clock_text(rank_ocr.read_clock_text(box))
+                if box is not None else None
+            )
+        except Exception:
+            parsed = None
+        minute = tracker.feed(now, parsed)
+        if minute != self._last_clock_minute:
+            self._last_clock_minute = minute
+            self._log_to_file_only(
+                f"[자동 종료] 경기 시계 {minute}분" if minute is not None
+                else "[자동 종료] 경기 시계 미상"
+            )
+        return minute
 
     def _run_auto_exit(self) -> None:
         """UI 스레드: 자동 종료 요청을 실행한다(수동 버튼과 같은 경로).

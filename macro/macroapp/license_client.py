@@ -159,6 +159,13 @@ def verify_signed_response(
         "auto_exit_ratio": (
             _parse_auto_exit_ratio(response.get("auto_exit_ratio")) if pro else None
         ),
+        # 구매자별 종료 규칙 전부(비율·점차·후반 분). 검증은 auto_exit.parse_exit_settings
+        # 가 필드 단위로 한다 — 여기서는 '프로 응답의 dict 인가'만 본다.
+        "auto_exit_settings": (
+            response.get("auto_exit_settings")
+            if pro and isinstance(response.get("auto_exit_settings"), dict)
+            else None
+        ),
     }
 
 # HWID는 머신마다 고정이므로 1회만 계산해 캐시합니다(매 30초 WMIC 서브프로세스 제거).

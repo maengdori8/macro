@@ -130,3 +130,56 @@ test("없는 키는 404, 관리자 키가 틀리면 401", async () => {
   res = await patch({ key: "PRO11-PRO11-PRO11-PRO11-PRO11", autoExitRatio: 0.5 }, "wrong");
   assert.equal(res.statusCode, 401);
 });
+
+
+test("키별 exitSettings: 보낸 필드만 저장, null 은 해제, 불량·모르는 필드는 거부", async () => {
+  const key = "PRO33-PRO33-PRO33-PRO33-PRO33";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro", autoExitRatio: 0.5 }));
+
+  let res = await patch({ key, exitSettings: { autoExitHardDeficit: 4, autoExitLateMinute: 75, autoExitLateRatio: 1 } });
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  let doc = db.read(`licenses/${key}`);
+  assert.equal(doc.autoExitHardDeficit, 4);
+  assert.equal(doc.autoExitLateMinute, 75);
+  assert.equal(doc.autoExitLateRatio, 1);
+  assert.equal(doc.autoExitRatio, 0.5, "안 보낸 필드는 그대로");
+  assert.equal(res.body.exitSettings.autoExitHardDeficit, 4);
+  assert.equal(res.body.exitSettings.autoExitRatio, 0.5);
+
+  res = await patch({ key, exitSettings: { autoExitHardDeficit: null } });
+  assert.equal(res.statusCode, 200);
+  assert.equal(db.read(`licenses/${key}`).autoExitHardDeficit, null);
+
+  for (const bad of [{ autoExitHardDeficit: 99 }, { autoExitLateMinute: -1 }, { bogus: 1 }, {}, "junk", [1]]) {
+    res = await patch({ key, exitSettings: bad });
+    assert.equal(res.statusCode, 400, `거부돼야 함: ${JSON.stringify(bad)}`);
+  }
+  assert.equal(db.read(`licenses/${key}`).autoExitLateMinute, 75, "거부된 요청이 문서를 바꿨다");
+
+  // 일반 키에는 안 된다.
+  const basic = "BAS33-BASIC-BASIC-BASIC-BASIC";
+  db._docs.set(`licenses/${basic}`, licenseDoc({ product: "macro" }));
+  res = await patch({ key: basic, exitSettings: { autoExitHardDeficit: 4 } });
+  assert.equal(res.statusCode, 400);
+});
+
+test("전역 setProSettings: 여러 필드 저장·null 해제·불량 거부, 응답은 실효값", async () => {
+  let res = await patch({ action: "setProSettings", autoExitRatio: 0.6, autoExitHardDeficit: 5, autoExitLateRatio: null });
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(res.body.proSettings.autoExitRatio, 0.6);
+  assert.equal(res.body.proSettings.autoExitHardDeficit, 5);
+  assert.equal(res.body.proSettings.autoExitLateRatio, null);
+  assert.equal(res.body.proSettings.autoExitBaseDeficit, 2, "안 보낸 필드는 기본값으로 채워져 온다");
+  const doc = db.read("config/pro_settings");
+  assert.equal(doc.autoExitRatio, 0.6);
+  assert.equal(doc.autoExitHardDeficit, 5);
+
+  res = await patch({ action: "setProSettings", autoExitHardDeficit: 42 });
+  assert.equal(res.statusCode, 400);
+  res = await patch({ action: "setProSettings" });
+  assert.equal(res.statusCode, 400, "보낸 필드가 없으면 거부");
+  // 옛 형태(비율만)도 그대로 된다.
+  res = await patch({ action: "setProSettings", autoExitRatio: 0.35 });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.proSettings.autoExitRatio, 0.35);
+});

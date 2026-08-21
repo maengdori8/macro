@@ -124,3 +124,92 @@ test("merge 저장이라 미래에 추가될 다른 설정 필드를 지우지 �
   assert.equal(db.read("config/pro_settings").futureField, "keep");
   assert.equal(db.read("config/pro_settings").autoExitRatio, 0.5);
 });
+
+
+// ─── 규칙 전부(점차·후반 분·후반 비율) — 키별 → 전역 → 기본값 ───────────────
+
+const {
+  FIELD_SPECS,
+  SETTING_FIELDS,
+  effectiveSettings,
+  normalizeSetting,
+  normalizeSettings,
+  readProSettings,
+  resolveExitSettings,
+  toClientPayload,
+  writeProSettings,
+} = require("../lib/pro_settings");
+
+test("정수 필드는 범위 안 정수만, 비율 필드는 0~1 만 통과한다", () => {
+  assert.equal(normalizeSetting("autoExitBaseDeficit", 2), 2);
+  assert.equal(normalizeSetting("autoExitBaseDeficit", "3"), 3);
+  assert.equal(normalizeSetting("autoExitBaseDeficit", 0), null);
+  assert.equal(normalizeSetting("autoExitHardDeficit", 0), 0, "0 = 끔은 유효하다");
+  assert.equal(normalizeSetting("autoExitHardDeficit", 10), null);
+  assert.equal(normalizeSetting("autoExitLateMinute", 120), 120);
+  assert.equal(normalizeSetting("autoExitLateMinute", 121), null);
+  assert.equal(normalizeSetting("autoExitLateMinute", 70.5), null);
+  assert.equal(normalizeSetting("autoExitLateRatio", 1), 1);
+  assert.equal(normalizeSetting("autoExitLateRatio", 1.5), null);
+  assert.equal(normalizeSetting("nope", 1), null);
+  for (const bad of [true, false, null, undefined, "", " ", NaN, {}, []]) {
+    assert.equal(normalizeSetting("autoExitBaseDeficit", bad), null, `통과되면 안 됨: ${String(bad)}`);
+  }
+});
+
+test("normalizeSettings 는 모든 필드를 돌려주고 없는 건 null 이다", () => {
+  const out = normalizeSettings({ autoExitRatio: 0.5, autoExitLateMinute: "80", junk: 1 });
+  assert.deepEqual(Object.keys(out).sort(), [...SETTING_FIELDS].sort());
+  assert.equal(out.autoExitRatio, 0.5);
+  assert.equal(out.autoExitLateMinute, 80);
+  assert.equal(out.autoExitHardDeficit, null);
+  assert.equal("junk" in out, false);
+  assert.deepEqual(normalizeSettings(null), normalizeSettings(undefined));
+});
+
+test("resolveExitSettings: 키별 → 전역 → 기본값 순서로 필드마다 고른다", async () => {
+  const db = new FakeFirestore({ "config/pro_settings": { autoExitRatio: 0.7, autoExitLateMinute: 80 } });
+  const resolved = await resolveExitSettings(db, { autoExitHardDeficit: 4, autoExitLateMinute: "x" });
+  assert.equal(resolved.autoExitRatio, 0.7, "키별 없음 → 전역");
+  assert.equal(resolved.autoExitHardDeficit, 4, "키별 값");
+  assert.equal(resolved.autoExitLateMinute, 80, "키별 깨짐 → 전역");
+  assert.equal(resolved.autoExitBaseDeficit, FIELD_SPECS.autoExitBaseDeficit.def, "둘 다 없음 → 기본값");
+  assert.equal(resolved.autoExitLateDeficit, 1);
+  assert.equal(resolved.autoExitLateRatio, null, "후반 비율 기본은 null(기본 비율 따름)");
+});
+
+test("toClientPayload 는 클라이언트 이름(snake_case)으로 바꾸고 null 을 유지한다", async () => {
+  const db = new FakeFirestore();
+  const payload = toClientPayload(await resolveExitSettings(db, { autoExitLateRatio: 1 }));
+  assert.deepEqual(payload, {
+    ratio: 0.4, base_deficit: 2, hard_deficit: 3, late_minute: 70, late_deficit: 1, late_ratio: 1,
+  });
+  const defaults = toClientPayload(await resolveExitSettings(db, {}));
+  assert.equal(defaults.late_ratio, null);
+});
+
+test("writeProSettings: 보낸 필드만 저장·null 은 지움·불량은 거부·모르는 필드는 거부", async () => {
+  const db = new FakeFirestore({ "config/pro_settings": { autoExitRatio: 0.4, keep: "me" } });
+  await writeProSettings(db, { autoExitHardDeficit: 4, autoExitLateRatio: null }, 123);
+  const doc = db.read("config/pro_settings");
+  assert.equal(doc.autoExitHardDeficit, 4);
+  assert.equal(doc.autoExitLateRatio, null);
+  assert.equal(doc.autoExitRatio, 0.4, "안 보낸 필드는 그대로");
+  assert.equal(doc.keep, "me");
+  assert.equal(doc.updatedAt, 123);
+  await assert.rejects(() => writeProSettings(db, { autoExitHardDeficit: 99 }), /0~9/);
+  await assert.rejects(() => writeProSettings(db, { bogus: 1 }), /모르는/);
+  await assert.rejects(() => writeProSettings(db, {}), /저장할/);
+  // 쓰기 뒤 같은 인스턴스는 즉시 새 값을 읽는다.
+  assert.equal((await readProSettings(db)).autoExitHardDeficit, 4);
+});
+
+test("effectiveSettings 는 null 을 기본값으로 채운다(후반 비율은 null 그대로)", () => {
+  const out = effectiveSettings(normalizeSettings({ autoExitRatio: 0.6 }));
+  assert.equal(out.autoExitRatio, 0.6);
+  assert.equal(out.autoExitBaseDeficit, 2);
+  assert.equal(out.autoExitHardDeficit, 3);
+  assert.equal(out.autoExitLateMinute, 70);
+  assert.equal(out.autoExitLateDeficit, 1);
+  assert.equal(out.autoExitLateRatio, null);
+});

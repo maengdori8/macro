@@ -350,8 +350,8 @@ test("프로 키 행에는 키별 비율(없으면 전역값)과 '종료율' 버
   assert.match(html, /종료 60% \(키별\)/, "키별 비율이 표시되지 않았다");
   assert.match(html, /종료 40% \(전역\)/, "키별 값 없는 프로 키가 전역값을 보여 주지 않았다");
   // 일반 키는 문서에 값이 적혀 있어도 표시하지 않는다(기능이 없는 제품이다).
-  assert.equal((html.match(/data-action="exitratio"/g) || []).length, 2, "종료율 버튼은 프로 키 두 개에만 있어야 한다");
-  assert.equal(html.includes('data-action="exitratio" data-key="BASIC-BASIC-BASIC-BASIC-BASIC"'), false);
+  assert.equal((html.match(/data-action="exitsettings"/g) || []).length, 2, "종료 설정 버튼은 프로 키 두 개에만 있어야 한다");
+  assert.equal(html.includes('data-action="exitsettings" data-key="BASIC-BASIC-BASIC-BASIC-BASIC"'), false);
   assert.equal(html.includes("종료 20%"), false, "일반 키 행에 비율이 새어 나왔다");
 });
 
@@ -402,4 +402,117 @@ test("'종료율' 행 동작이 프롬프트 값을 PATCH 로 보낸다(리스�
     await vm.runInContext("handleRowAction(__event)", context);
     assert.equal(patches().length, 0, `요청이 나가면 안 되는 입력: ${answer}`);
   }
+});
+
+
+// ─── 키별 종료 설정 모달 + 전역 다중 필드 ─────────────────────────────────
+
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+function loadWithSettings(context, licenses, proSettings) {
+  context.fetch = async () => ({ ok: true, json: async () => ({ success: true, licenses, proSettings }) });
+  return vm.runInContext("loadLicenses()", context);
+}
+
+test("전역 패널 저장은 채운 필드만 보내고, 후반 비율 빈 칸은 null(해제)로 보낸다", async () => {
+  const { context, byId } = makeContext();
+  const calls = [];
+  context.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({ success: true, message: "ok", proSettings: { autoExitRatio: 0.5, autoExitBaseDeficit: 2, autoExitHardDeficit: 4, autoExitLateMinute: 70, autoExitLateDeficit: 1, autoExitLateRatio: null } }) };
+  };
+  byId("autoExitRatioInput").value = "50";
+  byId("autoExitHardDeficitInput").value = "4";
+  byId("autoExitLateRatioInput").value = "";
+  await vm.runInContext("saveProSettings()", context);
+  const body = JSON.parse(calls[0].opts.body);
+  assert.deepEqual(body, { action: "setProSettings", autoExitRatio: 0.5, autoExitHardDeficit: 4, autoExitLateRatio: null });
+  // 응답의 실효값으로 입력칸이 채워진다.
+  assert.equal(byId("autoExitHardDeficitInput").value, 4);
+  assert.equal(byId("autoExitLateMinuteInput").value, 70);
+  assert.equal(byId("autoExitLateRatioInput").value, "");
+
+  // 범위 밖 정수(소수·초과)는 요청 자체가 안 나간다.
+  for (const [id, bad] of [["autoExitHardDeficitInput", "10"], ["autoExitLateMinuteInput", "70.5"], ["autoExitBaseDeficitInput", "0"]]) {
+    calls.length = 0;
+    byId(id).value = bad;
+    await vm.runInContext("saveProSettings()", context);
+    assert.equal(calls.length, 0, `요청이 나가면 안 되는 입력: ${id}=${bad}`);
+    byId(id).value = "";
+  }
+});
+
+test("'종료 설정' 행 동작이 모달을 열고 키별 값·전역 안내를 채운다", async () => {
+  const { context, byId } = makeContext();
+  const key = "PRO11-PRO11-PRO11-PRO11-PRO11";
+  await loadWithSettings(
+    context,
+    [license({ key, product: "macro_pro", autoExitRatio: 0.6, exitSettings: { autoExitRatio: 0.6, autoExitBaseDeficit: null, autoExitHardDeficit: 4, autoExitLateMinute: null, autoExitLateDeficit: null, autoExitLateRatio: null } })],
+    { autoExitRatio: 0.4, autoExitBaseDeficit: 2, autoExitHardDeficit: 3, autoExitLateMinute: 70, autoExitLateDeficit: 1, autoExitLateRatio: null }
+  );
+  context.__event = { target: { closest: () => ({ dataset: { key, action: "exitsettings" } }) } };
+  await vm.runInContext("handleRowAction(__event)", context);
+  assert.equal(byId("exitSettingsModal").classList.contains("show"), true, "모달이 안 열렸다");
+  assert.equal(byId("esRatioInput").value, 60);
+  assert.equal(byId("esHardDeficitInput").value, 4);
+  assert.equal(byId("esLateMinuteInput").value, "");
+  assert.equal(byId("esLateMinuteInput").placeholder, "전역 70");
+  assert.equal(byId("esLateRatioInput").placeholder, "기본 비율");
+  assert.match(byId("exitSettingsMeta").textContent, new RegExp(key));
+});
+
+test("모달 저장은 여섯 필드를 전부(빈 칸=null) 보내고, 전부 해제는 모두 null 을 보낸다", async () => {
+  const { context, byId } = makeContext();
+  const key = "PRO11-PRO11-PRO11-PRO11-PRO11";
+  const rows = [license({ key, product: "macro_pro", exitSettings: {} })];
+  const calls = [];
+  context.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({ success: true, message: "ok", licenses: rows, proSettings: { autoExitRatio: 0.4 } }) };
+  };
+  await vm.runInContext("loadLicenses()", context);
+  vm.runInContext(`openExitSettings(${JSON.stringify(key)})`, context);
+  byId("esRatioInput").value = "55";
+  byId("esHardDeficitInput").value = "4";
+  byId("esLateMinuteInput").value = "75";
+  byId("esLateRatioInput").value = "100";
+  await vm.runInContext("saveExitSettings(false)", context);
+  const saved = calls.filter((c) => c.opts && c.opts.method === "PATCH");
+  assert.equal(saved.length, 1);
+  assert.deepEqual(plain(JSON.parse(saved[0].opts.body)), {
+    key,
+    exitSettings: { autoExitRatio: 0.55, autoExitBaseDeficit: null, autoExitHardDeficit: 4, autoExitLateMinute: 75, autoExitLateDeficit: null, autoExitLateRatio: 1 },
+  });
+  assert.equal(byId("exitSettingsModal").classList.contains("show"), false, "저장 뒤 모달이 닫혀야 한다");
+
+  // 범위 밖은 요청이 안 나간다.
+  calls.length = 0;
+  vm.runInContext(`openExitSettings(${JSON.stringify(key)})`, context);
+  byId("esHardDeficitInput").value = "12";
+  await assert.rejects(() => vm.runInContext("saveExitSettings(false)", context), /0~9/);
+  assert.equal(calls.filter((c) => c.opts && c.opts.method === "PATCH").length, 0);
+
+  // 전부 해제.
+  calls.length = 0;
+  await vm.runInContext("saveExitSettings(true)", context);
+  const cleared = calls.filter((c) => c.opts && c.opts.method === "PATCH");
+  assert.equal(cleared.length, 1);
+  const body = plain(JSON.parse(cleared[0].opts.body));
+  assert.equal(Object.keys(body.exitSettings).length, 6);
+  assert.ok(Object.values(body.exitSettings).every((v) => v === null));
+});
+
+test("키별 규칙이 잡힌 행은 '맞춤 규칙' 표시가 붙는다", async () => {
+  const { context, byId } = makeContext();
+  await loadWithSettings(
+    context,
+    [
+      license({ key: "PRO11-PRO11-PRO11-PRO11-PRO11", product: "macro_pro", autoExitRatio: null, exitSettings: { autoExitHardDeficit: 4 } }),
+      license({ key: "PRO22-PRO22-PRO22-PRO22-PRO22", product: "macro_pro", autoExitRatio: null, exitSettings: {} }),
+    ],
+    { autoExitRatio: 0.4 }
+  );
+  const html = byId("licenseTable").innerHTML;
+  assert.match(html, /종료 40% \(전역\) · 맞춤 규칙/);
+  assert.equal((html.match(/맞춤 규칙/g) || []).length, 1);
 });

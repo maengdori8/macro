@@ -9,6 +9,7 @@ const {
   productSatisfies,
   requestedProductOf,
 } = require("./product");
+const { pickSettingFields } = require("./pro_settings");
 
 const DEFAULT_MAX_HWIDS = 3;
 
@@ -92,9 +93,10 @@ async function verifyAndActivateLicense({
       expiresAt: lifecycle.expiresAt || null,
       signatureExpiresAt: lifecycle.signatureExpiresAt || null,
       activatedAt: lifecycle.activatedAt || null,
-      // 키별 운영값(2점차 자동 종료 비율). 원값 그대로 넘기고 검증·전역 폴백은
-      // pro_settings.resolveAutoExitRatio 가 한다 — 규칙을 한 곳에 둔다.
+      // 키별 운영값(자동 종료 규칙 전부). 원값 그대로 넘기고 검증·전역 폴백은
+      // pro_settings.resolveExitSettings 가 한다 — 규칙을 한 곳에 둔다.
       autoExitRatio: data.autoExitRatio === undefined ? null : data.autoExitRatio,
+      exitSettings: pickSettingFields(data),
     };
   }, { maxAttempts: 3 });
 }

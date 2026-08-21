@@ -24,10 +24,16 @@ const {
   normalizeProduct,
 } = require("../lib/product");
 const {
+  SETTING_FIELDS,
   autoExitRatioAppliesTo,
+  effectiveSettings,
+  isSettingField,
   normalizeAutoExitRatio,
-  readAutoExitRatio,
-  writeAutoExitRatio,
+  normalizeSetting,
+  normalizeSettings,
+  readProSettings,
+  settingErrorMessage,
+  writeProSettings,
 } = require("../lib/pro_settings");
 
 if (!admin.apps.length) {
@@ -110,7 +116,8 @@ module.exports = async function handler(req, res) {
       // 읽기 실패는 목록 조회를 막지 않는다(패널만 비고 목록은 뜬다).
       let proSettings = null;
       try {
-        proSettings = { autoExitRatio: await readAutoExitRatio(db) };
+        // 실효값(값 ?? 기본값) — 관리 화면 입력칸을 그대로 채운다.
+        proSettings = effectiveSettings(await readProSettings(db));
       } catch (err) {
         console.error("Pro settings read error:", err);
       }
@@ -236,18 +243,28 @@ module.exports = async function handler(req, res) {
       }
 
       if (body.action === "setProSettings") {
-        // 2점차 자동 종료 비율 — 모든 mAuto Pro 클라이언트에 공통 적용되는 운영값.
-        // 잘못된 값이 저장되면 클라이언트가 조용히 기본값으로 돌아가 조절이 안 되는
-        // 것처럼 보이므로, 여기서 확실히 거부해 관리자에게 알린다.
-        const ratio = normalizeAutoExitRatio(body.autoExitRatio);
-        if (ratio === null) {
-          return res.status(400).json({ success: false, message: "자동 종료 비율은 0~1 사이 숫자여야 합니다." });
+        // 전역 자동 종료 규칙 — 모든 mAuto Pro 클라이언트에 공통 적용되는 운영값(키별
+        // 값이 없는 구매자에게). 보낸 필드만 바꾼다(null = 지워서 기본값으로). 잘못된
+        // 값이 저장되면 클라이언트가 조용히 기본값으로 돌아가 조절이 안 되는 것처럼
+        // 보이므로, 여기서 확실히 거부해 관리자에게 알린다.
+        const patch = {};
+        for (const name of SETTING_FIELDS) {
+          if (body[name] === undefined) continue;
+          if (body[name] !== null && normalizeSetting(name, body[name]) === null) {
+            return res.status(400).json({ success: false, message: settingErrorMessage(name) });
+          }
+          patch[name] = body[name];
         }
-        await writeAutoExitRatio(db, ratio, admin.firestore.FieldValue.serverTimestamp());
+        if (Object.keys(patch).length === 0) {
+          return res.status(400).json({ success: false, message: "저장할 설정이 없습니다." });
+        }
+        await writeProSettings(db, patch, admin.firestore.FieldValue.serverTimestamp());
+        const proSettings = effectiveSettings(await readProSettings(db));
+        const ratioText = `${Math.round(proSettings.autoExitRatio * 100)}%`;
         return res.status(200).json({
           success: true,
-          message: `2점차 자동 종료 비율을 ${Math.round(ratio * 100)}%로 저장했습니다.`,
-          proSettings: { autoExitRatio: ratio },
+          message: `프로 운영 설정을 저장했습니다. (기본 비율 ${ratioText})`,
+          proSettings,
         });
       }
 
@@ -258,6 +275,49 @@ module.exports = async function handler(req, res) {
       const doc = await col.doc(key).get();
       if (!doc.exists) {
         return res.status(404).json({ success: false, message: "존재하지 않는 키입니다." });
+      }
+
+      if (body.exitSettings !== undefined) {
+        // 키별 자동 종료 규칙 전부 — 구매자 한 명에게만 다른 규칙을 준다. 각 필드
+        // null = 해제(전역값을 따른다). 프로 키에만 받는다(아래 비율 단독 경로와 같은 이유).
+        if (!autoExitRatioAppliesTo(licenseProductOf(doc.data()))) {
+          return res.status(400).json({
+            success: false,
+            message: "키별 자동 종료 설정은 mAuto Pro 키에만 설정할 수 있습니다.",
+          });
+        }
+        const incoming = body.exitSettings;
+        if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+          return res.status(400).json({ success: false, message: "설정 형식이 올바르지 않습니다." });
+        }
+        const update = {};
+        for (const [name, value] of Object.entries(incoming)) {
+          if (!isSettingField(name)) {
+            return res.status(400).json({ success: false, message: `모르는 설정 필드입니다: ${name}` });
+          }
+          if (value === null) {
+            update[name] = null;
+            continue;
+          }
+          const normalized = normalizeSetting(name, value);
+          if (normalized === null) {
+            return res.status(400).json({ success: false, message: settingErrorMessage(name) });
+          }
+          update[name] = normalized;
+        }
+        if (Object.keys(update).length === 0) {
+          return res.status(400).json({ success: false, message: "저장할 설정이 없습니다." });
+        }
+        await col.doc(key).update(update);
+        const stored = normalizeSettings({ ...doc.data(), ...update });
+        const customized = Object.values(stored).some((value) => value !== null);
+        return res.status(200).json({
+          success: true,
+          message: customized
+            ? "이 키의 자동 종료 설정을 저장했습니다."
+            : "이 키의 자동 종료 설정을 모두 해제했습니다. 이제 전역값을 따릅니다.",
+          exitSettings: stored,
+        });
       }
 
       if (body.autoExitRatio !== undefined) {

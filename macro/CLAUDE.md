@@ -111,6 +111,36 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 
 ## 📝 결정 로그 (왜 이렇게 했는지 — 최신순)
 
+- `2026-08-21` **자동 종료 규칙 셋(기본·대량 실점·후반) + 구매자별 설정 — 시계 OCR 도입.**
+  사용자 요청: "3점차 이상이면 비율 무시하고 무조건 종료, 70분 이후 1점차로 지고 있으면
+  종료, 이 수치를 전부 패널에서 라이센스마다 다르게". 구현:
+  ① **규칙은 값이다** — `auto_exit.ExitRules(base_deficit=2, hard_deficit=3, late_minute=70,
+  late_deficit=1)`. `classify` 우선순위 hard > base > late. `LossTracker.observe()` 가 종류를
+  돌려주고(`feed()` 는 bool 호환 유지), **래치가 둘**이다: 쿼터 규칙(base/late)은 경기당
+  한 번(둘 다 같은 '진 판' 카운트 — 따로 걸리면 한 경기가 두 번 세어진다), hard 는 쿼터가
+  '방치'로 결정한 **뒤에도** 한 번 더 선다(0:2 방치 판이 0:3 으로 벌어지면 비율 무관하게
+  나가라는 뜻). late 비율은 따로 줄 수 있고(별도 ExitQuota), 없으면 base 쿼터를 같이 쓴다.
+  ② **경기 시계는 winocr 로 읽는다** — 스코어 숫자와 달리 읽힌다(저장 프레임 8장 전부:
+  '84:10'·'62•.04'·'6454'·'90:oo' 같은 형태 → `parse_clock_text` 가 전부 받음). 상대
+  닉네임 오른쪽 **흰 가로 박스**를 모양(가로 1.8~5배·밝음·꽉 참)으로 먼저 찾고
+  (`find_clock_box`, 위치가 아니라 모양 — 닉네임 길이에 안 흔들림; 숫자 닉네임은 검은
+  박스라 안 들어옴) 그 안만 2배·en 으로 OCR. 5초 간격(`AUTO_EXIT_CLOCK_INTERVAL_SECONDS`)
+  — SKIP·등수와 같은 워커라 자주 안 돌린다. `ClockTracker` 는 연속 2회 비역행이어야
+  확정, 크게 역행하면 확정 해제(새 경기/오독), 60초 부재면 비움. winocr 없으면 late 규칙만
+  조용히 꺼진다(minute None → classify 가 late 를 안 낸다).
+  ③ **서버는 필드 규격 하나**(`pro_settings.FIELD_SPECS`, 6필드: autoExitRatio·Base/Hard
+  Deficit·LateMinute/Deficit·LateRatio) 로 전역(config/pro_settings)·키별(라이센스 문서
+  평면 필드)·클라이언트 JSON(`auto_exit_settings` snake_case) 을 전부 만든다.
+  `resolveExitSettings` = 키별 → 전역 → 기본값, **필드마다**. 범위는 클라이언트
+  `auto_exit.SETTING_BOUNDS` 와 같아야 한다(다르면 서버가 받은 값을 클라이언트가 버려
+  "바꿨는데 안 바뀐다"). 서명 밖 운영값이라는 신뢰 모델은 그대로(비율 때와 같은 3중 방어).
+  `auto_exit_ratio` 도 같이 보내 구버전 클라이언트 호환. 관리 화면: 전역 패널 6필드
+  (빈 정수=미변경, 빈 후반 비율=null 해제), 키별 '종료 설정' 모달(빈 칸=null=전역 따름,
+  placeholder 에 전역 실효값), 행에 '맞춤 규칙' 표시. `update({field:null})` 로 해제
+  (FieldValue.delete 대신 — 의미 같고 가짜 저장소 테스트 가능).
+  ④ 글리프는 0~4(4 는 저장 프레임 4:0·4:1 에서 추출) — 5~9 는 `logs/score_unknown/`
+  자동 표본으로 채운다. 3점차는 0:3·1:4 까지 잡히고 0:5 는 아직 SCORE_UNKNOWN(진행 중).
+
 - `2026-08-21` **2점차 자동 종료 비율을 라이센스 키별로 — 전역값 위에 키별 덮어쓰기.**
   구매자 한 명에게만 다른 비율을 주고 싶다(사용자 요청). 라이센스 문서에 `autoExitRatio`
   (0~1, `null`=전역)를 두고 `pro_settings.resolveAutoExitRatio` 가 **키별 → 전역** 순으로

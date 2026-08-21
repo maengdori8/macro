@@ -24,6 +24,8 @@ OCR 워커 예산도 잠식하지 않는다. 템플릿은 macroapp/score_glyphs.
 from __future__ import annotations
 
 import base64
+import re
+from dataclasses import dataclass
 from typing import Optional, Union
 
 try:
@@ -189,6 +191,116 @@ def read_score_from_frame(gray, region_fractions, glyphs=None) -> Reading:
 
 
 # ---------------------------------------------------------------------------
+# 종료 규칙(구매자별 운영 설정) — 어떤 스코어·분에 '진 판'으로 볼지
+# ---------------------------------------------------------------------------
+
+#: 판정 종류. base/late 는 쿼터(비율)를 따르고, hard 는 비율을 무시하고 무조건 나간다.
+KIND_BASE = "base"     # 기본: 상대−나 ≥ base_deficit (예: 0:2)
+KIND_HARD = "hard"     # 대량 실점: 상대−나 ≥ hard_deficit (예: 0:3) → 비율 무시
+KIND_LATE = "late"     # 후반: 경기 분 ≥ late_minute 이고 상대−나 ≥ late_deficit (예: 70분 0:1)
+
+#: 설정값 허용 범위(클라이언트 fail-safe 검증 — 서버도 같은 범위를 쓴다).
+SETTING_BOUNDS = {
+    "base_deficit": (1, 9),
+    "hard_deficit": (0, 9),     # 0 = 끔
+    "late_minute": (0, 120),    # 0 = 끔
+    "late_deficit": (1, 9),
+}
+
+
+@dataclass(frozen=True)
+class ExitRules:
+    """스코어 규칙 세 개. 전부 구매자별로 바뀔 수 있어 상수가 아니라 값이다."""
+
+    base_deficit: int = 2
+    hard_deficit: int = 3
+    late_minute: int = 70
+    late_deficit: int = 1
+
+    def classify(self, mine: int, theirs: int, minute: Optional[int]) -> Optional[str]:
+        """한 관측이 어느 규칙에 걸리는지(우선순위 hard > base > late). 아니면 None."""
+
+        losing = int(theirs) - int(mine)
+        if self.hard_deficit > 0 and losing >= self.hard_deficit:
+            return KIND_HARD
+        if losing >= self.base_deficit:
+            return KIND_BASE
+        if (
+            self.late_minute > 0
+            and minute is not None
+            and int(minute) >= self.late_minute
+            and losing >= self.late_deficit
+        ):
+            return KIND_LATE
+        return None
+
+
+@dataclass(frozen=True)
+class ExitSettings:
+    """서버가 내려주는 구매자별 자동 종료 설정 전부(규칙 + 비율)."""
+
+    rules: ExitRules = ExitRules()
+    ratio: float = 0.4                    # base(+late_ratio 없을 때 late) 쿼터 비율
+    late_ratio: Optional[float] = None    # None = ratio 를 따른다
+
+
+def _coerce_int(value, bounds: tuple[int, int]) -> Optional[int]:
+    """정수 범위 검증. bool·소수·범위 밖·None 은 전부 None(= 기본값 유지)."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number != int(number):   # NaN·소수
+        return None
+    number = int(number)
+    if not (bounds[0] <= number <= bounds[1]):
+        return None
+    return number
+
+
+def _coerce_ratio(value) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= ratio <= 1.0):        # NaN 도 여기서 걸린다
+        return None
+    return ratio
+
+
+def parse_exit_settings(payload, defaults: Optional[ExitSettings] = None) -> ExitSettings:
+    """서버 응답의 ``auto_exit_settings`` 를 검증해 ExitSettings 로 만든다.
+
+    필드 단위 fail-safe: 빠졌거나 깨진 필드는 **그 필드만** 기본값(defaults)으로
+    남고 나머지는 반영된다. 통째로 거부하면 필드 하나 오타에 모든 규칙이 기본으로
+    돌아가 "패널에서 바꿨는데 안 바뀐다"가 된다. 이 값은 서명 밖 운영값이라
+    (license_client 참고) 위조로 얻는 것도 자기 종료 규칙 조절뿐이다.
+    """
+
+    base = defaults or ExitSettings()
+    if not isinstance(payload, dict):
+        return base
+    rules = base.rules
+    fields = {}
+    for name, bounds in SETTING_BOUNDS.items():
+        value = _coerce_int(payload.get(name), bounds)
+        fields[name] = getattr(rules, name) if value is None else value
+    ratio = _coerce_ratio(payload.get("ratio"))
+    late_ratio = _coerce_ratio(payload.get("late_ratio"))
+    return ExitSettings(
+        rules=ExitRules(**fields),
+        ratio=base.ratio if ratio is None else ratio,
+        # late_ratio 는 '없음(None)=기본 비율 따름'이 정상값이라 빠지면 None 으로 둔다.
+        late_ratio=late_ratio,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 한 경기당 한 번 세기
 # ---------------------------------------------------------------------------
 
@@ -224,20 +336,43 @@ class LossTracker:
         confirm_count: int = 3,
         reset_seconds: float = 60.0,
         require_prior_score: bool = True,
+        rules: Optional[ExitRules] = None,
     ) -> None:
         if confirm_count < 1:
             raise ValueError("confirm_count 는 1 이상이어야 합니다.")
         if int(deficit) < 1:
             raise ValueError("deficit 는 1 이상이어야 합니다.")
-        self.deficit = int(deficit)
+        # rules 를 안 주면 예전 그대로 '기본 규칙 하나'다(hard/late 꺼짐) — 기존 호출부·
+        # 테스트의 의미가 바뀌지 않는다. 규칙 세 개를 쓰려면 rules 를 준다.
+        self.rules = rules or ExitRules(
+            base_deficit=int(deficit), hard_deficit=0, late_minute=0
+        )
         self.confirm_count = int(confirm_count)
         self.reset_seconds = float(reset_seconds)
         self.require_prior_score = bool(require_prior_score)
 
-        self._streak = 0
-        self._latched = False
+        self._streak = 0                             # 어떤 규칙이든 연속으로 걸린 횟수
+        self._hard_streak = 0                        # hard 규칙만 연속으로 걸린 횟수
+        self._quota_fired = False                    # 이 경기에서 base/late 가 확정됐나
+        self._hard_fired = False                     # 이 경기에서 hard 가 확정됐나
         self._last_seen_at: Optional[float] = None   # 뭔가 보인 마지막 시각
         self._seen_other = False                     # 이 경기에서 열세 아닌 스코어를 봤나
+        self.last_kind: Optional[str] = None         # 마지막 확정 종류(로그용)
+
+    @property
+    def deficit(self) -> int:
+        return self.rules.base_deficit
+
+    @property
+    def _latched(self) -> bool:
+        """기존 이름 호환 — '이 경기는 쿼터 규칙으로 이미 확정됐다'."""
+
+        return self._quota_fired
+
+    def set_rules(self, rules: ExitRules) -> None:
+        """규칙만 바꾼다(경기 상태·래치는 보존). 서버 설정이 내려왔을 때 쓴다."""
+
+        self.rules = rules
 
     def resume_observation(self) -> None:
         """자동화를 정지했다 재시작할 때 부른다 — **래치는 유지**하고 관측만 비운다.
@@ -248,9 +383,24 @@ class LossTracker:
         풀린다 — 정지해 있던 시간도 벽시계로 그대로 흐르므로 계산은 맞다.
         """
         self._streak = 0
+        self._hard_streak = 0
         self._seen_other = False
 
-    def feed(self, now: float, reading: Reading) -> bool:
+    def feed(self, now: float, reading: Reading, minute: Optional[int] = None) -> bool:
+        """관측 한 번. 이번 관측으로 '진 판'이 새로 확정됐으면 True(종류는 last_kind)."""
+
+        return self.observe(now, reading, minute) is not None
+
+    def observe(self, now: float, reading: Reading, minute: Optional[int] = None) -> Optional[str]:
+        """feed 와 같되 확정 종류(KIND_*)를 돌려준다. 확정이 아니면 None.
+
+        경기당 래치가 둘이다: 쿼터 규칙(base/late)은 **한 번만** 확정되고(둘 다 같은
+        '진 판' 카운트라 둘이 따로 걸리면 한 경기가 두 번 세어진다), hard 는 쿼터
+        규칙이 '방치'로 결정한 **뒤에도** 한 번 더 확정될 수 있다 — 0:2 방치 판이
+        0:3 으로 벌어지면 비율과 무관하게 나가라는 게 규칙의 뜻이다. hard 가 먼저
+        확정되면 그 경기는 끝난 것이므로 쿼터 래치도 같이 건다.
+        """
+
         now = float(now)
 
         if reading is None:
@@ -260,35 +410,51 @@ class LossTracker:
                 and now - self._last_seen_at >= self.reset_seconds
             ):
                 self._streak = 0
-                self._latched = False
+                self._hard_streak = 0
+                self._quota_fired = False
+                self._hard_fired = False
                 self._seen_other = False
                 self._last_seen_at = None
-            return False
+            return None
 
         # 미상 포함, 뭔가 보였다 = 경기 진행 중 → 종료 타이머 리셋.
         self._last_seen_at = now
         if reading == SCORE_UNKNOWN:
-            return False
+            return None
 
         mine, theirs = int(reading[0]), int(reading[1])
-        if theirs - mine < self.deficit:
-            # 열세가 아니다(동점·근소한 열세·우세 전부) → 연속 판정을 깨고,
-            # '이 경기의 정상 스코어를 봤다'는 선행 증거로 기록한다.
+        kind = self.rules.classify(mine, theirs, minute)
+        if kind is None:
+            # 어느 규칙에도 안 걸린다(동점·근소한 열세·우세·후반 전 1점차 전부) →
+            # 연속 판정을 깨고, '이 경기의 정상 스코어를 봤다'는 선행 증거로 기록한다.
             self._streak = 0
+            self._hard_streak = 0
             self._seen_other = True
-            return False
-        if self._latched:
-            return False
+            return None
         if self.require_prior_score and not self._seen_other:
-            return False
+            return None
 
         self._streak += 1
-        if self._streak < self.confirm_count:
-            return False
+        self._hard_streak = self._hard_streak + 1 if kind == KIND_HARD else 0
 
-        self._latched = True
+        if kind == KIND_HARD:
+            if self._hard_fired or self._hard_streak < self.confirm_count:
+                return None
+            self._hard_fired = True
+            self._quota_fired = True
+            self._hard_streak = 0
+            self._streak = 0
+            self.last_kind = KIND_HARD
+            return KIND_HARD
+
+        if self._quota_fired or self._hard_fired:
+            return None
+        if self._streak < self.confirm_count:
+            return None
+        self._quota_fired = True
         self._streak = 0
-        return True
+        self.last_kind = kind
+        return kind
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +497,123 @@ class ExitQuota:
             self.exits_done += 1
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# 경기 시계 — '70분 이후' 규칙의 재료
+# ---------------------------------------------------------------------------
+#
+# 스코어 숫자와 달리 시계("84:10")는 winocr 가 읽는다(실측: 저장 프레임 8장 전부,
+# 2배 확대·en). 시계는 상대 닉네임 오른쪽의 **흰 가로 박스**에만 있으므로 스코어
+# 박스처럼 연결 요소로 그 박스를 먼저 찾고(위치가 아니라 모양으로 — 닉네임 길이에
+# 흔들리지 않게) 그 안만 OCR 한다. 숫자 닉네임("4903")은 검은 박스라 여기 안 들어온다.
+
+
+def find_clock_box(gray, region_fractions):
+    """시계가 든 흰 가로 박스를 크롭으로 돌려준다(원본 픽셀). 없으면 None.
+
+    스코어 박스(정사각형)와 달리 가로로 긴 밝은 덩어리를 고른다. 영역 안에서 가장
+    큰 후보 하나만 쓴다 — 시계 박스는 하나뿐이다.
+    """
+    if cv2 is None:
+        return None
+    try:
+        crop = crop_score_region(gray, region_fractions)
+        if crop is None:
+            return None
+        peak = int(crop.max())
+        if peak < 180:
+            return None
+        mask = (crop >= max(180, peak - 25)).astype(np.uint8)
+        count, _labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        best = None
+        for i in range(1, count):
+            x, y, width, height, area = stats[i]
+            if height < 15 or width < 40:
+                continue
+            if not (1.8 <= width / height <= 5.0):
+                continue                  # 정사각형(스코어)·가는 선은 제외
+            if area < 0.45 * width * height:
+                continue
+            if best is None or area > best[0]:
+                best = (area, x, y, width, height)
+        if best is None:
+            return None
+        _, x, y, width, height = best
+        return crop[y:y + height, x:x + width]
+    except Exception:
+        return None
+
+
+_CLOCK_COLON_RE = re.compile(r"(\d{1,3})\s*[:;.•·,]\s*(\d{2})")
+
+
+def parse_clock_text(text) -> Optional[tuple[int, int]]:
+    """OCR 문자열 → (분, 초). 못 읽으면 None.
+
+    실측 출력 형태를 다 받는다: "84:10", "62•.04", "6454"(콜론 누락), "90:oo"(0→o),
+    "90:00+3"(추가시간 — '+' 앞만 본다). 초가 60 이상이거나 분이 130 을 넘으면 버린다.
+    """
+    if not text:
+        return None
+    cleaned = str(text).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1")
+    cleaned = cleaned.split("+", 1)[0]
+    match = _CLOCK_COLON_RE.search(cleaned)
+    if match:
+        minute, second = int(match.group(1)), int(match.group(2))
+    else:
+        digits = re.sub(r"\D", "", cleaned)
+        if len(digits) not in (3, 4):
+            return None
+        minute, second = int(digits[:-2]), int(digits[-2:])
+    if not (0 <= second <= 59 and 0 <= minute <= 130):
+        return None
+    return minute, second
+
+
+class ClockTracker:
+    """시계 읽기의 그럴듯함을 검사해 '확정 분'을 낸다(순수 로직).
+
+    규칙: 연속 consensus 회 읽힌 값이 **내려가지 않아야** 확정한다(경기 시계는
+    단조 증가). 크게 내려가면(새 경기·오독) 확정을 버리고 처음부터 다시 쌓는다.
+    None(시계 없음)이 reset_seconds 이상 이어지면 경기가 끝난 것으로 보고 비운다.
+    확정된 분은 다음 확정 때까지 유지된다(정지·하프타임 중 같은 값 반복은 정상).
+    """
+
+    def __init__(self, *, consensus: int = 2, reset_seconds: float = 60.0) -> None:
+        self.consensus = max(1, int(consensus))
+        self.reset_seconds = float(reset_seconds)
+        self.minute: Optional[int] = None
+        self._pending: Optional[tuple[int, int]] = None
+        self._streak = 0
+        self._last_seen_at: Optional[float] = None
+
+    def reset(self) -> None:
+        self.minute = None
+        self._pending = None
+        self._streak = 0
+        self._last_seen_at = None
+
+    def feed(self, now: float, reading: Optional[tuple[int, int]]) -> Optional[int]:
+        now = float(now)
+        if reading is None:
+            if (
+                self._last_seen_at is not None
+                and now - self._last_seen_at >= self.reset_seconds
+            ):
+                self.reset()
+            return self.minute
+        self._last_seen_at = now
+        minute, second = int(reading[0]), int(reading[1])
+        if self._pending is not None and (minute, second) < self._pending:
+            if self._pending[0] - minute > 2:
+                # 크게 역행 — 새 경기이거나 오독. 확정값도 믿지 않는다.
+                self.minute = None
+            self._pending = (minute, second)
+            self._streak = 1
+            return self.minute
+        self._pending = (minute, second)
+        self._streak += 1
+        if self._streak >= self.consensus:
+            self.minute = minute
+        return self.minute

@@ -165,3 +165,17 @@ def test_standard_tier_never_reads_the_ratio():
     result = check(sign("macro"), auto_exit_ratio=0.9)
     assert result["valid"] is True
     assert result["auto_exit_ratio"] is None
+
+
+def test_pro_response_passes_settings_dict_through():
+    result = check(sign("macro_pro"), auto_exit_settings={"hard_deficit": 4, "late_minute": 75})
+    assert result["pro"] is True
+    assert result["auto_exit_settings"] == {"hard_deficit": 4, "late_minute": 75}
+
+
+def test_settings_must_be_a_dict_and_pro_only():
+    assert check(sign("macro_pro"), auto_exit_settings="junk")["auto_exit_settings"] is None
+    assert check(sign("macro_pro"), auto_exit_settings=[1, 2])["auto_exit_settings"] is None
+    assert check(sign("macro_pro"))["auto_exit_settings"] is None
+    # 일반 티어에는 실려 와도 읽지 않는다.
+    assert check(sign("macro"), auto_exit_settings={"hard_deficit": 9})["auto_exit_settings"] is None

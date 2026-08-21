@@ -226,6 +226,7 @@
     .ops-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
     .notice { padding:13px; color:#d7bd85; background:#211c13; border:1px solid #403721; border-radius:11px; font-size:12px; }
     .field-stack { display:grid; gap:10px; }
+    .field-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; }
     .field-stack label { margin-bottom:5px; }
     details summary { list-style:none; cursor:pointer; }
     details summary::-webkit-details-marker { display:none; }
@@ -576,10 +577,18 @@
               <summary class="details-title"><div><div class="eyebrow">PRO</div><h2>프로 운영 설정</h2></div></summary>
               <div class="details-body field-stack">
                 <div>
-                  <label for="autoExitRatioInput">2점차 자동 종료 비율 (%)</label>
+                  <label for="autoExitRatioInput">기본 규칙 · 자동 종료 비율 (%)</label>
                   <input id="autoExitRatioInput" type="number" min="0" max="100" step="1" placeholder="40">
-                  <div class="hint">상대에게 2점차 이상으로 지고 있는 판 중 이 비율만 자동으로 나갑니다(나머지는 방치 — 비매너 점수 분산). 모든 mAuto Pro 사용자에게 공통 적용되고, 각 프로그램은 다음 실행(재인증) 때 새 값을 받습니다.</div>
+                  <div class="hint">상대에게 <b>기본 점차</b> 이상으로 지고 있는 판 중 이 비율만 자동으로 나갑니다(나머지는 방치 — 비매너 점수 분산). 키별 값이 없는 모든 mAuto Pro 사용자에게 적용되고, 각 프로그램은 다음 실행(재인증) 때 새 값을 받습니다.</div>
                 </div>
+                <div class="field-grid">
+                  <div><label for="autoExitBaseDeficitInput">기본 점차 (골)</label><input id="autoExitBaseDeficitInput" type="number" min="1" max="9" step="1" placeholder="2"></div>
+                  <div><label for="autoExitHardDeficitInput">무조건 종료 점차 (골, 0=끔)</label><input id="autoExitHardDeficitInput" type="number" min="0" max="9" step="1" placeholder="3"></div>
+                  <div><label for="autoExitLateMinuteInput">후반 규칙 시작 분 (0=끔)</label><input id="autoExitLateMinuteInput" type="number" min="0" max="120" step="1" placeholder="70"></div>
+                  <div><label for="autoExitLateDeficitInput">후반 점차 (골)</label><input id="autoExitLateDeficitInput" type="number" min="1" max="9" step="1" placeholder="1"></div>
+                  <div><label for="autoExitLateRatioInput">후반 비율 (%, 비우면 기본 비율)</label><input id="autoExitLateRatioInput" type="number" min="0" max="100" step="1" placeholder="기본 비율"></div>
+                </div>
+                <div class="hint">무조건 종료 점차 이상이면 비율과 무관하게 즉시 나갑니다. 후반 규칙은 경기 시계가 시작 분을 넘긴 뒤 후반 점차 이상으로 지고 있을 때 적용됩니다. 빈 칸은 바꾸지 않습니다. 구매자별 값은 목록의 <b>종료 설정</b> 버튼에서 따로 둡니다.</div>
                 <button class="btn" id="proSettingsSaveButton">프로 설정 저장</button>
               </div>
             </details>
@@ -599,6 +608,30 @@
       <div class="modal-actions">
         <div class="actions"><button class="btn btn-primary" id="copyResultButton">전체 복사</button><button class="btn" id="downloadResultButton">TXT 저장</button></div>
         <span class="hint">번호·공백 없이 한 줄에 한 키</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="exitSettingsModal" role="dialog" aria-modal="true" aria-labelledby="exitSettingsTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div><div class="eyebrow">PRO · 구매자별</div><h2 id="exitSettingsTitle">자동 종료 설정</h2><span class="hint" id="exitSettingsMeta"></span></div>
+        <button class="btn btn-sm btn-ghost" id="closeExitSettingsButton">닫기</button>
+      </div>
+      <div class="field-stack">
+        <div class="field-grid">
+          <div><label for="esRatioInput">기본 비율 (%)</label><input id="esRatioInput" type="number" min="0" max="100" step="1"></div>
+          <div><label for="esBaseDeficitInput">기본 점차 (골)</label><input id="esBaseDeficitInput" type="number" min="1" max="9" step="1"></div>
+          <div><label for="esHardDeficitInput">무조건 종료 점차 (골, 0=끔)</label><input id="esHardDeficitInput" type="number" min="0" max="9" step="1"></div>
+          <div><label for="esLateMinuteInput">후반 시작 분 (0=끔)</label><input id="esLateMinuteInput" type="number" min="0" max="120" step="1"></div>
+          <div><label for="esLateDeficitInput">후반 점차 (골)</label><input id="esLateDeficitInput" type="number" min="1" max="9" step="1"></div>
+          <div><label for="esLateRatioInput">후반 비율 (%)</label><input id="esLateRatioInput" type="number" min="0" max="100" step="1"></div>
+        </div>
+        <div class="hint">빈 칸 = 전역값을 따름(회색 안내가 지금의 전역값). 저장하면 이 구매자 프로그램이 다음 실행(재인증) 때 새 규칙을 받습니다.</div>
+      </div>
+      <div class="modal-actions">
+        <div class="actions"><button class="btn btn-primary" id="saveExitSettingsButton">저장</button><button class="btn" id="clearExitSettingsButton">전부 해제(전역 따름)</button></div>
+        <span class="hint" id="exitSettingsStatus"></span>
       </div>
     </div>
   </div>
@@ -660,18 +693,110 @@
       renderAll();
       $("lastSyncText").textContent = `${new Date().toLocaleTimeString("ko-KR", { hour:"2-digit", minute:"2-digit" })} 동기화`;
     }
+    // 자동 종료 설정 필드 규격 — 서버 lib/pro_settings.js FIELD_SPECS 와 같아야 한다.
+    // [서버 이름, 입력칸 id(전역), 입력칸 id(키별), 종류, 최소, 최대]
+    const EXIT_FIELDS = [
+      ["autoExitRatio",       "autoExitRatioInput",       "esRatioInput",       "ratio", 0, 100],
+      ["autoExitBaseDeficit", "autoExitBaseDeficitInput", "esBaseDeficitInput", "int",   1, 9],
+      ["autoExitHardDeficit", "autoExitHardDeficitInput", "esHardDeficitInput", "int",   0, 9],
+      ["autoExitLateMinute",  "autoExitLateMinuteInput",  "esLateMinuteInput",  "int",   0, 120],
+      ["autoExitLateDeficit", "autoExitLateDeficitInput", "esLateDeficitInput", "int",   1, 9],
+      ["autoExitLateRatio",   "autoExitLateRatioInput",   "esLateRatioInput",   "ratio", 0, 100],
+    ];
+    const EXIT_FIELD_LABELS = { autoExitRatio:"기본 비율", autoExitBaseDeficit:"기본 점차", autoExitHardDeficit:"무조건 종료 점차", autoExitLateMinute:"후반 시작 분", autoExitLateDeficit:"후반 점차", autoExitLateRatio:"후반 비율" };
+    let proSettingsEffective = null;   // 전역 실효값(키별 모달의 안내·폴백 표시용)
+    let exitSettingsKey = "";          // 키별 모달이 열린 라이센스 키
+
+    // 입력 문자열 하나를 서버 값으로. "" → null(해제/미변경), 범위 밖 → 예외.
+    function parseExitFieldInput(field, raw) {
+      const [name, , , kind, min, max] = field;
+      const text = String(raw === null || raw === undefined ? "" : raw).trim();
+      if (text === "") return null;
+      const number = Number(text);
+      if (!Number.isFinite(number) || number < min || number > max || (kind === "int" && !Number.isInteger(number))) {
+        throw new Error(`${EXIT_FIELD_LABELS[name]}은(는) ${min}~${max} 사이 ${kind === "int" ? "정수" : "숫자"}여야 합니다.`);
+      }
+      return kind === "ratio" ? number / 100 : number;
+    }
+    function exitFieldDisplay(field, value) {
+      // 숫자를 그대로 둔다(입력칸이 문자열로 바꾼다) — 빈 값만 "".
+      if (value === null || value === undefined || !Number.isFinite(value)) return "";
+      return field[3] === "ratio" ? Math.round(value * 100) : value;
+    }
     function renderProSettings(settings) {
-      // 서버가 준 비율(0~1)을 % 로 보여 준다. 값이 없거나 깨졌으면 입력칸을 비워
-      // 두는 대신 건드리지 않는다 — 관리자가 입력 중일 수 있다.
+      // 서버가 준 실효값을 입력칸에 채운다. 값이 없거나 깨졌으면 건드리지 않는다 —
+      // 관리자가 입력 중일 수 있다. 비율은 0~1 → %.
       if (!settings || !Number.isFinite(settings.autoExitRatio)) return;
+      proSettingsEffective = settings;
       proAutoExitRatio = settings.autoExitRatio;
-      $("autoExitRatioInput").value = Math.round(settings.autoExitRatio * 100);
+      for (const field of EXIT_FIELDS) {
+        const [name, globalId] = field;
+        if (name === "autoExitLateRatio" && (settings[name] === null || settings[name] === undefined)) {
+          $(globalId).value = "";
+          continue;
+        }
+        if (settings[name] === undefined) continue;
+        $(globalId).value = exitFieldDisplay(field, settings[name]);
+      }
+    }
+    // 전역 입력칸 → setProSettings 본문. 비율은 필수, 나머지 빈 칸은 보내지 않는다(미변경),
+    // 후반 비율 빈 칸은 null(해제 = 기본 비율 따름).
+    function buildProSettingsBody() {
+      const body = { action:"setProSettings" };
+      for (const field of EXIT_FIELDS) {
+        const [name, globalId] = field;
+        const value = parseExitFieldInput(field, $(globalId).value);
+        if (name === "autoExitRatio" && value === null) throw new Error("비율은 0~100 사이 숫자여야 합니다.");
+        if (name === "autoExitLateRatio") { body[name] = value; continue; }
+        if (value !== null) body[name] = value;
+      }
+      return body;
+    }
+    // 키별 모달 입력칸 → exitSettings 본문. 빈 칸 = null(전역 따름) — 전부 보낸다.
+    function buildExitSettingsBody() {
+      const exitSettings = {};
+      for (const field of EXIT_FIELDS) exitSettings[field[0]] = parseExitFieldInput(field, $(field[2]).value);
+      return exitSettings;
+    }
+    function openExitSettings(key) {
+      const item = licenses.find((row) => row.key === key); if (!item) return;
+      exitSettingsKey = key;
+      const own = item.exitSettings || {};
+      $("exitSettingsTitle").textContent = "자동 종료 설정";
+      $("exitSettingsMeta").textContent = `${key} · ${productLabel(item.product)}`;
+      for (const field of EXIT_FIELDS) {
+        const [name, , ownId] = field;
+        $(ownId).value = exitFieldDisplay(field, own[name]);
+        const globalValue = proSettingsEffective ? proSettingsEffective[name] : null;
+        $(ownId).placeholder = name === "autoExitLateRatio" && (globalValue === null || globalValue === undefined)
+          ? "기본 비율" : `전역 ${exitFieldDisplay(field, globalValue) || "-"}`;
+      }
+      $("exitSettingsStatus").textContent = "";
+      $("exitSettingsModal").classList.add("show");
+    }
+    async function saveExitSettings(clearAll = false) {
+      if (!exitSettingsKey) return;
+      let exitSettings;
+      if (clearAll) {
+        exitSettings = {};
+        for (const field of EXIT_FIELDS) exitSettings[field[0]] = null;
+      } else {
+        exitSettings = buildExitSettingsBody();
+      }
+      const data = await api("PATCH", { key:exitSettingsKey, exitSettings });
+      $("exitSettingsModal").classList.remove("show");
+      await loadLicenses(); toast(data.message);
     }
     // 키별 2점차 자동 종료 비율 표시. 키별 값이 없으면 전역값(알면 %까지)을 보여 준다 —
     // 구매자 한 명의 화면에 실제로 적용되는 숫자가 곧바로 읽혀야 한다.
     function exitRatioLabel(item) {
-      if (Number.isFinite(item.autoExitRatio)) return `종료 ${Math.round(item.autoExitRatio * 100)}% (키별)`;
-      return Number.isFinite(proAutoExitRatio) ? `종료 ${Math.round(proAutoExitRatio * 100)}% (전역)` : "종료 전역값";
+      const base = Number.isFinite(item.autoExitRatio)
+        ? `종료 ${Math.round(item.autoExitRatio * 100)}% (키별)`
+        : (Number.isFinite(proAutoExitRatio) ? `종료 ${Math.round(proAutoExitRatio * 100)}% (전역)` : "종료 전역값");
+      // 비율 말고 다른 규칙(점차·후반)이 키별로 잡혀 있으면 표시해 준다.
+      const own = item.exitSettings || {};
+      const customized = Object.keys(own).some((name) => name !== "autoExitRatio" && own[name] !== null && own[name] !== undefined);
+      return customized ? `${base} · 맞춤 규칙` : base;
     }
     // 프롬프트 입력(%) → PATCH 본문. 빈 값 = 해제(null, 전역값 사용). 범위 밖은 예외로
     // 막아 요청 자체가 안 나간다 — Number("abc") 가 NaN 으로 서버까지 가면 안 된다.
@@ -683,13 +808,12 @@
       return { key, autoExitRatio: percent / 100 };
     }
     async function saveProSettings() {
-      const raw = String($("autoExitRatioInput").value).trim();
-      const percent = Number(raw);
-      // Number("") 는 0 이라, 빈 입력을 그냥 넘기면 '0% 저장'이 조용히 나간다.
-      if (raw === "" || !Number.isFinite(percent) || percent < 0 || percent > 100) {
-        return toast("비율은 0~100 사이 숫자여야 합니다.", "error");
-      }
-      const data = await api("PATCH", { action:"setProSettings", autoExitRatio: percent / 100 });
+      // Number("") 는 0 이라, 빈 입력을 그냥 넘기면 '0% 저장'이 조용히 나간다 —
+      // 규격 검증(parseExitFieldInput)이 빈 비율·범위 밖을 요청 전에 막는다.
+      let body;
+      try { body = buildProSettingsBody(); }
+      catch (error) { return toast(error.message, "error"); }
+      const data = await api("PATCH", body);
       renderProSettings(data.proSettings); toast(data.message);
     }
     function renderAll() {
@@ -825,7 +949,7 @@
             <button class="btn btn-sm row-action" data-action="extend" data-key="${item.key}">연장</button>
             <button class="btn btn-sm row-action" data-action="reset" data-key="${item.key}" ${item.hwids.length ? "" : "disabled"}>HWID</button>
             <button class="btn btn-sm row-action" data-action="discord" data-key="${item.key}">디스코드</button>
-            ${licenseProduct(item) === "macro_pro" ? `<button class="btn btn-sm row-action" data-action="exitratio" data-key="${item.key}">종료율</button>` : ""}
+            ${licenseProduct(item) === "macro_pro" ? `<button class="btn btn-sm row-action" data-action="exitsettings" data-key="${item.key}">종료 설정</button>` : ""}
             <button class="btn btn-sm ${item.disabled ? "btn-green" : "btn-danger"} row-action" data-action="toggle" data-key="${item.key}">${item.disabled ? "활성" : "비활성"}</button>
             <button class="btn btn-sm btn-danger row-action" data-action="delete" data-key="${item.key}">삭제</button>
           </div></td></tr>`;
@@ -994,8 +1118,12 @@
         } else if (action === "discord") {
           const value = prompt("디스코드 ID (비우면 연결 해제)", item.discordId || ""); if (value === null) return;
           await api("PATCH", { key, discordId:value.trim() });
+        } else if (action === "exitsettings") {
+          // 이 구매자에게만 적용할 자동 종료 규칙 전부 — 모달에서 편집(저장은 모달 버튼).
+          openExitSettings(key);
+          return;
         } else if (action === "exitratio") {
-          // 이 구매자에게만 적용할 2점차 자동 종료 비율. 비우면 전역값으로 돌아간다.
+          // (구) 비율 단독 프롬프트 — API 호환용으로 남겨 둔다.
           const current = Number.isFinite(item.autoExitRatio) ? String(Math.round(item.autoExitRatio * 100)) : "";
           const value = prompt(`"${key}"의 2점차 자동 종료 비율(%)을 입력하세요. 비우면 전역값을 따릅니다.`, current);
           if (value === null) return;
@@ -1138,13 +1266,22 @@
     $("migrationApplyButton").addEventListener("click", applyMigration);
     $("versionSaveButton").addEventListener("click", saveVersion);
     $("proSettingsSaveButton").addEventListener("click", () => saveProSettings().catch((e) => toast(e.message,"error")));
+    $("saveExitSettingsButton").addEventListener("click", () => saveExitSettings(false).catch((e) => toast(e.message,"error")));
+    $("clearExitSettingsButton").addEventListener("click", () => {
+      if (!confirm(`"${exitSettingsKey}"의 키별 종료 설정을 전부 해제하고 전역값을 따르게 할까요?`)) return;
+      saveExitSettings(true).catch((e) => toast(e.message,"error"));
+    });
+    $("closeExitSettingsButton").addEventListener("click", () => $("exitSettingsModal").classList.remove("show"));
+    $("exitSettingsModal").addEventListener("click", (event) => {
+      if (event.target === $("exitSettingsModal")) $("exitSettingsModal").classList.remove("show");
+    });
     // 제품을 바꾸면 그 제품의 현재 등록값을 다시 불러온다(다른 제품 값을 보고 덮어쓰지 않게).
     $("versionProductInput").addEventListener("change", () => loadVersion().catch(() => {}));
     $("resultModal").addEventListener("click", (event) => {
       if (event.target === $("resultModal")) $("resultModal").classList.remove("show");
     });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") $("resultModal").classList.remove("show");
+      if (event.key === "Escape") { $("resultModal").classList.remove("show"); $("exitSettingsModal").classList.remove("show"); }
     });
     document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => {
       document.querySelectorAll(".nav-item").forEach((nav) => nav.classList.toggle("active", nav === item));

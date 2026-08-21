@@ -432,6 +432,22 @@ def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
     return classify_skip_prompt(image_bgr_or_gray, logger=logger)[0]
 
 
+def read_clock_text(box_gray: np.ndarray) -> str:
+    """경기 시계 박스(auto_exit.find_clock_box 가 잘라 준 흰 박스)의 글자를 읽는다.
+
+    실측(저장 프레임 8장): 2배 확대 + 'en' 이 가장 안정적이었다 — ko 는 한 장을
+    빈 문자열로 냈고, 3배는 콜론을 '•.' 로 더 자주 깨뜨렸다. 해석(분·초 파싱)은
+    auto_exit.parse_clock_text 가 한다(순수 로직, winocr 없이 검증).
+    """
+    if winocr is None or cv2 is None or box_gray is None or box_gray.size == 0:
+        return ""
+    try:
+        up = cv2.resize(box_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        return _recognize_text(up, "en")
+    except Exception:
+        return ""
+
+
 # '(A) SKIP'(초록 A 버튼이 붙은 스킵) 전용 템플릿. 빌드 시 gen_assets가 target_skip_a.png를
 # _assets에 박아 넣으면 거기서, 개발 중엔 exe/소스 옆 느슨한 파일에서 로드한다.
 # None=아직 시도 안 함, False=없음(다시 안 찾음), ndarray=로드된 grayscale 템플릿.
