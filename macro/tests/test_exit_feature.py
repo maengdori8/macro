@@ -540,3 +540,17 @@ def test_default_rules_match_config(app):
     assert rules.late_minute == config.AUTO_EXIT_LATE_MINUTE
     assert rules.late_deficit == config.AUTO_EXIT_LATE_DEFICIT_GOALS
     assert app._late_quota is None
+
+
+# ─── 마무리 단계의 타겟 로드 경로 ─────────────────────────────────────────────
+# after_resume 는 targets 를 넘기지 않으므로 _load_target(None) 경로가 **항상** 돈다.
+# 예전엔 존재하지 않는 이름을 import 해 ImportError 로 죽었고 러너가 '실패'로 삼켰다.
+
+
+def test_followup_loads_the_exit_target_without_automation_targets():
+    from macroapp import exit_followup
+
+    target = exit_followup._load_target(None, lambda _m: None)
+    assert target is not None, "마무리 단계가 타겟을 못 읽는다(import 경로 깨짐)"
+    assert target.name == exit_followup.EXIT_TARGET_NAME
+    assert target.threshold == exit_followup.EXIT_MATCH_THRESHOLD

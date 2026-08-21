@@ -69,7 +69,8 @@
       "filename": "target_J.png",
       "action": "click",
       "threshold": 0.88,
-      "wait_after_action": 1.0
+      "wait_after_action": 1.0,
+      "click_offset_y": -3
     },
     {
       "name": "bm_click_example_disabled",

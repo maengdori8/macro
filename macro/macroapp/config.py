@@ -590,12 +590,16 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     # 눌러 가린다 — 전술창이 하단 22% 를 덮어 SKIP 프롬프트 인식을 막는다(사용자 요청,
     # 수동으로도 마우스로 − 를 누른다). 템플릿 = 전술 아이콘 + '−'(중심이 − 버튼),
     # 실전 프레임(2026-08-21 1920x1080)에서 잘라 냈다. 어두운 면이 넓어 임계값을 높였다.
+    # 템플릿은 아이콘 줄 + 그 아래 어두운 면 6px 다 — 접힌 상태(아이콘 줄이 프레임 맨
+    # 아래, '−' 가 초록)에서는 아래 면이 프레임 밖이라 안 맞는다(접힌 채 계속 누르던 실측
+    # 결함 수정: 펼침 1.000 / 접힘 ≤0.68). 중심이 버튼보다 3px 아래라 click_offset_y=-3.
     {
         "name": "target_J",
         "filename": "target_J.png",
         "action": "click",
         "threshold": 0.88,
         "wait_after_action": 1.0,
+        "click_offset_y": -3,
     },
 ]
 
@@ -671,6 +675,10 @@ class TargetImage:
     control_class: Optional[str] = None
     control_text: Optional[str] = None
     vibrate_before_click: bool = False
+    # 클릭 지점 보정(px). 템플릿 중심이 버튼이 아닐 때 쓴다 — 예: target_J 는 상태 구분을
+    # 위해 버튼 아래 어두운 면을 포함해야 해서 중심이 버튼보다 3px 아래다 → -3.
+    click_offset_x: int = 0
+    click_offset_y: int = 0
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -776,6 +784,8 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         control_class=control_class,
         control_text=control_text,
         vibrate_before_click=bool(config.get("vibrate_before_click", False)),
+        click_offset_x=int(_parse_optional_int(config.get("click_offset_x"), "click_offset_x") or 0),
+        click_offset_y=int(_parse_optional_int(config.get("click_offset_y"), "click_offset_y") or 0),
     )
 
 def load_target_definitions(
@@ -867,6 +877,8 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         control_class=target.control_class,
         control_text=target.control_text,
         vibrate_before_click=target.vibrate_before_click,
+        click_offset_x=target.click_offset_x,
+        click_offset_y=target.click_offset_y,
     )
 
 def load_targets(

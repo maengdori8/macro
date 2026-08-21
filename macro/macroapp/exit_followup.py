@@ -217,10 +217,15 @@ def _load_target(targets, log: LogCallback):
         return None
 
     # 자동화가 안 돌고 있으면 여기서 직접 읽는다.
-    from macroapp.config import TARGET_DEFINITIONS, load_targets
+    # ⚠️ 예전엔 존재하지 않는 이름(TARGET_DEFINITIONS)을 import 해서 이 경로가 늘
+    # ImportError 로 죽었고, 러너는 그걸 '마무리 실패'로 삼켰다(2026-08-22 발견 —
+    # after_resume 는 targets 를 안 넘기므로 **항상** 이 경로를 탄다). 정의는 런타임과
+    # 같은 규칙(임베드 targets.json → 기본값)으로 읽는다.
+    from macroapp.config import load_target_definitions, load_targets
     from macroapp.paths import app_dir
 
-    loaded = load_targets(app_dir(), log, definitions=TARGET_DEFINITIONS)
+    base_dir = app_dir()
+    loaded = load_targets(base_dir, log, definitions=load_target_definitions(base_dir, log))
     if not loaded:
         return None
     for item in loaded:

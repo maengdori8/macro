@@ -2291,7 +2291,7 @@ class AutomationApp:
                         continue
 
                     found_any = True
-                    base_x, base_y = center
+                    base_x, base_y = self._click_point(target, center)
                     x, y = self.apply_click_jitter(target, base_x, base_y)
                     self.queue_status("이미지 감지 성공")
                     self.queue_log(
@@ -4700,6 +4700,14 @@ class AutomationApp:
             + SKIP_EXPERIMENT_EXIT_CONFIRM_SECONDS
             + SKIP_OCR_INTERVAL_SECONDS,
         )
+
+    @staticmethod
+    def _click_point(target, center) -> tuple[int, int]:
+        """템플릿 중심에 타겟의 클릭 보정(click_offset_x/y)을 더한 실제 클릭 지점."""
+
+        dx = int(getattr(target, "click_offset_x", 0) or 0)
+        dy = int(getattr(target, "click_offset_y", 0) or 0)
+        return int(center[0]) + dx, int(center[1]) + dy
 
     def _anykey_direct_start(
         self,
