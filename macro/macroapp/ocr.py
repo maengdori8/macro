@@ -73,6 +73,15 @@ _TIER_DISPLAY = {"슈퍼챔피언스": "슈퍼 챔피언스"}
 
 # SKIP 자동 넘기기 토큰 (대소문자 무관, 공백 제거 후 부분일치). "skip"이 SKIP/Skip/skip 모두 커버.
 _SKIP_TOKENS = ("skip", "스킵")
+# '아무 키나' 프롬프트 근거 토큰. FC 의 일반 프롬프트는
+# ``SKIP 하려면 아무 키나 누르세요. (Enter 키 제외)`` 로 표시된다. 공백을 지운 뒤
+# 부분일치하므로 "아무 키나"→"아무키나" 도 "아무키" 로 잡힌다. 한글과 영문 Enter 를
+# 둘 다 보는 이유: 실측(저장된 크롭 112장)에서 한글 문구 85%·Enter 84% 가 각각
+# 읽혔고 어느 한쪽만 읽히는 프레임이 흔했다 — 둘을 합쳐야 한 프레임 인식률이 오른다.
+# SKIP 토큰이 함께 있어야만 쓰인다(classify_skip_prompt) — "계속하려면 아무 키나" 류
+# 다른 화면에 오반응하지 않게. "아무기" 는 winocr 가 실제로 자주 내놓는 오독
+# ("아무기나누르세요" — 실측 크롭 전부가 이렇게 읽혔다).
+_ANY_KEY_TOKENS = ("enter", "anykey", "아무키", "아무기", "하려면")
 
 
 def _normalize_ocr_text(raw: str) -> str:
@@ -407,10 +416,10 @@ def classify_skip_prompt(image_bgr_or_gray: np.ndarray, logger=None):
         return (False, None)
     if "esc" in cleaned:
         return (True, "escape")
-    # FC의 일반 프롬프트는 ``아무 키 ... (Enter 키 제외)``처럼 표시된다.
-    # 한글 OCR이 깨져도 영문 Enter는 안정적으로 남으므로 A/S 템플릿보다
-    # 우선할 수 있는 명시적 일반 프롬프트 근거로 사용한다.
-    if "enter" in cleaned or "anykey" in cleaned or "any key" in cleaned:
+    # FC의 일반 프롬프트는 ``SKIP 하려면 아무 키나 누르세요. (Enter 키 제외)``로
+    # 표시된다. 한글 문구와 영문 Enter 어느 쪽이든 읽히면 명시적 '아무 키나'
+    # 프롬프트로 본다(A/S 템플릿보다 우선).
+    if any(tok in cleaned for tok in _ANY_KEY_TOKENS):
         return (True, "any_key")
     if "start" in cleaned:
         return (True, "start")

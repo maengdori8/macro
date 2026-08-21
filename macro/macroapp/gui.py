@@ -89,6 +89,7 @@ from macroapp.config import (
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
+    SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
@@ -103,6 +104,7 @@ from macroapp.matching import find_template_center, downscale_screen, is_notific
 from macroapp.mining_ui import MiningDashboard
 from macroapp.session import MatchCounter, SessionTracker
 from macroapp import daily_stats
+from macroapp.skip_anykey import ACTION_PRESS as ANYKEY_PRESS, AnyKeyStartPolicy
 from macroapp.mining import MiningStore
 from macroapp.skip_experiment import (
     SkipExperimentTracker,
@@ -395,7 +397,12 @@ class AutomationApp:
         self._skip_seen_since = None    # 현재 스킵이 처음 감지된 시각(안전망 타이머용)
         self._skip_text_streak = 0      # 일반 스킵(OCR) 연속 감지 횟수(단발 노이즈 차단)
         self._skip_s_match_streak = 0   # S template must persist before control starts
-        self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start" (A형은 sticky)
+        self._skip_kind = None          # 현재 스킵 에피소드 종류: None|"a"|"start"|"anykey" (A형은 sticky)
+        # '아무 키나 누르세요' 프롬프트 직행 판정(연속 확인·재누름 간격) — 순수 로직.
+        self._skip_anykey_policy = AnyKeyStartPolicy(
+            consensus=SKIP_TEXT_CONSENSUS,
+            repress_seconds=SKIP_ANYKEY_REPRESS_SECONDS,
+        )
         self._skip_prompt_variant = None  # hold-to-skip 표시: None|"a"|"s"
         self._skip_generic_hint = None    # OCR 확인 일반 프롬프트: escape|escape_highlight|any_key|start
         # A generic prompt can flicker between OCR hints on a moving replay.
@@ -2058,6 +2065,7 @@ class AutomationApp:
             self._skip_text_streak = 0
             self._skip_s_match_streak = 0
             self._skip_kind = None
+            self._skip_anykey_policy.reset()
             self._skip_generic_hint = None
             self._skip_generic_episode_hint = None
             self._last_normal_action_at = float("-inf")
@@ -4585,10 +4593,64 @@ class AutomationApp:
             + SKIP_OCR_INTERVAL_SECONDS,
         )
 
+    def _anykey_direct_start(
+        self,
+        now: float,
+        has_text: bool,
+        is_a: bool,
+        is_s: bool,
+    ) -> bool:
+        """'SKIP 하려면 아무 키나 누르세요' 프롬프트를 실험 없이 바로 START 로 넘긴다.
+
+        적용되면 이번 OCR 패스를 여기서 끝내고 True, 아니면 False(기존 흐름 계속).
+
+        - 근거는 OCR 힌트 ``any_key`` (한글 문구 또는 Enter 가 SKIP 과 함께 읽힘).
+        - 에피소드에 이미 잠긴 힌트(escape 등)가 있으면 그쪽을 존중한다 — 실험의
+          귀속 불변식(한 에피소드 = 한 추적기)을 깨지 않는다.
+        - 연속 확인·재누름 간격은 AnyKeyStartPolicy(순수 로직)가 정한다.
+        - 템플릿(target_G) 경로는 막지 않는다. 누른 직후 0.5초만 매칭을 멈춰 같은
+          버튼이 두 스레드에서 겹쳐 나가는 것만 피한다.
+        """
+
+        if not SKIP_ANYKEY_DIRECT_START or not has_text or is_a or is_s:
+            return False
+        policy = getattr(self, "_skip_anykey_policy", None)
+        if policy is None:
+            return False
+        hint = (
+            getattr(self, "_skip_generic_episode_hint", None)
+            or self._skip_generic_hint
+        )
+        if hint != "any_key" or self._skip_kind not in (None, "anykey"):
+            return False
+
+        if self._skip_kind is None:
+            self._skip_kind = "anykey"
+            self._skip_generic_episode_hint = "any_key"
+            self._skip_generic_hint = "any_key"
+        self._skip_text_streak += 1
+        action = policy.observe(now, True)
+        if action == ANYKEY_PRESS:
+            start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
+            if start_btn is not None:
+                try:
+                    send_gamepad_button(start_btn)
+                except Exception as exc:  # noqa: BLE001
+                    self.queue_log(f"[SKIP] '아무 키나' START 입력 실패: {exc}")
+                else:
+                    self._skip_last_press = ("start", now)
+                    self._skip_active_until = max(
+                        self._skip_active_until, time.monotonic() + 0.5
+                    )
+                    self.queue_log("[SKIP] '아무 키나' 프롬프트 → START")
+        self.queue_status("SKIP 넘기는 중")
+        return True
+
     def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
         """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
 
         - '(A) SKIP'(초록 A 버튼 = target_skip_a.png 템플릿) → A만 누른다.
+        - '아무 키나 누르세요' 프롬프트(OCR any_key) → 실험 없이 바로 Start(_anykey_direct_start).
         - 그 외 일반 스킵(OCR 'skip'/'스킵', SKIP_TEXT_CONSENSUS회 연속 확인) → Start만.
         - 한 스킵이 SKIP_FALLBACK_BOTH_SECONDS 넘게 안 사라지면 A·Start 둘 다(안전망).
 
@@ -4723,7 +4785,7 @@ class AutomationApp:
             if (
                 not has_text
                 and generic_episode
-                and self._skip_kind is None
+                and self._skip_kind in (None, "anykey")
                 and self._skip_generic_hint
                 in {"escape", "escape_highlight", "any_key", "start"}
             ):
@@ -4857,6 +4919,9 @@ class AutomationApp:
             self._skip_text_streak = 0
             self._skip_s_match_streak = 0
             self._skip_kind = None
+            anykey_policy = getattr(self, "_skip_anykey_policy", None)
+            if anykey_policy is not None:
+                anykey_policy.observe(time.monotonic(), False)
             self._skip_prompt_variant = None
             self._skip_generic_hint = None
             self._skip_generic_episode_hint = None
@@ -4900,6 +4965,12 @@ class AutomationApp:
                     self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
             except Exception:
                 pass
+        # '아무 키나 누르세요' 프롬프트는 답이 알려진 화면이라 실험·대조·봉쇄를 거치지
+        # 않고 바로 START 를 누른다(아래 오염 판정·3초 대조보다 먼저 — 이 에피소드는
+        # 실험 표본이 아니다).
+        if self._anykey_direct_start(now, has_text, is_a, is_s):
+            return True
+
         if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_control_contaminated:
             # A racing normal action invalidates the current control. Restart
             # all trackers and require a fresh full three-second quiet period.

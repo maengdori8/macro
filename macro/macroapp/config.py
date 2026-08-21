@@ -471,6 +471,14 @@ SKIP_S_ICON_MATCH_THRESHOLD = 0.65
 SKIP_PROMPT_CLASSIFIER_GENERATION = 7
 SKIP_TEXT_CONSENSUS = 2           # 일반 스킵(OCR 'skip')은 이만큼 연속 감지돼야 Start(단발 노이즈 차단)
 SKIP_FALLBACK_BOTH_SECONDS = 0.6  # 한 스킵이 이 시간 넘게 안 사라지면 A·Start 둘 다(템플릿 빗나가도 안 갇힘)
+# ─── '아무 키나' 프롬프트 직행 ───
+# "SKIP 하려면 아무 키나 누르세요. (Enter 키 제외)" 는 답이 알려진 화면이다(START 로
+# 넘어감 — 7-28 실측 53/53, 사용자 확인). 그래서 OCR 이 이 문구를 읽으면 비활성 실험
+# (3초 대조·후보 순환·대조군)을 거치지 않고 **바로 START** 를 누른다. 템플릿(target_G)
+# 경로는 그대로 살아 있다 — winocr 가 없는 구매자 PC 의 유일한 경로라서, 이 규칙은
+# 그것을 대체하지 않고 보강한다(해상도가 달라 템플릿이 빗나가는 PC 대비).
+SKIP_ANYKEY_DIRECT_START = True
+SKIP_ANYKEY_REPRESS_SECONDS = 0.8  # 프롬프트가 계속 보이면 이 간격으로 START 를 다시 누른다
 
 # ─── 자동 정지 단발 오독 가드 ───
 # 합의로 확정된 값이라도, 같은 정지조건이 연속 이 횟수만큼 확정될 때만 실제로 멈춘다.
