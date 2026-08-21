@@ -136,6 +136,21 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
   와 VB_AI_*(인게임) 가상 버튼을 분리한다 — '메뉴는 배경에서 되는데 스킵은 안 되는' 이유와
   일치(인게임 계층이 포커스 게이트). customoptions.ini 에 배경 입력 옵션 없음. 안티치트
   (BlackCipher/NGM) 동작 중.
+  ⑤ **5각도 리서치 워크플로(웹+코드, 22건→3가설+5개선) 결론:** 유저모드 배경 스킵 가능성
+  **5~10%**. 확정 사실: `fczf.exe` 임포트는 DINPUT8+XINPUT9_1_0 뿐(RawInput 없음), 키보드 S 는
+  DirectInput 스캔코드(SC_S→VB_AI_A) 인데 DISCL_FOREGROUND 라 배경에서 키보드 장치가
+  unacquire 된다 → 's 메시지' 계열(pm_s/char_s/attach_state_s/attach_post_s…)이 전부 sham 과
+  같았던 이유가 '메시지 무시'가 아니라 '장치 자체가 죽음'이다. 남은 유일한 미검증 지렛대 =
+  **H1 `attach_active_hold_a`**(AttachThreadInput 으로 게임 큐에 붙은 채 SetActiveWindow → 스레드
+  로컬 활성 값을 세우고 A 홀드; 게이트가 GetActiveWindow/GetFocus 면 통과, 전역
+  GetForegroundWindow 면 불가) — 대조 `attach_hold_a` 와 함께 A 스윕에 넣었다
+  (`input_message.run_attached_to_window`, 우리 프로세스가 전면이면 시도 안 함). H2(전 창 최대
+  봉투 스푸핑)·H3(`spoof_a_hold` 청정 A/B, sham 2회마다)는 '불가를 통계로 봉인'하는 용도.
+  실험 설계 개선 제안(미적용): ① `skip_stats.py`(Wilson/Fisher/SPRT) + 보고 도구 ② 1.5초
+  경계 블랙아웃 제거(프레임 링버퍼) ③ sham 블록 무작위화 ④ 층화 대조(0.6/1.2/2.0/3.0)
+  ⑤ A 템플릿 2프레임 합의·`dump_window_classes` 실제 호출(현재 호출처 0 = 죽은 코드).
+  차선(정책 변경 시): `SKIP_A_FOREGROUND=True` 로 홀드 0.6~0.8초·컷신당 1회 실측해 번쩍임
+  최소화, 또는 '안 스킵하는 비용(컷신당 초)'을 로그로 수치화해 데이터로 결정.
 
 - `2026-08-21` **자동 종료 규칙 셋(기본·대량 실점·후반) + 구매자별 설정 — 시계 OCR 도입.**
   사용자 요청: "3점차 이상이면 비율 무시하고 무조건 종료, 70분 이후 1점차로 지고 있으면
