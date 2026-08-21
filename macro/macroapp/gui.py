@@ -288,6 +288,8 @@ class AutomationApp:
         )
         self._clock_last_ocr_at = float("-inf")
         self._last_clock_minute = None
+        self._clock_fail_streak = 0                 # 연속으로 시계를 못 읽은 횟수(진단용)
+        self._clock_dumped = False                  # 실행당 1회: 못 읽는 화면의 시계 영역 저장
         self._auto_exit_active = False
         self._last_match_score = None
         self._score_unknown_dumped = 0              # '숫자 미상' 표본 저장 수(세션 상한)
@@ -2077,8 +2079,13 @@ class AutomationApp:
             # (래치는 유지 — 정지→재시작으로 같은 경기가 두 번 세어지면 안 된다).
             self._auto_exit_active = self._auto_exit_allowed(capture_mode)
             self._loss_tracker.resume_observation()
+            # 시계는 실행 경계를 넘겨 믿지 않는다 — 85분에 정지했다가 다른 경기에서
+            # 재시작하면 옛 확정 분이 새 경기 초반에 쓰인다(리뷰 지적). 다시 쌓는 비용은 10초.
+            self._clock_tracker.reset()
             self._clock_last_ocr_at = float("-inf")
             self._last_clock_minute = None
+            self._clock_fail_streak = 0
+            self._clock_dumped = False
             self._last_match_score = None
             self._score_unknown_dumped = 0
             self._score_unknown_dumped_at = float("-inf")
@@ -5688,9 +5695,20 @@ class AutomationApp:
         if payload is None or not self._is_pro:
             return
         try:
-            settings = auto_exit.parse_exit_settings(payload, self._exit_settings)
+            # 기본값의 비율은 '직전 설정'이 아니라 **지금 쿼터에 걸린 비율**이다 —
+            # 바로 앞 _apply_auto_exit_ratio 가 auto_exit_ratio 로 맞춘 값을, settings 에
+            # ratio 가 빠지거나 깨졌을 때 내장 40% 로 되돌리지 않게(리뷰 지적).
+            defaults = auto_exit.ExitSettings(
+                rules=self._exit_settings.rules,
+                ratio=self._exit_quota.ratio,
+                late_ratio=self._exit_settings.late_ratio,
+            )
+            settings = auto_exit.parse_exit_settings(payload, defaults)
             self._exit_settings = settings
             self._loss_tracker.set_rules(settings.rules)
+            # 쿼터가 둘(late 비율 별도)이면 래치도 둘 — late 의 '방치'가 같은 경기의
+            # base(다른 장부) 확정을 굶기지 않게(리뷰 확정).
+            self._loss_tracker.shared_quota_latch = settings.late_ratio is None
             if settings.ratio != self._exit_quota.ratio:
                 self._exit_quota.set_ratio(settings.ratio)
             if settings.late_ratio is None:
@@ -5878,6 +5896,28 @@ class AutomationApp:
                 f"[자동 종료] 경기 시계 {minute}분" if minute is not None
                 else "[자동 종료] 경기 시계 미상"
             )
+        # 스코어보드는 보이는데 시계를 계속 못 읽으면(박스 미검출·OCR 실패·언어팩 없음)
+        # 후반 규칙이 조용히 꺼진 상태다 — 한 번은 소리 내고 그 화면을 남긴다(실측 근거).
+        if parsed is None:
+            self._clock_fail_streak += 1
+            if self._clock_fail_streak == 12 and not self._clock_dumped:
+                self._clock_dumped = True
+                self._log_to_file_only(
+                    "[자동 종료] 경기 시계를 60초째 못 읽음"
+                    f"(박스 {'없음' if box is None else '있음'}) — 후반 규칙 비활성 상태"
+                )
+                try:
+                    crop = auto_exit.crop_score_region(gray, AUTO_EXIT_CLOCK_REGION)
+                    if crop is not None and cv2 is not None:
+                        dump_dir = self.base_dir / "logs" / "score_unknown"
+                        dump_dir.mkdir(parents=True, exist_ok=True)
+                        path = dump_dir / f"clock_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                        if cv2.imwrite(str(path), crop):
+                            self._log_to_file_only(f"[자동 종료] 시계 영역 저장: {path.name}")
+                except Exception:
+                    pass
+        else:
+            self._clock_fail_streak = 0
         return minute
 
     def _run_auto_exit(self) -> None:

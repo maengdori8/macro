@@ -516,3 +516,18 @@ test("키별 규칙이 잡힌 행은 '맞춤 규칙' 표시가 붙는다", async
   assert.match(html, /종료 40% \(전역\) · 맞춤 규칙/);
   assert.equal((html.match(/맞춤 규칙/g) || []).length, 1);
 });
+
+
+test("모달 안내는 전역값 0(끔)을 '전역 0' 으로 보여 준다('-' 로 잃지 않는다)", async () => {
+  const { context, byId } = makeContext();
+  const key = "PRO11-PRO11-PRO11-PRO11-PRO11";
+  await loadWithSettings(
+    context,
+    [license({ key, product: "macro_pro", exitSettings: {} })],
+    { autoExitRatio: 0.4, autoExitBaseDeficit: 2, autoExitHardDeficit: 0, autoExitLateMinute: 0, autoExitLateDeficit: 1, autoExitLateRatio: null }
+  );
+  vm.runInContext(`openExitSettings(${JSON.stringify(key)})`, context);
+  assert.equal(byId("esHardDeficitInput").placeholder, "전역 0");
+  assert.equal(byId("esLateMinuteInput").placeholder, "전역 0");
+  assert.equal(byId("esRatioInput").placeholder, "전역 40");
+});

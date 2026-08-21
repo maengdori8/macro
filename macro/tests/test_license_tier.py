@@ -179,3 +179,11 @@ def test_settings_must_be_a_dict_and_pro_only():
     assert check(sign("macro_pro"))["auto_exit_settings"] is None
     # 일반 티어에는 실려 와도 읽지 않는다.
     assert check(sign("macro"), auto_exit_settings={"hard_deficit": 9})["auto_exit_settings"] is None
+
+
+
+def test_boolean_ratio_is_rejected_like_the_settings_parser():
+    """True→1.0 같은 조용한 변환 금지 — 두 파서(비율 단독/규칙 전부)가 같은 규칙을 쓴다."""
+    assert lc._parse_auto_exit_ratio(True) is None
+    assert lc._parse_auto_exit_ratio(False) is None
+    assert lc._parse_auto_exit_ratio(0.5) == 0.5

@@ -119,7 +119,15 @@ async function readAutoExitRatio(db, now = Date.now()) {
 // 그냥 꺼낸다 — 추가 Firestore 읽기 0. 전역값은 TTL 캐시 경로 그대로.
 async function resolveExitSettings(db, licenseData, now = Date.now()) {
   const own = normalizeSettings(licenseData);
-  const global = await readProSettings(db, now);
+  // 전역 문서 읽기 한 번의 장애(할당량·지연)로 **이미 손에 있는** 키별 값까지 잃으면
+  // 안 된다(키별 값은 추가 읽기 0). 실패하면 전역은 '없음'으로 두고 키별→기본값으로 간다.
+  let global;
+  try {
+    global = await readProSettings(db, now);
+  } catch (err) {
+    console.error("Pro settings read error (falling back to license/defaults):", err);
+    global = normalizeSettings(null);
+  }
   const out = {};
   for (const name of SETTING_FIELDS) {
     if (own[name] !== null) out[name] = own[name];

@@ -443,9 +443,19 @@ def read_clock_text(box_gray: np.ndarray) -> str:
         return ""
     try:
         up = cv2.resize(box_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        return _recognize_text(up, "en")
     except Exception:
         return ""
+    # en 언어팩이 없는 PC(winocr 가 예외를 낸다)나 en 이 빈 문자열을 낸 프레임은 ko 로
+    # 한 번 더 읽는다 — 박스가 작아 호출당 수 ms 라 예산 부담이 없다(리뷰 지적: en 만
+    # 전제하면 그런 PC 에서 후반 규칙이 로그 한 줄 없이 꺼진다).
+    for lang in ("en", "ko"):
+        try:
+            text = _recognize_text(up, lang)
+        except Exception:
+            continue
+        if text and text.strip():
+            return text
+    return ""
 
 
 # '(A) SKIP'(초록 A 버튼이 붙은 스킵) 전용 템플릿. 빌드 시 gen_assets가 target_skip_a.png를

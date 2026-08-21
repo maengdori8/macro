@@ -217,6 +217,12 @@ module.exports = async function handler(req, res) {
   if (req.method === "PATCH") {
     const body = req.body || {};
     try {
+      // 모르는 action 은 거부한다. 안 그러면 key 경로로 흘러 마지막 분기(disabled 토글)에
+      // 떨어져 비활성 키가 조용히 켜질 수 있다(리뷰 지적 — action 이 늘수록 표면이 넓어진다).
+      const KNOWN_ACTIONS = ["previewUnusedMigration", "migrateUnused", "setProSettings"];
+      if (body.action !== undefined && !KNOWN_ACTIONS.includes(body.action)) {
+        return res.status(400).json({ success: false, message: `모르는 작업입니다: ${String(body.action)}` });
+      }
       if (body.action === "previewUnusedMigration") {
         const { snapshot, targets } = await migrationTargets();
         return res.status(200).json({

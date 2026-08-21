@@ -768,8 +768,10 @@
         const [name, , ownId] = field;
         $(ownId).value = exitFieldDisplay(field, own[name]);
         const globalValue = proSettingsEffective ? proSettingsEffective[name] : null;
+        // 0 은 정상값(끔)이다 — `0 || "-"` 로 잃지 않게 빈 문자열만 '-' 로 본다.
+        const shown = exitFieldDisplay(field, globalValue);
         $(ownId).placeholder = name === "autoExitLateRatio" && (globalValue === null || globalValue === undefined)
-          ? "기본 비율" : `전역 ${exitFieldDisplay(field, globalValue) || "-"}`;
+          ? "기본 비율" : (shown === "" ? "전역 -" : `전역 ${shown}`);
       }
       $("exitSettingsStatus").textContent = "";
       $("exitSettingsModal").classList.add("show");

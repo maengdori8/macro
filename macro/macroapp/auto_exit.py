@@ -351,12 +351,23 @@ class LossTracker:
         self.reset_seconds = float(reset_seconds)
         self.require_prior_score = bool(require_prior_score)
 
+        # base/late 가 같은 쿼터(한 '진 판' 카운트)를 쓰면 래치도 하나다. late 비율이
+        # 따로 있어 쿼터가 둘이면 래치도 둘 — 안 그러면 late 의 '방치' 결정이 같은
+        # 경기의 base(다른 장부) 확정을 굶긴다(리뷰 확정).
+        self.shared_quota_latch = True
+
         self._streak = 0                             # 어떤 규칙이든 연속으로 걸린 횟수
         self._hard_streak = 0                        # hard 규칙만 연속으로 걸린 횟수
-        self._quota_fired = False                    # 이 경기에서 base/late 가 확정됐나
+        self._quota_fired = False                    # 이 경기에서 쿼터 규칙(base/late)이 확정됐나
+        self._base_fired = False                     # (래치 분리 시) base 확정 여부
+        self._late_fired = False                     # (래치 분리 시) late 확정 여부
         self._hard_fired = False                     # 이 경기에서 hard 가 확정됐나
         self._last_seen_at: Optional[float] = None   # 뭔가 보인 마지막 시각
-        self._seen_other = False                     # 이 경기에서 열세 아닌 스코어를 봤나
+        # 이 경기에서 본 '상대−나'의 최솟값. 선행 스코어 방어의 근거다: 어떤 규칙이든
+        # **그 규칙의 점차보다 나은 스코어**를 먼저 봤어야 확정한다. 예전의 '규칙에 안
+        # 걸린 스코어를 봤나'는 late(1점차) 에서 같은 (0,1) 픽셀이 선행 증거이자 판정
+        # 근거가 되는 구멍이 있었다(리뷰 확정).
+        self._min_losing_seen: Optional[int] = None
         self.last_kind: Optional[str] = None         # 마지막 확정 종류(로그용)
 
     @property
@@ -369,10 +380,36 @@ class LossTracker:
 
         return self._quota_fired
 
+    @property
+    def _seen_other(self) -> bool:
+        """기존 이름 호환 — 기본 규칙 기준으로 '열세 아닌 스코어를 봤나'."""
+
+        return (
+            self._min_losing_seen is not None
+            and self._min_losing_seen < self.rules.base_deficit
+        )
+
     def set_rules(self, rules: ExitRules) -> None:
         """규칙만 바꾼다(경기 상태·래치는 보존). 서버 설정이 내려왔을 때 쓴다."""
 
         self.rules = rules
+
+    def _deficit_of(self, kind: str) -> int:
+        if kind == KIND_HARD:
+            return self.rules.hard_deficit
+        if kind == KIND_LATE:
+            return self.rules.late_deficit
+        return self.rules.base_deficit
+
+    def _prior_ok(self, kind: str) -> bool:
+        """선행 스코어 방어: 이 규칙의 점차보다 **나은** 스코어를 이 경기에서 봤나."""
+
+        if not self.require_prior_score:
+            return True
+        return (
+            self._min_losing_seen is not None
+            and self._min_losing_seen < self._deficit_of(kind)
+        )
 
     def resume_observation(self) -> None:
         """자동화를 정지했다 재시작할 때 부른다 — **래치는 유지**하고 관측만 비운다.
@@ -384,7 +421,7 @@ class LossTracker:
         """
         self._streak = 0
         self._hard_streak = 0
-        self._seen_other = False
+        self._min_losing_seen = None
 
     def feed(self, now: float, reading: Reading, minute: Optional[int] = None) -> bool:
         """관측 한 번. 이번 관측으로 '진 판'이 새로 확정됐으면 True(종류는 last_kind)."""
@@ -412,8 +449,10 @@ class LossTracker:
                 self._streak = 0
                 self._hard_streak = 0
                 self._quota_fired = False
+                self._base_fired = False
+                self._late_fired = False
                 self._hard_fired = False
-                self._seen_other = False
+                self._min_losing_seen = None
                 self._last_seen_at = None
             return None
 
@@ -423,15 +462,18 @@ class LossTracker:
             return None
 
         mine, theirs = int(reading[0]), int(reading[1])
+        losing = theirs - mine
+        # 이 경기에서 본 가장 나은 스코어(상대−나 최솟값)를 기록한다 — 선행 증거.
+        if self._min_losing_seen is None or losing < self._min_losing_seen:
+            self._min_losing_seen = losing
         kind = self.rules.classify(mine, theirs, minute)
         if kind is None:
             # 어느 규칙에도 안 걸린다(동점·근소한 열세·우세·후반 전 1점차 전부) →
-            # 연속 판정을 깨고, '이 경기의 정상 스코어를 봤다'는 선행 증거로 기록한다.
+            # 연속 판정을 깬다.
             self._streak = 0
             self._hard_streak = 0
-            self._seen_other = True
             return None
-        if self.require_prior_score and not self._seen_other:
+        if not self._prior_ok(kind):
             return None
 
         self._streak += 1
@@ -447,11 +489,20 @@ class LossTracker:
             self.last_kind = KIND_HARD
             return KIND_HARD
 
-        if self._quota_fired or self._hard_fired:
+        if self._hard_fired:
+            return None
+        if self.shared_quota_latch:
+            if self._quota_fired:
+                return None
+        elif (self._base_fired if kind == KIND_BASE else self._late_fired):
             return None
         if self._streak < self.confirm_count:
             return None
         self._quota_fired = True
+        if kind == KIND_BASE:
+            self._base_fired = True
+        else:
+            self._late_fired = True
         self._streak = 0
         self.last_kind = kind
         return kind
@@ -562,8 +613,10 @@ def parse_clock_text(text) -> Optional[tuple[int, int]]:
     if match:
         minute, second = int(match.group(1)), int(match.group(2))
     else:
+        # 콜론이 통째로 빠진 경우("6454")만 받는다. 3자리("841" = "84:1" 의 자리 누락)는
+        # (8,41) 로 76분 역행을 만들어 확정을 흔들 뿐이라 버린다.
         digits = re.sub(r"\D", "", cleaned)
-        if len(digits) not in (3, 4):
+        if len(digits) != 4:
             return None
         minute, second = int(digits[:-2]), int(digits[-2:])
     if not (0 <= second <= 59 and 0 <= minute <= 130):
@@ -574,15 +627,25 @@ def parse_clock_text(text) -> Optional[tuple[int, int]]:
 class ClockTracker:
     """시계 읽기의 그럴듯함을 검사해 '확정 분'을 낸다(순수 로직).
 
-    규칙: 연속 consensus 회 읽힌 값이 **내려가지 않아야** 확정한다(경기 시계는
-    단조 증가). 크게 내려가면(새 경기·오독) 확정을 버리고 처음부터 다시 쌓는다.
-    None(시계 없음)이 reset_seconds 이상 이어지면 경기가 끝난 것으로 보고 비운다.
-    확정된 분은 다음 확정 때까지 유지된다(정지·하프타임 중 같은 값 반복은 정상).
+    규칙: 연속 consensus 회 읽힌 값이 **서로 이어져야**(직전 값에서 jump_minutes 분
+    안쪽으로 올라가야) 확정한다(경기 시계는 단조 증가·5초에 1분 미만). 크게 내려가면
+    (새 경기·오독) 확정을 버리고, 크게 **올라가도**(1↔7 같은 상향 오독) 확정값은 두고
+    새 값이 consensus 회 이어져야 받는다 — 상향 단발 오독 한 번이 '70분 이후'를 열면
+    14분 경기에서 종료가 나간다(리뷰 확정 결함). None(시계 없음)이 reset_seconds 이상
+    이어지면 경기가 끝난 것으로 보고 비운다. 확정된 분은 다음 확정 때까지 유지된다
+    (정지·하프타임 중 같은 값 반복은 정상).
     """
 
-    def __init__(self, *, consensus: int = 2, reset_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        consensus: int = 2,
+        reset_seconds: float = 60.0,
+        jump_minutes: int = 2,
+    ) -> None:
         self.consensus = max(1, int(consensus))
         self.reset_seconds = float(reset_seconds)
+        self.jump_minutes = max(1, int(jump_minutes))
         self.minute: Optional[int] = None
         self._pending: Optional[tuple[int, int]] = None
         self._streak = 0
@@ -605,13 +668,19 @@ class ClockTracker:
             return self.minute
         self._last_seen_at = now
         minute, second = int(reading[0]), int(reading[1])
-        if self._pending is not None and (minute, second) < self._pending:
-            if self._pending[0] - minute > 2:
-                # 크게 역행 — 새 경기이거나 오독. 확정값도 믿지 않는다.
-                self.minute = None
-            self._pending = (minute, second)
-            self._streak = 1
-            return self.minute
+        if self._pending is not None:
+            regressed = (minute, second) < self._pending
+            jumped_up = minute - self._pending[0] > self.jump_minutes
+            if regressed or jumped_up:
+                # **확정값** 기준으로 크게 역행했을 때만 확정을 버린다(새 경기·오독).
+                # pending 기준으로 비교하면 '14→(오독)74→14' 에서 멀쩡한 확정 14 까지 버린다.
+                if self.minute is not None and self.minute - minute > self.jump_minutes:
+                    self.minute = None
+                # 상향 점프는 확정값을 **유지**한다(단발 오독일 가능성) — 새 값이
+                # consensus 회 이어지면 그때 받는다(가림 뒤 재등장·늦은 시작 경로 보존).
+                self._pending = (minute, second)
+                self._streak = 1
+                return self.minute
         self._pending = (minute, second)
         self._streak += 1
         if self._streak >= self.consensus:

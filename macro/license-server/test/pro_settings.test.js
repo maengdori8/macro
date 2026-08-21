@@ -213,3 +213,16 @@ test("effectiveSettings 는 null 을 기본값으로 채운다(후반 비율은 
   assert.equal(out.autoExitLateDeficit, 1);
   assert.equal(out.autoExitLateRatio, null);
 });
+
+
+test("전역 문서 읽기가 실패해도 키별 값과 기본값으로 응답한다(리뷰 지적)", async () => {
+  const broken = {
+    collection() {
+      return { doc() { return { async get() { throw new Error("quota exceeded"); } }; } };
+    },
+  };
+  const resolved = await resolveExitSettings(broken, { autoExitHardDeficit: 4 });
+  assert.equal(resolved.autoExitHardDeficit, 4, "키별 값이 사라졌다");
+  assert.equal(resolved.autoExitRatio, DEFAULT_AUTO_EXIT_RATIO);
+  assert.equal(resolved.autoExitLateMinute, 70);
+});

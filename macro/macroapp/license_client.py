@@ -66,6 +66,9 @@ def _parse_auto_exit_ratio(value) -> Optional[float]:
     무관하다 — 대신 범위 밖 값은 버리고(fail-safe), 티어가 서명으로 확인된 프로 응답
     에서만 읽는다(verify_signed_response 참고).
     """
+    if isinstance(value, bool):
+        # True→1.0 같은 조용한 변환 금지(auto_exit._coerce_ratio 와 같은 규칙).
+        return None
     try:
         ratio = float(value)
     except (TypeError, ValueError):

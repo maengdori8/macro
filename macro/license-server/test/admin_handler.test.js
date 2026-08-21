@@ -183,3 +183,13 @@ test("전역 setProSettings: 여러 필드 저장·null 해제·불량 거부, �
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.proSettings.autoExitRatio, 0.35);
 });
+
+
+test("모르는 action 은 400 — key 경로(disabled 토글)로 떨어지지 않는다", async () => {
+  const key = "PRO44-PRO44-PRO44-PRO44-PRO44";
+  db._docs.set(`licenses/${key}`, licenseDoc({ product: "macro_pro", disabled: true }));
+  const res = await patch({ action: "setProSetings", key, autoExitRatio: 0.5 }); // 오타
+  assert.equal(res.statusCode, 400, JSON.stringify(res.body));
+  assert.equal(db.read(`licenses/${key}`).disabled, true, "비활성 키가 켜졌다");
+  assert.equal(db.read(`licenses/${key}`).autoExitRatio, undefined);
+});

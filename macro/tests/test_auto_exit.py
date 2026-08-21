@@ -486,7 +486,8 @@ def test_late_rule_needs_minute_and_shares_the_quota_latch():
     from macroapp.auto_exit import KIND_LATE, LossTracker
 
     t = LossTracker(confirm_count=2, reset_seconds=60, rules=_rules())
-    t.feed(0.0, (0, 1), 30)                           # 전반 0:1 — 규칙 없음 → 선행 증거
+    t.feed(0.0, (0, 0), 10)                           # 0:0 — 1점차보다 나은 스코어(선행 증거)
+    t.feed(0.5, (0, 1), 30)                           # 전반 0:1 — 규칙 없음
     assert t.observe(1.0, (0, 1), 71) is None
     assert t.observe(2.0, (0, 1), 71) == KIND_LATE
     assert t.observe(3.0, (0, 1), 80) is None         # 래치
@@ -609,3 +610,107 @@ def test_find_clock_box_on_saved_real_frames_if_present():
         box = find_clock_box(gray, (0.22, 0.05, 0.45, 0.13))
         assert box is not None, path.name
         assert 30 <= box.shape[0] <= 40 and 80 <= box.shape[1] <= 110, (path.name, box.shape)
+
+
+# ---------------------------------------------------------------------------
+# 적대적 리뷰(2026-08-21)가 확정한 결함의 회귀 테스트
+# ---------------------------------------------------------------------------
+
+
+def test_clock_single_upward_misread_does_not_confirm():
+    """14:10→14:15→'74:20'(1↔7 오독)→14:25 — 74 가 확정되면 14분 경기에서 후반 규칙이 선다."""
+    from macroapp.auto_exit import ClockTracker
+
+    c = ClockTracker(consensus=2, reset_seconds=60)
+    assert c.feed(0.0, (14, 10)) is None
+    assert c.feed(5.0, (14, 15)) == 14
+    assert c.feed(10.0, (74, 20)) == 14, "상향 단발 오독이 즉시 확정됐다"
+    assert c.feed(15.0, (14, 25)) == 14
+    # 반대로 점프가 2회 이어지면(가림 뒤 재등장·늦은 시작) 그때 받는다.
+    assert c.feed(20.0, (46, 0)) == 14
+    assert c.feed(25.0, (46, 30)) == 46
+    # +1분 이내의 정상 진행은 예전처럼 바로 따라간다.
+    assert c.feed(30.0, (47, 5)) == 47
+
+
+def test_clock_misread_timeline_does_not_fire_late_rule():
+    """스코어 1초·시계 5초 간격 실제 타임라인: 0:1 진행 중 시계가 한 번 83 으로 튀어도 late 가 안 선다."""
+    from macroapp.auto_exit import ClockTracker, LossTracker
+
+    clock = ClockTracker(consensus=2, reset_seconds=60)
+    tracker = LossTracker(confirm_count=3, reset_seconds=60, rules=_rules())
+    clock_reads = {0: (3, 26), 5: (3, 31), 10: (83, 36), 15: (3, 41), 20: (3, 46)}
+    fired = []
+    minute = None
+    for t in range(0, 25):
+        if t in clock_reads:
+            minute = clock.feed(float(t), clock_reads[t])
+        score = (0, 0) if t < 4 else (0, 1)
+        kind = tracker.observe(float(t), score, minute)
+        if kind:
+            fired.append((t, minute, kind))
+    assert fired == [], fired
+
+
+def test_late_rule_requires_a_better_score_than_its_deficit_first():
+    """정적 (0,1) 화면만 본 경기는 late 를 못 연다 — 같은 픽셀이 선행 증거이자 판정 근거면 방어가 없다."""
+    from macroapp.auto_exit import KIND_LATE, LossTracker
+
+    t = LossTracker(confirm_count=3, reset_seconds=60, rules=_rules())
+    for i in range(5):
+        assert t.observe(float(i), (0, 1), None) is None
+    assert [t.observe(10.0 + i, (0, 1), 75) for i in range(3)] == [None, None, None]
+
+    t2 = LossTracker(confirm_count=3, reset_seconds=60, rules=_rules())
+    t2.feed(0.0, (0, 0), 5)
+    assert [t2.observe(10.0 + i, (0, 1), 75) for i in range(3)] == [None, None, KIND_LATE]
+
+
+def test_separate_quotas_get_separate_latches():
+    """late 비율이 따로면(쿼터 둘) late 의 '방치'가 같은 경기의 base 확정을 굶기지 않는다."""
+    from macroapp.auto_exit import KIND_BASE, KIND_LATE, LossTracker
+
+    t = LossTracker(confirm_count=1, reset_seconds=60, rules=_rules())
+    t.shared_quota_latch = False
+    t.feed(0.0, (0, 0), 10)
+    assert t.observe(1.0, (0, 1), 75) == KIND_LATE
+    assert t.observe(2.0, (0, 1), 76) is None          # late 는 한 번
+    assert t.observe(3.0, (0, 2), 80) == KIND_BASE      # 다른 장부 — 한 번 더 선다
+    assert t.observe(4.0, (0, 2), 81) is None
+
+    shared = LossTracker(confirm_count=1, reset_seconds=60, rules=_rules())
+    shared.feed(0.0, (0, 0), 10)
+    assert shared.observe(1.0, (0, 1), 75) == KIND_LATE
+    assert shared.observe(3.0, (0, 2), 80) is None       # 같은 장부 — 한 경기 한 번
+
+
+def test_parse_clock_text_rejects_three_digit_fallback():
+    from macroapp.auto_exit import parse_clock_text
+
+    assert parse_clock_text("841") is None              # "84:1" 자리 누락 → 8:41 로 역행시키지 않는다
+    assert parse_clock_text("84:1") is None
+    assert parse_clock_text("6454") == (64, 54)
+
+
+def test_read_clock_text_falls_back_to_korean_pack():
+    from unittest.mock import patch
+
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    from macroapp import ocr
+
+    box = np.full((35, 94), 235, dtype=np.uint8)
+    calls = []
+
+    def fake(img, lang="ko"):
+        calls.append(lang)
+        if lang == "en":
+            raise RuntimeError("language pack missing")
+        return "84:10"
+
+    with patch.object(ocr, "winocr", object()), patch.object(ocr, "_recognize_text", side_effect=fake):
+        assert ocr.read_clock_text(box) == "84:10"
+    assert calls == ["en", "ko"]
+
+    with patch.object(ocr, "winocr", object()), patch.object(ocr, "_recognize_text", return_value=""):
+        assert ocr.read_clock_text(box) == ""
