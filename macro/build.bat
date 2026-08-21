@@ -20,6 +20,17 @@ if exist "setup.iss" (
     echo setup.iss 버전 동기화 완료
 )
 
+:: setup_pro.iss 도 같이 동기화 — 프로 설치본이 옛 버전으로 표시되던 사고 방지(1.0.39 실측)
+if exist "setup_pro.iss" (
+    python -c "import re,sys; t=open('setup_pro.iss','r',encoding='utf-8').read(); t=re.sub(r'AppVersion=.*','AppVersion=%APP_VER%',t); open('setup_pro.iss','w',encoding='utf-8').write(t)"
+    if errorlevel 1 (
+        echo [오류] setup_pro.iss 버전 동기화 실패. 빌드를 중단합니다.
+        pause
+        exit /b 1
+    )
+    echo setup_pro.iss 버전 동기화 완료
+)
+
 echo 패키지 설치 중...
 rem CRITICAL: opencv-python(일반)은 cv2.pyd가 Media Foundation(MF.dll/MFPlat.dll/
 rem MFReadWrite.dll)을 정적 임포트한다. Windows N/KN 에디션 등 미디어 기능이 없는 PC에선
