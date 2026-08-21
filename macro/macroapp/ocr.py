@@ -432,6 +432,60 @@ def contains_skip(image_bgr_or_gray: np.ndarray, logger=None) -> bool:
     return classify_skip_prompt(image_bgr_or_gray, logger=logger)[0]
 
 
+# ─── 감독모드 홈 화면(로비) — 티어·랭킹 점수·순위 ───
+# 경기 결과 패널과 달리 큰 글자라 winocr 가 잘 읽는다(실측: 1920x1080 홈 화면에서
+# "세미프로3부감독0승/0무/1패9경기남음세미프로2부감독승격까지17점남음…"). 챔피언스/슈퍼
+# 챔피언스는 '랭킹 점수 4,604'·'순위 1'이 뜨고, 그 아래 티어는 티어명과 승격 포인트만 뜬다.
+# 게이트 토큰: 다른 화면(경기 결과 패널·구단 관리)에 없는 홈 전용 문구만 쓴다.
+_HOME_GATE_TOKENS = ("랭킹점수", "경기남음", "승격까지", "강등보호", "갱신됩니다", "승률")
+_HOME_SCORE_RE = re.compile(r"랭킹점수(\d{1,6})")
+_HOME_RANK_RE = re.compile(r"순위(\d{1,6})")
+
+
+def parse_home_text(raw: str) -> dict:
+    """홈 화면 OCR 원문 → {has_home, tier, score, rank}. 순수 함수(winocr 불필요).
+
+    - tier: 첫 'OO 감독'(제목). 그 뒤의 '세미프로 2부 감독 승격까지…' 는 두 번째라 안 잡힌다.
+    - score: '랭킹 점수' 뒤 숫자만(승격 포인트 '17점'·'0점' 은 랭킹 점수가 아니다).
+    - rank: '순위' 바로 뒤 숫자만('친구 순위'·'클럽원 순위' 탭은 숫자가 안 붙어 안 잡힌다).
+    """
+    result = {"has_home": False, "tier": None, "score": None, "rank": None}
+    cleaned = _normalize_ocr_text(raw or "").replace(",", "")
+    if "감독" not in cleaned or not any(tok in cleaned for tok in _HOME_GATE_TOKENS):
+        return result
+    tm = _TIER_RE.search(cleaned)
+    tier = _canon_tier(tm.group(1)) if tm else None
+    if tier is None:
+        return result                      # 티어가 앵커다 — 없으면 홈 화면으로 안 본다
+    result["has_home"] = True
+    result["tier"] = tier
+    sm = _HOME_SCORE_RE.search(cleaned)
+    if sm:
+        score = int(sm.group(1))
+        if 0 < score <= 99999:
+            result["score"] = score
+    rm = _HOME_RANK_RE.search(cleaned)
+    if rm:
+        rank = int(rm.group(1))
+        if 1 <= rank <= 999999:
+            result["rank"] = rank
+    return result
+
+
+def read_home_screen(image_bgr_or_gray: np.ndarray, logger=None) -> dict:
+    """홈 화면 영역(HOME_OCR_REGION 크롭)을 읽어 parse_home_text 결과를 돌려준다."""
+    empty = {"has_home": False, "tier": None, "score": None, "rank": None}
+    if winocr is None or image_bgr_or_gray is None or image_bgr_or_gray.size == 0:
+        return empty
+    try:
+        text = _recognize_text(image_bgr_or_gray)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger(f"[홈 OCR] 인식 중 오류: {exc}")
+        return empty
+    return parse_home_text(text)
+
+
 def read_clock_text(box_gray: np.ndarray) -> str:
     """경기 시계 박스(auto_exit.find_clock_box 가 잘라 준 흰 박스)의 글자를 읽는다.
 

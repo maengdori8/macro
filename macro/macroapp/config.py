@@ -256,6 +256,17 @@ AUTO_EXIT_CLOCK_REGION = (0.22, 0.05, 0.45, 0.13)
 AUTO_EXIT_CLOCK_INTERVAL_SECONDS = 5.0
 #: 시계 값이 이만큼 연속으로 '내려가지 않게' 읽혀야 확정한다(단발 오독 차단).
 AUTO_EXIT_CLOCK_CONSENSUS = 2
+
+# ─── 감독모드 홈 화면 OCR(로비의 티어·랭킹 점수·순위) ───
+# 경기 결과 패널은 0.7초만 떠서 놓치기 쉬운데, 홈 화면은 큰 글자로 오래 떠 있다.
+# 매치 게이트(팀정보/유니폼 탭)가 안 보이는 화면에서만, 이 간격으로 읽는다.
+HOME_OCR_ENABLED = True
+#: 홈 화면 상단 카드 영역(클라이언트 비율, 좌·상·우·하). 1920x1080 실측: 제목 '세미프로 3부
+#: 감독'·'랭킹 점수'·'순위' 블록이 모두 들어오고, 아래 '등급 변동/친구 순위' 탭은 제외된다.
+HOME_OCR_REGION = (0.13, 0.16, 0.70, 0.47)
+HOME_OCR_INTERVAL_SECONDS = 3.0
+#: 같은 값이 이만큼 연속으로 읽혀야 확정한다(한 번의 오독이 등수·점수를 덮지 않게).
+HOME_OCR_VOTE_MIN = 2
 #: 0:2 가 이 횟수만큼 **연속** 읽혀야 한 판으로 확정합니다(오독 1회 방어).
 AUTO_EXIT_CONFIRM_COUNT = 3
 #: 스코어가 이 시간(초) 동안 계속 안 읽히면 경기가 끝난 것으로 봅니다.
@@ -575,6 +586,17 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     },
     {"name": "target_H", "filename": "target_H.png", "action": "click"},
     {"name": "target_I", "filename": "target_I.png", "action": "click"},
+    # 경기 중 하단 전술창(팀 전술/개인 전술/경기 분석)이 떠 있으면 오른쪽 위 '−'(접기)를
+    # 눌러 가린다 — 전술창이 하단 22% 를 덮어 SKIP 프롬프트 인식을 막는다(사용자 요청,
+    # 수동으로도 마우스로 − 를 누른다). 템플릿 = 전술 아이콘 + '−'(중심이 − 버튼),
+    # 실전 프레임(2026-08-21 1920x1080)에서 잘라 냈다. 어두운 면이 넓어 임계값을 높였다.
+    {
+        "name": "target_J",
+        "filename": "target_J.png",
+        "action": "click",
+        "threshold": 0.88,
+        "wait_after_action": 1.0,
+    },
 ]
 
 # 1차 사전필터 축소 배율. 클수록 CPU↓ (최종 클릭 정확도는 ROI 정밀매칭이라 무관).
