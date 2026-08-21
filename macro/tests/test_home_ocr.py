@@ -66,3 +66,73 @@ def test_config_defaults_are_sane():
     assert 0 <= l < r <= 1 and 0 <= t < b <= 1
     assert config.HOME_OCR_INTERVAL_SECONDS >= 1.0
     assert config.HOME_OCR_VOTE_MIN >= 2
+
+
+# ─── 배선: 매치 게이트 실패 프레임 → 홈 읽기 → 같은 값 2회 → _apply_rank_values ─────────
+
+
+def _home_app():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from macroapp import gui
+
+    app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app._home_consensus = ocr.RankConsensus(vote_min=2, gap=20.0, commit_after_gone=1e9)
+    app._home_ocr_last_at = float("-inf")
+    app._apply_rank_values = Mock()
+    app._log_to_file_only = Mock()
+    return app, SimpleNamespace
+
+
+def test_home_reading_applies_after_two_matching_reads():
+    import numpy as np
+    from unittest.mock import patch
+
+    from macroapp import gui
+
+    app, _ = _home_app()
+    frame = np.zeros((1017, 1920), dtype=np.uint8)
+    reading = {"has_home": True, "tier": "슈퍼 챔피언스 감독", "score": 4604, "rank": 1}
+    with (
+        patch.object(gui.rank_ocr, "ocr_available", return_value=True),
+        patch.object(gui.rank_ocr, "read_home_screen", return_value=reading) as read,
+    ):
+        app._observe_home(frame, 10.0)        # 1회 — 아직
+        app._apply_rank_values.assert_not_called()
+        app._observe_home(frame, 11.0)        # 간격(3초) 안 — 안 읽음
+        assert read.call_count == 1
+        app._observe_home(frame, 14.0)        # 2회 — 확정
+    app._apply_rank_values.assert_called_once_with(1, "슈퍼 챔피언스 감독", 4604, source="home")
+
+
+def test_non_home_frames_do_not_vote():
+    import numpy as np
+    from unittest.mock import patch
+
+    from macroapp import gui
+
+    app, _ = _home_app()
+    frame = np.zeros((1017, 1920), dtype=np.uint8)
+    with (
+        patch.object(gui.rank_ocr, "ocr_available", return_value=True),
+        patch.object(gui.rank_ocr, "read_home_screen", return_value={"has_home": False, "tier": None, "score": None, "rank": None}),
+    ):
+        for t in (0.0, 5.0, 10.0, 15.0):
+            app._observe_home(frame, t)
+    app._apply_rank_values.assert_not_called()
+
+
+def test_home_ocr_is_silent_without_winocr():
+    import numpy as np
+    from unittest.mock import patch
+
+    from macroapp import gui
+
+    app, _ = _home_app()
+    with (
+        patch.object(gui.rank_ocr, "ocr_available", return_value=False),
+        patch.object(gui.rank_ocr, "read_home_screen") as read,
+    ):
+        app._observe_home(np.zeros((1017, 1920), dtype=np.uint8), 0.0)
+    read.assert_not_called()

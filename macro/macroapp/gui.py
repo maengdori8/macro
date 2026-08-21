@@ -55,6 +55,7 @@ from macroapp.config import (
     AUTO_EXIT_UNKNOWN_DUMP_LIMIT, AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS,
     AUTO_EXIT_HARD_DEFICIT_GOALS, AUTO_EXIT_LATE_MINUTE, AUTO_EXIT_LATE_DEFICIT_GOALS,
     AUTO_EXIT_CLOCK_REGION, AUTO_EXIT_CLOCK_INTERVAL_SECONDS, AUTO_EXIT_CLOCK_CONSENSUS,
+    HOME_OCR_ENABLED, HOME_OCR_REGION, HOME_OCR_INTERVAL_SECONDS, HOME_OCR_VOTE_MIN,
     AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
@@ -414,6 +415,13 @@ class AutomationApp:
         self._latest_frame = None
         self._frame_seq = 0
         self._rank_consensus = rank_ocr.RankConsensus()  # 다중 프레임 투표(단발 오인식 폐기)
+        # 감독모드 홈 화면(로비)의 티어·랭킹 점수·순위 — 매치 화면이 아닐 때만 읽는다.
+        # 큰 글자라 잘 읽히지만 한 번의 오독이 등수·점수를 덮지 않게 같은 값 2회로 확정한다.
+        # '패널 소멸 확정'은 안 쓴다(commit_after_gone 을 사실상 무한대로) — 홈은 오래 떠 있다.
+        self._home_consensus = rank_ocr.RankConsensus(
+            vote_min=HOME_OCR_VOTE_MIN, gap=20.0, commit_after_gone=1e9,
+        )
+        self._home_ocr_last_at = float("-inf")
         self._rank_ocr_cache_key = None
         self._rank_ocr_cache_info = None
         self._rank_ocr_cache_at = 0.0
@@ -2074,6 +2082,8 @@ class AutomationApp:
             # 새 객체로 교체(reset 아님): 혹시 직전 run의 워커가 join 타임아웃으로 살아있어도
             # 옛 객체를 만지게 분리해, 새 워커의 투표 상태와 절대 안 섞이게 한다.
             self._rank_consensus = rank_ocr.RankConsensus()
+            self._home_consensus.reset()
+            self._home_ocr_last_at = float("-inf")
             # 0:2 자동 종료 활성 판정. 트래커·쿼터는 세션 수명(__init__)이고,
             # 여기서는 이번 실행에 관측을 공급할지와 관측 상태 리셋만 한다
             # (래치는 유지 — 정지→재시작으로 같은 경기가 두 번 세어지면 안 된다).
@@ -2513,6 +2523,8 @@ class AutomationApp:
                             "[게이트] 탭바('팀정보/유니폼') 미검출 → 등수 OCR 건너뜀"
                             "(매치 화면인데 반복되면 해상도/게이트 영역 확인)"
                         )
+                    # 매치 화면이 아니다 → 홈 화면(로비)일 수 있다. 거기서도 티어·점수·순위를 읽는다.
+                    self._observe_home(screen_gray, now)
                     return
             info = rank_ocr.read_rank_panel(crop, logger=None)
             self._rank_ocr_cache_key = cache_key
@@ -2547,6 +2559,54 @@ class AutomationApp:
         self._match_counter.note_commit(now)
 
         rank, tier, score = committed
+        self._apply_rank_values(rank, tier, score)
+
+    def _observe_home(self, screen_gray, now: float) -> None:
+        """감독모드 홈 화면(로비)에서 티어·랭킹 점수·순위를 읽어 같은 값 2회면 반영한다.
+
+        매치 게이트가 실패한 프레임에서만 불린다(경기 결과 패널과 겹치지 않는다). 읽기는
+        HOME_OCR_INTERVAL_SECONDS 마다 한 번 — OCR 워커를 SKIP·스코어와 나눠 쓴다. 읽힌 값은
+        경기 결과 패널과 같은 경로(_apply_rank_values)로 들어가 디스코드 보고·목표 정지에
+        쓰인다. 실패는 전부 무시한다(홈 읽기는 '있으면 좋은 것').
+        """
+
+        if not HOME_OCR_ENABLED or not rank_ocr.ocr_available():
+            return
+        if now - self._home_ocr_last_at < HOME_OCR_INTERVAL_SECONDS:
+            return
+        self._home_ocr_last_at = now
+        try:
+            crop = auto_exit.crop_score_region(screen_gray, HOME_OCR_REGION)
+            if crop is None:
+                return
+            info = rank_ocr.read_home_screen(crop, logger=None)
+            if not info.get("has_home"):
+                return
+            self._home_consensus.observe(
+                {
+                    "has_panel": True,
+                    "rank": info.get("rank"),
+                    "tier": info.get("tier"),
+                    "score": info.get("score"),
+                },
+                now,
+            )
+            committed = self._home_consensus.commit(now)
+            if committed is None:
+                return
+            self._home_consensus.reset()
+        except Exception:
+            return
+        rank, tier, score = committed
+        self._apply_rank_values(rank, tier, score, source="home")
+
+    def _apply_rank_values(self, rank, tier, score, *, source: str = "panel") -> None:
+        """확정된 (등수/티어/점수)를 마지막 값·표시·보고·목표 정지에 반영한다.
+
+        경기 결과 패널(_commit_rank)과 홈 화면(_observe_home)이 같은 경로를 쓴다 — 값의
+        의미가 같고(랭킹 순위·랭킹 점수·티어), 보고 형식이 둘로 갈리면 봇 쪽이 헷갈린다.
+        """
+
         # 컨센서스로 '확정된' 값에서만 목표 도달을 판정 → 단발 오인식/스테일로 잘못 멈추지 않음.
         # 정지 판정엔 '이번 패널에서 실제로 읽힌' 티어만 넘긴다(없으면 None) → 직전 매치의
         # 슈퍼챔스 티어가 다음 매치로 새서 거짓 정지하는 일을 막는다(#5). 표시용 보강은 아래에서.
@@ -2579,10 +2639,11 @@ class AutomationApp:
 
         # (등수, 메시지)를 한 번에 원자적으로 교체 → 다른 스레드가 짝이 안 맞는 값을 못 봄.
         self._rank_state = new_state
+        suffix = " (홈 화면)" if source == "home" else ""
         if rank is not None:
-            self.queue_log(f"[등수] 현재 등수: {rank}위")
+            self.queue_log(f"[등수] 현재 등수: {rank}위{suffix}")
         elif tier is not None or score is not None:
-            self.queue_log(f"[티어/점수] {message}")
+            self.queue_log(f"[티어/점수] {message}{suffix}")
         # 변경 즉시 서버로 전송(다음 30초 주기 안 기다림).
         self._report_status(running=True)
 
