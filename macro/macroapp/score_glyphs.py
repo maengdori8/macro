@@ -2,22 +2,26 @@
 
 실물 캡처에서 뽑았다: '0' 두 장은 사용자 녹화(0:0, tv 레인지), '1'·'2' 는
 사용자 스크린샷(1:2, full 레인지), '2' 두 번째와 '3' 은 2:3 스크린샷
-(2026-08-17, 1920x1080 전체화면). 20x28 이진 마스크 PNG 의 base64 다.
+(2026-08-17, 1920x1080 전체화면), '4' 두 장은 2026-08-11 실전 프레임 저장본
+(dist/fc_state_0157=4:0, fc_state_0211=4:1, 1936x1056 창 모드). 20x28 이진 마스크
+PNG 의 base64 다.
 
 왜 OCR 이 아니라 템플릿인가(실측): winocr 는 맥락 없는 숫자 한두 개를 프레임에
 따라 못 읽는다 — '0 0' 은 읽고 '1 2' 는 완벽한 크롭에서도 빈 문자열이었다.
+2026-08-21 재검증: 저장된 실전 프레임 8장의 스코어보드 띠(팀명·시계 포함)를 통째로
+넣어도 팀명과 시계("84:10")는 읽지만 **박스 안 숫자는 한 자리도 안 나온다.**
 게임 폰트는 고정이므로 실물 글리프 IoU 매칭이 결정적이고 훨씬 빠르다(~1ms).
 
 측정된 분리도(임계값 0.65):
-  * 같은 숫자   : 0.79~0.85 이상  (예: '2' 두 샘플끼리 0.854)
-  * 다른 숫자   : 0.48~0.61       (최악이 '3' vs '0' = 0.606)
-  ⚠️ '3' 이 들어오면서 교차 IoU 최악값이 0.51 → 0.606 으로 올라 여유가 얇아졌다.
-  숫자를 더 추가할 때는 반드시 교차 IoU 를 다시 재고, 0.65 에 근접하면 임계값이
+  * 같은 숫자   : 0.79~0.87 이상  (예: '4' 두 샘플끼리 1.000)
+  * 다른 숫자   : 최악 '0' vs '3' = 0.606
+  ⚠️ 숫자를 더 추가할 때는 반드시 교차 IoU 를 다시 재고, 0.65 에 근접하면 임계값이
   아니라 **마스크 해상도/여백**을 손봐야 한다(임계값을 낮추면 오인식이 는다).
 
-숫자 4~9 템플릿은 아직 없다 → 그 스코어는 '박스는 보이는데 숫자 미상'으로
+숫자 5~9 템플릿은 아직 없다 → 그 스코어는 '박스는 보이는데 숫자 미상'으로
 처리된다(진행 중 증거로만 쓰이고 판정은 하지 않는다 — 안전 방향).
-새 숫자를 추가하려면 그 숫자가 보이는 스크린샷을 받아 이 파일을 재생성한다.
+실전 표본은 logs/score_unknown/ 에 자동으로 쌓인다(gui._save_score_unknown_crop) —
+그 크롭으로 이 파일을 재생성한다.
 """
 
 GLYPH_PNGS_B64 = {
@@ -34,5 +38,9 @@ GLYPH_PNGS_B64 = {
     ],
     "3": [
         "iVBORw0KGgoAAAANSUhEUgAAABQAAAAcCAAAAABEscC8AAAAcklEQVQoFV3BgYHDIBADMHn/of1w9BtSKf5VfMRSjyCoWwj1FqHeInUEdaRGbDVSI7YasTSOGnGrEbcacaslYqtLxFaPEFs9Qmx1iXjUiLjUEbcacasRShw1UkscNVJbjBqpEVuN1K8I9Rah3iKW+orlD3wjJBArl95bAAAAAElFTkSuQmCC",
+    ],
+    "4": [
+        "iVBORw0KGgoAAAANSUhEUgAAABQAAAAcCAAAAABEscC8AAAAd0lEQVQoFWXBgXHCQAAEMW3/RV8e44BnkPIxl8jHXCIfc4nc5ha5zS1ym1vkbf5F3uZf5GW+Ii/zFWEumSPCHGGOCHOEOSLmJcwRMUeOOaI5cpkjmiOXOaL51fxqfjW/8jGXyNe8RB7miDzMEXmYI/IwR+RhjvgD6g0jGX4BrccAAAAASUVORK5CYII=",
+        "iVBORw0KGgoAAAANSUhEUgAAABQAAAAcCAAAAABEscC8AAAAd0lEQVQoFWXBgXHCQAAEMW3/RV8e44BnkPIxl8jHXCIfc4nc5ha5zS1ym1vkbf5F3uZf5GW+Ii/zFWEumSPCHGGOCHOEOSLmJcwRMUeOOaI5cpkjmiOXOaL51fxqfjW/8jGXyNe8RB7miDzMEXmYI/IwR+RhjvgD6g0jGX4BrccAAAAASUVORK5CYII=",
     ],
 }
