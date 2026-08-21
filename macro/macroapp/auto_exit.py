@@ -148,6 +148,22 @@ def classify_glyph(mask, glyphs=None) -> Optional[int]:
     return best_digit
 
 
+def crop_score_region(gray, region_fractions):
+    """스코어보드 영역(프레임 비율 좌표)을 원본 픽셀로 잘라 준다. 너무 작으면 None.
+
+    read_score_from_frame 과 '숫자 미상' 표본 저장이 **같은 크롭**을 쓰게 하는 단일
+    지점이다 — 저장된 표본으로 만든 글리프가 실전 크롭과 어긋나면 안 된다.
+    """
+    height, width = gray.shape[:2]
+    x1 = max(0, int(width * float(region_fractions[0])))
+    y1 = max(0, int(height * float(region_fractions[1])))
+    x2 = min(width, int(width * float(region_fractions[2])))
+    y2 = min(height, int(height * float(region_fractions[3])))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    return gray[y1:y2, x1:x2]
+
+
 def read_score_from_frame(gray, region_fractions, glyphs=None) -> Reading:
     """프레임에서 스코어를 읽는다. (a,b) / SCORE_UNKNOWN / None(스코어보드 없음).
 
@@ -155,14 +171,10 @@ def read_score_from_frame(gray, region_fractions, glyphs=None) -> Reading:
     자동화가 죽으면 안 된다).
     """
     try:
-        height, width = gray.shape[:2]
-        x1 = max(0, int(width * float(region_fractions[0])))
-        y1 = max(0, int(height * float(region_fractions[1])))
-        x2 = min(width, int(width * float(region_fractions[2])))
-        y2 = min(height, int(height * float(region_fractions[3])))
-        if x2 - x1 < 8 or y2 - y1 < 8:
+        crop = crop_score_region(gray, region_fractions)
+        if crop is None:
             return None
-        boxes = extract_score_boxes(gray[y1:y2, x1:x2])
+        boxes = extract_score_boxes(crop)
         if len(boxes) != 2:
             # 박스가 0개면 스코어보드가 없다. 1개나 3개+는 화면 전환·가림의
             # 순간이다 — '없음'으로 보면 경기 종료 타이머가 돌아 래치가 일찍

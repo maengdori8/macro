@@ -372,3 +372,45 @@ def test_read_failures_collapse_to_none():
     assert read_score_from_frame(None, REGION) is None
     frame = np.zeros((100, 100), dtype=np.uint8)
     assert read_score_from_frame(frame, (0.5, 0.5, 0.5, 0.5)) is None
+
+
+# ---------------------------------------------------------------------------
+# '숫자 미상' 표본 자동 저장 — 4~9 글리프를 실전에서 모은다
+# ---------------------------------------------------------------------------
+
+
+def test_crop_score_region_matches_read_path_and_rejects_tiny():
+    np = pytest.importorskip("numpy")
+    from macroapp.auto_exit import crop_score_region
+
+    gray = np.zeros((1080, 1920), dtype=np.uint8)
+    crop = crop_score_region(gray, (0.150, 0.050, 0.210, 0.130))
+    assert crop.shape == (int(1080 * 0.130) - int(1080 * 0.050), int(1920 * 0.210) - int(1920 * 0.150))
+    assert crop_score_region(gray, (0.5, 0.5, 0.501, 0.501)) is None
+
+
+def test_unknown_score_crops_are_saved_with_cap_and_interval(tmp_path):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    from unittest.mock import Mock
+
+    from macroapp import gui
+
+    app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.base_dir = tmp_path
+    app._score_unknown_dumped = 0
+    app._score_unknown_dumped_at = float("-inf")
+    app._log_to_file_only = Mock()
+    gray = np.full((1080, 1920), 40, dtype=np.uint8)
+
+    app._save_score_unknown_crop(gray, 100.0, fresh=True)      # 새 미상 구간 → 저장
+    app._save_score_unknown_crop(gray, 101.0, fresh=False)     # 간격 안 → 안 저장
+    app._save_score_unknown_crop(gray, 100.0 + gui.AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS, fresh=False)  # 간격 지남 → 저장
+    files = sorted((tmp_path / "logs" / "score_unknown").glob("score_*.png"))
+    assert len(files) == 2
+    assert app._score_unknown_dumped == 2
+
+    # 세션 상한을 넘기면 더 안 쓴다.
+    app._score_unknown_dumped = gui.AUTO_EXIT_UNKNOWN_DUMP_LIMIT
+    app._save_score_unknown_crop(gray, 9999.0, fresh=True)
+    assert len(list((tmp_path / "logs" / "score_unknown").glob("score_*.png"))) == 2

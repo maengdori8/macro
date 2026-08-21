@@ -52,6 +52,7 @@ from macroapp.config import (
     NOTIFICATION_PANEL_CONFIRM_COUNT, NOTIFICATION_PANEL_RETRY_SECONDS,
     NOTIFICATION_TOGGLE_X_FRACTION, NOTIFICATION_TOGGLE_Y_FRACTION,
     AUTO_EXIT_CONFIRM_COUNT, AUTO_EXIT_DEFICIT_GOALS, AUTO_EXIT_ENABLED,
+    AUTO_EXIT_UNKNOWN_DUMP_LIMIT, AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS,
     AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
@@ -267,6 +268,8 @@ class AutomationApp:
         )
         self._auto_exit_active = False
         self._last_match_score = None
+        self._score_unknown_dumped = 0              # '숫자 미상' 표본 저장 수(세션 상한)
+        self._score_unknown_dumped_at = float("-inf")
         # join 타임아웃으로 살아남은 좀비 OCR 워커가 재시작 후 부활해 트래커를
         # 이중 공급하지 않게, 워커마다 세대 번호를 준다(불일치 시 즉시 종료).
         self._ocr_generation = 0
@@ -2053,6 +2056,8 @@ class AutomationApp:
             self._auto_exit_active = self._auto_exit_allowed(capture_mode)
             self._loss_tracker.resume_observation()
             self._last_match_score = None
+            self._score_unknown_dumped = 0
+            self._score_unknown_dumped_at = float("-inf")
             self._rank_ocr_cache_key = None
             self._rank_ocr_cache_info = None
             self._rank_ocr_cache_at = 0.0
@@ -5684,6 +5689,38 @@ class AutomationApp:
             and capture_mode == "wgc"
         )
 
+    def _save_score_unknown_crop(self, gray, now: float, fresh: bool) -> None:
+        """'박스는 보이는데 숫자 미상' 순간의 스코어 영역을 logs/score_unknown/ 에 남긴다.
+
+        글리프 템플릿이 0~3 뿐이라 4 이상이 뜨면 읽지 못한다(SCORE_UNKNOWN). 지금까지는
+        사용자가 그 화면을 스크린샷으로 찍어 줘야 템플릿을 늘릴 수 있었다 — 실전에서
+        자동으로 모으면 그 수고가 없어진다. 새 미상 구간이 시작될 때(fresh)와 이어지는
+        동안 일정 간격으로 한 장씩, 세션당 상한까지만. 실패는 조용히 무시한다(표본
+        수집 때문에 자동화가 흔들리면 안 된다). 크롭은 read_score_from_frame 과 같은
+        함수(crop_score_region)로 잘라 실전 입력과 정확히 같은 픽셀이다.
+        """
+
+        if cv2 is None or self._score_unknown_dumped >= AUTO_EXIT_UNKNOWN_DUMP_LIMIT:
+            return
+        if not fresh and now - self._score_unknown_dumped_at < AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS:
+            return
+        try:
+            crop = auto_exit.crop_score_region(gray, AUTO_EXIT_SCORE_REGION)
+            if crop is None:
+                return
+            dump_dir = self.base_dir / "logs" / "score_unknown"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            self._score_unknown_dumped += 1
+            self._score_unknown_dumped_at = now
+            path = dump_dir / (
+                f"score_{time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{self._score_unknown_dumped:02d}.png"
+            )
+            if cv2.imwrite(str(path), crop):
+                self._log_to_file_only(f"[자동 종료] 미상 스코어 영역 저장: {path.name}")
+        except Exception:
+            pass
+
     def _observe_match_score(self, gray, now: float) -> None:
         """OCR 워커에서 매 새 프레임마다 부른다 — 2점차 이상 열세를 세고 종료를 결정한다.
 
@@ -5700,12 +5737,16 @@ class AutomationApp:
         reading = auto_exit.read_score_from_frame(gray, AUTO_EXIT_SCORE_REGION)
         # 읽힌 값이 바뀔 때만 파일 로그에 남긴다 — 좌표·템플릿을 실측으로 맞출 때
         # 이 로그가 유일한 근거다(화면 로그를 어지럽히지 않게 파일에만).
-        if reading != self._last_match_score:
+        fresh = reading != self._last_match_score
+        if fresh:
             self._last_match_score = reading
             if isinstance(reading, tuple):
                 self._log_to_file_only(f"[자동 종료] 스코어 읽음: {reading[0]}:{reading[1]}")
             elif reading == auto_exit.SCORE_UNKNOWN:
                 self._log_to_file_only("[자동 종료] 스코어 박스는 보이는데 숫자 미상")
+        if reading == auto_exit.SCORE_UNKNOWN:
+            # 템플릿 없는 숫자(4~9)의 실전 표본을 남긴다 — 다음 빌드에서 글리프를 넓힐 재료.
+            self._save_score_unknown_crop(gray, now, fresh)
 
         if not tracker.feed(now, reading):
             return
