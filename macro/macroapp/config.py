@@ -522,6 +522,15 @@ SKIP_FALLBACK_BOTH_SECONDS = 0.6  # 한 스킵이 이 시간 넘게 안 사라�
 # 경로는 그대로 살아 있다 — winocr 가 없는 구매자 PC 의 유일한 경로라서, 이 규칙은
 # 그것을 대체하지 않고 보강한다(해상도가 달라 템플릿이 빗나가는 PC 대비).
 SKIP_ANYKEY_DIRECT_START = True
+# 직행 START 를 적용할 프롬프트 형태(OCR 힌트). 처음엔 '아무 키나'만 넣었는데, 실측 로그가
+# **▷ SKIP(escape 형)도 같은 처리가 필요함**을 보여 줬다(2026-08-22, 구매자 다수 재보고):
+# 템플릿이 START 를 한 번 누른 직후 OCR 이 같은 프롬프트를 '실험 에피소드'로 가져가
+# _skip_active_until 을 5.2초씩 연장하며 **템플릿의 재시도를 굶겼다** — 8초 초과 6건이 전부
+# 이 모양이었다(13·15·16·16·16·27초). 이 프롬프트들의 답은 이미 START 로 확정돼 있으므로
+# (7-28 실측 349펄스, 에피소드 29/30 이 0~3초 통과) 후보를 탐색할 이유가 없다.
+# ⚠️ A/S(hold-to-skip)는 여기 없다 — 그쪽은 배경 입력이 원리적으로 안 되는, 답이 아직
+# 없는 프롬프트라 실험(H1 attach_active_hold_a 등)이 계속 돌아야 한다.
+SKIP_DIRECT_START_HINTS = ("any_key", "escape", "escape_highlight", "start")
 SKIP_ANYKEY_REPRESS_SECONDS = 0.8  # 프롬프트가 계속 보이면 이 간격으로 START 를 다시 누른다
 
 # ─── 자동 정지 단발 오독 가드 ───

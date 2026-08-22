@@ -94,7 +94,7 @@ from macroapp.config import (
     SKIP_OCR_MAX_WIDTH, SKIP_OCR_LEFT_FRACTION, SKIP_OCR_RIGHT_FRACTION,
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
-    SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS,
+    SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS, SKIP_DIRECT_START_HINTS,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
@@ -4750,16 +4750,18 @@ class AutomationApp:
         is_a: bool,
         is_s: bool,
     ) -> bool:
-        """'SKIP 하려면 아무 키나 누르세요' 프롬프트를 실험 없이 바로 START 로 넘긴다.
+        """답이 확정된 일반 프롬프트(▷ SKIP · '아무 키나' · ESC SKIP)를 바로 START 로 넘긴다.
 
         적용되면 이번 OCR 패스를 여기서 끝내고 True, 아니면 False(기존 흐름 계속).
 
-        - 근거는 OCR 힌트 ``any_key`` (한글 문구 또는 Enter 가 SKIP 과 함께 읽힘).
-        - 에피소드에 이미 잠긴 힌트(escape 등)가 있으면 그쪽을 존중한다 — 실험의
-          귀속 불변식(한 에피소드 = 한 추적기)을 깨지 않는다.
+        - 근거는 OCR 힌트가 SKIP_DIRECT_START_HINTS 안에 있는가다(any_key/escape/
+          escape_highlight/start). 이 형태들의 답은 START 로 이미 확정돼 있다.
+        - ⚠️ **A/S(hold-to-skip)는 제외한다** — 답이 아직 없는 프롬프트라 실험이 계속
+          돌아야 한다(is_a/is_s 로 걸러진다).
         - 연속 확인·재누름 간격은 AnyKeyStartPolicy(순수 로직)가 정한다.
-        - 템플릿(target_G) 경로는 막지 않는다. 누른 직후 0.5초만 매칭을 멈춰 같은
-          버튼이 두 스레드에서 겹쳐 나가는 것만 피한다.
+        - 템플릿(target_F/G) 경로는 막지 않는다. 누른 직후 0.5초만 매칭을 멈춰 같은
+          버튼이 두 스레드에서 겹쳐 나가는 것만 피한다 — 실험 경로(5.2초 봉쇄)와 달리
+          템플릿이 곧바로 재시도할 수 있어야 한다(이 결함이 재발 원인이었다).
         """
 
         if not SKIP_ANYKEY_DIRECT_START or not has_text or is_a or is_s:
@@ -4771,13 +4773,13 @@ class AutomationApp:
             getattr(self, "_skip_generic_episode_hint", None)
             or self._skip_generic_hint
         )
-        if hint != "any_key" or self._skip_kind not in (None, "anykey"):
+        if hint not in SKIP_DIRECT_START_HINTS or self._skip_kind not in (None, "anykey"):
             return False
 
         if self._skip_kind is None:
             self._skip_kind = "anykey"
-            self._skip_generic_episode_hint = "any_key"
-            self._skip_generic_hint = "any_key"
+            self._skip_generic_episode_hint = hint
+            self._skip_generic_hint = hint
         self._skip_text_streak += 1
         action = policy.observe(now, True)
         if action == ANYKEY_PRESS:
@@ -4786,13 +4788,13 @@ class AutomationApp:
                 try:
                     send_gamepad_button(start_btn)
                 except Exception as exc:  # noqa: BLE001
-                    self.queue_log(f"[SKIP] '아무 키나' START 입력 실패: {exc}")
+                    self.queue_log(f"[SKIP] 일반 프롬프트 START 입력 실패: {exc}")
                 else:
                     self._skip_last_press = ("start", now)
                     self._skip_active_until = max(
                         self._skip_active_until, time.monotonic() + 0.5
                     )
-                    self.queue_log("[SKIP] '아무 키나' 프롬프트 → START")
+                    self.queue_log(f"[SKIP] 일반 프롬프트({hint}) → START")
         self.queue_status("SKIP 넘기는 중")
         return True
 

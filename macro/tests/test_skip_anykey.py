@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -159,7 +160,7 @@ def test_any_key_prompt_presses_start_without_touching_the_experiment() -> None:
         tracker.choose.assert_not_called()
     app._report_skip_experiment_outcome.assert_not_called()
     assert any(
-        "아무 키나" in str(call.args[0]) for call in app.queue_log.call_args_list
+        "일반 프롬프트" in str(call.args[0]) for call in app.queue_log.call_args_list
     )
 
 
@@ -195,6 +196,45 @@ def test_locked_escape_episode_is_not_hijacked_by_a_later_any_key_read() -> None
     app._skip_generic_hint = "escape"
     assert app._anykey_direct_start(1.0, True, False, False) is False
     assert app._skip_kind == "start"
+
+
+def test_escape_prompt_also_goes_direct_not_into_the_experiment() -> None:
+    """▷ SKIP(escape 형)도 답이 START 로 확정된 프롬프트다.
+
+    2026-08-22 실측 결함: 템플릿이 START 를 한 번 누른 직후 OCR 이 같은 프롬프트를 실험
+    에피소드로 가져가 매칭을 5.2초씩 봉쇄해 템플릿의 재시도를 굶겼다(8초 초과 6건이 전부
+    이 모양). 이제 escape/escape_highlight/start 도 직행 경로가 받는다.
+    """
+
+    for hint in ("escape", "escape_highlight", "start"):
+        app = _app()
+        manager = SimpleNamespace(hwnd=123)
+        screen = np.zeros((720, 1280), dtype=np.uint8)
+        p = _patches([(True, hint)] * 2)
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad:
+            assert app._try_skip(screen, manager)
+            assert app._try_skip(screen, manager)
+        assert gamepad.call_count == 1, f"{hint}: 직행 START 가 안 나갔다"
+        assert app._skip_kind == "anykey", f"{hint}: 실험 경로로 샜다"
+        # 실험 추적기는 손대지 않는다(봉쇄 5.2초의 출처).
+        for tracker in (
+            app._skip_generic_experiment,
+            app._skip_generic_escape_experiment,
+            app._skip_generic_escape_highlight_experiment,
+        ):
+            tracker.choose.assert_not_called()
+        # 봉쇄는 0.5초뿐이라 템플릿이 곧바로 재시도할 수 있다.
+        assert app._skip_active_until - time.monotonic() <= 0.6
+
+
+def test_a_and_s_prompts_still_go_to_the_experiment() -> None:
+    """A/S(hold-to-skip)는 답이 없는 프롬프트라 실험이 계속 돌아야 한다."""
+
+    app = _app()
+    app._skip_generic_hint = "escape"
+    # is_a / is_s 가 서면 직행 경로는 물러난다.
+    assert app._anykey_direct_start(1.0, True, True, False) is False
+    assert app._anykey_direct_start(1.0, True, False, True) is False
 
 
 def test_disabled_flag_falls_back_to_the_experiment_path() -> None:
