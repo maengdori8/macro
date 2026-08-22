@@ -124,3 +124,83 @@ def test_duration_and_message_are_readable_korean() -> None:
     assert "12분" in stall_message(STALL_WINDOW, 720)
     assert "진행이 없" in stall_message(STALL_PROGRESS, 600)
     assert stall_message(STALL_NONE, 0) == ""
+
+
+# ─── 배선(_check_stall) — 1.0.45 사고를 막는 테스트 ─────────────────────────
+#
+# 위의 순수 로직 테스트는 전부 통과했는데도 실제로 실행되는 단 한 줄(알림 전송)의
+# 오타(report_status → _report_status)가 첫 알림에서 AutomationApp 을 죽였다.
+# 교훈: 순수 로직만 고정하면 '유일하게 돌아가는 배선'이 미검증으로 남는다.
+
+
+def _wired_app(monitor_kwargs=None):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from macroapp import config, gui
+
+    app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app._stall = StallMonitor(
+        first_alert_seconds=config.STALL_FIRST_ALERT_SECONDS,
+        repeat_alert_seconds=config.STALL_REPEAT_ALERT_SECONDS,
+        progress_grace_seconds=config.STALL_PROGRESS_GRACE_SECONDS,
+        **(monitor_kwargs or {}),
+    )
+    app._stall.reset(0.0)
+    app._stall_state = STALL_NONE
+    app.queue_log = Mock()
+    app._report_status = Mock()
+    return app, SimpleNamespace
+
+
+def test_check_stall_alerts_through_the_real_wiring() -> None:
+    """창 유실 알림이 로그와 상태 전송으로 실제로 나간다(메서드 이름 포함)."""
+
+    from macroapp import config
+
+    app, _ = _wired_app()
+    app._stall.note_window(False, 0.0)
+    app._check_stall(config.STALL_FIRST_ALERT_SECONDS + 10.0)
+    logged = str(app.queue_log.call_args.args[0])
+    assert "[가동률]" in logged and "게임 창" in logged
+    app._report_status.assert_called_once()
+    kwargs = app._report_status.call_args.kwargs
+    assert kwargs["running"] is True
+    assert "게임 창" in kwargs["message"]
+
+
+def test_check_stall_is_quiet_while_healthy() -> None:
+    app, _ = _wired_app()
+    app._stall.note_progress(0.0)
+    app._check_stall(10.0)
+    app.queue_log.assert_not_called()
+    app._report_status.assert_not_called()
+    assert app._stall_state == STALL_NONE
+
+
+def test_check_stall_never_raises_into_the_automation_loop() -> None:
+    """감시는 어떤 경우에도 본체를 못 막는다 — 1.0.45 가 이걸 어겨 매크로가 죽었다."""
+
+    from macroapp import config
+
+    app, _ = _wired_app()
+    app._stall.note_window(False, 0.0)
+    # 알림 경로의 어느 조각이 터져도 루프로 예외가 새면 안 된다.
+    for broken in ("queue_log", "_report_status"):
+        setattr(app, broken, _raise)
+        app._stall.reset(0.0)
+        app._stall.note_window(False, 0.0)
+        app._check_stall(config.STALL_FIRST_ALERT_SECONDS + 10.0)   # 예외 없이 통과해야 한다
+        setattr(app, broken, __import__("unittest.mock", fromlist=["Mock"]).Mock())
+    # 판정 자체가 터져도 마찬가지.
+    app._stall = _BrokenMonitor()
+    app._check_stall(1.0)
+
+
+def _raise(*args, **kwargs):
+    raise RuntimeError("의도적 실패")
+
+
+class _BrokenMonitor:
+    def poll(self, now):
+        raise RuntimeError("의도적 실패")

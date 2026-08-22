@@ -70,3 +70,84 @@ def test_non_lobby_targets_do_not_end_the_measurement() -> None:
     # 진짜 로비 타겟에서만 끝난다.
     app._note_exit_effect(_target("target_B"), 130.0)
     assert app._auto_exit_done_at is None
+
+
+# ─── 재시도 홀드 상승 + 로비 미도달 재시도 (2026-08-23 실측 기반) ──────────────
+#
+# 8-22 프로 로그 자동 종료 8건 전수 추적:
+#   성공 5건 = 마무리 15~20초, 로비까지 16~37초
+#   실패 3건 = 마무리 50초(홀드10+타임아웃40) 뒤 '게임 화면을 확인해 주세요',
+#              경기는 249·391·598초 더 진행([7]은 완료 직후 target_J 전술창=인게임)
+# → 실패 원인은 '확인 버튼을 못 눌러서'가 아니라 **정지 10초로 접속이 안 끊겨 확인 창이
+#   안 뜬 것**. 그래서 (a) 재시도는 홀드를 늘려서 하고 (b) 스코어를 못 읽어도
+#   '로비 미도달'만으로 재시도가 걸려야 한다([4]는 재시도가 아예 안 걸렸다).
+
+
+def _tick_app():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app._auto_exit_done_at = None
+    app._auto_exit_retries = 0
+    app._auto_exit_retry_at = None
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
+    app._log_to_file_only = Mock()
+    app.queue_log = Mock()
+    app.ui_queue = SimpleNamespace(put=Mock())
+    return app
+
+
+def test_hold_escalates_with_each_retry_up_to_a_cap() -> None:
+    """같은 10초로 다시 하면 같은 실패다 — 실측 [6]→[7]이 그랬다."""
+
+    app = _tick_app()
+    app._auto_exit_retries = 0
+    assert app._exit_hold_seconds() == config.EXIT_HOLD_SECONDS
+    app._auto_exit_retries = 1
+    assert app._exit_hold_seconds() == (
+        config.EXIT_HOLD_SECONDS + config.EXIT_RETRY_HOLD_STEP_SECONDS
+    )
+    app._auto_exit_retries = 99
+    assert app._exit_hold_seconds() == config.EXIT_RETRY_HOLD_MAX_SECONDS
+    assert config.EXIT_RETRY_HOLD_MAX_SECONDS > config.EXIT_HOLD_SECONDS
+
+
+def test_no_lobby_in_time_triggers_a_retry_without_reading_the_score() -> None:
+    """[4] 실패는 스코어 기반 재시도가 안 걸렸다 — 로비 미도달만으로도 걸려야 한다."""
+
+    app = _tick_app()
+    app._auto_exit_done_at = 100.0
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS - 1)   # 아직
+    app.ui_queue.put.assert_not_called()
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)   # 시간 초과
+    app.ui_queue.put.assert_called_once_with(("auto_exit", ""))
+    assert app._auto_exit_retries == 1
+    assert app._auto_exit_done_at is None, "같은 종료로 두 번 재시도하면 안 된다"
+    assert app._auto_exit_retry_at is None, "스코어 예약과 중복 발사 금지"
+
+
+def test_reaching_lobby_in_time_cancels_the_retry() -> None:
+    app = _tick_app()
+    app._auto_exit_done_at = 100.0
+    app._note_exit_effect(_target("target_B"), 130.0)      # 30초 — 정상 도달
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 10)
+    app.ui_queue.put.assert_not_called()
+    assert app._auto_exit_retries == 0
+
+
+def test_effect_tick_respects_stop_and_the_retry_cap() -> None:
+    from types import SimpleNamespace
+
+    app = _tick_app()
+    app.stop_event = SimpleNamespace(is_set=lambda: True)
+    app._auto_exit_done_at = 100.0
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
+    app.ui_queue.put.assert_not_called()                   # 정지 후 입력 0
+
+    app = _tick_app()
+    app._auto_exit_retries = config.AUTO_EXIT_RETRY_MAX
+    app._auto_exit_done_at = 100.0
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
+    app.ui_queue.put.assert_not_called()                   # 한도 초과
+    assert app._auto_exit_retries == config.AUTO_EXIT_RETRY_MAX

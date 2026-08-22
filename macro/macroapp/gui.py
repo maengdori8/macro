@@ -46,6 +46,7 @@ from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
     STALL_FIRST_ALERT_SECONDS, STALL_REPEAT_ALERT_SECONDS, STALL_PROGRESS_GRACE_SECONDS,
     EXIT_EFFECT_LOBBY_TARGETS, EXIT_EFFECT_FAST_SECONDS,
+    EXIT_HOLD_SECONDS, EXIT_RETRY_HOLD_STEP_SECONDS, EXIT_RETRY_HOLD_MAX_SECONDS,
     WINDOW_VALIDATION_INTERVAL_SECONDS,
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
@@ -2253,6 +2254,7 @@ class AutomationApp:
                     self._stall.note_window(True, now_mono)
 
                 self._check_stall(now_mono)
+                self._exit_effect_tick(now_mono)
                 self.queue_status("실행 중")
                 if capture_mode == "region":
                     screen_gray = self.capture_screen_region(region)
@@ -2430,6 +2432,50 @@ class AutomationApp:
         except Exception:
             pass
 
+    def _exit_effect_tick(self, now: float) -> None:
+        """종료가 **실제로 판을 끝냈는지**를 로비 도달로 감시하고, 아니면 재시도한다.
+
+        기존 재시도(_auto_exit_retry_tick)는 '스코어를 다시 읽어 아직 열세인가'에
+        의존한다. 그런데 8-22 실측에서 실패한 [4]는 재시도가 **아예 안 걸렸다** —
+        스코어를 못 읽으면 트리거가 서지 않기 때문이다. 여기서는 스코어를 전혀 안 보고
+        **로비 타겟이 제때 안 나타났다**는 사실만으로 판단한다(타겟 감지는 이 앱에서
+        가장 믿을 수 있는 신호다). 두 트리거는 서로를 보완한다.
+        """
+
+        started = self._auto_exit_done_at
+        if started is None:
+            return
+        if now - started < EXIT_EFFECT_FAST_SECONDS:
+            return
+        # 이 시간이 지나도록 로비를 못 봤다 = 판이 안 끝났다(경기가 계속 돌고 있다).
+        self._auto_exit_done_at = None
+        if self.stop_event.is_set():
+            return
+        if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
+            self._log_to_file_only(
+                f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — 이 판은 더 시도하지 않습니다"
+            )
+            return
+        self._auto_exit_retries += 1
+        self._auto_exit_retry_at = None      # 스코어 기반 예약과 중복 발사 방지
+        self.queue_log(
+            f"[자동 종료] {EXIT_EFFECT_FAST_SECONDS:.0f}초가 지나도 로비에 못 갔습니다"
+            f" — 판이 안 끝난 것으로 보고 {self._auto_exit_retries}번째 재시도"
+        )
+        self.ui_queue.put(("auto_exit", ""))
+
+    def _exit_hold_seconds(self) -> float:
+        """이번 종료에 쓸 정지 시간. 재시도할수록 늘린다(상한 있음).
+
+        근거(8-22 실측): 실패 3건은 전부 '확인 창이 안 떴다'였고 경기가 그대로 계속됐다.
+        정지 10초가 게임 서버의 접속 타임아웃 경계라 어떤 판은 끊기고 어떤 판은 안 끊긴다.
+        재시도를 같은 10초로 하면 같은 실패가 반복된다 — 실제로 [6]→[7]이 그랬다.
+        """
+
+        retries = int(getattr(self, "_auto_exit_retries", 0) or 0)
+        hold = EXIT_HOLD_SECONDS + EXIT_RETRY_HOLD_STEP_SECONDS * retries
+        return float(min(hold, EXIT_RETRY_HOLD_MAX_SECONDS))
+
     def _note_exit_effect(self, target, now: float) -> None:
         """자동 종료가 **실제로 판을 끝냈는지**를 '다음 로비 도달'로 기록한다.
 
@@ -2464,19 +2510,23 @@ class AutomationApp:
         한 번만. 판정은 순수 로직(health.StallMonitor)이 하고 여기서는 알리기만 한다.
         """
 
+        # ⚠️ **알림 경로 전체**를 감싼다. 판정만 감싸 뒀더니 알림 줄의 오타 하나
+        # (report_status → _report_status)가 예외로 터져 _automation_loop 최상위까지
+        # 올라가 **매크로를 통째로 정지**시켰다(1.0.45, 적대적 리뷰가 잡음). 가동률을
+        # 지키려는 감시가 가동률을 죽인 셈이다 — 감시는 어떤 경우에도 본체를 못 막는다.
         try:
             state, should_alert, duration = self._stall.poll(now)
+            self._stall_state = state
+            if not should_alert:
+                return
+            text = stall_message(state, duration)
+            if not text:
+                return
+            self.queue_log(f"[가동률] {text}")
+            # 디스코드 상태로도 올린다 — 구매자가 자리를 비운 사이 확인할 수 있어야 한다.
+            self._report_status(running=True, message=text)
         except Exception:  # noqa: BLE001 - 감시가 본체를 막으면 안 된다
             return
-        self._stall_state = state
-        if not should_alert:
-            return
-        text = stall_message(state, duration)
-        if not text:
-            return
-        self.queue_log(f"[가동률] {text}")
-        # 디스코드 상태로도 올린다 — 구매자가 자리를 비운 사이 확인할 수 있어야 한다.
-        self.report_status(running=True, message=text)
 
     def _ocr_worker_loop(self, generation: Optional[int] = None) -> None:
         """별도 스레드: 매칭 루프를 막지 않고 SKIP/등수 OCR을 처리합니다.
@@ -6314,7 +6364,13 @@ class AutomationApp:
         # 자동화 루프를 재운다. 여기서 세우지 않으면 정지된 화면을 계속 재매칭하고,
         # 재개 직후 확인 버튼을 자동화와 마무리 단계가 동시에 누른다.
         self._exit_gate.set()
-        if not self._exit_runner.start():
+        # 재시도는 **홀드를 늘려서** 한다. 실측상 실패는 '확인 버튼을 못 눌러서'가 아니라
+        # 정지 10초로 접속이 안 끊겨 확인 창 자체가 안 뜬 것이라, 같은 10초로 다시 하면
+        # 같은 결과다(8-22 [6]→[7] 재시도도 동일 실패).
+        hold = self._exit_hold_seconds()
+        if hold > EXIT_HOLD_SECONDS:
+            self.queue_log(f"[종료] 정지 시간을 {hold:.0f}초로 늘려 다시 시도합니다")
+        if not self._exit_runner.start(hold_seconds=hold):
             self._exit_gate.clear()
             return False
         self._poll_exit_events()
