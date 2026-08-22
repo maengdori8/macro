@@ -381,6 +381,16 @@ class LossTracker:
         return self._quota_fired
 
     @property
+    def latched(self) -> bool:
+        """이 경기에서 어떤 종료 규칙이든 이미 발동됐나(base/late/hard).
+
+        경기 종료(스코어보드 60초 부재)로만 풀린다. '같은 판을 나가기로 확정한
+        에피소드가 아직 살아 있는가'를 밖에서 물을 때 쓴다(종료 재시도 판정).
+        """
+
+        return self._quota_fired or self._hard_fired
+
+    @property
     def _seen_other(self) -> bool:
         """기존 이름 호환 — 기본 규칙 기준으로 '열세 아닌 스코어를 봤나'."""
 

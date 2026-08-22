@@ -55,6 +55,7 @@ from macroapp.config import (
     AUTO_EXIT_UNKNOWN_DUMP_LIMIT, AUTO_EXIT_UNKNOWN_DUMP_INTERVAL_SECONDS,
     AUTO_EXIT_HARD_DEFICIT_GOALS, AUTO_EXIT_LATE_MINUTE, AUTO_EXIT_LATE_DEFICIT_GOALS,
     AUTO_EXIT_CLOCK_REGION, AUTO_EXIT_CLOCK_INTERVAL_SECONDS, AUTO_EXIT_CLOCK_CONSENSUS,
+    AUTO_EXIT_RETRY_SECONDS, AUTO_EXIT_RETRY_RECHECK_SECONDS, AUTO_EXIT_RETRY_MAX,
     HOME_OCR_ENABLED, HOME_OCR_REGION, HOME_OCR_INTERVAL_SECONDS, HOME_OCR_VOTE_MIN,
     AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
@@ -292,6 +293,12 @@ class AutomationApp:
         self._clock_fail_streak = 0                 # 연속으로 시계를 못 읽은 횟수(진단용)
         self._clock_dumped = False                  # 실행당 1회: 못 읽는 화면의 시계 영역 저장
         self._auto_exit_active = False
+        # 종료 재시도: 마무리가 실패해 판이 안 나가졌을 때, 같은 판에서 조건이 그대로면
+        # 다시 시도한다. _auto_exit_current=이번 종료가 자동 경로였나(재시도 무장 대상),
+        # _auto_exit_retry_at=다음 확인 시각(None=꺼짐), _auto_exit_retries=이 판 재시도 횟수.
+        self._auto_exit_current = False
+        self._auto_exit_retry_at: Optional[float] = None
+        self._auto_exit_retries = 0
         self._last_match_score = None
         self._score_unknown_dumped = 0              # '숫자 미상' 표본 저장 수(세션 상한)
         self._score_unknown_dumped_at = float("-inf")
@@ -2096,6 +2103,9 @@ class AutomationApp:
             self._last_clock_minute = None
             self._clock_fail_streak = 0
             self._clock_dumped = False
+            self._auto_exit_current = False
+            self._auto_exit_retry_at = None
+            self._auto_exit_retries = 0
             self._last_match_score = None
             self._score_unknown_dumped = 0
             self._score_unknown_dumped_at = float("-inf")
@@ -5929,6 +5939,9 @@ class AutomationApp:
             self._save_score_unknown_crop(gray, now, fresh)
 
         minute = self._read_match_clock(gray, now, reading)
+        # 지난 종료가 실패했으면(같은 판·조건 지속) 다시 시도한다. tracker.observe 는 래치
+        # 때문에 같은 판을 재확정하지 않으므로, 재시도는 반드시 이 별도 경로로만 나간다.
+        self._auto_exit_retry_tick(reading, minute, now)
         kind = tracker.observe(now, reading, minute)
         if kind is None:
             return
@@ -5966,6 +5979,76 @@ class AutomationApp:
                 f"[자동 종료] {label} {quota.lost_games}번째 — 이번 판은 그대로 둡니다 "
                 f"(종료 {quota.exits_done}/{quota.lost_games}, 비매너 분산)"
             )
+
+    def _arm_auto_exit_retry(self) -> None:
+        """자동 종료 시도가 끝난 뒤, 판이 실제로 나갔는지 나중에 확인하도록 예약한다.
+
+        AUTO_EXIT_RETRY_SECONDS 뒤에 _auto_exit_retry_tick 이 같은 판에서 조건이 그대로면
+        다시 시도한다. '재시작 시점'이 아니라 '시도 완료 시점'부터 재는 이유: 완료 전에는
+        마무리가 아직 진행 중이라, 그 사이에 재시도를 걸면 두 시도가 겹친다.
+        """
+
+        if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
+            self._auto_exit_retry_at = None
+            self._log_to_file_only(
+                f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — 이 판은 더 시도하지 않습니다"
+            )
+            return
+        self._auto_exit_retry_at = time.monotonic() + AUTO_EXIT_RETRY_SECONDS
+        self._log_to_file_only(
+            f"[자동 종료] {AUTO_EXIT_RETRY_SECONDS:.0f}초 뒤 종료 성공 여부를 확인합니다"
+        )
+
+    def _auto_exit_retry_tick(self, reading, minute: Optional[int], now: float) -> None:
+        """OCR 워커에서 매 프레임 호출 — 예약된 종료 재시도 시점을 처리한다.
+
+        규칙:
+          - 예약 없음(_auto_exit_retry_at None) → 아무것도 안 함.
+          - 정지됐으면 예약 해제.
+          - 래치가 풀렸으면(스코어보드 60초 부재 = 판이 끝남 = 나갔음) → 종료 성공, 예약 해제.
+          - 마감 전이면 대기.
+          - 마감 도달 + 같은 판(래치 유지):
+              · 열세 스코어를 읽었다(종료조건 충족) → 안 나갔음 → 재시도.
+              · 열세 아님(회복·오독) → 조건 미충족 → 예약 해제.
+              · 스코어 못 읽음(None=리플레이 가림 / 미상) → 잠깐 뒤 다시 확인.
+        """
+
+        if self._auto_exit_retry_at is None:
+            return
+        if self.stop_event.is_set():
+            self._auto_exit_retry_at = None
+            return
+        tracker = self._loss_tracker
+        if tracker is None or not tracker.latched:
+            # 판이 끝났다(래치 풀림) = 나갔다. 재시도 대기 해제.
+            if self._auto_exit_retries or self._auto_exit_retry_at is not None:
+                self._log_to_file_only("[자동 종료] 판 종료 확인 — 재시도 대기 해제")
+            self._auto_exit_retry_at = None
+            self._auto_exit_retries = 0
+            return
+        if now < self._auto_exit_retry_at:
+            return
+
+        if isinstance(reading, tuple):
+            mine, theirs = int(reading[0]), int(reading[1])
+            if tracker.rules.classify(mine, theirs, minute) is not None:
+                # 아직 열세(종료조건 충족) = 마무리가 실패해 안 나갔다 → 다시 시도.
+                self._auto_exit_retries += 1
+                # 즉시 재무장(넘어간 요청이 드물게 유실돼도 스스로 복구). 실제로 시도가
+                # 끝나면 _arm_auto_exit_retry 가 이 값을 다시 덮어쓴다.
+                self._auto_exit_retry_at = now + AUTO_EXIT_RETRY_SECONDS
+                self.queue_log(
+                    f"[자동 종료] 종료 후에도 {theirs - mine}점차 열세 지속 — "
+                    f"{self._auto_exit_retries}번째 재시도"
+                )
+                self.ui_queue.put(("auto_exit", ""))
+                return
+            # 열세가 아니다(회복·오독) → 종료조건 미충족 → 재시도 안 함.
+            self._auto_exit_retry_at = None
+            self._auto_exit_retries = 0
+            return
+        # 스코어를 못 읽음(None/미상) → 확정 못 하니 잠깐 뒤 다시 본다.
+        self._auto_exit_retry_at = now + AUTO_EXIT_RETRY_RECHECK_SECONDS
 
     def _read_match_clock(self, gray, now: float, reading) -> Optional[int]:
         """'70분 이후' 규칙의 재료 — 경기 시계를 읽어 확정 분을 돌려준다(없으면 None).
@@ -6038,6 +6121,9 @@ class AutomationApp:
         worker = self.worker_thread
         if worker is None or not worker.is_alive():
             return
+        # 이번 종료는 자동 경로다 → 완료 뒤 '실제로 나갔는지' 재시도 감시를 무장한다.
+        # (수동 호출은 이 플래그를 안 세우므로 재시도 대상이 아니다.)
+        self._auto_exit_current = True
         self.run_quick_exit()
 
     def run_quick_exit(self) -> None:
@@ -6100,6 +6186,10 @@ class AutomationApp:
         if finished:
             # 자동화 루프를 다시 깨운다. 사용자가 시작을 다시 누를 필요가 없다.
             self._exit_gate.clear()
+            # 자동 종료였으면, 실제로 나갔는지 잠시 뒤 확인해 필요하면 재시도한다.
+            if self._auto_exit_current:
+                self._arm_auto_exit_retry()
+            self._auto_exit_current = False
             return
         self.root.after(100, self._poll_exit_events)
 
