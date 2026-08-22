@@ -4,7 +4,7 @@
 ; 덮어쓰거나 프로그램 추가/제거 항목이 충돌한다.
 AppId={{7C4B1E9A-2F63-4D58-9E71-6B0A5D3C8F42}
 AppName=mAuto Pro
-AppVersion=1.0.41
+AppVersion=1.0.42
 AppPublisher=maengdori
 DefaultDirName={autopf}\mAuto Pro
 DefaultGroupName=mAuto Pro
