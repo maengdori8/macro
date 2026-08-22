@@ -299,6 +299,7 @@ class AutomationApp:
         self._auto_exit_current = False
         self._auto_exit_retry_at: Optional[float] = None
         self._auto_exit_retries = 0
+        self._auto_exit_resumed_at: Optional[float] = None   # 되살아난 시각(재시도 기준)
         self._last_match_score = None
         self._score_unknown_dumped = 0              # '숫자 미상' 표본 저장 수(세션 상한)
         self._score_unknown_dumped_at = float("-inf")
@@ -2106,6 +2107,7 @@ class AutomationApp:
             self._auto_exit_current = False
             self._auto_exit_retry_at = None
             self._auto_exit_retries = 0
+            self._auto_exit_resumed_at = None
             self._last_match_score = None
             self._score_unknown_dumped = 0
             self._score_unknown_dumped_at = float("-inf")
@@ -5983,9 +5985,12 @@ class AutomationApp:
     def _arm_auto_exit_retry(self) -> None:
         """자동 종료 시도가 끝난 뒤, 판이 실제로 나갔는지 나중에 확인하도록 예약한다.
 
-        AUTO_EXIT_RETRY_SECONDS 뒤에 _auto_exit_retry_tick 이 같은 판에서 조건이 그대로면
-        다시 시도한다. '재시작 시점'이 아니라 '시도 완료 시점'부터 재는 이유: 완료 전에는
-        마무리가 아직 진행 중이라, 그 사이에 재시도를 걸면 두 시도가 겹친다.
+        기준 시각은 **대상이 되살아난 시점**(마무리 단계 진입, STATE_FOLLOWUP)이다 —
+        사용자 요구가 '재시작 시점부터 30초'이고, 마무리는 실패 시 40초까지 돌기 때문에
+        완료 기준으로 재면 재시도가 재시작+70초로 밀린다. 재시작~완료 사이에 재시도가
+        겹칠 걱정은 없다: 그 구간 내내 _exit_gate 가 서 있어 _observe_match_score 가
+        조기 리턴하므로 tick 자체가 안 돈다. 되살아난 시각을 못 받았으면(이상 경로)
+        지금 시각을 기준으로 삼는다.
         """
 
         if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
@@ -5994,9 +5999,15 @@ class AutomationApp:
                 f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — 이 판은 더 시도하지 않습니다"
             )
             return
-        self._auto_exit_retry_at = time.monotonic() + AUTO_EXIT_RETRY_SECONDS
+        base = self._auto_exit_resumed_at
+        if base is None:
+            base = time.monotonic()
+        self._auto_exit_resumed_at = None
+        self._auto_exit_retry_at = base + AUTO_EXIT_RETRY_SECONDS
+        remaining = max(0.0, self._auto_exit_retry_at - time.monotonic())
         self._log_to_file_only(
-            f"[자동 종료] {AUTO_EXIT_RETRY_SECONDS:.0f}초 뒤 종료 성공 여부를 확인합니다"
+            f"[자동 종료] 재시작 기준 {AUTO_EXIT_RETRY_SECONDS:.0f}초 뒤"
+            f"(남은 {remaining:.0f}초) 종료 성공 여부를 확인합니다"
         )
 
     def _auto_exit_retry_tick(self, reading, minute: Optional[int], now: float) -> None:
@@ -6033,6 +6044,15 @@ class AutomationApp:
             mine, theirs = int(reading[0]), int(reading[1])
             if tracker.rules.classify(mine, theirs, minute) is not None:
                 # 아직 열세(종료조건 충족) = 마무리가 실패해 안 나갔다 → 다시 시도.
+                # 한도는 여기서도 본다 — _arm 에만 두면 넘긴 요청이 드롭됐을 때
+                # 완료-무장이 안 돌아 한도 검사를 건너뛴다(리뷰 지적, 방어 이중화).
+                if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
+                    self._auto_exit_retry_at = None
+                    self._log_to_file_only(
+                        f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — "
+                        "이 판은 더 시도하지 않습니다"
+                    )
+                    return
                 self._auto_exit_retries += 1
                 # 즉시 재무장(넘어간 요청이 드물게 유실돼도 스스로 복구). 실제로 시도가
                 # 끝나면 _arm_auto_exit_retry 가 이 값을 다시 덮어쓴다.
@@ -6123,24 +6143,30 @@ class AutomationApp:
             return
         # 이번 종료는 자동 경로다 → 완료 뒤 '실제로 나갔는지' 재시도 감시를 무장한다.
         # (수동 호출은 이 플래그를 안 세우므로 재시도 대상이 아니다.)
-        self._auto_exit_current = True
-        self.run_quick_exit()
+        # ⚠️ 실제로 **시작된 경우에만** 표시한다. run_quick_exit 은 만료·busy·start 실패로
+        # 조용히 돌아설 수 있는데, 그때 True 로 남기면 나중의 다른 종료 완료가 이 판을
+        # '자동 종료였다'로 오귀속해 엉뚱하게 재시도를 무장한다(리뷰 지적).
+        self._auto_exit_current = bool(self.run_quick_exit())
 
-    def run_quick_exit(self) -> None:
-        """즉시 종료 1회 실행 (프로 전용)."""
+    def run_quick_exit(self) -> bool:
+        """즉시 종료 1회 실행 (프로 전용). 실제로 **시작됐으면** True.
+
+        반환값은 호출부가 '이 종료가 진짜 돌기 시작했나'를 알아야 하기 때문이다
+        (자동 경로의 재시도 무장 표시 — _run_auto_exit 참고).
+        """
 
         if not self._is_pro:
             self.log("[안내] 이 기능은 프로 버전 키에서만 사용할 수 있습니다.")
-            return
+            return False
         # 자동화 루프와 **같은 검사**를 여기서도 한다. 이게 없으면 시간권 프로 키로
         # 한 번 켠 뒤 앱을 안 끄는 것만으로 기간이 무한 연장된다(자동화는 멈추는데
         # 프로 기능만 계속 열려 있는 상태). exp 는 서명에 묶여 있어 로컬 검사로 충분하다.
         if self._license_deadline is not None and time.time() > self._license_deadline:
             self.log("[라이센스] 이용 기간이 끝났습니다. 프로그램을 다시 실행해 인증하세요.")
             self._apply_tier({})
-            return
+            return False
         if self._exit_runner is not None and self._exit_runner.busy:
-            return
+            return False
 
         if self._exit_runner is None:
             self._exit_runner = exit_runner.PauseRunner(
@@ -6152,8 +6178,9 @@ class AutomationApp:
         self._exit_gate.set()
         if not self._exit_runner.start():
             self._exit_gate.clear()
-            return
+            return False
         self._poll_exit_events()
+        return True
 
     def _exit_prepare(self, cancel):
         """정지 전에 창을 찾아 둔다. 자동화가 돌고 있으면 그 창 관리자를 빌려 쓴다."""
@@ -6176,6 +6203,15 @@ class AutomationApp:
                 self.log(f"[종료] {event.text}")
             if event.kind == exit_runner.EVT_STATE and event.text:
                 self.set_status(event.text)
+            if (
+                event.kind == exit_runner.EVT_STATE
+                and event.state == exit_core.STATE_FOLLOWUP
+            ):
+                # 마무리 단계 진입 = 대상 프로세스가 **되살아난 시점**이다. 재시도 기준
+                # 시각을 여기서 잡는다 — 사용자 요구가 '재시작 시점부터 30초'이고,
+                # 마무리는 확인 버튼을 못 찾으면 40초까지 도는데(재시도가 겨냥하는 바로
+                # 그 실패) 완료 기준으로 재면 재시작+70초로 밀린다.
+                self._auto_exit_resumed_at = time.monotonic()
             if event.kind == exit_runner.EVT_STATE and event.state in (
                 exit_core.STATE_DONE,
                 exit_core.STATE_FAILED,

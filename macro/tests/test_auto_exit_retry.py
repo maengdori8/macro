@@ -38,6 +38,7 @@ def _app(tracker):
     app._auto_exit_retry_at = None
     app._auto_exit_retries = 0
     app._auto_exit_current = False
+    app._auto_exit_resumed_at = None
     app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.ui_queue = queue.Queue()
     app.queue_log = Mock()
@@ -66,6 +67,53 @@ def test_arm_sets_a_deadline_and_respects_the_cap():
     app._auto_exit_retries = config.AUTO_EXIT_RETRY_MAX
     app._arm_auto_exit_retry()
     assert app._auto_exit_retry_at is None
+
+
+def test_arm_measures_from_the_resume_moment_not_completion():
+    """사용자 요구 = '재시작 시점부터 30초'. 마무리가 오래 끌어도 기준은 되살아난 시각이다."""
+    import time as _time
+
+    app = _app(_latched_tracker())
+    resumed = _time.monotonic() - 25.0        # 25초 전에 되살아났고 마무리가 그만큼 끌었다
+    app._auto_exit_resumed_at = resumed
+    app._arm_auto_exit_retry()
+    assert app._auto_exit_retry_at == resumed + config.AUTO_EXIT_RETRY_SECONDS
+    # 남은 대기는 30초가 아니라 5초 남짓이어야 한다(완료 기준이면 30초였다).
+    assert 0 < app._auto_exit_retry_at - _time.monotonic() < 10
+    # 기준 시각은 1회용이다 — 다음 종료가 옛 시각을 물려받으면 안 된다.
+    assert app._auto_exit_resumed_at is None
+
+
+def test_arm_falls_back_to_now_without_a_resume_stamp():
+    import time as _time
+
+    app = _app(_latched_tracker())
+    app._auto_exit_resumed_at = None
+    app._arm_auto_exit_retry()
+    assert app._auto_exit_retry_at - _time.monotonic() > config.AUTO_EXIT_RETRY_SECONDS - 2
+
+
+def test_followup_state_stamps_the_resume_moment():
+    """마무리 단계 진입(STATE_FOLLOWUP) = 대상이 되살아난 시점 → 기준 시각으로 기록."""
+    from macroapp import exit_core, exit_runner
+
+    app = _app(_latched_tracker())
+    app._exit_gate = SimpleNamespace(clear=Mock(), is_set=lambda: False)
+    app.log = Mock()
+    app.set_status = Mock()
+    app.root = SimpleNamespace(after=Mock())
+    app._auto_exit_current = False
+    events = [
+        SimpleNamespace(kind=exit_runner.EVT_STATE, text="마무리",
+                        state=exit_core.STATE_FOLLOWUP),
+        SimpleNamespace(kind=exit_runner.EVT_STATE, text="완료",
+                        state=exit_core.STATE_DONE),
+    ]
+    app._exit_runner = SimpleNamespace(
+        drain=lambda handle: [handle(e) for e in events]
+    )
+    app._poll_exit_events()
+    assert app._auto_exit_resumed_at is not None, "되살아난 시각이 기록되지 않았다"
 
 
 # ─── 재시도 판정 ─────────────────────────────────────────────────────────────
@@ -154,14 +202,15 @@ def test_stop_clears_retry():
     assert app._auto_exit_retry_at is None
 
 
-def test_cap_reached_gives_up():
+def test_cap_is_enforced_in_the_tick_too():
+    """한도가 _arm 에만 있으면, 넘긴 요청이 드롭돼 완료-무장이 안 돌 때 무한히 쏜다."""
     app = _app(_latched_tracker())
     app._auto_exit_retries = config.AUTO_EXIT_RETRY_MAX
     app._auto_exit_retry_at = 1000.0
-    # tick 이 재시도를 하나 더 큐에 넣더라도, 다음 무장에서 한도로 멈춘다.
     app._auto_exit_retry_tick((0, 2), None, 1000.0)
-    # 한도를 이미 채웠으니 무장은 거부된다.
-    app._auto_exit_retry_at = None
+    assert _queued(app) == [], "한도를 넘겼는데 tick 이 재시도를 또 쐈다"
+    assert app._auto_exit_retry_at is None
+    # 무장도 당연히 거부된다.
     app._arm_auto_exit_retry()
     assert app._auto_exit_retry_at is None
 
@@ -169,13 +218,27 @@ def test_cap_reached_gives_up():
 # ─── 완료 시 무장 배선 ────────────────────────────────────────────────────────
 
 
-def test_auto_exit_marks_current_for_retry():
+def _auto_exit_app():
     app = _app(_latched_tracker())
     app._is_pro = True
     app._exit_gate = SimpleNamespace(is_set=lambda: False)
     app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.worker_thread = SimpleNamespace(is_alive=lambda: True)
-    app.run_quick_exit = Mock()
+    return app
+
+
+def test_auto_exit_marks_current_only_when_it_actually_started():
+    app = _auto_exit_app()
+    app.run_quick_exit = Mock(return_value=True)
     app._run_auto_exit()
     assert app._auto_exit_current is True, "자동 종료가 재시도 대상으로 표시되지 않았다"
     app.run_quick_exit.assert_called_once()
+
+
+def test_auto_exit_does_not_mark_current_when_the_exit_never_started():
+    """만료·busy·start 실패로 조용히 돌아서면 재시도 대상이 아니다 — 그렇지 않으면
+    나중의 다른 종료 완료가 이 판을 '자동 종료였다'로 오귀속해 엉뚱하게 무장한다."""
+    app = _auto_exit_app()
+    app.run_quick_exit = Mock(return_value=False)
+    app._run_auto_exit()
+    assert app._auto_exit_current is False
