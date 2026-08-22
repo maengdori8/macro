@@ -789,3 +789,19 @@ def test_unknown_reset_is_longer_than_a_match_gap_but_shorter_than_a_session() -
 
     assert config.AUTO_EXIT_UNKNOWN_RESET_SECONDS >= 120.0
     assert config.AUTO_EXIT_UNKNOWN_RESET_SECONDS <= 300.0
+
+
+def test_digit_five_is_readable() -> None:
+    """숫자 5 글리프가 있어야 4:5 같은 스코어를 판정할 수 있다.
+
+    실측(2026-08-23 07:22): 사용자가 4:5 로 지고 있는데 자동 종료가 안 걸렸다. 글리프가
+    0~4 뿐이라 상대가 5점째를 넣는 순간 '숫자 미상'이 되어 판정 자체가 불가능했다
+    (로그: '스코어 읽음: 4:4' → 그 뒤로 전부 미상). 5~9 는 실전 표본에서 계속 넓힌다.
+    """
+
+    from macroapp import score_glyphs
+
+    have = {str(k) for k in score_glyphs.GLYPH_PNGS_B64}
+    assert "5" in have, f"숫자 5 글리프가 없다: {sorted(have)}"
+    for digit in ("0", "1", "2", "3", "4", "5"):
+        assert score_glyphs.GLYPH_PNGS_B64[digit], f"{digit} 템플릿이 비었다"
