@@ -335,6 +335,7 @@ class LossTracker:
         deficit: int = 2,
         confirm_count: int = 3,
         reset_seconds: float = 60.0,
+        unknown_reset_seconds: float = 180.0,
         require_prior_score: bool = True,
         rules: Optional[ExitRules] = None,
     ) -> None:
@@ -349,6 +350,13 @@ class LossTracker:
         )
         self.confirm_count = int(confirm_count)
         self.reset_seconds = float(reset_seconds)
+        # ⚠️ '미상'만으로는 경기를 무한 연장하지 않는다. 미상은 원래 '3:1 같은 화면을
+        # 경기 종료로 오인하지 마라'는 방어인데, **경기가 아닌 화면**(구단 엠블럼·결과
+        # 패널·빈 박스)도 미상으로 잡히는 바람에 판 사이 공백에 미상이 한 번만 섞여도
+        # 래치가 영영 안 풀렸다. 실측(2026-08-23): 06:11 에 한 판이 쿼터를 쓴 뒤 세션이
+        # 끝날 때까지 발동 0회 — 0:2 로 26 게임분을 방치했다.
+        # → **진짜 스코어(튜플)** 를 이 시간 동안 한 번도 못 읽으면 경기가 끝난 것으로 본다.
+        self.unknown_reset_seconds = float(unknown_reset_seconds)
         self.require_prior_score = bool(require_prior_score)
 
         # base/late 가 같은 쿼터(한 '진 판' 카운트)를 쓰면 래치도 하나다. late 비율이
@@ -362,7 +370,8 @@ class LossTracker:
         self._base_fired = False                     # (래치 분리 시) base 확정 여부
         self._late_fired = False                     # (래치 분리 시) late 확정 여부
         self._hard_fired = False                     # 이 경기에서 hard 가 확정됐나
-        self._last_seen_at: Optional[float] = None   # 뭔가 보인 마지막 시각
+        self._last_seen_at: Optional[float] = None   # 뭔가(미상 포함) 보인 마지막 시각
+        self._last_score_at: Optional[float] = None  # **진짜 스코어**를 읽은 마지막 시각
         # 이 경기에서 본 '상대−나'의 최솟값. 선행 스코어 방어의 근거다: 어떤 규칙이든
         # **그 규칙의 점차보다 나은 스코어**를 먼저 봤어야 확정한다. 예전의 '규칙에 안
         # 걸린 스코어를 봤나'는 late(1점차) 에서 같은 (0,1) 픽셀이 선행 증거이자 판정
@@ -438,6 +447,19 @@ class LossTracker:
 
         return self.observe(now, reading, minute) is not None
 
+    def _end_match(self) -> None:
+        """경기가 끝났다고 보고 다음 경기를 셀 수 있게 모든 래치를 푼다."""
+
+        self._streak = 0
+        self._hard_streak = 0
+        self._quota_fired = False
+        self._base_fired = False
+        self._late_fired = False
+        self._hard_fired = False
+        self._min_losing_seen = None
+        self._last_seen_at = None
+        self._last_score_at = None
+
     def observe(self, now: float, reading: Reading, minute: Optional[int] = None) -> Optional[str]:
         """feed 와 같되 확정 종류(KIND_*)를 돌려준다. 확정이 아니면 None.
 
@@ -456,21 +478,22 @@ class LossTracker:
                 self._last_seen_at is not None
                 and now - self._last_seen_at >= self.reset_seconds
             ):
-                self._streak = 0
-                self._hard_streak = 0
-                self._quota_fired = False
-                self._base_fired = False
-                self._late_fired = False
-                self._hard_fired = False
-                self._min_losing_seen = None
-                self._last_seen_at = None
+                self._end_match()
             return None
 
         # 미상 포함, 뭔가 보였다 = 경기 진행 중 → 종료 타이머 리셋.
         self._last_seen_at = now
         if reading == SCORE_UNKNOWN:
+            # ⚠️ 미상만 계속 오는 건 '경기 중'의 증거가 못 된다 — 경기가 아닌 화면도
+            # 미상으로 잡힌다. 진짜 스코어를 오래 못 읽었으면 판이 끝난 것으로 본다.
+            if (
+                self._last_score_at is not None
+                and now - self._last_score_at >= self.unknown_reset_seconds
+            ):
+                self._end_match()
             return None
 
+        self._last_score_at = now
         mine, theirs = int(reading[0]), int(reading[1])
         losing = theirs - mine
         # 이 경기에서 본 가장 나은 스코어(상대−나 최솟값)를 기록한다 — 선행 증거.

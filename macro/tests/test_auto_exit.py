@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 from macroapp.auto_exit import (  # noqa: E402
     SCORE_UNKNOWN,
     ExitQuota,
+    ExitRules,
     LossTracker,
     classify_glyph,
     read_score_from_frame,
@@ -714,3 +715,77 @@ def test_read_clock_text_falls_back_to_korean_pack():
 
     with patch.object(ocr, "winocr", object()), patch.object(ocr, "_recognize_text", return_value=""):
         assert ocr.read_clock_text(box) == ""
+
+
+# ─── 2026-08-23 실측: '숫자 미상'이 판 경계를 지워 자동 종료가 세션 내내 죽었다 ────
+
+
+def _rules_100():
+    return ExitRules(
+        base_deficit=2, hard_deficit=3, late_minute=70, late_deficit=1
+    )
+
+
+def _play(tracker, reading, seconds, minute=None, clock=None):
+    """초 단위로 같은 값을 먹이고 발동된 종류들을 돌려준다."""
+    fired = []
+    for _ in range(int(seconds)):
+        clock[0] += 1.0
+        kind = tracker.observe(clock[0], reading, minute)
+        if kind:
+            fired.append(kind)
+    return fired
+
+
+def test_unknown_only_must_not_keep_a_match_alive_forever() -> None:
+    """판 사이 공백에 '미상'이 섞여도 래치가 풀려야 한다.
+
+    실측(2026-08-23): 구단 엠블럼·결과 패널·빈 박스 같은 **경기가 아닌 화면**도
+    SCORE_UNKNOWN 으로 읽힌다. 미상이 종료 타이머를 되살리는 바람에 06:11 에 한 판이
+    쿼터를 쓴 뒤 세션이 끝날 때까지 발동 0회였고, 0:2 를 26 게임분 방치했다.
+    """
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    _play(tracker, (0, 0), 60, clock=clock)
+    assert _play(tracker, (0, 2), 30, clock=clock), "1판이 발동해야 한다"
+    assert tracker.latched
+
+    # 판 사이 공백 200초 — 10초마다 '미상'이 한 번씩 섞인다(실제 로그 모양).
+    for i in range(200):
+        clock[0] += 1.0
+        tracker.observe(
+            clock[0], SCORE_UNKNOWN if i % 10 == 0 else None, None
+        )
+    assert not tracker.latched, "미상 때문에 판 경계가 지워졌다"
+
+    # 다음 판도 정상적으로 발동해야 한다.
+    _play(tracker, (0, 0), 40, clock=clock)
+    assert _play(tracker, (0, 2), 40, clock=clock), "2판이 발동하지 않았다"
+
+
+def test_unknown_still_protects_a_live_match_from_early_release() -> None:
+    """반대 방향도 지킨다 — 경기 중 잠깐 못 읽는다고 판이 끝난 걸로 보면 안 된다.
+
+    (숫자 3~9 글리프가 없어 3:1 같은 화면이 미상으로 읽히는 경우가 그것이다.)
+    """
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    _play(tracker, (0, 0), 60, clock=clock)
+    _play(tracker, (0, 2), 30, clock=clock)
+    assert tracker.latched
+    # 진짜 스코어를 계속 읽는 중이라면 미상이 섞여도 판은 이어진다.
+    for i in range(150):
+        clock[0] += 1.0
+        tracker.observe(
+            clock[0], SCORE_UNKNOWN if i % 3 else (0, 2), None
+        )
+    assert tracker.latched, "경기 중인데 판이 끝난 것으로 처리됐다"
+
+
+def test_unknown_reset_is_longer_than_a_match_gap_but_shorter_than_a_session() -> None:
+    from macroapp import config
+
+    assert config.AUTO_EXIT_UNKNOWN_RESET_SECONDS >= 120.0
+    assert config.AUTO_EXIT_UNKNOWN_RESET_SECONDS <= 300.0

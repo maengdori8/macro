@@ -60,7 +60,7 @@ from macroapp.config import (
     AUTO_EXIT_CLOCK_REGION, AUTO_EXIT_CLOCK_INTERVAL_SECONDS, AUTO_EXIT_CLOCK_CONSENSUS,
     AUTO_EXIT_RETRY_SECONDS, AUTO_EXIT_RETRY_RECHECK_SECONDS, AUTO_EXIT_RETRY_MAX,
     HOME_OCR_ENABLED, HOME_OCR_REGION, HOME_OCR_INTERVAL_SECONDS, HOME_OCR_VOTE_MIN,
-    AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
+    AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_UNKNOWN_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
     RANK_OCR_PANEL_GAP_SECONDS,
@@ -286,6 +286,7 @@ class AutomationApp:
             deficit=AUTO_EXIT_DEFICIT_GOALS,
             confirm_count=AUTO_EXIT_CONFIRM_COUNT,
             reset_seconds=AUTO_EXIT_MATCH_RESET_SECONDS,
+            unknown_reset_seconds=AUTO_EXIT_UNKNOWN_RESET_SECONDS,
             rules=self._exit_settings.rules,
         )
         # '70분 이후' 규칙의 재료 — 경기 시계(winocr). 스코어와 달리 읽힌다(실측).
@@ -6119,6 +6120,11 @@ class AutomationApp:
         # 이 로그가 유일한 근거다(화면 로그를 어지럽히지 않게 파일에만).
         fresh = reading != self._last_match_score
         if fresh:
+            # 스코어가 바뀌었다 = 게임도 매크로도 살아 있다. 경기 중에는 타겟 입력이
+            # 드물어 '진행 없음' 오탐이 난다(실측 08-23: 05:03·05:36·05:48 세 번).
+            stall = getattr(self, "_stall", None)
+            if stall is not None:
+                stall.note_progress(now)
             self._last_match_score = reading
             if isinstance(reading, tuple):
                 self._log_to_file_only(f"[자동 종료] 스코어 읽음: {reading[0]}:{reading[1]}")
@@ -6132,6 +6138,19 @@ class AutomationApp:
         # 지난 종료가 실패했으면(같은 판·조건 지속) 다시 시도한다. tracker.observe 는 래치
         # 때문에 같은 판을 재확정하지 않으므로, 재시도는 반드시 이 별도 경로로만 나간다.
         self._auto_exit_retry_tick(reading, minute, now)
+        # ⚠️ 판이 바뀌면 재시도 예산을 새로 준다. _auto_exit_retry_tick 은 예약이 있을
+        # 때만(_auto_exit_retry_at 이 None 이 아닐 때만) 카운터를 비우는데, '5회 모두
+        # 실패'로 끝나면 예약이 None 이 되어 그 뒤로 영영 안 비워진다. 실측(2026-08-23
+        # 04:54): 다음 판의 **첫** 종료가 이미 '정지 시간을 11초로 늘려'(=재시도 5회째)
+        # 로 시작해 곧바로 한도에 걸렸다 — 그 판은 한 번도 제대로 못 나갔다.
+        if not tracker.latched and self._auto_exit_retries:
+            self._log_to_file_only(
+                "[자동 종료] 새 판 시작 — 재시도 예산 초기화"
+                f"(직전 판 {self._auto_exit_retries}회 사용)"
+            )
+            self._auto_exit_retries = 0
+            self._auto_exit_retry_at = None
+            self._auto_exit_done_at = None
         kind = tracker.observe(now, reading, minute)
         if kind is None:
             return
