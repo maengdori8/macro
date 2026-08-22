@@ -589,17 +589,20 @@ DEFAULT_TARGET_CONFIGS: list[dict[str, object]] = [
     # 경기 중 하단 전술창(팀 전술/개인 전술/경기 분석)이 떠 있으면 오른쪽 위 '−'(접기)를
     # 눌러 가린다 — 전술창이 하단 22% 를 덮어 SKIP 프롬프트 인식을 막는다(사용자 요청,
     # 수동으로도 마우스로 − 를 누른다). 템플릿 = 전술 아이콘 + '−'(중심이 − 버튼),
-    # 실전 프레임(2026-08-21 1920x1080)에서 잘라 냈다. 어두운 면이 넓어 임계값을 높였다.
-    # 템플릿은 아이콘 줄 + 그 아래 어두운 면 6px 다 — 접힌 상태(아이콘 줄이 프레임 맨
-    # 아래, '−' 가 초록)에서는 아래 면이 프레임 밖이라 안 맞는다(접힌 채 계속 누르던 실측
-    # 결함 수정: 펼침 1.000 / 접힘 ≤0.68). 중심이 버튼보다 3px 아래라 click_offset_y=-3.
+    # 실전 프레임(2026-08-21 1920x1080)에서 잘라 냈다.
+    # ⚠️ 템플릿은 펼침·접힘 두 상태에 다 맞는다(실측 1.000/0.997) — 그레이스케일로는
+    # 못 가른다. '아래 어두운 면' 트릭은 실전 프레임마다 밝기가 달라 오히려 펼침도 놓쳤다
+    # (0.82). 대신 **위치**로 가른다: 펼침은 아이콘 줄이 y≈0.75, 접힘은 y≈0.97(맨 아래).
+    # match_top/bottom_frac 로 펼침 밴드만 받아, 펼쳤을 때만 눌러 접고 접힌 뒤엔 다시 안
+    # 누른다. 템플릿 중심 x=1608·y=804 가 곧 '−' 라 click_offset 는 0.
     {
         "name": "target_J",
         "filename": "target_J.png",
         "action": "click",
         "threshold": 0.88,
         "wait_after_action": 1.0,
-        "click_offset_y": -3,
+        "match_top_frac": 0.55,
+        "match_bottom_frac": 0.90,
     },
 ]
 
@@ -675,10 +678,15 @@ class TargetImage:
     control_class: Optional[str] = None
     control_text: Optional[str] = None
     vibrate_before_click: bool = False
-    # 클릭 지점 보정(px). 템플릿 중심이 버튼이 아닐 때 쓴다 — 예: target_J 는 상태 구분을
-    # 위해 버튼 아래 어두운 면을 포함해야 해서 중심이 버튼보다 3px 아래다 → -3.
+    # 클릭 지점 보정(px). 템플릿 중심이 버튼이 아닐 때 쓴다.
     click_offset_x: int = 0
     click_offset_y: int = 0
+    # 세로 검색 밴드(프레임 높이 비율). 같은 템플릿이 화면 두 곳(예: 전술창 펼침/접힘)에
+    # 나타날 때, 원하는 위치의 매칭만 받는다. 매칭 중심 y 가 이 밴드 밖이면 무시한다.
+    # 기본 (0,1) = 전체. target_J: 펼침 상태 아이콘 줄은 y≈0.75, 접힘은 y≈0.97 →
+    # 밴드 (0.55,0.90) 이면 펼침만 눌러 접고 접힌 뒤엔 다시 안 누른다(실측 결함 수정).
+    match_top_frac: float = 0.0
+    match_bottom_frac: float = 1.0
 
     # load_targets()에서 GrayScale 이미지가 채워집니다.
     # repr=False로 두면 로그에 큰 NumPy 배열 내용이 출력되지 않습니다.
@@ -786,6 +794,8 @@ def _target_from_config(config: dict[str, object], index: int) -> Optional[Targe
         vibrate_before_click=bool(config.get("vibrate_before_click", False)),
         click_offset_x=int(_parse_optional_int(config.get("click_offset_x"), "click_offset_x") or 0),
         click_offset_y=int(_parse_optional_int(config.get("click_offset_y"), "click_offset_y") or 0),
+        match_top_frac=float(config.get("match_top_frac", 0.0) or 0.0),
+        match_bottom_frac=float(config.get("match_bottom_frac", 1.0) if config.get("match_bottom_frac") is not None else 1.0),
     )
 
 def load_target_definitions(
@@ -879,6 +889,8 @@ def clone_target_definition(target: TargetImage) -> TargetImage:
         vibrate_before_click=target.vibrate_before_click,
         click_offset_x=target.click_offset_x,
         click_offset_y=target.click_offset_y,
+        match_top_frac=target.match_top_frac,
+        match_bottom_frac=target.match_bottom_frac,
     )
 
 def load_targets(

@@ -70,7 +70,8 @@
       "action": "click",
       "threshold": 0.88,
       "wait_after_action": 1.0,
-      "click_offset_y": -3
+      "match_top_frac": 0.55,
+      "match_bottom_frac": 0.90
     },
     {
       "name": "bm_click_example_disabled",

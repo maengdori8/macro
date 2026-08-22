@@ -2289,6 +2289,10 @@ class AutomationApp:
                     )
                     if center is None:
                         continue
+                    if not self._match_in_band(target, center, screen_gray.shape[0]):
+                        # 같은 템플릿이 프레임 두 곳에 나타날 때 원하는 위치만 받는다
+                        # (target_J: 전술창 펼침 밴드만 → 접힌 '−' 는 무시).
+                        continue
 
                     found_any = True
                     base_x, base_y = self._click_point(target, center)
@@ -4708,6 +4712,24 @@ class AutomationApp:
         dx = int(getattr(target, "click_offset_x", 0) or 0)
         dy = int(getattr(target, "click_offset_y", 0) or 0)
         return int(center[0]) + dx, int(center[1]) + dy
+
+    @staticmethod
+    def _match_in_band(target, center, frame_height: int) -> bool:
+        """매칭 중심 y 가 타겟의 세로 검색 밴드(match_top/bottom_frac) 안인가.
+
+        같은 템플릿이 화면 두 곳에 나타나는 타겟(target_J 전술창 펼침/접힘)에서 원하는
+        위치만 받는다. 밴드를 안 정한 타겟은 (0,1) 이라 항상 통과한다.
+        """
+
+        top = float(getattr(target, "match_top_frac", 0.0) or 0.0)
+        bottom = float(getattr(target, "match_bottom_frac", 1.0)
+                       if getattr(target, "match_bottom_frac", 1.0) is not None else 1.0)
+        if top <= 0.0 and bottom >= 1.0:
+            return True
+        if frame_height <= 0:
+            return True
+        frac = float(center[1]) / float(frame_height)
+        return top <= frac <= bottom
 
     def _anykey_direct_start(
         self,

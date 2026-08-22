@@ -1,11 +1,10 @@
 """target_J — 경기 중 하단 전술창을 '−' 로 접는 타겟.
 
-실측(2026-08-22): 처음 템플릿(아이콘 줄만, 28px)은 **접힌 상태**(아이콘 줄이 프레임 맨 아래로
-내려가고 '−' 가 초록으로 바뀜)에도 0.997 로 맞아 접힌 전술창의 '−' 를 계속 눌렀다.
-그레이스케일 상관은 밝기 변화에 둔감해 초록/흰 '−' 를 못 가른다. 그래서 템플릿에 아이콘 줄
-**아래 어두운 면 6px**(그 아래는 핫키 바의 선택 박스가 흰색이라 포함하면 선택 상태에 따라 흔들린다) 를 포함했다 — 접힌 상태에선 그 아래가 프레임 밖이라 안 맞는다
-(펼침 1.000 / 접힘 ≤0.68). 대신 템플릿 중심이 버튼보다 3px 아래라 click_offset_y=-3 으로
-클릭 지점을 버튼으로 되돌린다. 이 테스트는 그 약속들을 고정한다.
+실측(2026-08-22): 템플릿(아이콘 줄+'−')은 전술창 펼침·접힘 두 상태에 모두 맞는다
+(NCC 1.000/0.997). 그레이스케일로는 못 가른다 — '아래 어두운 면' 트릭은 실전 프레임마다
+밝기가 달라 펼침도 놓쳤다(0.82). 대신 **위치**로 가른다: 펼침은 아이콘 줄이 y≈0.75,
+접힘은 y≈0.97(맨 아래). match_top/bottom_frac 밴드로 펼침만 눌러 접고, 접힌 뒤엔 다시
+안 누른다. 이 테스트는 그 약속들을 고정한다.
 """
 
 from __future__ import annotations
@@ -37,34 +36,40 @@ def _sources():
 
 
 @pytest.mark.parametrize("label, item", list(_sources()), ids=lambda v: v if isinstance(v, str) else "")
-def test_target_j_is_a_click_with_offset_back_onto_the_button(label, item):
+def test_target_j_is_click_gated_to_the_expanded_band(label, item):
     assert item["action"] == "click"
-    assert float(item["threshold"]) >= 0.85, f"{label}: 어두운 면이 넓은 템플릿이라 임계값을 낮추면 오탐"
-    assert int(item["click_offset_y"]) == -3, f"{label}: 중심이 버튼 아래라 보정이 없으면 버튼을 빗맞힌다"
+    assert float(item["threshold"]) >= 0.85, f"{label}"
+    # 펼침(y≈0.75)은 밴드 안, 접힘(y≈0.97)은 밴드 밖이어야 한다.
+    top, bottom = float(item["match_top_frac"]), float(item["match_bottom_frac"])
+    assert 0.0 < top < 0.75 < bottom < 0.97, f"{label}: 밴드가 펼침만 받고 접힘은 걸러야 한다 ({top},{bottom})"
     assert float(item.get("wait_after_action", 0)) >= 0.5
 
 
-def test_template_includes_the_dark_band_below_the_icon_row():
+def test_template_is_the_plain_icon_row_no_dark_band():
     cv2 = pytest.importorskip("cv2")
     tpl = cv2.imread(str(ROOT / "target_J.png"), cv2.IMREAD_GRAYSCALE)
     assert tpl is not None
-    h, w = tpl.shape
-    assert (h, w) == (34, 128), (h, w)
-    # 아래 6px 는 어두운 면(접힘 상태 구분의 근거) — 평균 밝기가 낮아야 한다.
-    assert float(tpl[28:, :].mean()) < 60, "템플릿 아래 띠가 어둡지 않다 — 접힘 구분이 깨진다"
-    # 위 28px 에는 흰 아이콘/'−' 가 있다.
-    assert float(tpl[:28, :].max()) > 200
+    assert tpl.shape == (28, 128), tpl.shape          # 아이콘 줄만, 아래 띠 없음
+    assert float(tpl[:, :].max()) > 200               # 흰 아이콘/'−' 가 있다
 
 
-def test_click_offset_is_parsed_and_applied():
+def test_match_band_accepts_expanded_and_rejects_minimized():
     from macroapp import gui
 
-    target = _target_from_config({
-        "name": "t", "filename": "x.png", "action": "click", "click_offset_y": -3,
-    }, 0)
+    target = _target_from_config(_named(DEFAULT_TARGET_CONFIGS, "target_J"), 9)
     assert target is not None
-    assert target.click_offset_x == 0 and target.click_offset_y == -3
-    assert gui.AutomationApp._click_point(target, (100, 200)) == (100, 197)
-    # 보정이 없는 타겟은 중심 그대로.
-    plain = _target_from_config({"name": "p", "filename": "x.png", "action": "click"}, 1)
-    assert gui.AutomationApp._click_point(plain, (100, 200)) == (100, 200)
+    h = 1040
+    # 펼침 아이콘 줄 중심 y≈768 → 0.74, 접힘 y≈986 → 0.95
+    assert gui.AutomationApp._match_in_band(target, (1608, 768), h) is True
+    assert gui.AutomationApp._match_in_band(target, (1608, 986), h) is False
+    # 밴드 없는 일반 타겟은 어디든 통과.
+    plain = _target_from_config({"name": "p", "filename": "x.png", "action": "click"}, 0)
+    assert gui.AutomationApp._match_in_band(plain, (10, 10), h) is True
+    assert gui.AutomationApp._match_in_band(plain, (10, 1030), h) is True
+
+
+def test_target_j_click_point_has_no_offset():
+    from macroapp import gui
+
+    target = _target_from_config(_named(DEFAULT_TARGET_CONFIGS, "target_J"), 9)
+    assert gui.AutomationApp._click_point(target, (1608, 804)) == (1608, 804)
