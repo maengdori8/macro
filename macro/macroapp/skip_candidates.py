@@ -398,8 +398,14 @@ _S_LEGACY_CANDIDATES = tuple(
         "gamepad_s_process_rescan_spoof_sequence",
     }
 )
+# H1(attach_active_hold_a)은 A 목록(index 4·5)에만 있었다. 그런데 구매자 PC 가 실제로 보는
+# 컷신 프롬프트는 **S 형**(키보드 표시 장치, 2026-08-22 로그 감지 1,964회)이라 H1 은 실전
+# 원장에 **0행** — 마지막 미검증 가설이 한 번도 시도되지 않았다. S 에서도 맨 앞에 둔다.
+# attach_hold_a 는 대조(큐 공유만)라 짝으로 함께 간다.
+_S_H1_PRIORITY = ("attach_hold_a", "attach_active_hold_a")
 SKIP_S_CANDIDATES = tuple(dict.fromkeys(
-    ("control_noop",) + _S_START_ENVELOPE_PRIORITY + _S_LEGACY_CANDIDATES
+    ("control_noop",) + _S_H1_PRIORITY + _S_START_ENVELOPE_PRIORITY
+    + _S_LEGACY_CANDIDATES
 ))
 
 # Generic OCR prompts currently include a captured "ESC SKIP" presentation.

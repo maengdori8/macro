@@ -802,7 +802,10 @@ def test_automatic_generic_catalogues_never_send_escape() -> None:
     assert "spoof_start_envelope2" in SKIP_S_CANDIDATES
     assert "spoof_start_preactivate80_burst3" in SKIP_S_CANDIDATES
     assert "spoof_start_envelope4_fast" in SKIP_S_CANDIDATES
-    assert SKIP_S_CANDIDATES[1:7] == (
+    # 2026-08-22: H1(attach_active_hold_a)+대조(attach_hold_a)가 S 맨 앞(1·2)에 선다 —
+    # 구매자 PC 가 보는 프롬프트는 S 형이라 A 목록에만 있으면 영영 시도되지 않았다(원장 0행).
+    assert SKIP_S_CANDIDATES[1:3] == ("attach_hold_a", "attach_active_hold_a")
+    assert SKIP_S_CANDIDATES[3:9] == (
         "process_device_spoof_a_envelope2",
         "spoof_a_envelope2",
         "spoof_a_preactivate80_burst3",
