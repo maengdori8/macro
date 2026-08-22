@@ -44,6 +44,8 @@ from macroapp.input_gamepad import (
 from macroapp.paths import APP_VERSION, app_dir
 from macroapp.config import (
     TargetImage, WINDOW_TITLE, LOOP_SLEEP_SECONDS, WINDOW_RETRY_SECONDS,
+    STALL_FIRST_ALERT_SECONDS, STALL_REPEAT_ALERT_SECONDS, STALL_PROGRESS_GRACE_SECONDS,
+    EXIT_EFFECT_LOBBY_TARGETS, EXIT_EFFECT_FAST_SECONDS,
     WINDOW_VALIDATION_INTERVAL_SECONDS,
     CLICK_JITTER_PIXELS, MOUSE_HOVER_BEFORE_CLICK_SECONDS,
     DEFAULT_REGION_X, DEFAULT_REGION_Y, DEFAULT_REGION_WIDTH, DEFAULT_REGION_HEIGHT,
@@ -109,6 +111,7 @@ from macroapp.license_client import (
 from macroapp.matching import find_template_center, downscale_screen, is_notification_panel_open
 from macroapp.mining_ui import MiningDashboard
 from macroapp.session import MatchCounter, SessionTracker
+from macroapp.health import StallMonitor, STALL_NONE, stall_message
 from macroapp import daily_stats
 from macroapp.skip_anykey import ACTION_PRESS as ANYKEY_PRESS, AnyKeyStartPolicy
 from macroapp.mining import MiningStore
@@ -298,6 +301,9 @@ class AutomationApp:
         # 다시 시도한다. _auto_exit_current=이번 종료가 자동 경로였나(재시도 무장 대상),
         # _auto_exit_retry_at=다음 확인 시각(None=꺼짐), _auto_exit_retries=이 판 재시도 횟수.
         self._auto_exit_current = False
+        # 종료 '실효' 측정 — '완료 메시지'가 아니라 **다음 로비 도달**로 성공을 잰다.
+        # 8-22 실측: '[종료] 완료' 뒤에도 경기가 4분 더 진행된 판이 있었다(완료≠나감).
+        self._auto_exit_done_at: Optional[float] = None
         self._auto_exit_retry_at: Optional[float] = None
         self._auto_exit_retries = 0
         self._auto_exit_resumed_at: Optional[float] = None   # 되살아난 시각(재시도 기준)
@@ -377,6 +383,13 @@ class AutomationApp:
         # 판수는 '등수 패널이 사라진 순간'에 센다. 확정마다 세면 같은 패널이
         # 0.3초마다 재확정되므로 화면에 머무는 내내 유령 경기가 쌓인다.
         self._match_counter = MatchCounter(gone_seconds=RANK_OCR_PANEL_GAP_SECONDS)
+        # 가동률 감시 — '켜져 있는데 서 있는 시간'을 잡아 알린다(로그 실측상 최대 손실).
+        self._stall = StallMonitor(
+            first_alert_seconds=STALL_FIRST_ALERT_SECONDS,
+            repeat_alert_seconds=STALL_REPEAT_ALERT_SECONDS,
+            progress_grace_seconds=STALL_PROGRESS_GRACE_SECONDS,
+        )
+        self._stall_state = STALL_NONE
         # 오늘 판수: 앱을 껐다 켜도 유지되게 원장에 남긴다. 저장소를 못 열어도
         # 매크로 본체는 그대로 돌아야 하므로 실패는 통계 비활성화로만 처리한다.
         self._session_id = uuid.uuid4().hex
@@ -1795,6 +1808,8 @@ class AutomationApp:
         self._session_tracker.start()
         # 직전 실행에서 보던 패널 상태가 새 세션의 첫 판으로 새지 않게 함께 비웁니다.
         self._match_counter.reset()
+        self._stall.reset(time.monotonic())
+        self._stall_state = STALL_NONE
         self._refresh_session_ui()
         self._set_button_state(running=True)
         self.set_status("실행 중")
@@ -2224,15 +2239,20 @@ class AutomationApp:
                         self.queue_status("대상 창 검색 중")
                         window_is_valid = manager.find_window()
                         last_window_validation = time.monotonic()
+                        self._stall.note_window(window_is_valid, last_window_validation)
 
                         if self.stop_event.is_set():
                             break
 
                         if not window_is_valid:
-                            self.queue_log(f"[대기] {WINDOW_RETRY_SECONDS}초 후 창을 다시 찾습니다.")
+                            # 8-18 실측: 여기서 3시간 동안 같은 줄을 7,509회 찍고 서 있었다.
+                            # 줄을 늘리지 말고, 정해진 간격으로 '알림'만 낸다.
+                            self._check_stall(time.monotonic())
                             self.interruptible_sleep(WINDOW_RETRY_SECONDS)
                             continue
+                    self._stall.note_window(True, now_mono)
 
+                self._check_stall(now_mono)
                 self.queue_status("실행 중")
                 if capture_mode == "region":
                     screen_gray = self.capture_screen_region(region)
@@ -2317,6 +2337,8 @@ class AutomationApp:
                     )
 
                     action_now = time.monotonic()
+                    self._stall.note_progress(action_now)   # 실제 입력 = 진행의 증거
+                    self._note_exit_effect(target, action_now)
                     if self._defer_escape_target_for_skip_probe(
                         target,
                         action_now,
@@ -2407,6 +2429,54 @@ class AutomationApp:
             )
         except Exception:
             pass
+
+    def _note_exit_effect(self, target, now: float) -> None:
+        """자동 종료가 **실제로 판을 끝냈는지**를 '다음 로비 도달'로 기록한다.
+
+        기존에는 종료 러너의 '완료' 메시지를 성공으로 봤는데, 8-22 실측에서 완료 뒤에도
+        경기가 4분 넘게 계속된 판이 있었다(마무리 클릭 실패). 완료는 '시도가 끝났다'는
+        뜻일 뿐이다. 로비 진입 타겟(EXIT_EFFECT_LOBBY_TARGETS)을 다시 누르는 순간이
+        '판이 진짜 끝났다'는 관측 가능한 증거다.
+        """
+
+        started = self._auto_exit_done_at
+        if started is None:
+            return
+        if getattr(target, "name", None) not in EXIT_EFFECT_LOBBY_TARGETS:
+            return
+        self._auto_exit_done_at = None
+        elapsed = max(0.0, now - started)
+        verdict = "즉시" if elapsed <= EXIT_EFFECT_FAST_SECONDS else "지연"
+        self._log_to_file_only(
+            f"[자동 종료 실효] 종료 완료 → 로비({target.name}) {elapsed:.0f}초 ({verdict})"
+        )
+        if elapsed > EXIT_EFFECT_FAST_SECONDS:
+            # 느리면 마무리가 실패해 경기가 계속 돌았다는 뜻 — 재시도 설계의 표적이다.
+            self.queue_log(
+                f"[자동 종료] 판이 끝나기까지 {elapsed:.0f}초 걸렸습니다"
+                " — 마무리 클릭이 빗나갔을 수 있습니다"
+            )
+
+    def _check_stall(self, now: float) -> None:
+        """가동률 감시 — 정지가 길어지면 로그·상태·디스코드로 한 번씩 알린다.
+
+        도배 금지: 같은 정지에 대해 처음 한 번, 그 뒤 STALL_REPEAT_ALERT_SECONDS 마다
+        한 번만. 판정은 순수 로직(health.StallMonitor)이 하고 여기서는 알리기만 한다.
+        """
+
+        try:
+            state, should_alert, duration = self._stall.poll(now)
+        except Exception:  # noqa: BLE001 - 감시가 본체를 막으면 안 된다
+            return
+        self._stall_state = state
+        if not should_alert:
+            return
+        text = stall_message(state, duration)
+        if not text:
+            return
+        self.queue_log(f"[가동률] {text}")
+        # 디스코드 상태로도 올린다 — 구매자가 자리를 비운 사이 확인할 수 있어야 한다.
+        self.report_status(running=True, message=text)
 
     def _ocr_worker_loop(self, generation: Optional[int] = None) -> None:
         """별도 스레드: 매칭 루프를 막지 않고 SKIP/등수 OCR을 처리합니다.
@@ -6293,6 +6363,8 @@ class AutomationApp:
             # 자동 종료였으면, 실제로 나갔는지 잠시 뒤 확인해 필요하면 재시도한다.
             if self._auto_exit_current:
                 self._arm_auto_exit_retry()
+                # 실효 측정 시작: 여기서부터 다음 로비(target_D)까지 몇 초 걸리나.
+                self._auto_exit_done_at = time.monotonic()
             self._auto_exit_current = False
             return
         self.root.after(100, self._poll_exit_events)
