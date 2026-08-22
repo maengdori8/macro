@@ -118,6 +118,7 @@ def _app() -> gui.AutomationApp:
     app._reconcile_skip_learning = Mock()
     app.queue_status = Mock()
     app.queue_log = Mock()
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     return app
 
 
@@ -206,7 +207,7 @@ def test_escape_prompt_also_goes_direct_not_into_the_experiment() -> None:
     이 모양). 이제 escape/escape_highlight/start 도 직행 경로가 받는다.
     """
 
-    for hint in ("escape", "escape_highlight", "start"):
+    for hint in ("escape", "start"):
         app = _app()
         manager = SimpleNamespace(hwnd=123)
         screen = np.zeros((720, 1280), dtype=np.uint8)
@@ -220,7 +221,6 @@ def test_escape_prompt_also_goes_direct_not_into_the_experiment() -> None:
         for tracker in (
             app._skip_generic_experiment,
             app._skip_generic_escape_experiment,
-            app._skip_generic_escape_highlight_experiment,
         ):
             tracker.choose.assert_not_called()
         # 봉쇄는 0.5초뿐이라 템플릿이 곧바로 재시도할 수 있다.
@@ -251,3 +251,93 @@ def test_a_or_s_template_match_never_takes_the_direct_path() -> None:
     assert app._anykey_direct_start(1.0, True, True, False) is False
     assert app._anykey_direct_start(1.0, True, False, True) is False
     assert app._anykey_direct_start(1.0, False, False, False) is False
+
+
+# ─── 2026-08-22 리뷰 확정: 맨 '▷ SKIP'(힌트 미상)이 직행에서 빠져 있던 결함 ──────────
+
+
+def test_plain_skip_prompt_without_any_hint_goes_direct() -> None:
+    """맨 '▷ SKIP' — OCR 이 "skip" 만 읽어 힌트가 None 인 형태.
+
+    실전 원장에서 generic 에피소드의 44%(104/236)가 이것이고, 증거 이미지 40장을 다시
+    돌려 보니 classify=(True,None)·A/S/F/G 템플릿 전부 미매칭이었다. 이게 직행에서
+    빠져 있으면 정작 구매자가 보고한 화면이 5.2초 봉쇄 실험에 그대로 남는다.
+    """
+
+    app = _app()
+    manager = SimpleNamespace(hwnd=123)
+    screen = np.zeros((720, 1280), dtype=np.uint8)
+    p = _patches([(True, None)] * 2)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad:
+        assert app._try_skip(screen, manager)
+        assert app._try_skip(screen, manager)
+    assert gamepad.call_count == 1, "맨 ▷ SKIP 이 직행 START 를 못 받았다"
+    assert app._skip_kind == "anykey", "맨 ▷ SKIP 이 실험 경로로 샜다"
+    app._skip_generic_experiment.choose.assert_not_called()
+    # 봉쇄는 0.5초 — 템플릿이 곧바로 재시도할 수 있어야 한다.
+    assert app._skip_active_until - time.monotonic() <= 0.6
+
+
+def test_fallback_locked_episode_is_reclaimed_by_direct() -> None:
+    """증거 없이 'start' 폴백으로 잠긴 에피소드는 직행이 되찾는다(영구 배제 방지)."""
+
+    app = _app()
+    app._skip_kind = "start"
+    app._skip_generic_episode_hint = "start"
+    app._skip_generic_hint = "start"
+    assert app._anykey_direct_start(1.0, True, False, False) is True
+    assert app._skip_kind == "anykey"
+    app._skip_generic_experiment.reset_episode.assert_called()
+
+
+def test_evidenced_escape_highlight_lock_is_respected() -> None:
+    """증거로 잠긴 하이라이트 에피소드는 직행이 가로채지 않는다(실험 유지)."""
+
+    app = _app()
+    app._skip_kind = "start"
+    app._skip_generic_episode_hint = "escape_highlight"
+    app._skip_generic_hint = "escape_highlight"
+    assert app._anykey_direct_start(1.0, True, False, False) is False
+    assert app._skip_kind == "start"
+
+
+def test_highlight_screen_stays_in_the_experiment_even_without_a_hint() -> None:
+    """경기 후 하이라이트는 맨 START 가 통한다는 증거가 없다 — 힌트 None 이어도 제외."""
+
+    app = _app()
+    # 실측 기준: 중앙 ROI 의 어두운 픽셀 비율 0.70~0.95 가 하이라이트 요약 화면이다
+    # (완전 검정 1.00 은 캡처 실패/로딩이라 제외된다).
+    dark = np.full((720, 1280), 200, dtype=np.uint8)
+    dark[int(720 * 0.12):int(720 * 0.74), int(1280 * 0.23):int(1280 * 0.77)] = 10
+    assert app._direct_start_form(None, dark) is None
+    bright = np.full((720, 1280), 200, dtype=np.uint8)
+    assert app._direct_start_form(None, bright) == "plain"
+    assert app._direct_start_form("escape_highlight", bright) is None
+
+
+def test_direct_start_sends_the_activation_spoof_like_the_template_path() -> None:
+    """템플릿 경로와 같은 입력이어야 한다 — WGC + WM_ACTIVATE 가짜 포커스 + vgamepad."""
+
+    app = _app()
+    manager = SimpleNamespace(hwnd=4242)
+    posted = []
+    fake = SimpleNamespace(PostMessage=lambda h, m, w, l: posted.append((h, m, w, l)))
+    p = _patches([(True, "escape")] * 2)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad,             patch.object(gui.winapi, "win32gui", fake):
+        app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
+        app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
+    assert gamepad.call_count == 1
+    assert posted == [(4242, 0x0006, 1, 0)], f"활성 스푸핑이 안 나갔다: {posted}"
+
+
+def test_direct_start_does_not_fire_after_stop() -> None:
+    """'정지 후 입력 0' 불변식 — 정지가 눌렸으면 START 를 보내지 않는다."""
+
+    app = _app()
+    app.stop_event = SimpleNamespace(is_set=lambda: True)
+    manager = SimpleNamespace(hwnd=123)
+    p = _patches([(True, "escape")] * 2)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad:
+        app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
+        app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
+    gamepad.assert_not_called()

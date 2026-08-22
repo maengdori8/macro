@@ -530,7 +530,19 @@ SKIP_ANYKEY_DIRECT_START = True
 # (7-28 실측 349펄스, 에피소드 29/30 이 0~3초 통과) 후보를 탐색할 이유가 없다.
 # ⚠️ A/S(hold-to-skip)는 여기 없다 — 그쪽은 배경 입력이 원리적으로 안 되는, 답이 아직
 # 없는 프롬프트라 실험(H1 attach_active_hold_a 등)이 계속 돌아야 한다.
-SKIP_DIRECT_START_HINTS = ("any_key", "escape", "escape_highlight", "start")
+SKIP_DIRECT_START_HINTS = ("any_key", "escape", "start")
+# ⚠️ **힌트가 아예 안 나온 프롬프트(None)도 직행이다** — 이게 맨 '▷ SKIP' 이고, 실측상
+# 가장 흔하다. 실전 원장(mAuto Pro skip_experiments.jsonl, 2026-08-22): generic 에피소드
+# 236건 중 **104건(44%)** 이 prompt_hint="start" 인데, 그 "start" 는 OCR 이 읽은 게 아니라
+# **힌트를 못 냈을 때의 폴백**이다(같은 블록에서 _skip_kind="start" 로 잠긴다). 그 104건의
+# 증거 이미지를 다시 돌려 보니 OCR 원문은 "skip"(+선수 이름)뿐이고 esc/enter/아무키 토큰이
+# 없어 classify 가 (True, None) 을 내며, A/S/F/G 템플릿은 40/40 전부 미매칭이었다.
+# → 힌트 None 을 직행에서 빼면 '고치려던 화면'이 그대로 실험(5.2초 봉쇄)에 남는다.
+SKIP_DIRECT_START_INCLUDES_UNKNOWN = True
+# ⚠️ escape_highlight(경기 후 하이라이트)는 **직행에서 뺀다.** 이 레포가 '아직 답을 못 찾은'
+# 형태로 기록해 둔 유일한 프롬프트다(전용 후보 카탈로그·전용 exit_confirm 5.0초·learned 강제
+# None). 맨 START 가 통한다는 증거가 없으므로 실험에 남긴다. 힌트가 None 이어도 화면이
+# 하이라이트로 판정되면(_is_highlight_summary_context) 직행하지 않는다.
 SKIP_ANYKEY_REPRESS_SECONDS = 0.8  # 프롬프트가 계속 보이면 이 간격으로 START 를 다시 누른다
 
 # ─── 자동 정지 단발 오독 가드 ───

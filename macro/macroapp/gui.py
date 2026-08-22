@@ -95,6 +95,7 @@ from macroapp.config import (
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
     SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS, SKIP_DIRECT_START_HINTS,
+    SKIP_DIRECT_START_INCLUDES_UNKNOWN,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
     save_custom_target_image, delete_custom_target_image,
@@ -4743,12 +4744,38 @@ class AutomationApp:
         frac = float(center[1]) / float(frame_height)
         return top <= frac <= bottom
 
+    def _direct_start_form(self, hint, screen_gray) -> Optional[str]:
+        """직행 START 로 넘길 프롬프트인지 판정하고, 로그에 쓸 이름을 돌려준다(아니면 None).
+
+        - 힌트가 SKIP_DIRECT_START_HINTS(any_key/escape/start) 면 그대로.
+        - **힌트 None 도 직행이다** — 이게 맨 '▷ SKIP'. OCR 이 "skip" 만 읽고 구분 토큰을
+          못 낸 형태로, 실전 원장에서 generic 에피소드의 44%(104/236)를 차지한다. 여기서
+          빼면 정작 구매자가 보고한 화면이 실험(5.2초 봉쇄)에 그대로 남는다.
+        - 단, **경기 후 하이라이트 화면은 제외**한다 — 이 레포가 '아직 답을 못 찾은'
+          형태로 기록해 둔 유일한 프롬프트라 맨 START 로 대체할 근거가 없다.
+        """
+
+        if hint in SKIP_DIRECT_START_HINTS:
+            return hint
+        if hint is None and SKIP_DIRECT_START_INCLUDES_UNKNOWN:
+            if screen_gray is not None:
+                try:
+                    if self._is_highlight_summary_context(screen_gray):
+                        return None
+                except Exception:  # noqa: BLE001 - 판정 실패는 '하이라이트 아님'으로 본다
+                    pass
+            return "plain"
+        return None
+
     def _anykey_direct_start(
         self,
         now: float,
         has_text: bool,
         is_a: bool,
         is_s: bool,
+        *,
+        manager: Optional[InactiveManager] = None,
+        screen_gray=None,
     ) -> bool:
         """답이 확정된 일반 프롬프트(▷ SKIP · '아무 키나' · ESC SKIP)를 바로 START 로 넘긴다.
 
@@ -4773,18 +4800,55 @@ class AutomationApp:
             getattr(self, "_skip_generic_episode_hint", None)
             or self._skip_generic_hint
         )
-        if hint not in SKIP_DIRECT_START_HINTS or self._skip_kind not in (None, "anykey"):
+        form = self._direct_start_form(hint, screen_gray)
+        if form is None:
+            return False
+        if self._skip_kind == "start":
+            # 증거 없이 폴백으로 잠긴 에피소드('start')는 직행으로 되찾는다. 안 그러면
+            # 애매한 프레임 두 번만으로 그 에피소드가 끝까지 실험에 갇힌다(리뷰 확정).
+            # 실험 추적기의 진행 중 에피소드는 정리해 귀속이 오염되지 않게 한다.
+            if (getattr(self, "_skip_generic_episode_hint", None) or "start") != "start":
+                return False
+            self._reset_generic_experiment_episodes()
+            self._skip_kind = None
+            self._skip_generic_episode_hint = None
+        if self._skip_kind not in (None, "anykey"):
             return False
 
         if self._skip_kind is None:
             self._skip_kind = "anykey"
-            self._skip_generic_episode_hint = hint
-            self._skip_generic_hint = hint
+            if hint is not None:
+                self._skip_generic_episode_hint = hint
+                self._skip_generic_hint = hint
         self._skip_text_streak += 1
         action = policy.observe(now, True)
         if action == ANYKEY_PRESS:
+            # 정지 뒤에는 입력이 나가면 안 된다(불변식). winocr 호출이 수백 ms 걸리는
+            # 동안 사용자가 정지를 눌렀을 수 있다.
+            if self.stop_event.is_set():
+                return True
             start_btn = input_gamepad.KEY_TO_GAMEPAD.get("start")
             if start_btn is not None:
+                # 템플릿 경로(dispatch_key_press)와 **같은 입력**이어야 한다 —
+                # 이 레포가 기록한 배경 입력 메커니즘은 'WGC + WM_ACTIVATE 가짜
+                # 포커스 + vgamepad' 다. 템플릿이 빗나가는 PC(=이 경로의 존재
+                # 이유)에서는 여기가 유일한 발사점이라 스푸핑이 빠지면 안 된다.
+                # ⚠️ 스푸핑은 **최선 노력**이다 — 창 핸들이 낡아 PostMessage 가 예외를
+                # 내도 진짜 입력인 패드 펄스까지 같이 죽으면 안 된다(같은 try 로 묶었다가
+                # START 가 통째로 안 나가는 것을 테스트가 잡았다).
+                if (
+                    manager is not None
+                    and getattr(manager, "hwnd", None)
+                    and winapi.win32gui is not None
+                ):
+                    try:
+                        WM_ACTIVATE = 0x0006
+                        WA_ACTIVE = 1
+                        winapi.win32gui.PostMessage(
+                            manager.hwnd, WM_ACTIVATE, WA_ACTIVE, 0
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     send_gamepad_button(start_btn)
                 except Exception as exc:  # noqa: BLE001
@@ -4794,7 +4858,7 @@ class AutomationApp:
                     self._skip_active_until = max(
                         self._skip_active_until, time.monotonic() + 0.5
                     )
-                    self.queue_log(f"[SKIP] 일반 프롬프트({hint}) → START")
+                    self.queue_log(f"[SKIP] 일반 프롬프트({form}) → START")
         self.queue_status("SKIP 넘기는 중")
         return True
 
@@ -5117,10 +5181,12 @@ class AutomationApp:
                     self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
             except Exception:
                 pass
-        # '아무 키나 누르세요' 프롬프트는 답이 알려진 화면이라 실험·대조·봉쇄를 거치지
-        # 않고 바로 START 를 누른다(아래 오염 판정·3초 대조보다 먼저 — 이 에피소드는
-        # 실험 표본이 아니다).
-        if self._anykey_direct_start(now, has_text, is_a, is_s):
+        # 답이 확정된 일반 프롬프트(▷ SKIP · '아무 키나' · ESC SKIP)는 실험·대조·봉쇄를
+        # 거치지 않고 바로 START 를 누른다(아래 오염 판정·3초 대조보다 먼저 — 이
+        # 에피소드는 실험 표본이 아니다).
+        if self._anykey_direct_start(
+            now, has_text, is_a, is_s, manager=manager, screen_gray=screen_gray
+        ):
             return True
 
         if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_control_contaminated:
