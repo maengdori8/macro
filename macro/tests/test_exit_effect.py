@@ -113,6 +113,20 @@ def test_hold_escalates_with_each_retry_up_to_a_cap() -> None:
     assert config.EXIT_RETRY_HOLD_MAX_SECONDS > config.EXIT_HOLD_SECONDS
 
 
+def test_hold_never_exceeds_the_game_crash_threshold() -> None:
+    """⚠️ 정지가 11초를 넘으면 **게임이 통째로 꺼진다**(사용자 실측 2026-08-23).
+
+    무인 방치가 기본이라 게임이 꺼지면 창을 못 찾아 그날 나머지가 날아간다. 이 상한을
+    올리는 변경은 이 테스트가 막는다.
+    """
+
+    assert config.EXIT_RETRY_HOLD_MAX_SECONDS <= 11.0, "게임이 꺼지는 값이다"
+    app = _tick_app()
+    for retries in range(0, 200):
+        app._auto_exit_retries = retries
+        assert app._exit_hold_seconds() <= 11.0, retries
+
+
 def test_no_lobby_in_time_triggers_a_retry_without_reading_the_score() -> None:
     """[4] 실패는 스코어 기반 재시도가 안 걸렸다 — 로비 미도달만으로도 걸려야 한다."""
 
