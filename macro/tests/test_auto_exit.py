@@ -805,3 +805,41 @@ def test_digit_five_is_readable() -> None:
     assert "5" in have, f"숫자 5 글리프가 없다: {sorted(have)}"
     for digit in ("0", "1", "2", "3", "4", "5"):
         assert score_glyphs.GLYPH_PNGS_B64[digit], f"{digit} 템플릿이 비었다"
+
+
+def test_unknown_timeout_must_not_double_count_the_same_match() -> None:
+    """미상 타임아웃으로 판을 끝냈어도 **새 판 증거 없이는** 다시 발동하지 않는다.
+
+    6~9 득점으로 오래 미상이던 같은 판이 새 판으로 둔갑하면 한 경기를 두 번 세고
+    두 번 나간다(쿼터 비율이 무너진다). Codex 2차 의견으로 발견, 시뮬로 재현했다.
+    새 판 증거는 '총 1골 이하'(킥오프 직후로만 가능한 스코어)로 본다.
+    """
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    _play(tracker, (0, 0), 60, clock=clock)
+    assert _play(tracker, (0, 2), 30, clock=clock), "첫 발동이 있어야 한다"
+
+    # 같은 판이 계속되는데 숫자를 못 읽는다(5~9 글리프 없음).
+    for _ in range(200):
+        clock[0] += 1.0
+        tracker.observe(clock[0], SCORE_UNKNOWN, None)
+
+    # 같은 판이 이어진다 — 절대 다시 발동하면 안 된다.
+    again = _play(tracker, (3, 4), 10, clock=clock)
+    again += _play(tracker, (3, 5), 30, clock=clock)
+    assert not again, "같은 판을 두 번 셌다"
+
+
+def test_a_genuine_new_match_still_fires_after_an_unknown_timeout() -> None:
+    """반대로 진짜 새 판(0:0 부터 시작)은 정상적으로 발동해야 한다."""
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    _play(tracker, (0, 0), 60, clock=clock)
+    _play(tracker, (0, 2), 30, clock=clock)
+    for _ in range(200):
+        clock[0] += 1.0
+        tracker.observe(clock[0], SCORE_UNKNOWN, None)
+    _play(tracker, (0, 0), 40, clock=clock)          # 새 판 증거(킥오프)
+    assert _play(tracker, (0, 2), 40, clock=clock), "새 판이 발동하지 않았다"

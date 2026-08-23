@@ -372,6 +372,10 @@ class LossTracker:
         self._hard_fired = False                     # 이 경기에서 hard 가 확정됐나
         self._last_seen_at: Optional[float] = None   # 뭔가(미상 포함) 보인 마지막 시각
         self._last_score_at: Optional[float] = None  # **진짜 스코어**를 읽은 마지막 시각
+        # 미상 타임아웃으로 판을 끝냈지만 '새 판이 시작됐다'는 양성 증거는 아직 없는
+        # 상태. 이때 곧바로 다시 발동하면 **같은 판을 두 번 세고 두 번 나간다**
+        # (Codex 2차 의견으로 발견, 시뮬로 재현). 새 판 증거를 볼 때까지 침묵한다.
+        self._epoch_pending = False
         # 이 경기에서 본 '상대−나'의 최솟값. 선행 스코어 방어의 근거다: 어떤 규칙이든
         # **그 규칙의 점차보다 나은 스코어**를 먼저 봤어야 확정한다. 예전의 '규칙에 안
         # 걸린 스코어를 봤나'는 late(1점차) 에서 같은 (0,1) 픽셀이 선행 증거이자 판정
@@ -447,8 +451,13 @@ class LossTracker:
 
         return self.observe(now, reading, minute) is not None
 
-    def _end_match(self) -> None:
-        """경기가 끝났다고 보고 다음 경기를 셀 수 있게 모든 래치를 푼다."""
+    def _end_match(self, *, confirmed: bool = True) -> None:
+        """경기가 끝났다고 보고 다음 경기를 셀 수 있게 모든 래치를 푼다.
+
+        confirmed=False 는 '미상 타임아웃으로 끝난 것 같다'는 약한 근거다. 이 경우
+        새 판 증거(0~1골 스코어 = 킥오프 직후)를 볼 때까지 발동을 막는다 — 안 그러면
+        6~9 득점으로 오래 미상이던 **같은 판**이 새 판으로 둔갑해 두 번 나간다.
+        """
 
         self._streak = 0
         self._hard_streak = 0
@@ -459,6 +468,7 @@ class LossTracker:
         self._min_losing_seen = None
         self._last_seen_at = None
         self._last_score_at = None
+        self._epoch_pending = not confirmed
 
     def observe(self, now: float, reading: Reading, minute: Optional[int] = None) -> Optional[str]:
         """feed 와 같되 확정 종류(KIND_*)를 돌려준다. 확정이 아니면 None.
@@ -490,11 +500,17 @@ class LossTracker:
                 self._last_score_at is not None
                 and now - self._last_score_at >= self.unknown_reset_seconds
             ):
-                self._end_match()
+                self._end_match(confirmed=False)
             return None
 
         self._last_score_at = now
         mine, theirs = int(reading[0]), int(reading[1])
+        if self._epoch_pending:
+            # 새 판 증거 = 킥오프 직후로만 가능한 스코어(총 1골 이하).
+            if mine + theirs <= 1:
+                self._epoch_pending = False
+            else:
+                return None
         losing = theirs - mine
         # 이 경기에서 본 가장 나은 스코어(상대−나 최솟값)를 기록한다 — 선행 증거.
         if self._min_losing_seen is None or losing < self._min_losing_seen:

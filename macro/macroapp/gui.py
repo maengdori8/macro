@@ -2452,6 +2452,20 @@ class AutomationApp:
         self._auto_exit_done_at = None
         if self.stop_event.is_set():
             return
+        # ⚠️ **같은 판인지 확인하고 쏜다.** 로비 타겟을 '못 본 것'은 판이 안 끝났다는 증거도
+        # 되지만 '로비를 지나갔는데 템플릿을 놓친 것'일 수도 있다. 그 경우 이 재시도는
+        # **다음 경기를 정지**시킨다 — 24시간 무인에서 남의 판을 끊는 사고다(Codex 2차 의견).
+        # 래치는 판이 끝나면 풀리므로, 아직 서 있다는 건 같은 판이라는 뜻이다. 스코어를
+        # 못 읽는 상황에서도 래치는 유지되므로 이 경로의 원래 목적(스코어 무관 재시도)은
+        # 그대로 살아 있다.
+        tracker = self._loss_tracker
+        if tracker is None or not tracker.latched:
+            self._log_to_file_only(
+                "[자동 종료] 로비 미도달이지만 판이 끝난 것으로 보여 재시도하지 않습니다"
+            )
+            self._auto_exit_retries = 0
+            self._auto_exit_retry_at = None
+            return
         if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
             self._log_to_file_only(
                 f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — 이 판은 더 시도하지 않습니다"

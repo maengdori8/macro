@@ -283,6 +283,11 @@ class PauseRunner:
 
             # 3단계 — 정지
             self._set_state(core.STATE_SUSPENDING, MSG_WORKING)
+            # ⚠️ **첫 정지 직전**에 기준 시각을 잡는다. 예전엔 정지 루프와 원장 기록이 끝난
+            # 뒤에 deadline 을 계산해서, 먼저 정지된 프로세스는 nominal 보다 오래 멈춰
+            # 있었다. 정지 11초가 '게임이 꺼지는' 경계라(사용자 실측) 이 초과분이 그대로
+            # 사고가 된다 — 무인 방치에서 게임이 꺼지면 그날 나머지가 전부 날아간다.
+            suspend_started = time.monotonic()
             for handle in opened:
                 # 창을 닫아 shutdown() 이 이미 지나간 뒤에 새로 거는 것을 막는다.
                 if self._cancel.is_set():
@@ -315,7 +320,8 @@ class PauseRunner:
 
             # 4단계 — 유지 (취소에 즉시 반응하도록 잘게 쪼개서 대기)
             self._set_state(core.STATE_HELD, MSG_WORKING)
-            deadline = time.monotonic() + hold_seconds
+            # 총 정지 시간(첫 정지 → 재개 시작)이 hold_seconds 를 넘지 않게 한다.
+            deadline = suspend_started + hold_seconds
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._cancel.is_set():

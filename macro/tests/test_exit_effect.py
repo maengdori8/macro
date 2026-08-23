@@ -83,7 +83,8 @@ def test_non_lobby_targets_do_not_end_the_measurement() -> None:
 #   '로비 미도달'만으로 재시도가 걸려야 한다([4]는 재시도가 아예 안 걸렸다).
 
 
-def _tick_app():
+def _tick_app(latched: bool = True):
+    """latched=True 는 '아직 같은 판' — 재시도가 겨냥하는 유일한 상태."""
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -92,10 +93,25 @@ def _tick_app():
     app._auto_exit_retries = 0
     app._auto_exit_retry_at = None
     app.stop_event = SimpleNamespace(is_set=lambda: False)
+    app._loss_tracker = SimpleNamespace(latched=latched)
     app._log_to_file_only = Mock()
     app.queue_log = Mock()
     app.ui_queue = SimpleNamespace(put=Mock())
     return app
+
+
+def test_blind_retry_never_attacks_a_new_match() -> None:
+    """로비 타겟을 '놓친' 경우 이 재시도는 **다음 경기를 정지**시킬 수 있다.
+
+    래치가 풀렸다(=판이 끝났다)면 쏘지 않는다. 24시간 무인에서 남의 판을 끊는 사고를
+    막는 가드다(Codex 2차 의견으로 발견).
+    """
+
+    app = _tick_app(latched=False)
+    app._auto_exit_done_at = 100.0
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
+    app.ui_queue.put.assert_not_called()
+    assert app._auto_exit_retries == 0
 
 
 def test_hold_escalates_with_each_retry_up_to_a_cap() -> None:
