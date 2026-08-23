@@ -83,6 +83,14 @@ def test_non_lobby_targets_do_not_end_the_measurement() -> None:
 #   '로비 미도달'만으로 재시도가 걸려야 한다([4]는 재시도가 아예 안 걸렸다).
 
 
+def config_rules():
+    from macroapp import auto_exit
+
+    return auto_exit.ExitRules(
+        base_deficit=2, hard_deficit=3, late_minute=70, late_deficit=1
+    )
+
+
 def _tick_app(latched: bool = True):
     """latched=True 는 '아직 같은 판' — 재시도가 겨냥하는 유일한 상태."""
     from types import SimpleNamespace
@@ -93,7 +101,12 @@ def _tick_app(latched: bool = True):
     app._auto_exit_retries = 0
     app._auto_exit_retry_at = None
     app.stop_event = SimpleNamespace(is_set=lambda: False)
-    app._loss_tracker = SimpleNamespace(latched=latched)
+    app._loss_tracker = SimpleNamespace(
+        latched=latched,
+        rules=config_rules(),
+    )
+    app._last_match_score = None          # 못 읽는 상태 = 이 경로의 기본 전제
+    app._clock_tracker = SimpleNamespace(confirmed=None)
     app._log_to_file_only = Mock()
     app.queue_log = Mock()
     app.ui_queue = SimpleNamespace(put=Mock())
@@ -181,3 +194,28 @@ def test_effect_tick_respects_stop_and_the_retry_cap() -> None:
     app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
     app.ui_queue.put.assert_not_called()                   # 한도 초과
     assert app._auto_exit_retries == config.AUTO_EXIT_RETRY_MAX
+
+
+
+def test_recovered_score_cancels_the_blind_retry() -> None:
+    """스코어가 회복됐으면 더 나가지 않는다.
+
+    이 경로는 '스코어를 못 읽을 때'를 위한 보조인데, 읽히는데도 무시하면 사용자가 정한
+    규칙(2점차·후반 1점차)에 안 맞는 판을 강제로 나간다. 실측(2026-08-23 19:06): 0:1
+    이던 판이 1:1 동점이 됐는데 스코어 경로는 '회복'으로 재시도를 취소한 반면 이 경로가
+    덮어써서 계속 나가려 했다.
+    """
+
+    app = _tick_app()
+    app._auto_exit_done_at = 100.0
+    app._last_match_score = (1, 1)            # 동점 = 어떤 규칙에도 안 걸린다
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
+    app.ui_queue.put.assert_not_called()
+    assert app._auto_exit_retries == 0
+
+    # 아직 열세면 그대로 재시도한다.
+    app = _tick_app()
+    app._auto_exit_done_at = 100.0
+    app._last_match_score = (0, 2)
+    app._exit_effect_tick(100.0 + config.EXIT_EFFECT_FAST_SECONDS + 1)
+    app.ui_queue.put.assert_called_once_with(("auto_exit", ""))

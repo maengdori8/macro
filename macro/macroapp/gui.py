@@ -2467,6 +2467,24 @@ class AutomationApp:
             self._auto_exit_retries = 0
             self._auto_exit_retry_at = None
             return
+        # ⚠️ **스코어가 회복됐으면 더 나가지 않는다.** 이 경로는 스코어를 못 읽을 때를
+        # 위한 보조인데, 읽히는데도 무시하면 사용자가 정한 규칙(2점차·후반 1점차)에
+        # 맞지 않는 판을 강제로 나간다. 실측(19:06): 0:1 이던 판이 1:1 로 동점이 됐는데
+        # 스코어 경로는 '회복'으로 재시도를 취소했는데 이 경로가 덮어써서 계속 나가려 했다.
+        # 못 읽을 때(None/미상)는 그대로 진행한다 — 그게 이 경로의 존재 이유다.
+        reading = self._last_match_score
+        if isinstance(reading, tuple):
+            minute = None
+            clock = getattr(self, "_clock_tracker", None)
+            if clock is not None:
+                minute = getattr(clock, "confirmed", None)
+            if tracker.rules.classify(int(reading[0]), int(reading[1]), minute) is None:
+                self._log_to_file_only(
+                    f"[자동 종료] 스코어가 {reading[0]}:{reading[1]} 로 회복 — 재시도하지 않습니다"
+                )
+                self._auto_exit_retries = 0
+                self._auto_exit_retry_at = None
+                return
         if self._auto_exit_retries >= AUTO_EXIT_RETRY_MAX:
             self._log_to_file_only(
                 f"[자동 종료] 재시도 {AUTO_EXIT_RETRY_MAX}회 모두 실패 — 이 판은 더 시도하지 않습니다"
