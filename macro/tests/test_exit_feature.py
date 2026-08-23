@@ -554,3 +554,54 @@ def test_followup_loads_the_exit_target_without_automation_targets():
     assert target is not None, "마무리 단계가 타겟을 못 읽는다(import 경로 깨짐)"
     assert target.name == exit_followup.EXIT_TARGET_NAME
     assert target.threshold == exit_followup.EXIT_MATCH_THRESHOLD
+
+
+# ─── 2026-08-23: 재개 직후 START 가 씹혀 종료가 통째로 실패하던 것 ─────────────
+
+
+def test_start_is_spammed_until_the_confirm_button_appears() -> None:
+    """확인 버튼이 보일 때까지 짧은 간격으로 START 를 연타한다(사용자 지시).
+
+    예전엔 0·5·10초에 딱 3번이었다. 게임은 10초 얼어 있다가 막 깨어난 참이라 **재개 직후
+    첫 START 가 자주 씹히고**, 그러면 다음 기회가 5초 뒤라 종료가 통째로 실패했다
+    (실측 15:33~15:35 재시도 4회 연속 실패).
+    """
+
+    from macroapp import config, exit_core
+
+    assert config.EXIT_OPEN_RETRY_SECONDS <= 0.6, "연타 간격이 너무 길다"
+    assert config.EXIT_OPEN_RETRY_SECONDS >= 0.2, "너무 짧으면 화면 반응을 못 본다"
+    assert config.EXIT_MAX_OPENS >= 30, "시한 동안 계속 누를 만큼 넉넉해야 한다"
+
+    seq = exit_core.ConfirmSequence(
+        0.0,
+        methods=("click",),
+        verify_seconds=config.EXIT_VERIFY_SECONDS,
+        settle_seconds=config.EXIT_SETTLE_SECONDS,
+        timeout_seconds=config.EXIT_TIMEOUT_SECONDS,
+        max_presses=config.EXIT_MAX_PRESSES,
+        open_delay_seconds=config.EXIT_OPEN_DELAY_SECONDS,
+        open_retry_seconds=config.EXIT_OPEN_RETRY_SECONDS,
+        max_opens=config.EXIT_MAX_OPENS,
+        first_press_delay_seconds=config.EXIT_FIRST_PRESS_DELAY_SECONDS,
+    )
+    # 확인 버튼이 안 보이는 동안 10초에 몇 번 누르나 — 예전 설정이면 2~3번뿐이었다.
+    opens = 0
+    t = 0.0
+    while t < 10.0:
+        if seq.decide(t, False).action == "open":
+            opens += 1
+        t += 0.05
+    assert opens >= 12, f"10초 동안 {opens}번밖에 안 눌렀다(연타가 아니다)"
+
+    # ⚠️ 그림이 한 번이라도 보이면 더 누르지 않는다 — 열린 메뉴를 도로 닫으면 안 된다.
+    before = opens
+    seq.decide(t, True)
+    t += 0.05
+    extra = 0
+    while t < 20.0:
+        if seq.decide(t, False).action == "open":
+            extra += 1
+        t += 0.05
+    assert extra == 0, f"확인 버튼을 본 뒤에도 {extra}번 더 열었다(토글로 닫힌다)"
+    assert before > 0
