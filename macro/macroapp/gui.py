@@ -60,7 +60,8 @@ from macroapp.config import (
     AUTO_EXIT_CLOCK_REGION, AUTO_EXIT_CLOCK_INTERVAL_SECONDS, AUTO_EXIT_CLOCK_CONSENSUS,
     AUTO_EXIT_RETRY_SECONDS, AUTO_EXIT_RETRY_RECHECK_SECONDS, AUTO_EXIT_RETRY_MAX,
     HOME_OCR_ENABLED, HOME_OCR_REGION, HOME_OCR_INTERVAL_SECONDS, HOME_OCR_VOTE_MIN,
-    AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_UNKNOWN_RESET_SECONDS, AUTO_EXIT_OCR_INTERVAL_SECONDS,
+    AUTO_EXIT_MATCH_RESET_SECONDS, AUTO_EXIT_UNKNOWN_RESET_SECONDS,
+    AUTO_EXIT_OPPONENT_REGION, AUTO_EXIT_OCR_INTERVAL_SECONDS,
     AUTO_EXIT_RATIO, AUTO_EXIT_SCORE_REGION,
     RANK_OCR_ENABLED, RANK_OCR_INTERVAL_SECONDS, RANK_OCR_CACHE_SECONDS,
     RANK_OCR_PANEL_GAP_SECONDS,
@@ -6165,7 +6166,15 @@ class AutomationApp:
             self._auto_exit_retries = 0
             self._auto_exit_retry_at = None
             self._auto_exit_done_at = None
-        kind = tracker.observe(now, reading, minute)
+        # 상대 닉네임 지문 — 판 경계의 직접 증거(바뀌면 새 판). 스코어보드가 보일
+        # 때만 나오고, 못 읽으면 None 이라 기존 경계 판정이 그대로 뒤를 받친다.
+        try:
+            opponent = auto_exit.read_opponent_fingerprint(
+                gray, AUTO_EXIT_SCORE_REGION, AUTO_EXIT_OPPONENT_REGION
+            )
+        except Exception:  # noqa: BLE001 - 판정 보조가 본체를 막으면 안 된다
+            opponent = None
+        kind = tracker.observe(now, reading, minute, opponent=opponent)
         if kind is None:
             return
 

@@ -150,6 +150,99 @@ def classify_glyph(mask, glyphs=None) -> Optional[int]:
     return best_digit
 
 
+#: 상대 닉네임 칸의 지문 크기(가로x세로 셀). 글자를 읽는 게 아니라 **같은 판인지**만
+#: 가리면 되므로 작게 잡는다 — 작을수록 렌더링 흔들림에 둔감하다.
+_OPPONENT_FINGERPRINT_SIZE = (64, 12)
+#: 두 지문이 이 거리(다른 비트 수) 이하면 같은 상대로 본다.
+#: 실측(2026-08-23 녹화 12에피소드): 같은 상대 최대 24, 다른 상대 최소 60 — 그 사이.
+OPPONENT_SAME_DISTANCE = 40
+
+
+def read_opponent_fingerprint(gray, score_region, opponent_region):
+    """상대 닉네임 칸의 지문을 돌려준다(스코어보드가 없으면 None).
+
+    **글자를 읽지 않는다.** 같은 판인지만 가리면 되므로 픽셀 밝기 패턴을 그대로 쓴다 —
+    OCR 이 필요 없고 언어에 무관하며 훨씬 빠르다.
+
+    왜 필요한가: 판 경계를 '스코어 래치 + 60초 부재 + 미상 타임아웃'이라는 **간접 신호
+    세 개**로 추정하고 있었는데, 2026-08-23 실측에서 셋 다 사고를 냈다(세션 내내 종료
+    침묵 / 같은 판 이중 계수). 상대 닉네임은 **직접 증거**다 — 바뀌면 새 판이다.
+    """
+
+    if cv2 is None or gray is None:
+        return None
+    # 인게임 스코어보드가 실제로 보일 때만 읽는다(로비·결과 화면 배제).
+    try:
+        if len(extract_score_boxes(crop_score_region(gray, score_region))) != 2:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    crop = crop_score_region(gray, opponent_region)
+    if crop is None or crop.size == 0 or crop.shape[1] < 40:
+        return None
+    small = cv2.resize(
+        crop, _OPPONENT_FINGERPRINT_SIZE, interpolation=cv2.INTER_AREA
+    ).astype("float32")
+    return (small > small.mean()).tobytes()
+
+
+def opponent_distance(a, b) -> int:
+    """지문 두 개의 다른 비트 수. 하나라도 없으면 -1(비교 불가)."""
+
+    if not a or not b or len(a) != len(b):
+        return -1
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def same_opponent(a, b) -> bool:
+    d = opponent_distance(a, b)
+    return 0 <= d <= OPPONENT_SAME_DISTANCE
+
+
+class OpponentTracker:
+    """상대 닉네임 지문을 연속 확인으로 확정하고, 바뀌면 알린다(순수 로직).
+
+    한 프레임짜리 흔들림(골 연출로 스코어보드가 잠깐 다르게 그려짐 등)을 새 판으로
+    오인하지 않도록 ``confirm_count`` 회 연속 같은 지문을 봐야 확정한다 — 실측에서
+    에피소드 안 최대 흔들림이 377bit 였는데 전부 단발이었다.
+
+    실측 튜닝(녹화 12에피소드, 상대 6번 바뀜): 연속 2회 + 임계 40 은 오탐 2건,
+    **연속 3회 + 임계 40 은 감지 6/6 · 놓침 0 · 오탐 0**. 연속 5회로 올리면 오히려
+    짧은 에피소드를 놓친다. 안전 지대의 가운데를 택했다.
+    """
+
+    def __init__(self, *, confirm_count: int = 3) -> None:
+        self.confirm_count = max(1, int(confirm_count))
+        self.confirmed = None
+        self._pending = None
+        self._streak = 0
+
+    def reset(self) -> None:
+        self.confirmed = None
+        self._pending = None
+        self._streak = 0
+
+    def observe(self, fingerprint) -> bool:
+        """지문을 하나 먹인다. **상대가 바뀌었다고 확정되면** True."""
+
+        if fingerprint is None:
+            return False
+        if self._pending is not None and same_opponent(fingerprint, self._pending):
+            self._streak += 1
+        else:
+            self._pending = fingerprint
+            self._streak = 1
+        if self._streak < self.confirm_count:
+            return False
+        if self.confirmed is None:
+            self.confirmed = self._pending
+            return False
+        if same_opponent(self._pending, self.confirmed):
+            return False
+        self.confirmed = self._pending
+        return True
+
+
 def crop_score_region(gray, region_fractions):
     """스코어보드 영역(프레임 비율 좌표)을 원본 픽셀로 잘라 준다. 너무 작으면 None.
 
@@ -376,6 +469,8 @@ class LossTracker:
         # 상태. 이때 곧바로 다시 발동하면 **같은 판을 두 번 세고 두 번 나간다**
         # (Codex 2차 의견으로 발견, 시뮬로 재현). 새 판 증거를 볼 때까지 침묵한다.
         self._epoch_pending = False
+        # 상대 닉네임 지문 추적기 — 판 경계의 직접 증거.
+        self._opponents = OpponentTracker()
         # 이 경기에서 본 '상대−나'의 최솟값. 선행 스코어 방어의 근거다: 어떤 규칙이든
         # **그 규칙의 점차보다 나은 스코어**를 먼저 봤어야 확정한다. 예전의 '규칙에 안
         # 걸린 스코어를 봤나'는 late(1점차) 에서 같은 (0,1) 픽셀이 선행 증거이자 판정
@@ -470,7 +565,13 @@ class LossTracker:
         self._last_score_at = None
         self._epoch_pending = not confirmed
 
-    def observe(self, now: float, reading: Reading, minute: Optional[int] = None) -> Optional[str]:
+    def observe(
+        self,
+        now: float,
+        reading: Reading,
+        minute: Optional[int] = None,
+        opponent=None,
+    ) -> Optional[str]:
         """feed 와 같되 확정 종류(KIND_*)를 돌려준다. 확정이 아니면 None.
 
         경기당 래치가 둘이다: 쿼터 규칙(base/late)은 **한 번만** 확정되고(둘 다 같은
@@ -481,6 +582,14 @@ class LossTracker:
         """
 
         now = float(now)
+
+        # ── 판 경계: 상대가 바뀌면 새 판이다(가장 확실한 직접 증거) ──────────────
+        # 스코어 래치·60초 부재·미상 타임아웃은 전부 '경기가 계속되는 것 같다'는 간접
+        # 추정이라, 로비 화면이 미상으로 읽히거나 6~9 득점으로 오래 미상이면 무너진다
+        # (2026-08-23 실측: 세션 내내 종료 침묵 / 같은 판 이중 계수). 닉네임이 바뀌면
+        # 의심의 여지 없이 새 판이므로 즉시·확정적으로 판을 넘긴다.
+        if opponent is not None and self._opponents.observe(opponent):
+            self._end_match(confirmed=True)
 
         if reading is None:
             # 계속 안 보이면 경기가 끝난 것이다 → 다음 경기를 셀 수 있게 푼다.

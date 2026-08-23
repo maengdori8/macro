@@ -843,3 +843,95 @@ def test_a_genuine_new_match_still_fires_after_an_unknown_timeout() -> None:
         tracker.observe(clock[0], SCORE_UNKNOWN, None)
     _play(tracker, (0, 0), 40, clock=clock)          # 새 판 증거(킥오프)
     assert _play(tracker, (0, 2), 40, clock=clock), "새 판이 발동하지 않았다"
+
+
+# ─── 상대 닉네임으로 판 경계 판정 (사용자 제안, 2026-08-23) ───────────────────
+#
+# 기존 판 경계는 '스코어 래치 + 60초 부재 + 미상 타임아웃'이라는 간접 추정 셋이었고,
+# 실측에서 셋 다 사고를 냈다(세션 내내 종료 침묵 / 같은 판 이중 계수).
+# 상대 닉네임은 직접 증거다 — 바뀌면 새 판이다. 글자를 읽지 않고 픽셀 지문만 비교한다.
+
+
+def _fp(seed: int, size: int = 96) -> bytes:
+    """테스트용 가짜 지문 — 같은 seed 면 같은 상대."""
+    import random
+
+    rnd = random.Random(seed)
+    return bytes(rnd.getrandbits(1) for _ in range(size))
+
+
+def test_opponent_tracker_needs_consensus_before_declaring_a_new_match() -> None:
+    """한 프레임짜리 흔들림(골 연출 등)을 새 판으로 오인하면 안 된다.
+
+    실측: 에피소드 안 최대 흔들림이 377bit 였는데 전부 단발이었다. 연속 3회 확인이면
+    감지 6/6 · 놓침 0 · 오탐 0(녹화 12에피소드).
+    """
+
+    from macroapp.auto_exit import OpponentTracker
+
+    tracker = OpponentTracker(confirm_count=3)
+    a, b = _fp(1), _fp(2)
+    for _ in range(3):
+        assert tracker.observe(a) is False, "첫 상대 확정은 '바뀜'이 아니다"
+    # 단발 흔들림 두 번 — 아직 확정 못 한다.
+    assert tracker.observe(b) is False
+    assert tracker.observe(a) is False
+    # 진짜로 상대가 바뀌면 연속 확인 뒤 True.
+    assert tracker.observe(b) is False
+    assert tracker.observe(b) is False
+    assert tracker.observe(b) is True
+    # 같은 상대가 계속되면 더는 안 알린다.
+    assert tracker.observe(b) is False
+
+
+def test_opponent_change_ends_the_match_immediately() -> None:
+    """상대가 바뀌면 스코어·시간과 무관하게 즉시 새 판으로 넘어간다."""
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    a, b = _fp(11), _fp(22)
+
+    def play(reading, seconds, opponent):
+        fired = []
+        for _ in range(int(seconds)):
+            clock[0] += 1.0
+            kind = tracker.observe(clock[0], reading, None, opponent=opponent)
+            if kind:
+                fired.append(kind)
+        return fired
+
+    play((0, 0), 10, a)
+    assert play((0, 2), 30, a), "1판이 발동해야 한다"
+    assert tracker.latched
+    # 상대가 바뀌었다 = 새 판. 부재 60초를 기다리지 않아도 즉시 풀려야 한다.
+    play((0, 0), 5, b)
+    assert not tracker.latched, "상대가 바뀌었는데 판이 안 넘어갔다"
+    assert play((0, 2), 30, b), "새 판이 발동하지 않았다"
+
+
+def test_same_opponent_never_ends_the_match() -> None:
+    """상대가 그대로면 스코어가 어떻든 같은 판이다(이중 계수 금지)."""
+
+    tracker = LossTracker(rules=_rules_100())
+    clock = [0.0]
+    a = _fp(7)
+    fired = []
+    for reading in ((0, 0), (0, 2), (1, 2), (1, 3), (2, 3)):
+        for _ in range(20):
+            clock[0] += 1.0
+            kind = tracker.observe(clock[0], reading, None, opponent=a)
+            if kind:
+                fired.append(kind)
+    assert len(fired) == 1, f"같은 판인데 {len(fired)}번 발동했다"
+
+
+def test_fingerprint_comparison_pins_the_measured_threshold() -> None:
+    """실측 분리값: 같은 상대 최대 24, 다른 상대 최소 60 — 임계는 그 사이여야 한다."""
+
+    from macroapp import auto_exit
+
+    assert 24 < auto_exit.OPPONENT_SAME_DISTANCE < 60
+    a = _fp(3)
+    assert auto_exit.same_opponent(a, a)
+    assert auto_exit.opponent_distance(a, None) == -1
+    assert auto_exit.same_opponent(a, None) is False
