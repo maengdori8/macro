@@ -166,6 +166,42 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
   **지원 가능한 방법이 없다**. 다만 "모든 유저모드 가능성이 0"이 증명된 것은 아니다.
   DirectInput `DISCL_FOREGROUND` 장치의 acquired 상태는 **게임 프로세스의 객체**라
   외부에서 바꾸는 지원 API가 없고, 활성 메시지는 실제 foreground 를 위조하지 못한다.
+  ⑧ **진짜 지렛대는 봉쇄였다 — 실험이 작동하는 템플릿 경로를 106초 굶겼다(6각도 워크플로 확정).**
+  `_strict_skip_quiet_seconds()` = 3.0+1.5+0.4+0.3 = **5.20초** 이고, 이 값이 프롬프트가
+  보이는 **모든** 패스에서(입력이 0인 패스에서도) `_skip_active_until` 에 다시 얹힌다.
+  메인 루프는 그동안 타겟 매칭을 통째로 건너뛴다. 실측: 8-23 15:06:26 첫 `감지(S)` 이후
+  다음 `[감지]` 가 **15:08:12** — 106초 동안 타겟 감지 0건(SKIP 도 못 넘기고 일반 자동화도
+  정지). 그리고 봉쇄가 풀린 15:08:12 에 **`target_E` 가 뜨자마자 `[키] S` 를 눌렀고 프롬프트가
+  끝났다.** `targets.json` 의 target_E 는 바로 그 `[S]` 키캡 템플릿이고 key="s" 인데
+  `KEY_TO_GAMEPAD["s"] == KEY_TO_GAMEPAD["a"] == 4096` 이라 **결국 게임패드 A** 다.
+  → 답을 아는 경로가 이미 있었는데 실험이 그 앞을 막고 있었던 것이다.
+  **수정:** `SKIP_S_EXPERIMENT_EVERY=5` — 5번에 1번만 실험 에피소드로 양보하고 나머지는
+  전면·배경 **모두 직행**(배경은 패드만; SendInput 키보드 S 는 전면일 때만 — 배경에서
+  보내면 다른 앱으로 유출된다). 2026-08-22 교훈의 세 번째 적용.
+  ⑨ **⚠️ `_advance_past` 만으로는 굶주림이 안 고쳐진다(내 1차 수정이 실효 0이었다).**
+  `self.index` 는 `SkipExperimentTracker` 에서 **설정(359행)·변경(656행)만 되고 한 번도
+  읽히지 않는다** — 실제 선택은 `_select_explore` 의 `attempt_counts`/family 기준이다.
+  그런데 defer 는 `_record_final`(attempt_counts 증가의 유일한 지점)을 안 타므로 카운트가
+  0에 고정돼 매번 같은 후보가 최소값으로 뽑힌다. 항상 defer 하는 가드로 200회 돌린 재현:
+  **200회 모두 동일 후보**. → 실제 수정은 (a) defer 시 `selected_candidate` 캐시를 비우고
+  (b) `deferral_counts` 를 `_select_explore` 의 정렬 키에 넣는 것. 수정 후 같은 재현에서
+  **66종**이 돌았다. 교훈: '순서 상태'를 고칠 땐 그 값을 **읽는 쪽**을 먼저 찾아라.
+  ⑪ **사다리 순서가 거꾸로였다 — 키보드 S 를 첫 발부터 보낸다.**
+  2026-07-02 실측 원문: "가상 A는 탭·1s 홀드 **모두 무시**, 클릭 무효, **전면전환+키보드
+  s '탭'은 통함**". 즉 전면에서 성공이 기록된 유일한 입력은 **키보드 s 탭**이고 패드 A 는
+  무시됐다. 오늘 사용자 진술도 같은 말이다. 그런데 내 1차 사다리는 첫 1.2초(≈4발)를
+  '무시된다고 기록된' 패드 A 로만 쓰고 키보드 S 를 4번째 발부터 냈다 —
+  `SKIP_FOREGROUND_KEY_AFTER_SECONDS = 1.2 → **0.0**`. 반대 증거(07-07 "A 홀드+알트탭")도
+  있으므로 A 를 빼지 않고 **같은 패스에 둘 다** 보낸다.
+  또 재누름을 '횟수'가 아니라 '시간'으로 끊는다: 옛 값(24회×0.35초=8.4초)은 실측 116초
+  정체의 **7%** 밖에 못 덮었다 → 0~3초 0.35초 간격, 그 뒤 1초 간격, 상한 90초.
+  ⑩ 같이 확정된 것(수정은 아직): (a) `variant="s"` 분류는 정확하다 — 증거 52장 전부
+  target_E 0.943~0.955 로 `[S]` 키캡이고 ▷/ESC/(A) 교차 오분류 0건. (b) 원장의 `prompt_visual`
+  은 에피소드 시작 때 한 번만 만들어져 그 에피소드의 모든 행이 재사용한다 → **variant=s 의
+  n 은 549행이 아니라 서로 다른 파일 52개**다. (c) `prompt_hint="escape_highlight"` 442행 중
+  241행(55%)은 ESC 가 아니라 `▷ SKIP` 화면이다 — gui.py 의 승격 규칙이 `_skip_prompt_center`
+  가 있기만 하면 힌트를 escape 로 올리기 때문. 최소한 원장에 `esc_icon_score` 를 같이 적어야
+  사후 판별이 된다.
 
 - `2026-08-23` **배경 컷신 스킵 최종 봉인(H0 반증) + 진짜 지렛대는 가동률이었다.**
   사용자 "완전 근본적으로 해결 방안 생각좀" → 5관점 워크플로(웹·설치폴더·원장·코드·Codex).
@@ -307,7 +343,14 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
   일치(인게임 계층이 포커스 게이트). customoptions.ini 에 배경 입력 옵션 없음. 안티치트
   (BlackCipher/NGM) 동작 중.
   ⑤ **5각도 리서치 워크플로(웹+코드, 22건→3가설+5개선) 결론:** 유저모드 배경 스킵 가능성
-  **5~10%**. 확정 사실: `fczf.exe` 임포트는 DINPUT8+XINPUT9_1_0 뿐(RawInput 없음), 키보드 S 는
+  **5~10%**. ⚠️ **아래 '확정 사실' 은 2026-09-06 에 반증됐다 — `fczf.exe` 는 Themida
+  패킹이라(`.themida` vsize 9.6MB/raw 0, 진입점은 `.boot`, DLL 45개 전부 임포트 함수
+  1개씩, USER32 는 EmptyClipboard 하나) 임포트 테이블도 문자열도 원본이 아니다.
+  'RegisterRawInputDevices 0회' 와 나란히 'buttonData 0회'·'customoptions 0회' 도
+  나오는데 게임은 그 ini 들을 실제로 읽는다 → 0회는 '안 쓴다'가 아니라 '암호화됐다'는
+  뜻이다. 입력 API 계층은 파일로 판별 불가하며, 배경 s 계열이 sham 과 같았던 이유를
+  'DirectInput unacquire' 로 설명한 것은 근거 없는 추정이다.** (원문 보존:) 확정 사실:
+  `fczf.exe` 임포트는 DINPUT8+XINPUT9_1_0 뿐(RawInput 없음), 키보드 S 는
   DirectInput 스캔코드(SC_S→VB_AI_A) 인데 DISCL_FOREGROUND 라 배경에서 키보드 장치가
   unacquire 된다 → 's 메시지' 계열(pm_s/char_s/attach_state_s/attach_post_s…)이 전부 sham 과
   같았던 이유가 '메시지 무시'가 아니라 '장치 자체가 죽음'이다. 남은 유일한 미검증 지렛대 =

@@ -468,14 +468,36 @@ SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-ski
 # '비활성 100%'·'깜빡임 0' 불변식과 무관하다.
 SKIP_FOREGROUND_DIRECT = True
 SKIP_FOREGROUND_REPRESS_SECONDS = 0.35    # 안 사라지면 이 간격으로 재누름
-SKIP_FOREGROUND_KEY_AFTER_SECONDS = 1.2   # 이만큼 버티면 키보드 S 스캔코드까지 같이
+# ⚠️ **0.0 = 첫 발부터 키보드 S 를 패드 A 와 같이 보낸다.** 순서가 거꾸로였다:
+# CLAUDE.md 2026-07-02 실측 원문이 "가상 A는 탭·1s 홀드 **모두 무시**, 클릭 무효,
+# **전면전환+키보드 s '탭'은 통함**" 이다. 즉 전면에서 성공이 기록된 유일한 입력은
+# 키보드 s 탭이고 패드 A 는 무시됐다. 2026-09-06 사용자 진술도 같은 말이다.
+# 그런데 사다리가 처음 1.2초(≈4발)를 '무시된다고 기록된' 패드 A 로만 썼다.
+# 반대 증거(07-07 "A 홀드+알트탭")도 있으므로 A 를 빼지 않고 **같은 패스에 둘 다** 보낸다.
+SKIP_FOREGROUND_KEY_AFTER_SECONDS = 0.0
 SKIP_FOREGROUND_HOLD_AFTER_SECONDS = 2.6  # 그래도 안 되면 A·S 홀드(마지막 폴백)
 SKIP_FOREGROUND_HOLD_SECONDS = 0.5        # 그때의 홀드 길이
-SKIP_FOREGROUND_MAX_PRESSES = 24          # 한 컷신에서 최대 이만큼(무한 연타 금지)
+# 재누름은 '횟수'가 아니라 '시간'으로 끊는다. 옛 값(24회 × 0.35초 = 8.4초)은 실측한
+# 116초 정체의 7% 밖에 못 덮었다. 3초까지는 촘촘히(0.35초), 그 뒤로는 1초 간격으로
+# 90초까지 — 컷신 지속 중앙값 13초·최대 40초(08-22 실측)를 두 배 넘게 덮는다.
+SKIP_FOREGROUND_MAX_PRESSES = 120
+SKIP_FOREGROUND_SLOW_AFTER_SECONDS = 3.0  # 이후로는 재누름 간격을 늘린다
+SKIP_FOREGROUND_SLOW_REPRESS_SECONDS = 1.0
+SKIP_FOREGROUND_MAX_EPISODE_SECONDS = 90.0  # 이걸 넘으면 컷신이 아니라 화면 정지다
 # SendInput 키보드 S 승격. SendInput 은 전역이라 전면 창으로만 가는데, 그 전면 창이
 # 게임 자신이므로 '다른 앱 유출'이 성립하지 않는다(유출 금지 불변식은 지켜진다).
 # 그래도 보내는 동안 포그라운드를 계속 확인해 바뀌면 즉시 키를 뗀다.
 SKIP_FOREGROUND_KEY_ENABLED = True
+
+# ── 실험 vs 직행 배분 ──
+# 컷신 `[S] SKIP` 의 '무엇을 누르나' 는 이미 답이 있다(A = target_E 가 누르는 그 버튼).
+# 아직 못 푼 건 '배경에서 어떻게 전달하나' 뿐이다. 그런데 실험은 매 컷신마다 3초 무입력
+# 대조 + 5.2초 매칭 봉쇄를 요구해서, **답을 아는 경로(target_E 템플릿)까지 굶긴다**.
+# 실측 2026-08-23: 15:06:26~15:08:12 **106초 동안 타겟 감지 0건** — SKIP 도 못 넘기고
+# 일반 자동화도 멈췄다. 봉쇄가 풀린 15:08:12 에 target_E 가 뜨자마자 프롬프트가 끝났다.
+# → N 번에 1번만 실험 에피소드로 양보하고 나머지는 직행한다(0 이면 실험 완전히 끔).
+# 2026-08-22 교훈의 재적용: "실험은 답을 모르는 형태에만 붙인다."
+SKIP_S_EXPERIMENT_EVERY = 5
 SKIP_FOREGROUND_KEY_HOLD_SECONDS = 0.06
 # 완전 비활성 실험 모드. 후보 입력 동안 별도 감시 스레드가 전면 HWND를 연속 확인하고,
 # 대상 게임 HWND가 한 번이라도 전면이 된 후보만 해당 세션에서 즉시 격리합니다.

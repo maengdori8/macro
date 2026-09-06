@@ -132,7 +132,8 @@ def test_게임이_전면이면_실험_없이_A_를_바로_누른다() -> None:
     assert app._skip_foreground_direct is True
     assert app._skip_kind == "a"
     assert any(
-        "[SKIP 전면]" in str(call.args[0]) for call in app.queue_log.call_args_list
+        "[SKIP 직행] 전면" in str(call.args[0])
+        for call in app.queue_log.call_args_list
     )
 
 
@@ -146,8 +147,11 @@ def test_전면_직행은_긴_봉쇄를_걸지_않는다() -> None:
     assert app._skip_active_until - time.monotonic() <= 0.5
 
 
-def test_게임이_배경이면_기존_실험_경로가_돈다() -> None:
+def test_실험_몫_에피소드는_배경에서_기존_실험_경로가_돈다() -> None:
+    """N 번에 1번은 실험에 양보한다 — 배경 전달 가설을 계속 검증해야 하기 때문."""
     app = _app()
+    # 다음 에피소드가 실험 차례가 되도록 일련번호를 맞춘다.
+    app._skip_ap_episode_index = config.SKIP_S_EXPERIMENT_EVERY - 1
     manager = SimpleNamespace(hwnd=GAME_HWND)
     p = _patches(foreground_hwnd=999999)   # 다른 창이 전면
     with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8]:
@@ -155,22 +159,54 @@ def test_게임이_배경이면_기존_실험_경로가_돈다() -> None:
         gamepad.assert_not_called()
 
     assert app._skip_foreground_direct is False
-    # 배경에서는 실험이 후보를 고른다(기존 동작 유지).
+    assert app._skip_episode_is_direct is False
     app._skip_experiment.choose.assert_called_once()
 
 
-def test_오래_버티면_키보드_S_까지_보낸다() -> None:
+def test_직행_몫_에피소드는_배경에서도_A_를_누른다() -> None:
+    """실험 봉쇄가 작동하는 경로(target_E)까지 굶기던 것이 근본 문제였다."""
+    app = _app()
+    manager = SimpleNamespace(hwnd=GAME_HWND)
+    p = _patches(foreground_hwnd=999999)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
+        assert app._try_skip(_screen(), manager) is True
+        gamepad.assert_called_once_with(4096, config.SKIP_A_TAP_SECONDS)
+        # ⚠️ 배경에서는 키보드 S(SendInput)를 절대 보내지 않는다 — 다른 앱 유출.
+        send_key.assert_not_called()
+
+    assert app._skip_episode_is_direct is True
+    app._skip_experiment.choose.assert_not_called()
+    assert any(
+        "[SKIP 직행] 배경" in str(call.args[0])
+        for call in app.queue_log.call_args_list
+    )
+
+
+def test_배경에서_오래_버텨도_키보드_S_는_안_나간다() -> None:
+    app = _app()
+    manager = SimpleNamespace(hwnd=GAME_HWND)
+    p = _patches(foreground_hwnd=999999)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8] as send_key:
+        app._try_skip(_screen(), manager)
+        app._skip_foreground_policy.first_seen_at = (
+            time.monotonic() - config.SKIP_FOREGROUND_HOLD_AFTER_SECONDS - 1.0
+        )
+        app._try_skip(_screen(), manager)
+        send_key.assert_not_called()
+
+
+def test_전면이면_첫_발부터_키보드_S_를_같이_보낸다() -> None:
+    """2026-07-02 실측: 전면에서 통한 유일한 입력이 키보드 s '탭' 이었다.
+
+    패드 A 는 "탭·1s 홀드 모두 무시" 로 기록돼 있다. 그러니 키보드 S 를 뒤로 미루면
+    안 된다 — 첫 발에 둘 다 보낸다.
+    """
     app = _app()
     manager = SimpleNamespace(hwnd=GAME_HWND)
     p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8] as send_key:
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
         app._try_skip(_screen(), manager)
-        send_key.assert_not_called()
-        # 프롬프트가 승격 시간 넘게 버틴 상황을 만든다.
-        app._skip_foreground_policy.first_seen_at = (
-            time.monotonic() - config.SKIP_FOREGROUND_KEY_AFTER_SECONDS - 1.0
-        )
-        app._try_skip(_screen(), manager)
+        gamepad.assert_called_once_with(4096, config.SKIP_A_TAP_SECONDS)
         send_key.assert_called_once()
         assert send_key.call_args.args[0] == GAME_HWND
         assert send_key.call_args.args[1] == gui.input_message.SCAN_S
@@ -205,7 +241,7 @@ def test_프롬프트가_사라지면_직행_상태가_정리된다() -> None:
     # 전면 입력이 배경 후보의 성공으로 귀속되면 안 된다.
     app._report_skip_experiment_outcome.assert_not_called()
     assert any(
-        "[SKIP 전면] 소멸" in str(call.args[0])
+        "[SKIP 직행] 소멸" in str(call.args[0])
         for call in app.queue_log.call_args_list
     )
 
@@ -213,8 +249,12 @@ def test_프롬프트가_사라지면_직행_상태가_정리된다() -> None:
 def test_설정_기본값_고정() -> None:
     assert config.SKIP_FOREGROUND_DIRECT is True
     assert 0.1 <= config.SKIP_FOREGROUND_REPRESS_SECONDS <= 1.0
-    assert 0.5 <= config.SKIP_FOREGROUND_KEY_AFTER_SECONDS <= 3.0
-    assert 5 <= config.SKIP_FOREGROUND_MAX_PRESSES <= 60
+    # 0.0 = 첫 발부터 키보드 S. 이 값을 올리면 07-02 실측이 "통한다"고 기록한
+    # 유일한 입력을 다시 뒤로 미루는 것이라 회귀다.
+    assert config.SKIP_FOREGROUND_KEY_AFTER_SECONDS == 0.0
+    assert config.SKIP_FOREGROUND_MAX_PRESSES >= 60
+    assert config.SKIP_FOREGROUND_MAX_EPISODE_SECONDS >= 40.0
+    assert 0 < config.SKIP_S_EXPERIMENT_EVERY <= 20
 
 
 def test_일반_프롬프트도_전면이면_START_직행() -> None:
@@ -258,12 +298,15 @@ def test_전면에서_누른_뒤_배경이_돼도_실험에_넘기지_않는다(
     assert app._skip_foreground_direct is True
 
     # 컷신 도중 사용자가 다른 창을 눌러 게임이 배경이 됐다.
+    app._skip_episode_is_direct = False      # 실험 몫이었다고 가정(최악의 경우)
     bg = _patches(foreground_hwnd=999999)
     with bg[0], bg[1], bg[2], bg[3], bg[4], bg[5], bg[6] as gamepad, bg[7], bg[8]:
         assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_not_called()          # 배경에서는 안 누른다
+        gamepad.assert_not_called()          # 실험 몫이라 배경에서는 안 누른다
 
     # 이 에피소드는 끝까지 직행 소유 — 실험이 후보를 고르지 않는다.
+    # (전면에서 누른 A 로 사라진 컷신이 배경 후보의 '성공' 으로 귀속되면 가짜 승자를
+    #  학습한다.)
     app._skip_experiment.choose.assert_not_called()
     app._skip_s_experiment.choose.assert_not_called()
 
@@ -274,11 +317,50 @@ def test_아주_오래_버티면_홀드로_승격한다() -> None:
     p = _patches(foreground_hwnd=GAME_HWND)
     with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
         app._try_skip(_screen(), manager)
-        app._skip_foreground_policy.first_seen_at = (
-            time.monotonic() - config.SKIP_FOREGROUND_HOLD_AFTER_SECONDS - 1.0
+        # 홀드 승격 시각을 넘기고, 저속 재누름 간격도 지난 상태로 만든다.
+        policy = app._skip_foreground_policy
+        policy.first_seen_at = (
+            time.monotonic() - config.SKIP_FOREGROUND_HOLD_AFTER_SECONDS - 5.0
+        )
+        policy.last_press_at = (
+            time.monotonic() - config.SKIP_FOREGROUND_SLOW_REPRESS_SECONDS - 1.0
         )
         app._try_skip(_screen(), manager)
 
     # 마지막 패드 입력은 탭이 아니라 홀드 길이여야 한다.
     assert gamepad.call_args.args[1] == config.SKIP_FOREGROUND_HOLD_SECONDS
     assert send_key.call_args.args[2] == config.SKIP_FOREGROUND_HOLD_SECONDS
+
+
+def test_보류된_패스는_5초_봉쇄를_걸지_않는다() -> None:
+    """입력이 0인 패스에서 5.2초를 얹으면 답을 아는 템플릿 경로까지 굶는다.
+
+    실측 2026-08-23: 15:06:26~15:08:12 **106초 동안 타겟 감지 0건**. 봉쇄가 풀린
+    순간 target_E([S] 키캡 → 패드 A)가 눌러 프롬프트가 끝났다.
+    """
+    from macroapp.skip_experiment import GuardedActionResult, SkipOutcome
+
+    app = _app()
+    app._skip_ap_episode_index = config.SKIP_S_EXPERIMENT_EVERY - 1  # 실험 몫
+    manager = SimpleNamespace(hwnd=GAME_HWND)
+    deferred = GuardedActionResult(
+        attempted=False, action_ok=False, foreground_before=GAME_HWND,
+        foreground_after=GAME_HWND, foreground_samples=(GAME_HWND,),
+        invariant_ok=False, reason="target_already_foreground", elapsed_seconds=0.0,
+    )
+    app._skip_s_experiment.choose = Mock(return_value=("attach_char_s", None))
+    app._skip_s_experiment.record_attempt = Mock(
+        return_value=SkipOutcome("deferred", "attach_char_s", detail="target_already_foreground")
+    )
+    app._skip_experiment.choose = Mock(return_value=("attach_char_s", None))
+    app._skip_experiment.record_attempt = app._skip_s_experiment.record_attempt
+
+    p = _patches(foreground_hwnd=999999)
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], \
+        patch.object(gui, "run_guarded_inactive_action", return_value=deferred):
+        assert app._try_skip(_screen(), manager) is True
+
+    remaining = app._skip_active_until - time.monotonic()
+    assert remaining <= 1.0, (
+        f"보류 패스가 {remaining:.2f}초를 봉쇄했다 — 템플릿 재시도가 굶는다"
+    )

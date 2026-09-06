@@ -19,9 +19,16 @@ from macroapp.skip_foreground import (
 
 
 def test_전면이면_첫_프레임에_바로_누른다():
+    """⚠️ 기본값은 **첫 발부터 패드 A + 키보드 S 를 같이** 보낸다.
+
+    2026-07-02 실측: "가상 A는 탭·1s 홀드 모두 무시, 전면전환+키보드 s '탭'은 통함".
+    전면에서 성공이 기록된 유일한 입력이 키보드 S 탭이므로 그걸 뒤로 미루면 안 된다.
+    """
     policy = ForegroundSkipPolicy()
-    assert policy.observe(100.0, True, True) == ACTION_PAD
+    assert policy.key_escalation_seconds == 0.0
+    assert policy.observe(100.0, True, True) == ACTION_PAD_AND_KEY
     assert policy.presses == 1
+    assert policy.key_presses == 1
 
 
 def test_배경이면_누르지_않는다():
@@ -37,7 +44,7 @@ def test_프롬프트가_없으면_아무것도_안_한다():
 
 
 def test_재누름_간격_안에서는_다시_누르지_않는다():
-    policy = ForegroundSkipPolicy(repress_seconds=0.35)
+    policy = ForegroundSkipPolicy(repress_seconds=0.35, key_escalation_seconds=99.0)
     assert policy.observe(100.0, True, True) == ACTION_PAD
     assert policy.observe(100.2, True, True) == ACTION_NONE
     assert policy.observe(100.36, True, True) == ACTION_PAD
@@ -72,7 +79,7 @@ def test_배경_구간은_경과시간을_리셋하지_않는다():
 
 
 def test_프롬프트가_사라지면_에피소드가_닫힌다():
-    policy = ForegroundSkipPolicy(repress_seconds=0.0)
+    policy = ForegroundSkipPolicy(repress_seconds=0.0, key_escalation_seconds=99.0)
     policy.observe(0.0, True, True)
     policy.observe(0.1, True, True)
     assert policy.presses == 2
@@ -119,3 +126,33 @@ def test_홀드까지_사다리로_승격한다():
     assert policy.key_presses == 2
     policy.reset()
     assert policy.hold_presses == 0
+
+
+def test_오래_버티면_재누름_간격이_늘어난다():
+    """옛 값(24회 × 0.35초 = 8.4초)은 실측 116초 정체의 7%밖에 못 덮었다."""
+    policy = ForegroundSkipPolicy(
+        repress_seconds=0.35,
+        slow_repress_after_seconds=3.0,
+        slow_repress_seconds=1.0,
+        key_escalation_seconds=99.0,
+        hold_escalation_seconds=99.0,
+    )
+    t = 0.0
+    presses = 0
+    while t <= 60.0:
+        if policy.observe(t, True, True) != ACTION_NONE:
+            presses += 1
+        t += 0.3
+    # 0~3초는 촘촘히(≈9발), 3~60초는 1초 간격(≈57발)
+    # 0.3초 샘플링이라 1.0초 간격은 실효 1.2초가 된다.
+    assert 45 <= presses <= 72, presses
+
+
+def test_시간_상한을_넘으면_멈춘다():
+    policy = ForegroundSkipPolicy(
+        repress_seconds=0.0, max_episode_seconds=10.0, key_escalation_seconds=99.0
+    )
+    assert policy.observe(0.0, True, True) != ACTION_NONE
+    assert policy.observe(9.9, True, True) != ACTION_NONE
+    assert policy.observe(10.0, True, True) == ACTION_NONE
+    assert policy.observe(30.0, True, True) == ACTION_NONE

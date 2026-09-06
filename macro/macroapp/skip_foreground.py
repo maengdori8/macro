@@ -35,7 +35,9 @@
   "홀드 아니고 그냥 탭"이라고 했지만(2026-09-06), 2026-07-12 메모는 "전면에서 A
   홀드로 넘어감"이었다. 둘이 엇갈리므로 탭을 먼저 충분히 쓰고 안 되면 홀드도
   시도한다 — 사다리라서 어느 쪽이 맞아도 결국 넘어간다.
-- `max_presses` 를 넘으면 이 에피소드는 포기한다. 안 되는 화면을 무한 연타하면
+- 3초까지는 촘촘히(`repress_seconds`), 그 뒤로는 `slow_repress_seconds` 간격으로 늦춘다.
+  옛 값(24회 × 0.35초 = 8.4초)은 실측한 116초 정체의 7%밖에 못 덮었다.
+- `max_episode_seconds` 를 넘으면 이 에피소드는 포기한다. 안 되는 화면을 무한 연타하면
   다음 화면까지 눌러 버린다.
 
 전면 상태에서만 동작하므로 "비활성 100%"·"깜빡임 0" 불변식과 무관하다 —
@@ -59,9 +61,12 @@ class ForegroundSkipPolicy:
     """전면 상태에서 컷신 프롬프트를 넘기는 재누름 정책."""
 
     repress_seconds: float = 0.35
-    key_escalation_seconds: float = 1.2
+    slow_repress_after_seconds: float = 3.0
+    slow_repress_seconds: float = 1.0
+    key_escalation_seconds: float = 0.0
     hold_escalation_seconds: float = 2.6
-    max_presses: int = 24
+    max_presses: int = 120
+    max_episode_seconds: float = 90.0
 
     first_seen_at: Optional[float] = field(default=None, init=False)
     last_press_at: Optional[float] = field(default=None, init=False)
@@ -112,14 +117,19 @@ class ForegroundSkipPolicy:
             return ACTION_NONE
         if self.presses >= self.max_presses:
             return ACTION_NONE
-        if (
-            self.last_press_at is not None
-            and now - self.last_press_at < self.repress_seconds
-        ):
+        elapsed = self.elapsed(now)
+        if self.max_episode_seconds > 0 and elapsed >= self.max_episode_seconds:
+            # 이 정도로 안 사라지면 컷신이 아니라 화면 정지다. 계속 쏘지 않는다.
+            return ACTION_NONE
+        gap = (
+            self.slow_repress_seconds
+            if elapsed >= self.slow_repress_after_seconds
+            else self.repress_seconds
+        )
+        if self.last_press_at is not None and now - self.last_press_at < gap:
             return ACTION_NONE
         self.presses += 1
         self.last_press_at = now
-        elapsed = self.elapsed(now)
         if elapsed >= self.hold_escalation_seconds:
             self.key_presses += 1
             self.hold_presses += 1

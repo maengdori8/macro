@@ -448,6 +448,10 @@ class SkipExperimentTracker:
                 key=lambda name: (
                     self._family_attempts(self.candidate_families[name]),
                     self.attempt_counts.get(name, 0),
+                    # 시도조차 못 한(defer) 후보는 뒤로 민다. 안 그러면 defer 를 유발한
+                    # 조건이 계속되는 동안 attempt_counts 가 0으로 고정돼 **같은 후보가
+                    # 영원히** 뽑힌다(2026-08-23: 한 컷신에서 432회 연속).
+                    self.deferral_counts.get(name, 0),
                     family_rank[self.candidate_families[name]],
                     self.candidates.index(name),
                 ),
@@ -468,6 +472,8 @@ class SkipExperimentTracker:
             family_candidates,
             key=lambda name: (
                 self.attempt_counts.get(name, 0),
+                # under_sampled 와 같은 이유 — defer 한 후보는 뒤로 민다.
+                self.deferral_counts.get(name, 0),
                 self.candidates.index(name),
             ),
         )
@@ -767,6 +773,15 @@ class SkipExperimentTracker:
             self.deferral_counts[candidate] = (
                 self.deferral_counts.get(candidate, 0) + 1
             )
+            # ⚠️ `_advance_past` 만으로는 **안 고쳐진다**. self.index 는 이 클래스에서
+            # 설정(359행)·변경(656행)만 되고 **한 번도 읽히지 않는다** — 실제 선택은
+            # `_select_explore` 의 attempt_counts/family 기준이다. 그리고 defer 는
+            # `_record_final`(attempt_counts 증가의 유일한 지점)을 안 타므로 카운트가
+            # 영원히 0이라 매번 같은 후보가 최소값으로 뽑힌다. 실측 재현: 항상 defer 하는
+            # 가드로 200회 돌리면 200회 모두 동일 후보였다.
+            # → (a) 에피소드 캐시를 비워 다음 차례에 다시 고르게 하고
+            #   (b) deferral_counts 를 선택 키에 넣어 defer 한 후보가 뒤로 밀리게 한다.
+            self.selected_candidate = None
             self._advance_past(candidate)
             return SkipOutcome("deferred", candidate, detail=guard.reason)
         self.attempted_this_episode = True

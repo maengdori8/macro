@@ -102,3 +102,46 @@ def test_대조군은_defer_해도_스윕_인덱스를_안_옮긴다() -> None:
     before = exp.index
     exp.record_attempt("control_noop", 10.0, _deferred_guard())
     assert exp.index == before
+
+
+def test_defer_가_반복되면_실제_선택도_회전한다() -> None:
+    """⚠️ `_advance_past`(self.index) 만으로는 **안 고쳐진다**.
+
+    self.index 는 이 클래스에서 설정·변경만 되고 **한 번도 읽히지 않는다** — 실제 선택은
+    `_select_explore` 의 attempt_counts/family 기준이다. 그리고 defer 는 attempt_counts
+    증가 지점(`_record_final`)을 안 타므로 카운트가 0에 고정돼 매번 같은 후보가 뽑힌다.
+    (수정 전 재현: 항상 defer 하는 가드로 200회 → 200회 모두 동일 후보.)
+
+    이 테스트는 실제 선택 경로(choose)가 회전하는지를 본다.
+    """
+    from macroapp import config, skip_candidates
+
+    exp = SkipExperimentTracker(
+        skip_candidates.SKIP_S_CANDIDATES,
+        result_window_seconds=config.SKIP_EXPERIMENT_RESULT_WINDOW_SECONDS,
+        attempt_gap_seconds=0.0,
+        confirm_successes=config.SKIP_EXPERIMENT_CONFIRM_SUCCESSES,
+        control_seconds=0.0,
+        sham_candidate=config.SKIP_SHAM_CANDIDATE,
+        sham_every=config.SKIP_SHAM_EVERY,
+        candidate_families=skip_candidates.skip_candidate_families(
+            skip_candidates.SKIP_S_CANDIDATES
+        ),
+        min_family_attempts=config.SKIP_EXPERIMENT_MIN_FAMILY_ATTEMPTS,
+        real_allocation=config.SKIP_EXPERIMENT_REAL_ALLOCATION,
+    )
+    seen = []
+    now = 100.0
+    for _ in range(60):
+        candidate, _expired = exp.choose(now)
+        if candidate:
+            exp.record_attempt(candidate, now, _deferred_guard())
+            seen.append(candidate)
+        now += 0.5
+
+    assert len(seen) >= 50, seen
+    assert len(set(seen)) >= 10, (
+        f"defer 가 반복되는데 후보가 {len(set(seen))}종밖에 안 돌았다 — 굶주림 재발"
+    )
+    # 첫 후보가 두 번째 시도까지 붙들고 있으면 안 된다.
+    assert seen[0] != seen[1], seen[:4]
