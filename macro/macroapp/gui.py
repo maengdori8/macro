@@ -99,6 +99,10 @@ from macroapp.config import (
     SKIP_OCR_TOP_FRACTION, SKIP_OCR_BOTTOM_FRACTION,
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
     SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS, SKIP_DIRECT_START_HINTS,
+    SKIP_FOREGROUND_DIRECT, SKIP_FOREGROUND_REPRESS_SECONDS,
+    SKIP_FOREGROUND_KEY_AFTER_SECONDS, SKIP_FOREGROUND_MAX_PRESSES,
+    SKIP_FOREGROUND_KEY_ENABLED, SKIP_FOREGROUND_KEY_HOLD_SECONDS,
+    SKIP_FOREGROUND_HOLD_AFTER_SECONDS, SKIP_FOREGROUND_HOLD_SECONDS,
     SKIP_DIRECT_START_INCLUDES_UNKNOWN,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
@@ -116,6 +120,12 @@ from macroapp.session import MatchCounter, SessionTracker
 from macroapp.health import StallMonitor, STALL_NONE, stall_message
 from macroapp import daily_stats
 from macroapp.skip_anykey import ACTION_PRESS as ANYKEY_PRESS, AnyKeyStartPolicy
+from macroapp.skip_foreground import (
+    ACTION_HOLD_AND_KEY as FG_HOLD_AND_KEY,
+    ACTION_PAD as FG_PAD,
+    ACTION_PAD_AND_KEY as FG_PAD_AND_KEY,
+    ForegroundSkipPolicy,
+)
 from macroapp.mining import MiningStore
 from macroapp.skip_experiment import (
     SkipExperimentTracker,
@@ -463,6 +473,15 @@ class AutomationApp:
             consensus=SKIP_TEXT_CONSENSUS,
             repress_seconds=SKIP_ANYKEY_REPRESS_SECONDS,
         )
+        # 게임이 **이미 전면**인 컷신은 실험 밖에서 즉시 누른다(순수 로직).
+        # 실험 가드가 전면 상태를 통째로 deferred 로 버려 입력이 0이던 결함의 보수.
+        self._skip_foreground_policy = ForegroundSkipPolicy(
+            repress_seconds=SKIP_FOREGROUND_REPRESS_SECONDS,
+            key_escalation_seconds=SKIP_FOREGROUND_KEY_AFTER_SECONDS,
+            hold_escalation_seconds=SKIP_FOREGROUND_HOLD_AFTER_SECONDS,
+            max_presses=SKIP_FOREGROUND_MAX_PRESSES,
+        )
+        self._skip_foreground_direct = False  # 이번 에피소드가 전면 직행인가
         self._skip_prompt_variant = None  # hold-to-skip 표시: None|"a"|"s"
         self._skip_generic_hint = None    # OCR 확인 일반 프롬프트: escape|escape_highlight|any_key|start
         # A generic prompt can flicker between OCR hints on a moving replay.
@@ -2143,6 +2162,8 @@ class AutomationApp:
             self._skip_s_match_streak = 0
             self._skip_kind = None
             self._skip_anykey_policy.reset()
+            self._skip_foreground_policy.reset()
+            self._skip_foreground_direct = False
             self._skip_generic_hint = None
             self._skip_generic_episode_hint = None
             self._last_normal_action_at = float("-inf")
@@ -3302,6 +3323,14 @@ class AutomationApp:
                 event["gamepad"] = input_gamepad.virtual_gamepad_status()
         if experiment is not None:
             event["search"] = experiment.diagnostics(outcome.candidate)
+        # H1(attach 계열) 계측: 붙은 큐에서 실제로 활성/포커스가 게임으로 바뀌었는지.
+        # 이게 있어야 '전제가 안 섰다' 와 '전제는 섰는데 게임이 무시했다' 를 가른다.
+        attach_state = input_message.consume_last_attach_state()
+        if attach_state is not None and (
+            time.monotonic() - float(attach_state.get("at") or 0.0) < 5.0
+        ):
+            attach_state.pop("at", None)
+            event["attach_state"] = attach_state
         if guard is not None:
             event["guard"] = {
                 "attempted": guard.attempted,
@@ -3567,6 +3596,24 @@ class AutomationApp:
                         if name != "click_prompt"
                         else {}
                     ),
+                )
+            if name in {"attach_char_s", "attach_active_char_s"}:
+                # H1 을 **키보드 S** 모양으로 검증한다. 컷신 프롬프트가 실제로 표시하는
+                # 건 S 키캡이고(증거 이미지 "[S] SKIP"), 사용자 실측도 "그냥 키만
+                # 먹으면 된다"(2026-09-06)다. 지금까지 H1 은 'A 장홀드' 한 모양으로만
+                # 돌아서, 답이 S 라면 가설이 한 번도 검증되지 않은 셈이다.
+                # post_char_deep 은 PostMessage 라 안쪽에서 다시 attach 하지 않는다 —
+                # 바깥 attach 가 유지돼야 SetActiveWindow 의 효과가 살아 있다.
+                vk = input_message.KEY_TO_VK.get("s")
+                if vk is None or not manager.hwnd:
+                    return False
+                target = int(manager.hwnd)
+                return input_message.run_attached_to_window(
+                    target,
+                    lambda: input_message.post_char_deep(
+                        target, vk, ord("s"), press_delay=hold_secs
+                    ),
+                    activate=(name == "attach_active_char_s"),
                 )
             if name in {"attach_a", "attach_active_a"}:
                 # 게임 큐에 붙어 있는 동안 A 홀드(+활성 창 세우기). 전면 불변은 헬퍼와
@@ -4921,6 +4968,130 @@ class AutomationApp:
             return "plain"
         return None
 
+    def _foreground_direct_skip(
+        self,
+        now: float,
+        is_a: bool,
+        is_s: bool,
+        *,
+        manager: Optional[InactiveManager] = None,
+    ) -> bool:
+        """게임이 **이미 전면**인 컷신 프롬프트는 실험을 건너뛰고 바로 누른다.
+
+        적용되면 이번 OCR 패스를 여기서 끝내고 True, 아니면 False(기존 실험 흐름 계속).
+
+        ## 왜
+
+        배경 컷신 스킵은 아직 답이 없어 실험 기계가 붙어 있는데, 그 안전 가드가
+        **게임이 전면이면 시도 자체를 포기**한다(`target_already_foreground`).
+        배경 효과를 재는 게 목적이라 전면 시도는 귀속이 불가능하기 때문이다.
+        그런데 그 포기가 **입력 자체를 없앴다** — 2026-08-23 실측으로 15:06:26 의
+        [S] SKIP 프롬프트가 **116초 동안** 떠 있는 내내 입력이 0회였다(같은 후보
+        432회 연속 '보류'). 답을 아는 상황에서 탐색 기계가 아무것도 안 쏜 것이다
+        (2026-08-22 '실험이 템플릿을 굶겼다'와 같은 뿌리).
+
+        게임이 전면이면 답은 확정돼 있다(2026-07-07 사용자 실측: 전면화하면 넘어감).
+        그래서 여기서는 대조 구간도, 5.2초 봉쇄도 없이 바로 A 를 누르고, 안 사라지면
+        재누름하고, 오래 버티면 키보드 S 스캔코드까지 같이 보낸다.
+
+        ## 불변식
+
+        - 창을 전면으로 **올리지 않는다**. 이미 전면인 창에 누를 뿐이라 깜빡임 0.
+        - SendInput 키는 포그라운드가 게임일 때만, 누르는 내내 재확인하며 보낸다
+          (`send_scancode_to_foreground_window`) → 다른 앱 유출 0.
+        - 실험 표본을 오염시키지 않는다. 전면 구간 에피소드는 트래커에서 통째로 뺀다.
+        """
+
+        if not SKIP_FOREGROUND_DIRECT or manager is None:
+            return False
+        if not (is_a or is_s or self._skip_kind == "a"):
+            return False
+        hwnd = int(getattr(manager, "hwnd", 0) or 0)
+        if not hwnd:
+            return False
+
+        policy = getattr(self, "_skip_foreground_policy", None)
+        if policy is None:
+            return False
+        is_foreground = input_message.get_foreground_hwnd() == hwnd
+        claimed = bool(getattr(self, "_skip_foreground_direct", False))
+        action = policy.observe(now, True, is_foreground)
+        if not is_foreground:
+            if not claimed:
+                # 배경 구간은 기존 실험 경로가 그대로 담당한다. 경과 시계만 돌려 두었다.
+                return False
+            # ⚠️ 이미 이 에피소드에서 전면 입력을 보냈다. 도중에 배경으로 바뀌었다고
+            # 실험에 넘기면, 우리가 전면에서 누른 A 로 사라진 컷신이 **배경 후보의
+            # 성공**으로 귀속된다(가짜 승자 학습). 프롬프트가 사라질 때까지 이
+            # 에피소드는 직행이 소유한다.
+            self._skip_active_until = max(
+                self._skip_active_until, time.monotonic() + 0.25
+            )
+            self.queue_status("SKIP 넘기는 중")
+            return True
+
+        # 이 에피소드는 실험 표본이 아니다. 트래커의 진행 중 에피소드를 정리해
+        # 전면 입력이 배경 후보의 성공으로 귀속되는 것을 막는다.
+        if not getattr(self, "_skip_foreground_direct", False):
+            self._skip_experiment.reset_episode()
+            self._skip_s_experiment.reset_episode()
+            self._skip_foreground_direct = True
+        self._skip_kind = "a"
+        self._skip_text_streak = 0
+        detected_variant = "s" if is_s else "a" if is_a else None
+        if detected_variant is not None:
+            self._skip_prompt_variant = detected_variant
+
+        if action in (FG_PAD, FG_PAD_AND_KEY, FG_HOLD_AND_KEY):
+            # 정지 뒤에는 입력이 나가면 안 된다(불변식). winocr 호출이 수백 ms 걸리는
+            # 동안 사용자가 정지를 눌렀을 수 있다.
+            if self.stop_event.is_set():
+                return True
+            a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
+            key_note = ""
+            # 사다리: 탭 → 탭+키보드 S → 홀드+키보드 S. 사용자는 "탭이면 된다"고
+            # 했고 2026-07-12 메모는 "홀드"였다. 엇갈리므로 둘 다 결국 시도한다.
+            hold_seconds = (
+                SKIP_FOREGROUND_HOLD_SECONDS
+                if action == FG_HOLD_AND_KEY
+                else SKIP_A_TAP_SECONDS
+            )
+            if a_btn is not None:
+                try:
+                    send_gamepad_button(a_btn, hold_seconds)
+                except Exception as exc:  # noqa: BLE001
+                    self.queue_log(f"[SKIP 전면] A 입력 실패: {exc}")
+            if (
+                action in (FG_PAD_AND_KEY, FG_HOLD_AND_KEY)
+                and SKIP_FOREGROUND_KEY_ENABLED
+            ):
+                # 사용자가 손으로 누르는 바로 그 키(키보드 S). 전면일 때만 나간다.
+                try:
+                    delivered = input_message.send_scancode_to_foreground_window(
+                        hwnd,
+                        input_message.SCAN_S,
+                        (
+                            SKIP_FOREGROUND_HOLD_SECONDS
+                            if action == FG_HOLD_AND_KEY
+                            else SKIP_FOREGROUND_KEY_HOLD_SECONDS
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.queue_log(f"[SKIP 전면] S 키 입력 실패: {exc}")
+                else:
+                    key_note = " + 키보드 S" if delivered else " (S 키 전면 이탈로 취소)"
+            self._skip_last_press = ("foreground_direct", now)
+            # 실험 경로의 5.2초 봉쇄와 달리 짧게만 멈춘다 — 같은 버튼이 두 스레드에서
+            # 겹쳐 나가는 것만 피하고, 템플릿·재누름이 곧바로 다시 돌아야 한다.
+            self._skip_active_until = max(
+                self._skip_active_until, time.monotonic() + 0.25
+            )
+            self.queue_log(
+                f"[SKIP 전면] 게임이 전면 → A 직행 {policy.presses}회째{key_note}"
+            )
+        self.queue_status("SKIP 넘기는 중")
+        return True
+
     def _anykey_direct_start(
         self,
         now: float,
@@ -5202,7 +5373,19 @@ class AutomationApp:
 
             # 스킵 없음 → 에피소드 종료. 엄격 실험 모드에서는 직전 입력과 소멸 시각을
             # 연결하고, 같은 후보가 반복 확인된 뒤에만 학습한다. 자연 종료는 귀속하지 않는다.
-            if (
+            if getattr(self, "_skip_foreground_direct", False):
+                # 전면 직행 에피소드는 실험 표본이 아니다. 후보 성공률에 절대 섞지
+                # 않고, 사용자가 결과를 볼 수 있게 로그만 남긴다.
+                policy = self._skip_foreground_policy
+                self.queue_log(
+                    f"[SKIP 전면] 소멸 — 직행 입력 {policy.presses}회"
+                    f"(키 {policy.key_presses}회), "
+                    f"{policy.elapsed(time.monotonic()):.2f}초"
+                )
+                self._skip_experiment.reset_episode()
+                self._skip_s_experiment.reset_episode()
+                self._reset_generic_experiment_episodes()
+            elif (
                 self._skip_kind in {"a", "start"}
                 and SKIP_STRICT_INACTIVE_EXPERIMENT
             ):
@@ -5293,6 +5476,10 @@ class AutomationApp:
             if anykey_policy is not None:
                 anykey_policy.observe(time.monotonic(), False)
             self._skip_prompt_variant = None
+            foreground_policy = getattr(self, "_skip_foreground_policy", None)
+            if foreground_policy is not None:
+                foreground_policy.reset()
+            self._skip_foreground_direct = False
             self._skip_generic_hint = None
             self._skip_generic_episode_hint = None
             self._skip_esc_probe_negative_streak = 0
@@ -5341,6 +5528,12 @@ class AutomationApp:
         if self._anykey_direct_start(
             now, has_text, is_a, is_s, manager=manager, screen_gray=screen_gray
         ):
+            return True
+
+        # 게임이 **이미 전면**인 컷신(A/S)은 답이 확정돼 있다 — 실험·대조·봉쇄를 거치지
+        # 않고 바로 A(그리고 오래 버티면 키보드 S)를 누른다. 실험 가드가 전면 상태를
+        # 통째로 deferred 로 버려 입력이 0이던 결함의 보수(2026-08-23 원장 440/494).
+        if self._foreground_direct_skip(now, is_a, is_s, manager=manager):
             return True
 
         if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_control_contaminated:
@@ -5442,6 +5635,28 @@ class AutomationApp:
                 learning_variant = self._generic_learning_key(
                     self._generic_hint_for_tracker(experiment)
                 )
+                if (
+                    SKIP_FOREGROUND_DIRECT
+                    and manager.hwnd
+                    and input_message.get_foreground_hwnd() == manager.hwnd
+                ):
+                    # 게임이 전면이면 실험 가드가 어차피 deferred 로 버려 입력이 0이
+                    # 된다(A/S 와 같은 결함). 이 화면들의 답은 START 로 확정돼 있고
+                    # (esc/start 는 같은 버튼 16), 전면이면 전달도 확실하다.
+                    experiment.reset_episode()
+                    if not self.stop_event.is_set() and start_btn is not None:
+                        try:
+                            send_gamepad_button(start_btn)
+                        except Exception as exc:  # noqa: BLE001
+                            self.queue_log(f"[SKIP 전면] START 입력 실패: {exc}")
+                        else:
+                            self._skip_last_press = ("start", now)
+                    self._skip_active_until = max(
+                        self._skip_active_until, time.monotonic() + 0.25
+                    )
+                    self.queue_status("SKIP 넘기는 중")
+                    self.queue_log("[SKIP 전면] 게임이 전면 → 일반 프롬프트 START 직행")
+                    return True
                 candidate, expired = experiment.choose(now)
                 self._report_skip_experiment_outcome(
                     expired,

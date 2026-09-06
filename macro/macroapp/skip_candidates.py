@@ -84,6 +84,15 @@ _SPECS = (
     # attach_hold_a 는 대조(큐 공유만), attach_active_hold_a 가 진짜 가설. 둘 다 전면 불변.
     _spec("attach_hold_a", "attach_a", "gamepad_attach", "게임 큐에 붙은 채 A 장홀드(대조 — 큐 공유만으로는 변화 없을 것)", hold=1.25, input_scope="virtual_gamepad"),
     _spec("attach_active_hold_a", "attach_active_a", "gamepad_attach_activate", "붙은 큐에서 SetActiveWindow 로 스레드 로컬 활성 창을 세운 뒤 A 장홀드(게이트가 GetActiveWindow/GetFocus 면 통과)", hold=1.25, input_scope="virtual_gamepad"),
+    # 2026-09-06 사용자 실측: "start 아니고, 홀드 아니고, **그냥 키만 먹으면 된다**".
+    # H1(붙은 큐 + SetActiveWindow)은 지금까지 'A 1.25초 홀드' 한 가지 모양으로만 돌았다.
+    # 답이 'S 키 탭'이라면 그 모양으로는 가설을 한 번도 검증하지 못한 것이다.
+    # → 같은 전달 경로(H1)를 **탭**과 **키보드 S** 모양으로도 만든다. 각각 대조
+    #   (SetActiveWindow 없이 큐 공유만)와 짝. 전부 배경 유지·SendInput 없음.
+    _spec("attach_a_tap", "attach_a", "gamepad_attach", "게임 큐에 붙은 채 A 탭(대조 — 큐 공유만)", input_scope="virtual_gamepad"),
+    _spec("attach_active_a_tap", "attach_active_a", "gamepad_attach_activate", "붙은 큐에서 SetActiveWindow 뒤 A 탭 — 사용자가 말한 '그냥 키' 모양의 H1", input_scope="virtual_gamepad"),
+    _spec("attach_char_s", "attach_char_s", "keyboard_attach", "게임 큐에 붙은 채 S 딥 키 메시지(대조 — 큐 공유만)"),
+    _spec("attach_active_char_s", "attach_active_char_s", "keyboard_attach_activate", "붙은 큐에서 SetActiveWindow 로 스레드 로컬 활성 창을 세운 뒤 S 딥 키 메시지 — H1 을 컷신이 실제로 표시하는 키(S)로 검증"),
     _spec("a", "a", "gamepad", "게임패드 A 탭 경로", input_scope="virtual_gamepad"),
     _spec("a_hold_500", "a", "gamepad", "A 홀드 임계값이 0.5초 부근일 가능성", hold=0.50, input_scope="virtual_gamepad"),
     _spec("a_hold", "a", "gamepad", "기존 1.0초 A 홀드 경로", hold=1.00, input_scope="virtual_gamepad"),
@@ -402,9 +411,31 @@ _S_LEGACY_CANDIDATES = tuple(
 # 컷신 프롬프트는 **S 형**(키보드 표시 장치, 2026-08-22 로그 감지 1,964회)이라 H1 은 실전
 # 원장에 **0행** — 마지막 미검증 가설이 한 번도 시도되지 않았다. S 에서도 맨 앞에 둔다.
 # attach_hold_a 는 대조(큐 공유만)라 짝으로 함께 간다.
-_S_H1_PRIORITY = ("attach_hold_a", "attach_active_hold_a")
+# 2026-09-06 사용자 실측으로 모양을 고쳤다: "start 아니고, 홀드 아니고, 그냥 키".
+# 컷신 프롬프트가 실제로 표시하는 건 **키보드 S 키캡**이다(증거 이미지
+# prompt_20260823_150628_e3662b759605.png = "[S] SKIP"). 그러니 S 스윕은
+#   ① H1 을 '키보드 S 탭' 모양으로,  ② 그 다음 'A 탭' 모양으로,
+#   ③ 그 다음 일반 키보드 S 전달 경로들,  ④ A 탭,  ⑤ 예전 홀드 모양의 H1,
+#   ⑥ START 계열(사용자가 아니라고 한 것) 순으로 표본을 쓴다.
+# 각 H1 후보는 대조(SetActiveWindow 없이 큐 공유만)와 **짝으로** 간다 — 짝이 없으면
+# 성공해도 '활성 창 세우기' 덕인지 '큐 공유' 덕인지 못 가른다.
+_S_H1_PRIORITY = (
+    "attach_char_s", "attach_active_char_s",
+    "attach_a_tap", "attach_active_a_tap",
+)
+_S_KEYBOARD_TAP_PRIORITY = (
+    "spoof_char_s", "char_s", "sync_char_s", "pm_s", "spoof_pm_s",
+    "attach_state_s", "attach_post_s",
+)
+_S_A_TAP_PRIORITY = ("a", "spoof_a_envelope2", "process_device_spoof_a_envelope2")
+_S_H1_LEGACY_HOLD = ("attach_hold_a", "attach_active_hold_a")
 SKIP_S_CANDIDATES = tuple(dict.fromkeys(
-    ("control_noop",) + _S_H1_PRIORITY + _S_START_ENVELOPE_PRIORITY
+    ("control_noop",)
+    + _S_H1_PRIORITY
+    + _S_KEYBOARD_TAP_PRIORITY
+    + _S_A_TAP_PRIORITY
+    + _S_H1_LEGACY_HOLD
+    + _S_START_ENVELOPE_PRIORITY
     + _S_LEGACY_CANDIDATES
 ))
 

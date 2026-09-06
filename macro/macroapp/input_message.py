@@ -222,6 +222,38 @@ def send_scancode_key(scan: int, hold: float = 0.1) -> bool:
     return True
 
 
+def send_scancode_to_foreground_window(
+    hwnd: int, scan: int, hold: float = 0.06
+) -> bool:
+    """대상 창이 **전면일 때만** SendInput 스캔코드를 보낸다(다른 앱 유출 차단).
+
+    SendInput 은 전역이라 그 순간의 포그라운드 창으로 간다. 그래서 이 함수는
+    보내기 직전에 포그라운드가 ``hwnd`` 인지 확인하고, 누르고 있는 동안에도 5ms 마다
+    다시 확인한다. 사용자가 중간에 다른 창으로 옮겨 가면 **즉시 키를 떼고** False 를
+    돌려준다 — 남의 앱에 's' 가 찍히는 것을 막는 유일한 장치다.
+
+    반환 True = 누르는 내내 대상 창이 전면이었다(유출 없음).
+    """
+    hwnd = int(hwnd or 0)
+    if not hwnd or not hasattr(ctypes, "windll"):
+        return False
+    if get_foreground_hwnd() != hwnd:
+        return False
+    if not _send_scancode(scan, keyup=False):
+        return False
+    leaked = False
+    try:
+        deadline = time.monotonic() + max(0.0, float(hold))
+        while time.monotonic() < deadline:
+            if get_foreground_hwnd() != hwnd:
+                leaked = True
+                break
+            time.sleep(0.005)
+    finally:
+        _send_scancode(scan, keyup=True)
+    return not leaked
+
+
 def post_key_deep(hwnd: int, vk_code: int, press_delay: float = 0.08) -> bool:
     """WM_KEYDOWN/UP을 최상위 + 포커스 자식 + 모든 자식 창에 전송합니다(비활성 유지).
 
@@ -1146,6 +1178,63 @@ def send_key_attach_state(hwnd: int, vk_code: int, hold: float = 0.12) -> bool:
                 pass
 
 
+# ── H1 계측: 붙은 큐의 활성/포커스 창을 실제로 읽는다 ──
+# 지금까지 attach 계열 후보는 "실패했다"만 남겼다. 그런데 실패에는 두 종류가 있다:
+#   (A) 전제가 안 섰다 — SetActiveWindow 가 큐의 활성 창을 못 바꿨다.
+#   (B) 전제는 섰는데 게임이 그 값을 안 본다(= 전역 GetForegroundWindow 로 게이팅).
+# 이 둘을 못 가르면 실측을 아무리 쌓아도 07-07 질문이 안 닫힌다. GetGUIThreadInfo 로
+# **게임 스레드 큐의** hwndActive/hwndFocus 를 직접 읽어 원장에 남긴다.
+_LAST_ATTACH_STATE: Optional[dict] = None
+
+
+def read_gui_thread_state(hwnd: int) -> dict:
+    """대상 창을 소유한 스레드의 입력 큐 상태를 읽는다(진단 전용, 부작용 0).
+
+    반환 키: ok / active / focus / capture / foreground / matches_active / matches_focus
+    """
+    result = {
+        "ok": False,
+        "active": 0,
+        "focus": 0,
+        "capture": 0,
+        "foreground": 0,
+        "matches_active": False,
+        "matches_focus": False,
+    }
+    if not hasattr(ctypes, "windll"):
+        return result
+    try:
+        hwnd = int(hwnd or 0)
+        u = ctypes.windll.user32
+        _setup_user32_sigs()
+        result["foreground"] = get_foreground_hwnd()
+        if not hwnd:
+            return result
+        tid = u.GetWindowThreadProcessId(wintypes.HWND(hwnd), None)
+        if not tid:
+            return result
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if not u.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return result
+        result["ok"] = True
+        result["active"] = int(info.hwndActive or 0)
+        result["focus"] = int(info.hwndFocus or 0)
+        result["capture"] = int(info.hwndCapture or 0)
+        result["matches_active"] = result["active"] == hwnd
+        result["matches_focus"] = result["focus"] == hwnd
+    except Exception:  # noqa: BLE001 - 진단은 절대 입력을 막으면 안 된다
+        pass
+    return result
+
+
+def consume_last_attach_state() -> Optional[dict]:
+    """직전 attach 시도에서 관측한 큐 상태를 꺼내고 비운다(원장 기록용)."""
+    global _LAST_ATTACH_STATE
+    state, _LAST_ATTACH_STATE = _LAST_ATTACH_STATE, None
+    return state
+
+
 def run_attached_to_window(hwnd: int, action, *, activate: bool = False) -> bool:
     """게임 입력 스레드 큐에 AttachThreadInput 으로 붙어 있는 **동안** action 을 돌린다.
 
@@ -1160,6 +1249,7 @@ def run_attached_to_window(hwnd: int, action, *, activate: bool = False) -> bool
       — 그때는 큐 공유가 전면 큐와 합쳐져 게임이 전면으로 올라올 수 있다(깜빡임). 게임이 이미
       전면이어도 의미가 없어 False. 호출부(run_guarded_inactive_action)가 전면 불변을 한 번 더 지킨다.
     """
+    global _LAST_ATTACH_STATE
     if winapi.win32gui is None or not hasattr(ctypes, "windll"):
         return False
     u = ctypes.windll.user32
@@ -1167,6 +1257,7 @@ def run_attached_to_window(hwnd: int, action, *, activate: bool = False) -> bool
     tid_cur = 0
     tid_target = 0
     attached = False
+    _LAST_ATTACH_STATE = None
     try:
         hwnd = int(hwnd)
         if not hwnd or not winapi.win32gui.IsWindow(hwnd):
@@ -1186,9 +1277,34 @@ def run_attached_to_window(hwnd: int, action, *, activate: bool = False) -> bool
             return False
         attached = bool(u.AttachThreadInput(tid_cur, tid_target, True))
         if not attached:
+            _LAST_ATTACH_STATE = {
+                "at": time.monotonic(),
+                "attached": False,
+                "activate": bool(activate),
+            }
             return False
+        # 붙은 직후(스푸핑 전) 큐 상태 — 기준선.
+        before = read_gui_thread_state(hwnd)
+        set_active_ok = None
         if activate:
+            # SetActiveWindow 는 이전 활성 창을 돌려준다. 0 이 곧 실패는 아니므로
+            # 성공 여부는 반환값이 아니라 아래 after 관측으로 판정한다.
             u.SetActiveWindow(wintypes.HWND(hwnd))
+            set_active_ok = True
+        after = read_gui_thread_state(hwnd)
+        _LAST_ATTACH_STATE = {
+            "at": time.monotonic(),
+            "attached": True,
+            "activate": bool(activate),
+            "set_active_called": set_active_ok,
+            "before": before,
+            "after": after,
+            # H1 판정: 큐의 활성/포커스 창이 게임이 됐는데도 전면창은 그대로인가?
+            "precondition_met": bool(
+                after.get("matches_active") or after.get("matches_focus")
+            ),
+            "foreground_unchanged": after.get("foreground") != hwnd,
+        }
         return bool(action())
     except Exception:
         return False

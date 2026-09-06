@@ -455,6 +455,28 @@ SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
                         "a_hold", "a")
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-skip 대응)
+
+# ── 전면(포커스) 상태 컷신 SKIP 직행 ──
+# 배경(비활성) 컷신 스킵은 아직 답을 못 찾은 문제라 실험 기계가 붙어 있다. 그런데 그
+# 실험의 안전 가드는 **게임이 이미 전면이면 시도 자체를 포기**한다
+# (detail="target_already_foreground") — 배경 효과 측정이 목적이라 귀속이 안 되기 때문이다.
+# 문제는 그 포기가 입력 자체를 없앤다는 것. 2026-08-23 실측:
+#   15:06:26 의 [S] SKIP 프롬프트가 116초 동안 떠 있는 내내 입력 0회
+#   (같은 후보 432회 연속 '보류'). 그날 A/S 에피소드 15개 중 4개가 입력 0회.
+# 게임이 전면이면 답은 이미 확정돼 있다(2026-07-07 사용자 실측: 전면화하면 넘어감).
+# 그래서 전면 구간은 실험 밖에서 즉시 누른다. 창을 전면으로 **올리지는 않으므로**
+# '비활성 100%'·'깜빡임 0' 불변식과 무관하다.
+SKIP_FOREGROUND_DIRECT = True
+SKIP_FOREGROUND_REPRESS_SECONDS = 0.35    # 안 사라지면 이 간격으로 재누름
+SKIP_FOREGROUND_KEY_AFTER_SECONDS = 1.2   # 이만큼 버티면 키보드 S 스캔코드까지 같이
+SKIP_FOREGROUND_HOLD_AFTER_SECONDS = 2.6  # 그래도 안 되면 A·S 홀드(마지막 폴백)
+SKIP_FOREGROUND_HOLD_SECONDS = 0.5        # 그때의 홀드 길이
+SKIP_FOREGROUND_MAX_PRESSES = 24          # 한 컷신에서 최대 이만큼(무한 연타 금지)
+# SendInput 키보드 S 승격. SendInput 은 전역이라 전면 창으로만 가는데, 그 전면 창이
+# 게임 자신이므로 '다른 앱 유출'이 성립하지 않는다(유출 금지 불변식은 지켜진다).
+# 그래도 보내는 동안 포그라운드를 계속 확인해 바뀌면 즉시 키를 뗀다.
+SKIP_FOREGROUND_KEY_ENABLED = True
+SKIP_FOREGROUND_KEY_HOLD_SECONDS = 0.06
 # 완전 비활성 실험 모드. 후보 입력 동안 별도 감시 스레드가 전면 HWND를 연속 확인하고,
 # 대상 게임 HWND가 한 번이라도 전면이 된 후보만 해당 세션에서 즉시 격리합니다.
 SKIP_STRICT_INACTIVE_EXPERIMENT = True

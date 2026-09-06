@@ -804,15 +804,26 @@ def test_automatic_generic_catalogues_never_send_escape() -> None:
     assert "spoof_start_envelope4_fast" in SKIP_S_CANDIDATES
     # 2026-08-22: H1(attach_active_hold_a)+대조(attach_hold_a)가 S 맨 앞(1·2)에 선다 —
     # 구매자 PC 가 보는 프롬프트는 S 형이라 A 목록에만 있으면 영영 시도되지 않았다(원장 0행).
-    assert SKIP_S_CANDIDATES[1:3] == ("attach_hold_a", "attach_active_hold_a")
-    assert SKIP_S_CANDIDATES[3:9] == (
+    # 2026-09-06 사용자 실측("start 아니고 홀드 아니고 그냥 키")으로 H1 의 모양을
+    # 탭·키보드 S 로 고쳤다. 예전 홀드 모양은 목록에 남되 우선순위만 뒤로 간다.
+    assert SKIP_S_CANDIDATES[1:5] == (
+        "attach_char_s", "attach_active_char_s",
+        "attach_a_tap", "attach_active_a_tap",
+    )
+    assert "attach_hold_a" in SKIP_S_CANDIDATES
+    assert "attach_active_hold_a" in SKIP_S_CANDIDATES
+    # 엔벨로프 계열은 여전히 S 스윕에 있지만, 사용자가 "그냥 키" 라고 한 이상
+    # 키보드 S·A 탭보다 **뒤**에 온다. 순서만 강등이고 폐기가 아니다.
+    for name in (
         "process_device_spoof_a_envelope2",
         "spoof_a_envelope2",
         "spoof_a_preactivate80_burst3",
         "spoof_start_preactivate80_burst3",
         "spoof_start_envelope4_fast",
         "spoof_start_envelope2",
-    )
+    ):
+        assert name in SKIP_S_CANDIDATES, name
+        assert SKIP_S_CANDIDATES.index("attach_active_char_s") < SKIP_S_CANDIDATES.index(name)
     assert "pm_esc" not in SKIP_A_CANDIDATES
     assert "pm_esc" not in SKIP_S_CANDIDATES
     assert all(

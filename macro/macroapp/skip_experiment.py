@@ -353,6 +353,9 @@ class SkipExperimentTracker:
         self.preferred: Optional[str] = self.learned
         self.quarantined: set[str] = set()
         self.success_counts: dict[str, int] = {}
+        # 후보별 '시도조차 못 한' 횟수. 실패가 아니므로 성공률 분모에 안 들어가고,
+        # 굶주림 진단(어떤 후보가 계속 막히는가)에만 쓴다.
+        self.deferral_counts: dict[str, int] = {}
         self.index = 0
         self.last_attempt_at = float("-inf")
         self.control_started_at: Optional[float] = None
@@ -752,6 +755,19 @@ class SkipExperimentTracker:
         self.last_attempt_at = now
         attempt = SkipAttempt(candidate, now, guard)
         if not guard.attempted:
+            # 굶주림 방지. defer 는 실패가 아니지만(입력이 안 나갔으므로 표본도 아니다),
+            # 후보를 그대로 두면 **defer 를 유발한 조건이 계속되는 동안 스윕 전체가
+            # 멈춘다**. 2026-08-23 실측(프로 원장 + macro_2026-08-23.log):
+            # 15:06:26 에 뜬 컷신 프롬프트 하나에서 attach_hold_a 가
+            # detail="target_already_foreground" 로 **432회 연속** deferred —
+            # 그 한 화면이 **116초 동안 입력 0회**로 방치됐다.
+            # (⚠️ 432 는 '에피소드' 가 아니라 '시도 행' 수다. 원장 행을 에피소드로
+            #  읽으면 피해를 30배 부풀리게 된다 — 로그 타임스탬프로 재확인할 것.)
+            # 성공/격리 통계는 건드리지 않고 **차례만** 넘긴다.
+            self.deferral_counts[candidate] = (
+                self.deferral_counts.get(candidate, 0) + 1
+            )
+            self._advance_past(candidate)
             return SkipOutcome("deferred", candidate, detail=guard.reason)
         self.attempted_this_episode = True
         if not guard.invariant_ok:
