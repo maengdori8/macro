@@ -111,6 +111,30 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 
 ## 📝 결정 로그 (왜 이렇게 했는지 — 최신순)
 
+- `2026-09-24` **마우스 이동 속도를 실제로 랜덤화(0.12~0.50초) + 테스트가 매크로 창을 띄우던 문제 수정.**
+  사용자: "마우스 이동속도가 일치하면 게임에서 마우스를 못 읽더라. 랜덤하게 바뀌게 했는데 이것도 인식 못 해서
+  속도 범위를 더 넓게".
+  ① **예전 코드는 속도를 랜덤화한 적이 없었다.** 스텝 수 15~25 랜덤은 속도와 무관하다 — 위치가 시간에 대해
+  B(시간/이동시간)로 정해져서 스텝 수는 샘플링 촘촘함만 바꾼다. 이동 시간은 0.2초 **고정**이었다.
+  실측(800px·40회): 0.205~0.222초, 같은 거리 평균 속도 폭 **x1.1**(휨 때문에 경로가 조금 길어지는 정도).
+  → `CURVED_CLICK_MOVE_DURATION_MIN/MAX_SECONDS = 0.12/0.50`(이동마다 새로 뽑음) +
+  `CURVED_CLICK_STEP_JITTER = 0.45`(스텝 간격 ±45%, 합계는 유지 → 한 이동 안에서도 순간 속도가 바뀜).
+  실측 폭 **x3.5~3.8**.
+  ② **궤적 불변식은 지켰다.** 속도 난수는 궤적 난수(스텝 수 → 휨 → 제어점 흔들림)를 다 뽑은 **뒤**에 뽑는다.
+  `tests/test_input_mouse_speed.py` 가 변경 전 HEAD 로 뜬 골든 궤적 4개를 바이트 단위로 고정한다
+  (순서를 바꾸는 변이를 넣으면 4개 모두 실패함을 확인).
+  ③ ⚠️ 미확인 가설(다음 레버): PostMessage 경로는 마지막 WM_MOUSEMOVE 직후 **곧바로** WM_LBUTTONDOWN 을
+  보낸다(호버 대기 0 — pyautogui 경로엔 `MOUSE_HOVER_BEFORE_CLICK_SECONDS=0.8` 이 있다). 게임 UI 가 호버 상태를
+  한 프레임 반영한 뒤에만 클릭을 받는다면 속도와 무관하게 씹힐 수 있다. 속도 확대로도 안 되면 이걸 본다.
+  ④ **테스트가 진짜 매크로 창을 띄웠다.** 전체 테스트 한 번에 매크로가 15초 동안 9번 켜졌다 꺼졌다
+  (사용자가 봄 — 게임 중이면 포커스도 뺏긴다). `AutomationApp.__init__` 의 `_bring_window_to_front`
+  (deiconify + focus_force + 1.2초 topmost)를 `test_exit_feature` 가 안 막았다. → `tests/conftest.py` autouse
+  픽스처가 **모든 테스트**에서 새 Tk 창을 숨김·투명으로 시작하고 앞으로 끌어오기를 끈다
+  (`tests/test_gui_tests_stay_hidden.py` 가 이 보호 자체를 고정). 같이 드러난 간헐 실패
+  (`test_observation_is_dropped_when_stop_arrives_mid_ocr`)는 판 기록 스레드가 비동기로 넣는 `('session','')`
+  때문이었다 — '큐가 비었나' 대신 '종료 요청이 없나'로 고쳤다(10/10 통과, 정지를 빼면 `auto_exit` 가 실제로
+  들어가는 것도 확인).
+
 - `2026-09-06` **컷신 스킵: 배경 가설을 더 파기 전에, 매크로가 '누를 수 있는데 안 누르던' 구간부터 고쳤다.**
   사용자: "s스킵(a스킵) 되게 해봐 제발. **start,홀드 다 아니고 그냥 키만 먹으면 되는데 키가 안먹힘**."
   ① **가장 큰 구멍은 배경 입력의 한계가 아니라 '입력 0'이었다.** 실험 안전 가드
@@ -660,6 +684,11 @@ python3 -c "import macroapp.gui, macroapp.ocr, macroapp.config"   # import 스�
 ---
 
 ## 🧠 교훈 & 실수 노트 (에이전트가 갱신)
+
+- **테스트가 사용자 PC 에 창을 띄우면 안 된다.** 사용자는 게임 중일 수 있고, 창이 뜰 때마다 포커스를 뺏긴다.
+  `tests/conftest.py` 가 모든 Tk 창을 숨김·투명으로 시작시키고 `_bring_window_to_front` 를 끈다 — 새 GUI 테스트도
+  `AutomationApp` 을 그냥 만들면 자동으로 숨겨진다. 창이 실제로 매핑돼야 하면 `test_ui_layout` 처럼 alpha 0 인 채로
+  deiconify 한다.
 
 - **원장 '행 수'를 '사건 수'로 읽지 마라.** `skip_experiments.jsonl` 은 한 에피소드에서
   여러 행(시도·pending·결과)을 쓴다. 2026-09-06 에 "deferred 440행"을 "컷신 440개"로

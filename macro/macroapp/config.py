@@ -659,10 +659,24 @@ CLICK_MESSAGE_DELAY_SECONDS = 0.01
 # 마우스를 대상 위치에 올린 뒤 클릭하기 전 기다리는 시간입니다.
 MOUSE_HOVER_BEFORE_CLICK_SECONDS = 0.8
 
-# PostMessage 가상 마우스 이동 단계와 전체 이동 시간입니다.
+# PostMessage 가상 마우스 이동 단계 수입니다(곡선을 몇 점으로 나눠 보낼지).
+# ⚠️ 이 값은 **속도를 바꾸지 않는다** — 위치가 시간에 대해 B(시간/이동시간)로 정해져서
+# 스텝 수는 샘플링 촘촘함만 바꾼다. 속도는 아래 이동 시간 범위가 정한다.
 CURVED_CLICK_MIN_STEPS = 15
 CURVED_CLICK_MAX_STEPS = 25
-CURVED_CLICK_MOVE_DURATION_SECONDS = 0.2
+
+# ── 곡선 이동 속도 랜덤화 ──
+# 사용자 실측: 마우스 이동 속도가 일정하면 게임이 마우스를 못 읽는다.
+# 예전엔 이동 시간이 0.2초 **고정**이었다. 실측(2026-09-24, 800px·40회): 이동 시간
+# 0.205~0.222초, 같은 거리 평균 속도 폭 x1.1 — 휨 때문에 경로가 조금 길어지는 정도라
+# 사실상 매번 같은 속도였다(스텝 수 랜덤은 위 설명대로 속도와 무관).
+# → 이동마다 시간을 이 범위에서 새로 뽑고(같은 거리 속도 폭 약 x4),
+#   한 이동 안에서도 스텝 간격을 흔들어 순간 속도가 계속 바뀌게 한다.
+CURVED_CLICK_MOVE_DURATION_MIN_SECONDS = 0.12
+CURVED_CLICK_MOVE_DURATION_MAX_SECONDS = 0.50
+# 스텝 간격을 1±이 비율로 흔든다. 합계는 뽑은 이동 시간 그대로 다시 맞춘다
+# (이동 시간은 유지, 순간 속도만 변동). 0 이면 등간격(예전 방식).
+CURVED_CLICK_STEP_JITTER = 0.45
 
 # DWM 확장 프레임 bounds 속성입니다.
 DWMWA_EXTENDED_FRAME_BOUNDS = 9

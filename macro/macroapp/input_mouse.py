@@ -9,7 +9,9 @@ from macroapp.config import (
     CLICK_MESSAGE_DELAY_SECONDS,
     CURVED_CLICK_MIN_STEPS,
     CURVED_CLICK_MAX_STEPS,
-    CURVED_CLICK_MOVE_DURATION_SECONDS,
+    CURVED_CLICK_MOVE_DURATION_MIN_SECONDS,
+    CURVED_CLICK_MOVE_DURATION_MAX_SECONDS,
+    CURVED_CLICK_STEP_JITTER,
 )
 from macroapp.input_message import post_mouse_move, post_mouse_down, post_mouse_up
 
@@ -54,6 +56,38 @@ def _build_bezier_control_point(
     return int(round(control_x)), int(round(control_y))
 
 
+def pick_move_duration(min_seconds: float, max_seconds: float, rng=random) -> float:
+    """이번 이동에 쓸 전체 이동 시간(초)을 범위 안에서 새로 뽑습니다."""
+
+    low, high = sorted((max(0.0, float(min_seconds)), max(0.0, float(max_seconds))))
+    return rng.uniform(low, high)
+
+
+def build_step_delays(
+    steps: int,
+    move_duration: float,
+    jitter: float,
+    rng=random,
+) -> list[float]:
+    """스텝 사이 대기 시간 목록(steps-1개)을 만듭니다. 합계는 move_duration 그대로입니다.
+
+    각 간격을 1±jitter 배로 흔든 뒤 합계를 move_duration 에 다시 맞춥니다.
+    전체 이동 시간은 뽑은 값 그대로 두고, 한 이동 안의 순간 속도만 계속 바뀝니다.
+    jitter 가 0 이면 예전과 같은 등간격입니다.
+    """
+
+    gaps = max(1, int(steps) - 1)
+    total = max(0.0, float(move_duration))
+    spread = max(0.0, min(0.95, float(jitter)))
+    if total <= 0.0:
+        return [0.0] * gaps
+    if spread <= 0.0:
+        return [total / gaps] * gaps
+    weights = [rng.uniform(1.0 - spread, 1.0 + spread) for _ in range(gaps)]
+    scale = total / sum(weights)
+    return [weight * scale for weight in weights]
+
+
 def _clamp_client_point(
     point: tuple[int, int],
     client_width: int,
@@ -76,12 +110,16 @@ def post_curved_click(
     end_y: int,
     *,
     steps: Optional[int] = None,
-    move_duration: float = CURVED_CLICK_MOVE_DURATION_SECONDS,
+    move_duration: Optional[float] = None,
     down_up_delay: float = CLICK_MESSAGE_DELAY_SECONDS,
     use_send_message: bool = False,
     logger: Optional[LogCallback] = None,
 ) -> bool:
-    """클라이언트 좌표 기준으로 베지에 곡선 이동 후 왼쪽 클릭 메시지를 보냅니다."""
+    """클라이언트 좌표 기준으로 베지에 곡선 이동 후 왼쪽 클릭 메시지를 보냅니다.
+
+    move_duration 을 안 주면 이동마다 CURVED_CLICK_MOVE_DURATION_MIN~MAX 범위에서 새로
+    뽑습니다(이동 속도 랜덤화). 스텝 간격도 CURVED_CLICK_STEP_JITTER 만큼 흔듭니다.
+    """
 
     if winapi.win32gui is None:
         raise RuntimeError("pywin32 win32gui 모듈이 필요합니다.")
@@ -97,7 +135,6 @@ def post_curved_click(
     if steps is None:
         steps = random.randint(CURVED_CLICK_MIN_STEPS, CURVED_CLICK_MAX_STEPS)
     steps = max(2, int(steps))
-    step_delay = max(0.0, float(move_duration)) / max(1, steps - 1)
 
     start_pos = _clamp_client_point((start_x, start_y), client_width, client_height)
     end_pos = _clamp_client_point((end_x, end_y), client_width, client_height)
@@ -106,6 +143,16 @@ def post_curved_click(
         client_width,
         client_height,
     )
+
+    # ⚠️ 속도 난수는 **궤적 난수(스텝 수 → 휨 → 제어점 흔들림)를 모두 뽑은 뒤**에 뽑는다.
+    # 순서를 바꾸면 같은 시드에서 궤적 좌표가 달라진다 — 궤적은 불변식(CLAUDE.md)이고
+    # 이번 변경은 '속도'만 바꾼다. tests/test_input_mouse_speed.py 가 좌표를 바이트 단위로 고정한다.
+    if move_duration is None:
+        move_duration = pick_move_duration(
+            CURVED_CLICK_MOVE_DURATION_MIN_SECONDS,
+            CURVED_CLICK_MOVE_DURATION_MAX_SECONDS,
+        )
+    step_delays = build_step_delays(steps, move_duration, CURVED_CLICK_STEP_JITTER)
 
     for index in range(steps):
         t = index / (steps - 1)
@@ -120,8 +167,8 @@ def post_curved_click(
             move_y,
             use_send_message=use_send_message,
         )
-        if index < steps - 1 and step_delay > 0:
-            time.sleep(step_delay)
+        if index < steps - 1 and step_delays[index] > 0:
+            time.sleep(step_delays[index])
 
     final_x, final_y = end_pos
     post_mouse_down(hwnd, final_x, final_y, use_send_message=use_send_message)

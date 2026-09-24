@@ -300,7 +300,15 @@ def test_observation_is_dropped_when_stop_arrives_mid_ocr(app, monkeypatch):
 
     monkeypatch.setattr(auto_exit_mod, "read_score_from_frame", read_and_stop)
     app._observe_match_score(object(), 1.0)
-    assert app.ui_queue.empty(), "정지 후에 종료 요청이 큐에 남았다"
+    # 큐가 '완전히 비었나'가 아니라 '종료 요청이 없나'를 본다. 앱 초기화가 띄운 판 기록
+    # 스레드(_match_writer_loop)가 오늘 판수를 읽은 뒤 ('session', '') 을 비동기로 넣는데,
+    # 그게 이 단언보다 먼저 도착하면 정지 로직과 무관하게 실패했다(간헐 실패, 2026-09-24 진단).
+    pending = []
+    while not app.ui_queue.empty():
+        pending.append(app.ui_queue.get_nowait())
+    assert not any(kind == "auto_exit" for kind, _ in pending), (
+        f"정지 후에 종료 요청이 큐에 남았다: {pending}"
+    )
 
 
 def test_auto_exit_request_is_ignored_without_pro(app):
