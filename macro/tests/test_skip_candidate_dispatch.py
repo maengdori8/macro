@@ -2707,6 +2707,7 @@ def test_esc_icon_promotes_ambiguous_skip_text_before_tracker_lock() -> None:
         choose=Mock(return_value=(None, None)),
     )
     app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.base_dir = SimpleNamespace()
     app._skip_seen_since = None
     app._skip_text_streak = gui.SKIP_TEXT_CONSENSUS - 1
@@ -2772,6 +2773,7 @@ def test_generic_episode_keeps_first_hint_when_later_ocr_hint_flickers() -> None
         choose=Mock(return_value=(None, None)),
     )
     app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.base_dir = SimpleNamespace()
     app._skip_seen_since = None
     app._skip_text_streak = gui.SKIP_TEXT_CONSENSUS - 1
@@ -2825,6 +2827,7 @@ def test_provisional_escape_episode_ignores_later_a_template_false_positive() ->
         choose=Mock(return_value=(None, None)),
     )
     app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.base_dir = SimpleNamespace()
     app._skip_seen_since = 1.0
     app._skip_text_streak = gui.SKIP_TEXT_CONSENSUS
@@ -2859,8 +2862,9 @@ def test_provisional_escape_episode_ignores_later_a_template_false_positive() ->
     ):
         assert app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
 
-    match_a.assert_not_called()
-    match_s.assert_not_called()
+    # 현재 템플릿도 매번 검사하되, 같은 프레임의 명시적인 ESC가 우선한다.
+    match_a.assert_called_once()
+    match_s.assert_called_once()
     tracker.choose.assert_called_once()
     gamepad.assert_not_called()
     assert app._skip_kind == "start"
@@ -2911,6 +2915,7 @@ def test_positive_escape_hint_overrides_stale_one_shot_release() -> None:
 
 def test_strict_escape_probe_never_releases_ambiguous_normal_escape() -> None:
     app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.base_dir = SimpleNamespace()
     app._skip_seen_since = None
     app._skip_text_streak = 0
@@ -2937,6 +2942,8 @@ def test_strict_escape_probe_never_releases_ambiguous_normal_escape() -> None:
     with (
         patch.object(gui.winapi, "vg", object()),
         patch.object(gui.rank_ocr, "ocr_available", return_value=True),
+        patch.object(gui.rank_ocr, "match_skip_a", return_value=(False, 0.1, None)),
+        patch.object(gui.rank_ocr, "match_skip_s", return_value=(False, 0.1, None)),
         patch.object(gui.rank_ocr, "classify_skip_prompt", return_value=(False, None)),
     ):
         assert app._try_skip(frame, manager)
@@ -2952,13 +2959,15 @@ def test_strict_escape_probe_never_releases_ambiguous_normal_escape() -> None:
     assert app._defer_escape_target_for_skip_probe(target, 13.2)
 
 
-def test_escape_probe_forces_ocr_before_a_template_matching() -> None:
+def test_stale_escape_probe_does_not_override_current_a_template() -> None:
     tracker = SimpleNamespace(
         episode_control_seconds=3.0,
         pending=None,
         choose=Mock(return_value=(None, None)),
+        reset_episode=Mock(),
     )
     app = gui.AutomationApp.__new__(gui.AutomationApp)
+    app.stop_event = SimpleNamespace(is_set=lambda: False)
     app.base_dir = SimpleNamespace()
     app._skip_seen_since = None
     app._skip_text_streak = gui.SKIP_TEXT_CONSENSUS - 1
@@ -2975,6 +2984,9 @@ def test_escape_probe_forces_ocr_before_a_template_matching() -> None:
     app._skip_diag_count = 20
     app._skip_active_until = 0.0
     app._skip_generic_experiment = tracker
+    app._skip_experiment = SimpleNamespace(reset_episode=Mock())
+    app._skip_s_experiment = SimpleNamespace(reset_episode=Mock())
+    app._send_skip_tap = Mock(return_value=True)
     app._report_skip_experiment_outcome = Mock()
     app._reconcile_skip_learning = Mock()
     app.queue_status = Mock()
@@ -2994,11 +3006,14 @@ def test_escape_probe_forces_ocr_before_a_template_matching() -> None:
     ):
         assert app._try_skip(np.zeros((720, 1280), dtype=np.uint8), manager)
 
-    match_a.assert_not_called()
-    match_s.assert_not_called()
-    tracker.choose.assert_called_once()
-    assert app._skip_kind == "start"
-    assert app._skip_generic_hint == "escape"
+    match_a.assert_called_once()
+    match_s.assert_called_once()
+    tracker.choose.assert_not_called()
+    tracker.reset_episode.assert_called_once()
+    app._send_skip_tap.assert_called_once_with(manager, frame_seq=None)
+    assert app._skip_kind == "a"
+    assert app._skip_generic_hint is None
+    assert app._skip_generic_episode_hint is None
 
 
 def test_strict_skip_quiet_gate_covers_control_and_result_windows() -> None:

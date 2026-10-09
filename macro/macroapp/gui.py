@@ -100,10 +100,7 @@ from macroapp.config import (
     SKIP_TEXT_CONSENSUS, SKIP_FALLBACK_BOTH_SECONDS, STOP_CONFIRM_COUNT,
     SKIP_ANYKEY_DIRECT_START, SKIP_ANYKEY_REPRESS_SECONDS, SKIP_DIRECT_START_HINTS,
     SKIP_FOREGROUND_DIRECT, SKIP_FOREGROUND_REPRESS_SECONDS,
-    SKIP_FOREGROUND_KEY_AFTER_SECONDS, SKIP_FOREGROUND_MAX_PRESSES,
-    SKIP_FOREGROUND_KEY_ENABLED, SKIP_FOREGROUND_KEY_HOLD_SECONDS,
-    SKIP_FOREGROUND_HOLD_AFTER_SECONDS, SKIP_FOREGROUND_HOLD_SECONDS,
-    SKIP_S_EXPERIMENT_EVERY,
+    SKIP_FOREGROUND_MAX_PRESSES,
     SKIP_DIRECT_START_INCLUDES_UNKNOWN,
     load_targets, load_target_definitions,
     read_target_image_bytes, has_custom_target_image,
@@ -122,11 +119,10 @@ from macroapp.health import StallMonitor, STALL_NONE, stall_message
 from macroapp import daily_stats
 from macroapp.skip_anykey import ACTION_PRESS as ANYKEY_PRESS, AnyKeyStartPolicy
 from macroapp.skip_foreground import (
-    ACTION_HOLD_AND_KEY as FG_HOLD_AND_KEY,
-    ACTION_PAD as FG_PAD,
-    ACTION_PAD_AND_KEY as FG_PAD_AND_KEY,
+    ACTION_TAP as FG_TAP,
     ForegroundSkipPolicy,
 )
+from macroapp.skip_inactive import run_inactive_skip_tap
 from macroapp.mining import MiningStore
 from macroapp.skip_experiment import (
     SkipExperimentTracker,
@@ -367,6 +363,8 @@ class AutomationApp:
         }
         self.capture_mode_var = tk.StringVar(value="wgc")
         self.click_mode_var = tk.StringVar(value="postmessage")
+        # 창 전환은 사용자가 명시적으로 체크한 세션에서만 허용한다.
+        self._skip_inactive_attempt = 0
         # 목표 도달 시 자동 정지: "off"=안 멈춤 / "rank"=등수 / "score"=점수 (둘 중 하나)
         self.stop_mode_var = tk.StringVar(value="off")
         self.stop_value_var = tk.StringVar(value="")
@@ -478,14 +476,15 @@ class AutomationApp:
         # 실험 가드가 전면 상태를 통째로 deferred 로 버려 입력이 0이던 결함의 보수.
         self._skip_foreground_policy = ForegroundSkipPolicy(
             repress_seconds=SKIP_FOREGROUND_REPRESS_SECONDS,
-            key_escalation_seconds=SKIP_FOREGROUND_KEY_AFTER_SECONDS,
-            hold_escalation_seconds=SKIP_FOREGROUND_HOLD_AFTER_SECONDS,
             max_presses=SKIP_FOREGROUND_MAX_PRESSES,
         )
-        self._skip_foreground_direct = False  # 이번 에피소드가 직행인가
+        self._skip_tap_lock = threading.Lock()
+        self._skip_tap_last_attempt = float("-inf")
+        self._skip_tap_frame_floor = -1
+        self._skip_foreground_direct = False  # 이번 에피소드가 탭 경로인가
         self._skip_ap_episode_index = 0       # A/S 컷신 에피소드 일련번호
         self._skip_episode_is_direct = None    # 이 에피소드의 배분 결정(직행/실험)
-        self._skip_prompt_variant = None  # hold-to-skip 표시: None|"a"|"s"
+        self._skip_prompt_variant = None  # 같은 스킵의 표시 장치: None|"a"|"s"|"plain"
         self._skip_generic_hint = None    # OCR 확인 일반 프롬프트: escape|escape_highlight|any_key|start
         # A generic prompt can flicker between OCR hints on a moving replay.
         # Once its control episode starts, keep one immutable attribution key
@@ -1118,7 +1117,7 @@ class AutomationApp:
         ).pack(anchor=tk.W)
         tk.Label(
             header_text,
-            text="게임 창을 백그라운드에 둔 채 감지와 입력을 처리합니다.",
+            text="게임 창을 백그라운드에 둔 채 감지와 입력을 처리합니다. 스킵 때도 창을 활성화하지 않습니다.",
             bg=c["bg"],
             fg=c["muted"],
             font=self._font(9),
@@ -2166,6 +2165,9 @@ class AutomationApp:
             self._skip_kind = None
             self._skip_anykey_policy.reset()
             self._skip_foreground_policy.reset()
+            self._skip_tap_frame_floor = -1
+            self._skip_tap_last_attempt = float("-inf")
+            self._skip_inactive_attempt = 0
             self._skip_foreground_direct = False
             self._skip_ap_episode_index = 0
             self._skip_episode_is_direct = None
@@ -2211,7 +2213,7 @@ class AutomationApp:
             self._notification_last_action_at = 0.0
             self._stop_confirm_count = 0
             rank_ocr.reset_skip_a_template()  # 커스텀 (A) SKIP 교체 가능성 → 캐시 새로고침
-            if (RANK_OCR_ENABLED or SKIP_ENABLED) and rank_ocr.ocr_available():
+            if SKIP_ENABLED or (RANK_OCR_ENABLED and rank_ocr.ocr_available()):
                 # 세대 번호를 넘긴다 — join 타임아웃으로 살아남은 이전 워커가 재시작
                 # 후 부활해 같은 트래커·컨센서스를 이중 공급하지 않게(불일치 즉시 종료).
                 self._ocr_generation += 1
@@ -2601,6 +2603,7 @@ class AutomationApp:
         last_rank_seq = -1
         last_rank_time = 0.0
         last_skip = 0.0
+        last_skip_seq = -1
         last_score_seq = -1
         last_score_time = 0.0
         # generation 불일치 = 나는 이전 실행의 좀비다(join 타임아웃 생존) → 즉시 종료.
@@ -2629,9 +2632,12 @@ class AutomationApp:
                     seq, gray = frame
                     # SKIP: 0.3초 데드라인으로 정확히 끼어듦(입력 직결이라 우선).
                     skip_interval = self._current_skip_ocr_interval()
-                    if SKIP_ENABLED and now - last_skip >= skip_interval:
+                    if (SKIP_ENABLED and seq > last_skip_seq
+                            and seq > getattr(self, "_skip_tap_frame_floor", -1)
+                            and now - last_skip >= skip_interval):
                         last_skip = now
-                        self._try_skip(gray, self._ocr_manager)
+                        last_skip_seq = seq
+                        self._try_skip(gray, self._ocr_manager, frame_seq=seq)
                         did_ocr = True
                     # 등수: 새 프레임(seq 변화)마다 OCR+투표. 같은 프레임은 재OCR 안 함.
                     # RANK_OCR_INTERVAL_SECONDS(기본 0)는 하한일 뿐 — 보통은 seq 변화가 트리거.
@@ -4973,155 +4979,107 @@ class AutomationApp:
             return "plain"
         return None
 
-    def _foreground_direct_skip(
-        self,
-        now: float,
-        is_a: bool,
-        is_s: bool,
-        *,
-        manager: Optional[InactiveManager] = None,
-    ) -> bool:
-        """게임이 **이미 전면**인 컷신 프롬프트는 실험을 건너뛰고 바로 누른다.
+    def _send_skip_tap(
+        self, manager: Optional[InactiveManager], *, frame_seq: Optional[int] = None,
+    ) -> Optional[bool]:
+        """포커스를 바꾸지 않는 S/A 짧은 탭. 새 관측마다 한 경로만 사용한다.
 
-        적용되면 이번 OCR 패스를 여기서 끝내고 True, 아니면 False(기존 실험 흐름 계속).
-
-        ## 왜
-
-        배경 컷신 스킵은 아직 답이 없어 실험 기계가 붙어 있는데, 그 안전 가드가
-        **게임이 전면이면 시도 자체를 포기**한다(`target_already_foreground`).
-        배경 효과를 재는 게 목적이라 전면 시도는 귀속이 불가능하기 때문이다.
-        그런데 그 포기가 **입력 자체를 없앴다** — 2026-08-23 실측으로 15:06:26 의
-        [S] SKIP 프롬프트가 **116초 동안** 떠 있는 내내 입력이 0회였다(같은 후보
-        432회 연속 '보류'). 답을 아는 상황에서 탐색 기계가 아무것도 안 쏜 것이다
-        (2026-08-22 '실험이 템플릿을 굶겼다'와 같은 뿌리).
-
-        게임이 전면이면 답은 확정돼 있다(2026-07-07 사용자 실측: 전면화하면 넘어감).
-        그래서 여기서는 대조 구간도, 5.2초 봉쇄도 없이 바로 A 를 누르고, 안 사라지면
-        재누름하고, 오래 버티면 키보드 S 스캔코드까지 같이 보낸다.
-
-        ## 불변식
-
-        - 창을 전면으로 **올리지 않는다**. 이미 전면인 창에 누를 뿐이라 깜빡임 0.
-        - SendInput 키는 포그라운드가 게임일 때만, 누르는 내내 재확인하며 보낸다
-          (`send_scancode_to_foreground_window`) → 다른 앱 유출 0.
-        - 실험 표본을 오염시키지 않는다. 전면 구간 에피소드는 트래커에서 통째로 뺀다.
+        한 관측에 한 장치만 누른다. True는 API 전송 결과로, 게임의 스킵 성공은
+        별도로 관측해야 한다. None은 중복/간격/잠금 대기이다.
         """
-
-        if not SKIP_FOREGROUND_DIRECT or manager is None:
-            return False
-        if not (is_a or is_s or self._skip_kind == "a"):
-            return False
         hwnd = int(getattr(manager, "hwnd", 0) or 0)
-        if not hwnd:
+        exit_gate = getattr(self, "_exit_gate", None)
+        if not hwnd or self.stop_event.is_set() or (exit_gate is not None and exit_gate.is_set()):
             return False
+        lock = getattr(self, "_skip_tap_lock", None)
+        if lock is None:
+            lock = self._skip_tap_lock = threading.Lock()
+        # OCR 입력 중 캡처 생산자가 잠금을 기다리지 않도록 한다.
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            if self.stop_event.is_set() or (exit_gate is not None and exit_gate.is_set()):
+                return False
+            now = time.monotonic()
+            if frame_seq is not None and frame_seq <= getattr(self, "_skip_tap_frame_floor", -1):
+                return None
+            if now - getattr(self, "_skip_tap_last_attempt", float("-inf")) < SKIP_FOREGROUND_REPRESS_SECONDS:
+                return None
+            generation = getattr(self, "_ocr_generation", None)
+            self._skip_tap_last_attempt = now
+            self._skip_active_until = max(self._skip_active_until, now + 0.25)
+            attempt = getattr(self, "_skip_inactive_attempt", 0)
+            pad_available = winapi.vg is not None and input_gamepad.KEY_TO_GAMEPAD.get("a") is not None
+            route = "pad_a" if pad_available and attempt % 2 == 0 else "posted_s"
+            self._skip_inactive_attempt = attempt + 1
+            delivered = False
+            try:
+                def cancelled():
+                    return bool(
+                        self.stop_event.is_set()
+                        or (exit_gate is not None and exit_gate.is_set())
+                        or getattr(self, "_ocr_generation", None) != generation
+                        or int(getattr(manager, "hwnd", 0) or 0) != hwnd
+                    )
 
+                outcome = run_inactive_skip_tap(hwnd, route=route, cancelled=cancelled)
+                delivered = outcome.sent
+                self.queue_log(f"[SKIP 비활성] {route} · {outcome.reason}")
+            except Exception as exc:  # noqa: BLE001
+                self.queue_log(f"[SKIP 탭] {route} 전송 오류: {exc}")
+            finally:
+                # 누르는 동안 수집된 프레임도 다음 입력의 근거로 재사용하지 않는다.
+                self._skip_tap_frame_floor = max(
+                    getattr(self, "_skip_tap_frame_floor", -1),
+                    frame_seq if frame_seq is not None else -1,
+                    getattr(self, "_frame_seq", -1),
+                )
+                self._skip_active_until = max(self._skip_active_until, time.monotonic() + 0.25)
+            if delivered:
+                self._skip_last_press = (route, time.monotonic())
+                self.queue_log(f"[SKIP 탭] {route} 전송됨 · 게임 수신/스킵 성공은 미확인")
+            else:
+                self.queue_log(f"[SKIP 탭] {route} 전송 실패 — 다음 프레임에서 재시도")
+            return delivered
+        finally:
+            lock.release()
+
+    def _foreground_direct_skip(
+        self, now: float, is_a: bool, is_s: bool, *,
+        manager: Optional[InactiveManager] = None, plain: bool = False,
+        frame_seq: Optional[int] = None,
+    ) -> bool:
+        """현재 S/A 또는 맨 SKIP 프롬프트를 탭한다. START/홀드/실험으로 승격하지 않는다."""
+        if manager is None or not (is_a or is_s or plain):
+            return False
+        if not int(getattr(manager, "hwnd", 0) or 0):
+            return False
         policy = getattr(self, "_skip_foreground_policy", None)
         if policy is None:
-            return False
-        is_foreground = input_message.get_foreground_hwnd() == hwnd
-        claimed = bool(getattr(self, "_skip_foreground_direct", False))
-        # 이 에피소드를 '직행' 으로 쓸지 '실험' 으로 쓸지 한 번만 정한다.
-        # 실험은 매 컷신 3초 무입력 대조 + 5.2초 매칭 봉쇄를 요구해서, 답을 아는
-        # 경로(target_E 템플릿)까지 굶긴다 — 2026-08-23 에는 106초 동안 매크로 전체가
-        # 멈췄다. 그래서 N 번에 1번만 실험에 양보한다.
-        if getattr(self, "_skip_episode_is_direct", None) is None:
-            self._skip_ap_episode_index = (
-                int(getattr(self, "_skip_ap_episode_index", 0)) + 1
+            policy = self._skip_foreground_policy = ForegroundSkipPolicy(
+                repress_seconds=SKIP_FOREGROUND_REPRESS_SECONDS,
+                max_presses=SKIP_FOREGROUND_MAX_PRESSES,
             )
-            every = int(SKIP_S_EXPERIMENT_EVERY or 0)
-            self._skip_episode_is_direct = bool(
-                every <= 0 or (self._skip_ap_episode_index % every) != 0
-            )
-        # 게임이 전면이면 실험 가드가 어차피 시도를 포기하므로(귀속 불가) 무조건 직행.
-        can_press = bool(is_foreground or self._skip_episode_is_direct)
-        action = policy.observe(now, True, can_press)
-        if not can_press:
-            if not claimed:
-                # 이 에피소드는 실험 몫이다. 기존 경로가 그대로 담당한다.
-                return False
-            # ⚠️ 이미 이 에피소드에서 전면 입력을 보냈다. 도중에 배경으로 바뀌었다고
-            # 실험에 넘기면, 우리가 전면에서 누른 A 로 사라진 컷신이 **배경 후보의
-            # 성공**으로 귀속된다(가짜 승자 학습). 프롬프트가 사라질 때까지 이
-            # 에피소드는 직행이 소유한다.
-            self._skip_active_until = max(
-                self._skip_active_until, time.monotonic() + 0.25
-            )
-            self.queue_status("SKIP 넘기는 중")
-            return True
-
-        # 이 에피소드는 실험 표본이 아니다. 트래커의 진행 중 에피소드를 정리해
-        # 전면 입력이 배경 후보의 성공으로 귀속되는 것을 막는다.
         if not getattr(self, "_skip_foreground_direct", False):
+            self._skip_inactive_attempt = 0
             self._skip_experiment.reset_episode()
             self._skip_s_experiment.reset_episode()
+            self._reset_generic_experiment_episodes()
             self._skip_foreground_direct = True
+        self._skip_episode_is_direct = True
         self._skip_kind = "a"
-        self._skip_text_streak = 0
-        detected_variant = "s" if is_s else "a" if is_a else None
-        if detected_variant is not None:
-            self._skip_prompt_variant = detected_variant
-
-        if action in (FG_PAD, FG_PAD_AND_KEY, FG_HOLD_AND_KEY):
-            # 정지 뒤에는 입력이 나가면 안 된다(불변식). winocr 호출이 수백 ms 걸리는
-            # 동안 사용자가 정지를 눌렀을 수 있다.
-            if self.stop_event.is_set():
+        self._skip_prompt_variant = "s" if is_s else "a" if is_a else "plain"
+        self._skip_generic_hint = None
+        self._skip_generic_episode_hint = None
+        if plain:
+            self._skip_text_streak += 1
+            if self._skip_text_streak < SKIP_TEXT_CONSENSUS:
                 return True
-            a_btn = input_gamepad.KEY_TO_GAMEPAD.get("a")
-            key_note = ""
-            if not is_foreground and winapi.win32gui is not None:
-                # 배경 직행은 템플릿 경로(target_E)와 **같은 입력**이어야 한다 —
-                # 이 레포가 기록한 배경 입력 메커니즘은 'WGC + WM_ACTIVATE 가짜 포커스
-                # + vgamepad' 다. 스푸핑은 최선 노력(실패해도 패드 펄스는 나간다).
-                try:
-                    winapi.win32gui.PostMessage(hwnd, 0x0006, 1, 0)
-                except Exception:  # noqa: BLE001
-                    pass
-            # 사다리: 탭 → 탭+키보드 S → 홀드+키보드 S. 사용자는 "탭이면 된다"고
-            # 했고 2026-07-12 메모는 "홀드"였다. 엇갈리므로 둘 다 결국 시도한다.
-            # 키보드 S(SendInput)는 전면일 때만 나간다 — 배경에서 보내면 다른 앱으로
-            # 유출된다(send_scancode_to_foreground_window 가 스스로 거부하지만,
-            # 애초에 호출하지 않는 게 계약이 분명하다).
-            hold_seconds = (
-                SKIP_FOREGROUND_HOLD_SECONDS
-                if action == FG_HOLD_AND_KEY
-                else SKIP_A_TAP_SECONDS
-            )
-            if a_btn is not None:
-                try:
-                    send_gamepad_button(a_btn, hold_seconds)
-                except Exception as exc:  # noqa: BLE001
-                    self.queue_log(f"[SKIP 전면] A 입력 실패: {exc}")
-            if (
-                action in (FG_PAD_AND_KEY, FG_HOLD_AND_KEY)
-                and SKIP_FOREGROUND_KEY_ENABLED
-                and is_foreground
-            ):
-                # 사용자가 손으로 누르는 바로 그 키(키보드 S). 전면일 때만 나간다.
-                try:
-                    delivered = input_message.send_scancode_to_foreground_window(
-                        hwnd,
-                        input_message.SCAN_S,
-                        (
-                            SKIP_FOREGROUND_HOLD_SECONDS
-                            if action == FG_HOLD_AND_KEY
-                            else SKIP_FOREGROUND_KEY_HOLD_SECONDS
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.queue_log(f"[SKIP 전면] S 키 입력 실패: {exc}")
-                else:
-                    key_note = " + 키보드 S" if delivered else " (S 키 전면 이탈로 취소)"
-            self._skip_last_press = ("foreground_direct", now)
-            # 실험 경로의 5.2초 봉쇄와 달리 짧게만 멈춘다 — 같은 버튼이 두 스레드에서
-            # 겹쳐 나가는 것만 피하고, 템플릿·재누름이 곧바로 다시 돌아야 한다.
-            self._skip_active_until = max(
-                self._skip_active_until, time.monotonic() + 0.25
-            )
-            where = "전면" if is_foreground else "배경"
-            self.queue_log(
-                f"[SKIP 직행] {where} → A {policy.presses}회째{key_note}"
-            )
-        self.queue_status("SKIP 넘기는 중")
+        else:
+            self._skip_text_streak = 0
+        if policy.observe(now, True, not self.stop_event.is_set()) == FG_TAP:
+            self._send_skip_tap(manager, frame_seq=frame_seq)
+        self.queue_status("SKIP 탭 재시도 중")
         return True
 
     def _anykey_direct_start(
@@ -5140,8 +5098,8 @@ class AutomationApp:
 
         - 근거는 OCR 힌트가 SKIP_DIRECT_START_HINTS 안에 있는가다(any_key/escape/
           escape_highlight/start). 이 형태들의 답은 START 로 이미 확정돼 있다.
-        - ⚠️ **A/S(hold-to-skip)는 제외한다** — 답이 아직 없는 프롬프트라 실험이 계속
-          돌아야 한다(is_a/is_s 로 걸러진다).
+        - S/A와 맨 SKIP은 _foreground_direct_skip의 짧은 탭으로 처리한다.
+          이 메서드는 명시적인 ESC/아무 키/START 메뉴에만 사용한다.
         - 연속 확인·재누름 간격은 AnyKeyStartPolicy(순수 로직)가 정한다.
         - 템플릿(target_F/G) 경로는 막지 않는다. 누른 직후 0.5초만 매칭을 멈춰 같은
           버튼이 두 스레드에서 겹쳐 나가는 것만 피한다 — 실험 경로(5.2초 봉쇄)와 달리
@@ -5219,26 +5177,18 @@ class AutomationApp:
         self.queue_status("SKIP 넘기는 중")
         return True
 
-    def _try_skip(self, screen_gray, manager: Optional[InactiveManager]) -> bool:
-        """화면에 SKIP이 보이면 종류에 맞는 버튼을 눌러 넘기고 True를 반환합니다.
+    def _try_skip(
+        self, screen_gray, manager: Optional[InactiveManager],
+        *, frame_seq: Optional[int] = None,
+    ) -> bool:
+        """S/A/맨 SKIP은 짧은 탭. 명시적 ESC/아무 키 프롬프트는 별도 처리한다.
 
-        - '(A) SKIP'(초록 A 버튼 = target_skip_a.png 템플릿) → A만 누른다.
-        - '아무 키나 누르세요' 프롬프트(OCR any_key) → 실험 없이 바로 Start(_anykey_direct_start).
-        - 그 외 일반 스킵(OCR 'skip'/'스킵', SKIP_TEXT_CONSENSUS회 연속 확인) → Start만.
-        - 한 스킵이 SKIP_FALLBACK_BOTH_SECONDS 넘게 안 사라지면 A·Start 둘 다(안전망).
-
-        반환 True면 매칭이 _skip_active_until까지 잠시 멈춥니다. 미감지 시 False이고
-        스킵 상태(타이머·연속카운트)를 초기화합니다.
+        템플릿은 winocr/패드 설치 여부와 무관하게 인식한다. 워커는 새 프레임만
+        전달하며 입력 중 수집된 프레임도 다음 입력에 재사용하지 않는다.
         """
-        if winapi.vg is None or not rank_ocr.ocr_available() or manager is None:
-            # 대상 창 없음/화면영역 모드 → 헛누름 방지로 건너뛰고 상태 초기화.
-            self._skip_seen_since = None
-            self._skip_text_streak = 0
-            self._skip_s_match_streak = 0
-            self._skip_generic_hint = None
-            self._skip_generic_episode_hint = None
-            self._skip_esc_probe_negative_streak = 0
-            self._skip_esc_probe_allow_once = False
+        if manager is None or not getattr(manager, "hwnd", 0) or self.stop_event.is_set():
+            return False
+        if frame_seq is not None and frame_seq <= getattr(self, "_skip_tap_frame_floor", -1):
             return False
         try:
             h, w = screen_gray.shape[:2]
@@ -5256,18 +5206,11 @@ class AutomationApp:
                     "any_key", "start"
                 }
             )
-            if generic_episode:
-                is_a, skip_a_score, a_center = (False, 0.0, None)
-                is_s, skip_s_score, s_center = (False, 0.0, None)
-            else:
-                # 1) 명시적인 ESC형이 아닌 에피소드에서만 A/S 템플릿을 우선한다.
-                is_a, skip_a_score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
-                is_s, skip_s_score, s_center = rank_ocr.match_skip_s(crop, self.base_dir)
+            # 이전 OCR 힌트가 현재의 S/A 프롬프트 검사를 가로막지 않게 한다.
+            is_a, skip_a_score, a_center = rank_ocr.match_skip_a(crop, self.base_dir)
+            is_s, skip_s_score, s_center = rank_ocr.match_skip_s(crop, self.base_dir)
             raw_is_s = bool(is_s)
-            if not generic_episode:
-                is_s = self._confirmed_s_template_match(raw_is_s)
-            else:
-                self._skip_s_match_streak = 0
+            is_s = self._confirmed_s_template_match(raw_is_s)
             provisional_s = raw_is_s and not is_s
             # 2) 일반 프롬프트의 명시적 ESC/Enter/START 근거는 A/S 템플릿보다
             # 우선한다. A/S 템플릿도 공통 SKIP 글자를 포함해 일반 프롬프트에서
@@ -5279,15 +5222,22 @@ class AutomationApp:
                     ocr_crop, (SKIP_OCR_MAX_WIDTH, max(1, int(ocr_crop.shape[0] * scale))),
                     interpolation=cv2.INTER_AREA,
                 )
-            has_text, text_hint = rank_ocr.classify_skip_prompt(
-                ocr_crop,
-                logger=None,
-            )
+            has_text, text_hint = (False, None)
+            if rank_ocr.ocr_available():
+                has_text, text_hint = rank_ocr.classify_skip_prompt(
+                    ocr_crop, logger=None,
+                )
             if provisional_s:
                 # Do not let OCR-only SKIP text turn the first S-template
                 # frame into a generic episode.  The next frame confirms S or
                 # clears this provisional match.
                 has_text, text_hint = False, None
+            if (is_a or is_s) and text_hint not in {
+                "escape", "escape_highlight", "any_key", "start"
+            }:
+                self._skip_generic_hint = None
+                self._skip_generic_episode_hint = None
+                generic_episode = False
             if has_text:
                 # Clear the negative-release state *before* publishing the
                 # positive hint.  This ordering makes the two-thread handoff
@@ -5315,13 +5265,19 @@ class AutomationApp:
                         # keycap itself, so a concurrent icon match is stronger
                         # evidence than the generic START fallback.  Promote
                         # before the episode hint is locked to its tracker.
-                        if text_hint in {None, "start"}:
+                        if text_hint in {None, "start"} and not (is_a or is_s):
                             text_hint = "escape"
                 if (
                     text_hint == "escape"
                     and self._is_highlight_summary_context(screen_gray)
                 ):
                     text_hint = "escape_highlight"
+            if has_text and text_hint is None:
+                # 현재 프레임에 S/A/맨 SKIP만 보이면 이전 메뉴의 ESC/START 힌트를
+                # 이월하지 않는다. 현재 ESC 아이콘 매칭은 위에서 이미 반영했다.
+                self._skip_generic_hint = None
+                self._skip_generic_episode_hint = None
+                generic_episode = False
             if has_text and text_hint in {
                 "escape", "escape_highlight", "any_key", "start"
             }:
@@ -5410,8 +5366,7 @@ class AutomationApp:
                 # 않고, 사용자가 결과를 볼 수 있게 로그만 남긴다.
                 policy = self._skip_foreground_policy
                 self.queue_log(
-                    f"[SKIP 직행] 소멸 — 입력 {policy.presses}회"
-                    f"(키 {policy.key_presses}회), "
+                    f"[SKIP 직행] 프롬프트 소멸 — 탭 시도 {policy.presses}회, "
                     f"{policy.elapsed(time.monotonic()):.2f}초"
                 )
                 self._skip_experiment.reset_episode()
@@ -5555,18 +5510,23 @@ class AutomationApp:
                     self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
             except Exception:
                 pass
-        # 답이 확정된 일반 프롬프트(▷ SKIP · '아무 키나' · ESC SKIP)는 실험·대조·봉쇄를
-        # 거치지 않고 바로 START 를 누른다(아래 오염 판정·3초 대조보다 먼저 — 이
-        # 에피소드는 실험 표본이 아니다).
-        if self._anykey_direct_start(
-            now, has_text, is_a, is_s, manager=manager, screen_gray=screen_gray
+        # S/A와 장치 글리프 없는 SKIP은 같은 탭이다. 모호한 SKIP을 START로
+        # 추측하지 않고 현재 관측만 사용한다. 자동 실험/오래된 학습을 타지 않는다.
+        plain_skip = bool(has_text and not is_a and not is_s and self._skip_generic_hint is None)
+        if self._foreground_direct_skip(
+            now, is_a, is_s, manager=manager, plain=plain_skip, frame_seq=frame_seq
         ):
             return True
 
-        # 게임이 **이미 전면**인 컷신(A/S)은 답이 확정돼 있다 — 실험·대조·봉쇄를 거치지
-        # 않고 바로 A(그리고 오래 버티면 키보드 S)를 누른다. 실험 가드가 전면 상태를
-        # 통째로 deferred 로 버려 입력이 0이던 결함의 보수(2026-08-23 원장 440/494).
-        if self._foreground_direct_skip(now, is_a, is_s, manager=manager):
+        if getattr(self, "_skip_foreground_direct", False):
+            # S/A 뒤에 명시적인 다른 메뉴가 나타나면 지난 스킵 종류를 이월하지 않는다.
+            self._skip_foreground_policy.reset()
+            self._skip_foreground_direct = False
+            self._skip_kind = None
+            self._skip_text_streak = 0
+        if self._anykey_direct_start(
+            now, has_text, is_a, is_s, manager=manager, screen_gray=screen_gray
+        ):
             return True
 
         if SKIP_STRICT_INACTIVE_EXPERIMENT and self._skip_control_contaminated:
@@ -6042,6 +6002,14 @@ class AutomationApp:
         if not target.key:
             self.queue_log(f"[오류] {target.name}에 전송할 키가 설정되지 않았습니다.")
             return False
+        normalized_key = target.key.strip().lower()
+        if normalized_key == "s" or (
+            normalized_key == "a" and getattr(target, "name", "") in {
+                "target_E", "target_skip_a", "target_skip_s", "target_skip_s_dark"
+            }
+        ):
+            result = self._send_skip_tap(manager, frame_seq=getattr(self, "_frame_seq", None))
+            return result is True
         if winapi.vg is None:
             self.queue_log("[오류] vgamepad를 불러올 수 없어 게임패드 입력을 보낼 수 없습니다.")
             self.queue_log(f"       원본 오류: {winapi.VGAMEPAD_IMPORT_ERROR}")

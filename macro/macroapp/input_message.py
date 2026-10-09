@@ -225,14 +225,14 @@ def send_scancode_key(scan: int, hold: float = 0.1) -> bool:
 def send_scancode_to_foreground_window(
     hwnd: int, scan: int, hold: float = 0.06
 ) -> bool:
-    """대상 창이 **전면일 때만** SendInput 스캔코드를 보낸다(다른 앱 유출 차단).
+    """전면을 확인하고 스캔코드 탭을 보내며, 두 입력의 전송 결과를 확인한다.
 
-    SendInput 은 전역이라 그 순간의 포그라운드 창으로 간다. 그래서 이 함수는
-    보내기 직전에 포그라운드가 ``hwnd`` 인지 확인하고, 누르고 있는 동안에도 5ms 마다
-    다시 확인한다. 사용자가 중간에 다른 창으로 옮겨 가면 **즉시 키를 떼고** False 를
-    돌려준다 — 남의 앱에 's' 가 찍히는 것을 막는 유일한 장치다.
+    누르기 직전, 누르는 동안 5ms 간격, 떼기 직전에 대상 HWND가 전면인지
+    확인한다. 관측 중 다른 창으로 바뀌면 키를 해제하고 False를 반환한다.
+    SendInput은 전역 입력이므로 전면 확인과 전송 사이의 경쟁까지 막지는 못한다.
 
-    반환 True = 누르는 내내 대상 창이 전면이었다(유출 없음).
+    True는 관측한 전면 상태가 일치하고 Down/Up 전송이 모두 성공했다는 뜻이다.
+    게임이 입력을 소비했거나 실제로 스킵됐다는 의미는 아니다.
     """
     hwnd = int(hwnd or 0)
     if not hwnd or not hasattr(ctypes, "windll"):
@@ -241,17 +241,21 @@ def send_scancode_to_foreground_window(
         return False
     if not _send_scancode(scan, keyup=False):
         return False
-    leaked = False
+    foreground_unchanged = True
+    released = False
     try:
         deadline = time.monotonic() + max(0.0, float(hold))
         while time.monotonic() < deadline:
             if get_foreground_hwnd() != hwnd:
-                leaked = True
+                foreground_unchanged = False
                 break
             time.sleep(0.005)
+        # 0초 탭과 마지막 폴링 이후 전면 변경도 전송 성공으로 기록하지 않는다.
+        if get_foreground_hwnd() != hwnd:
+            foreground_unchanged = False
     finally:
-        _send_scancode(scan, keyup=True)
-    return not leaked
+        released = _send_scancode(scan, keyup=True)
+    return foreground_unchanged and bool(released)
 
 
 def post_key_deep(hwnd: int, vk_code: int, press_delay: float = 0.08) -> bool:

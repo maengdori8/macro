@@ -227,8 +227,8 @@ def test_escape_prompt_also_goes_direct_not_into_the_experiment() -> None:
         assert app._skip_active_until - time.monotonic() <= 0.6
 
 
-def test_a_and_s_prompts_still_go_to_the_experiment() -> None:
-    """A/S(hold-to-skip)는 답이 없는 프롬프트라 실험이 계속 돌아야 한다."""
+def test_a_and_s_prompts_do_not_use_the_anykey_start_path() -> None:
+    """S/A 탭 프롬프트는 별도 탭 경로에서 처리하며 일반 메뉴 START를 타지 않는다."""
 
     app = _app()
     app._skip_generic_hint = "escape"
@@ -268,11 +268,18 @@ def test_plain_skip_prompt_without_any_hint_goes_direct() -> None:
     manager = SimpleNamespace(hwnd=123)
     screen = np.zeros((720, 1280), dtype=np.uint8)
     p = _patches([(True, None)] * 2)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad:
+    with (p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad,
+          patch.object(gui, "run_inactive_skip_tap", return_value=SimpleNamespace(
+              sent=True, reason="sent"
+          )) as inactive):
         assert app._try_skip(screen, manager)
+        inactive.assert_not_called()
         assert app._try_skip(screen, manager)
-    assert gamepad.call_count == 1, "맨 ▷ SKIP 이 직행 START 를 못 받았다"
-    assert app._skip_kind == "anykey", "맨 ▷ SKIP 이 실험 경로로 샜다"
+    inactive.assert_called_once()
+    assert inactive.call_args.args == (123,)
+    assert inactive.call_args.kwargs["route"] == "pad_a"
+    gamepad.assert_not_called()
+    assert app._skip_kind == "a", "맨 ▷ SKIP 이 탭 경로로 가지 않았다"
     app._skip_generic_experiment.choose.assert_not_called()
     # 봉쇄는 0.5초 — 템플릿이 곧바로 재시도할 수 있어야 한다.
     assert app._skip_active_until - time.monotonic() <= 0.6
@@ -311,7 +318,7 @@ def test_highlight_screen_stays_in_the_experiment_even_without_a_hint() -> None:
     dark[int(720 * 0.12):int(720 * 0.74), int(1280 * 0.23):int(1280 * 0.77)] = 10
     assert app._direct_start_form(None, dark) is None
     bright = np.full((720, 1280), 200, dtype=np.uint8)
-    assert app._direct_start_form(None, bright) == "plain"
+    assert app._direct_start_form(None, bright) is None  # 맨 SKIP을 START로 추측하지 않는다.
     assert app._direct_start_form("escape_highlight", bright) is None
 
 

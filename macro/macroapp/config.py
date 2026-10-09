@@ -456,49 +456,18 @@ SKIP_A_SWEEP_BUTTONS = ("char_s_hold", "char_s",
 SKIP_A_TAP_SECONDS = 0.15    # 후보 버튼 탭 길이
 SKIP_A_SWEEP_HOLD_SECONDS = 1.0   # '*_hold' 후보의 홀드 길이(hold-to-skip 대응)
 
-# ── 전면(포커스) 상태 컷신 SKIP 직행 ──
-# 배경(비활성) 컷신 스킵은 아직 답을 못 찾은 문제라 실험 기계가 붙어 있다. 그런데 그
-# 실험의 안전 가드는 **게임이 이미 전면이면 시도 자체를 포기**한다
-# (detail="target_already_foreground") — 배경 효과 측정이 목적이라 귀속이 안 되기 때문이다.
-# 문제는 그 포기가 입력 자체를 없앤다는 것. 2026-08-23 실측:
-#   15:06:26 의 [S] SKIP 프롬프트가 116초 동안 떠 있는 내내 입력 0회
-#   (같은 후보 432회 연속 '보류'). 그날 A/S 에피소드 15개 중 4개가 입력 0회.
-# 게임이 전면이면 답은 이미 확정돼 있다(2026-07-07 사용자 실측: 전면화하면 넘어감).
-# 그래서 전면 구간은 실험 밖에서 즉시 누른다. 창을 전면으로 **올리지는 않으므로**
-# '비활성 100%'·'깜빡임 0' 불변식과 무관하다.
+# ── S/A 컷신 스킵: 짧은 탭 전용 ──
+# S 키와 패드 A는 같은 동작이다. 오래 걸려도 START/홀드로 바꾸지 않는다.
+# 포커스는 바꾸지 않는다. 새 관측마다 패드 A/대상 창 S 메시지를 하나씩 교대한다.
 SKIP_FOREGROUND_DIRECT = True
-SKIP_FOREGROUND_REPRESS_SECONDS = 0.35    # 안 사라지면 이 간격으로 재누름
-# ⚠️ **0.0 = 첫 발부터 키보드 S 를 패드 A 와 같이 보낸다.** 순서가 거꾸로였다:
-# CLAUDE.md 2026-07-02 실측 원문이 "가상 A는 탭·1s 홀드 **모두 무시**, 클릭 무효,
-# **전면전환+키보드 s '탭'은 통함**" 이다. 즉 전면에서 성공이 기록된 유일한 입력은
-# 키보드 s 탭이고 패드 A 는 무시됐다. 2026-09-06 사용자 진술도 같은 말이다.
-# 그런데 사다리가 처음 1.2초(≈4발)를 '무시된다고 기록된' 패드 A 로만 썼다.
-# 반대 증거(07-07 "A 홀드+알트탭")도 있으므로 A 를 빼지 않고 **같은 패스에 둘 다** 보낸다.
-SKIP_FOREGROUND_KEY_AFTER_SECONDS = 0.0
-SKIP_FOREGROUND_HOLD_AFTER_SECONDS = 2.6  # 그래도 안 되면 A·S 홀드(마지막 폴백)
-SKIP_FOREGROUND_HOLD_SECONDS = 0.5        # 그때의 홀드 길이
-# 재누름은 '횟수'가 아니라 '시간'으로 끊는다. 옛 값(24회 × 0.35초 = 8.4초)은 실측한
-# 116초 정체의 7% 밖에 못 덮었다. 3초까지는 촘촘히(0.35초), 그 뒤로는 1초 간격으로
-# 90초까지 — 컷신 지속 중앙값 13초·최대 40초(08-22 실측)를 두 배 넘게 덮는다.
+SKIP_FOREGROUND_REPRESS_SECONDS = 0.35
 SKIP_FOREGROUND_MAX_PRESSES = 120
-SKIP_FOREGROUND_SLOW_AFTER_SECONDS = 3.0  # 이후로는 재누름 간격을 늘린다
+SKIP_FOREGROUND_SLOW_AFTER_SECONDS = 3.0
 SKIP_FOREGROUND_SLOW_REPRESS_SECONDS = 1.0
-SKIP_FOREGROUND_MAX_EPISODE_SECONDS = 90.0  # 이걸 넘으면 컷신이 아니라 화면 정지다
-# SendInput 키보드 S 승격. SendInput 은 전역이라 전면 창으로만 가는데, 그 전면 창이
-# 게임 자신이므로 '다른 앱 유출'이 성립하지 않는다(유출 금지 불변식은 지켜진다).
-# 그래도 보내는 동안 포그라운드를 계속 확인해 바뀌면 즉시 키를 뗀다.
-SKIP_FOREGROUND_KEY_ENABLED = True
-
-# ── 실험 vs 직행 배분 ──
-# 컷신 `[S] SKIP` 의 '무엇을 누르나' 는 이미 답이 있다(A = target_E 가 누르는 그 버튼).
-# 아직 못 푼 건 '배경에서 어떻게 전달하나' 뿐이다. 그런데 실험은 매 컷신마다 3초 무입력
-# 대조 + 5.2초 매칭 봉쇄를 요구해서, **답을 아는 경로(target_E 템플릿)까지 굶긴다**.
-# 실측 2026-08-23: 15:06:26~15:08:12 **106초 동안 타겟 감지 0건** — SKIP 도 못 넘기고
-# 일반 자동화도 멈췄다. 봉쇄가 풀린 15:08:12 에 target_E 가 뜨자마자 프롬프트가 끝났다.
-# → N 번에 1번만 실험 에피소드로 양보하고 나머지는 직행한다(0 이면 실험 완전히 끔).
-# 2026-08-22 교훈의 재적용: "실험은 답을 모르는 형태에만 붙인다."
-SKIP_S_EXPERIMENT_EVERY = 5
-SKIP_FOREGROUND_KEY_HOLD_SECONDS = 0.06
+SKIP_FOREGROUND_MAX_EPISODE_SECONDS = 90.0
+SKIP_FOREGROUND_KEY_ENABLED = False  # 구 진단 도구 호환. S/A 운영 경로는 전역 입력 금지.
+SKIP_FOREGROUND_KEY_HOLD_SECONDS = 0.06  # key-down/up 사이 짧은 탭 길이
+SKIP_S_EXPERIMENT_EVERY = 0  # S/A 실험 분배 폐기(구 진단 도구 호환)
 # 완전 비활성 실험 모드. 후보 입력 동안 별도 감시 스레드가 전면 HWND를 연속 확인하고,
 # 대상 게임 HWND가 한 번이라도 전면이 된 후보만 해당 세션에서 즉시 격리합니다.
 SKIP_STRICT_INACTIVE_EXPERIMENT = True
@@ -637,7 +606,7 @@ SKIP_DIRECT_START_HINTS = ("any_key", "escape", "start")
 # 증거 이미지를 다시 돌려 보니 OCR 원문은 "skip"(+선수 이름)뿐이고 esc/enter/아무키 토큰이
 # 없어 classify 가 (True, None) 을 내며, A/S/F/G 템플릿은 40/40 전부 미매칭이었다.
 # → 힌트 None 을 직행에서 빼면 '고치려던 화면'이 그대로 실험(5.2초 봉쇄)에 남는다.
-SKIP_DIRECT_START_INCLUDES_UNKNOWN = True
+SKIP_DIRECT_START_INCLUDES_UNKNOWN = False  # 맨 SKIP은 S/A 탭 경로가 담당한다.
 # ⚠️ escape_highlight(경기 후 하이라이트)는 **직행에서 뺀다.** 이 레포가 '아직 답을 못 찾은'
 # 형태로 기록해 둔 유일한 프롬프트다(전용 후보 카탈로그·전용 exit_confirm 5.0초·learned 강제
 # None). 맨 START 가 통한다는 증거가 없으므로 실험에 남긴다. 힌트가 None 이어도 화면이

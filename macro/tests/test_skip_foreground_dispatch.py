@@ -1,366 +1,406 @@
-"""전면 직행이 _try_skip 에 실제로 배선돼 있다 — 배선 누락 재발 방지.
+"""S/A 실제 경로: 새 관측당 비활성 탭 하나, 전면화·홀드·실험 없음."""
 
-## 고정하는 계약
-
-1. 게임 창이 **전면**이고 컷신(A/S) 프롬프트가 보이면, 실험 추적기를 건드리지 않고
-   가상패드 A 를 바로 누른다. (실험 가드가 이 경우를 통째로
-   `deferred(target_already_foreground)` 로 버려 입력이 0이던 것이 원인이었다 —
-   2026-08-23 에는 한 프롬프트가 116초 동안 입력 0회였다.)
-2. 게임이 **배경**이면 전면 직행은 발동하지 않고 기존 실험 경로가 그대로 돈다.
-3. 프롬프트가 오래 버티면 키보드 S 스캔코드까지 같이 나간다.
-4. 전면 직행 에피소드는 실험 봉쇄(5.2초)를 걸지 않는다 — 재누름이 곧바로 돌아야 한다.
-5. 정지 뒤에는 입력이 나가지 않는다.
-"""
-
-from __future__ import annotations
-
-import time
+import ast
+from contextlib import ExitStack, contextmanager
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import pytest
 
-from macroapp import config, gui
+from macroapp import config, gui, skip_inactive
 from macroapp.skip_anykey import AnyKeyStartPolicy
 from macroapp.skip_foreground import ForegroundSkipPolicy
 
 GAME_HWND = 4321
+OTHER_HWND = 9876
 
 
-def _tracker() -> SimpleNamespace:
+def _tracker():
     return SimpleNamespace(
-        episode_control_seconds=3.0,
-        pending=None,
-        choose=Mock(return_value=(None, None)),
-        reset_episode=Mock(),
+        episode_control_seconds=3.0, pending=None,
+        choose=Mock(return_value=(None, None)), reset_episode=Mock(),
         record_attempt=Mock(),
     )
 
 
-def _app() -> gui.AutomationApp:
+def _app():
     app = gui.AutomationApp.__new__(gui.AutomationApp)
     app.base_dir = SimpleNamespace()
-    app._skip_seen_since = None
-    app._skip_text_streak = 0
-    app._skip_s_match_streak = 0
-    app._skip_kind = None
-    app._skip_prompt_variant = None
-    app._skip_generic_hint = None
-    app._skip_generic_episode_hint = None
-    app._skip_prompt_center = None
-    app._skip_prompt_visual = None
-    app._skip_last_press = None
-    app._skip_a_learned = None
-    app._skip_a_sweep_idx = 0
+    for attr in (
+        "_skip_seen_since", "_skip_kind", "_skip_prompt_variant",
+        "_skip_generic_hint", "_skip_generic_episode_hint", "_skip_prompt_center",
+        "_skip_prompt_visual", "_skip_last_press", "_skip_a_learned",
+    ):
+        setattr(app, attr, None)
+    for attr in ("_skip_text_streak", "_skip_s_match_streak", "_skip_a_sweep_idx",
+                 "_skip_esc_probe_negative_streak", "_frame_seq", "_skip_inactive_attempt"):
+        setattr(app, attr, 0)
+    for attr in ("_skip_esc_probe_allow_once", "_skip_precontrol_contaminated",
+                 "_skip_control_contaminated", "_skip_foreground_direct"):
+        setattr(app, attr, False)
     app._last_normal_action_at = float("-inf")
-    app._skip_esc_probe_negative_streak = 0
-    app._skip_esc_probe_allow_once = False
-    app._skip_precontrol_contaminated = False
-    app._skip_control_contaminated = False
     app._skip_a_dumped = True
     app._skip_diag_count = 20
     app._skip_active_until = 0.0
-    app._skip_experiment = _tracker()
-    app._skip_s_experiment = _tracker()
-    app._skip_generic_experiment = _tracker()
-    app._skip_generic_any_key_experiment = _tracker()
-    app._skip_generic_escape_experiment = _tracker()
-    app._skip_generic_escape_highlight_experiment = _tracker()
-    app._skip_anykey_policy = AnyKeyStartPolicy(
-        consensus=config.SKIP_TEXT_CONSENSUS,
-        repress_seconds=config.SKIP_ANYKEY_REPRESS_SECONDS,
-    )
-    # 재누름 간격 0 — 매 패스마다 눌러 배선을 관찰할 수 있게 한다.
-    app._skip_foreground_policy = ForegroundSkipPolicy(
-        repress_seconds=0.0,
-        key_escalation_seconds=config.SKIP_FOREGROUND_KEY_AFTER_SECONDS,
-        max_presses=config.SKIP_FOREGROUND_MAX_PRESSES,
-    )
-    app._skip_foreground_direct = False
-    app._capture_skip_prompt_visual = Mock()
-    app._report_skip_experiment_outcome = Mock()
-    app._reconcile_skip_learning = Mock()
-    app.queue_status = Mock()
-    app.queue_log = Mock()
+    for attr in ("_skip_experiment", "_skip_s_experiment", "_skip_generic_experiment",
+                 "_skip_generic_any_key_experiment", "_skip_generic_escape_experiment",
+                 "_skip_generic_escape_highlight_experiment"):
+        setattr(app, attr, _tracker())
+    app._skip_anykey_policy = AnyKeyStartPolicy(consensus=config.SKIP_TEXT_CONSENSUS)
+    app._skip_foreground_policy = ForegroundSkipPolicy()
+    for attr in ("_capture_skip_prompt_visual", "_report_skip_experiment_outcome",
+                 "_reconcile_skip_learning", "queue_status", "queue_log"):
+        setattr(app, attr, Mock())
     app.stop_event = SimpleNamespace(is_set=lambda: False)
     return app
 
 
-def _patches(*, foreground_hwnd: int, a_hit: bool = True):
-    """A 템플릿이 맞은 컷신 프롬프트 + 지정한 포그라운드 창."""
-    return (
-        patch.object(gui.winapi, "vg", object()),
-        patch.object(gui.rank_ocr, "ocr_available", return_value=True),
-        patch.object(
-            gui.rank_ocr, "match_skip_a", return_value=(a_hit, 0.9, (10, 10))
-        ),
-        patch.object(gui.rank_ocr, "match_skip_s", return_value=(False, 0.1, None)),
-        patch.object(
-            gui.rank_ocr, "classify_skip_prompt", return_value=(False, None)
-        ),
-        patch.dict(
-            gui.input_gamepad.KEY_TO_GAMEPAD, {"a": 4096, "start": 16}, clear=False
-        ),
-        patch.object(gui, "send_gamepad_button", return_value=True),
-        patch.object(
-            gui.input_message, "get_foreground_hwnd", return_value=foreground_hwnd
-        ),
-        patch.object(
-            gui.input_message,
-            "send_scancode_to_foreground_window",
-            return_value=True,
-        ),
-    )
+@contextmanager
+def _environment(*, foreground=GAME_HWND, a_hit=True, s_hit=False,
+                 text=(False, None), ocr=True, vg=True):
+    """Mock every input endpoint, including window messages to the fake HWND."""
+    with ExitStack() as stack:
+        clock = SimpleNamespace(now=100.0)
+        stack.enter_context(patch.object(gui.time, "monotonic", side_effect=lambda: clock.now))
+        stack.enter_context(patch.object(gui.winapi, "vg", object() if vg else None))
+        win32 = stack.enter_context(patch.object(gui.winapi, "win32gui", Mock()))
+        stack.enter_context(patch.object(gui.rank_ocr, "ocr_available", return_value=ocr))
+        match_a = stack.enter_context(patch.object(gui.rank_ocr, "match_skip_a",
+            return_value=(a_hit, 0.9 if a_hit else 0.1, (10, 10) if a_hit else None)))
+        stack.enter_context(patch.object(gui.rank_ocr, "match_skip_s",
+            return_value=(s_hit, 0.9 if s_hit else 0.1, (10, 10) if s_hit else None)))
+        classify = stack.enter_context(patch.object(gui.rank_ocr, "classify_skip_prompt", return_value=text))
+        stack.enter_context(patch.dict(gui.input_gamepad.KEY_TO_GAMEPAD,
+                                      {"a": 4096, "s": 4096, "start": 16}, clear=True))
+        pad = stack.enter_context(patch.object(gui, "send_gamepad_button", return_value=True))
+        foreground_reader = stack.enter_context(patch.object(
+            gui.input_message, "get_foreground_hwnd", return_value=foreground))
+        key = stack.enter_context(patch.object(gui.input_message,
+            "send_scancode_to_foreground_window", return_value=True))
+        candidate = stack.enter_context(patch.object(gui.AutomationApp, "_press_skip_candidate",
+            side_effect=AssertionError("S/A production must not run old candidate experiments")))
+        sender = stack.enter_context(patch.object(gui, "run_inactive_skip_tap",
+            side_effect=lambda _hwnd, **kwargs: SimpleNamespace(
+                sent=True, route=kwargs["route"], reason="sent",
+            )))
+        yield SimpleNamespace(clock=clock, win32=win32, pad=pad, key=key, sender=sender,
+                              classify=classify, match_a=match_a,
+                              foreground=foreground_reader, candidate=candidate)
 
 
-def _screen() -> np.ndarray:
-    return np.zeros((720, 1280), dtype=np.uint8)
+def _observe(app, seq=1):
+    app._frame_seq = seq
+    return app._try_skip(np.zeros((720, 1280), dtype=np.uint8),
+                         SimpleNamespace(hwnd=GAME_HWND), frame_seq=seq)
 
 
-def test_게임이_전면이면_실험_없이_A_를_바로_누른다() -> None:
+def _routes(env):
+    return [item.kwargs["route"] for item in env.sender.call_args_list]
+
+
+def _assert_no_foreground_or_legacy_input(env):
+    env.key.assert_not_called()
+    env.win32.PostMessage.assert_not_called()
+    env.win32.SetForegroundWindow.assert_not_called()
+    env.win32.SetFocus.assert_not_called()
+    env.pad.assert_not_called()
+    env.candidate.assert_not_called()
+
+
+@pytest.mark.parametrize("variant", ["a", "s"])
+@pytest.mark.parametrize("foreground", [GAME_HWND, OTHER_HWND])
+def test_a_and_s_use_one_equivalent_short_tap(variant, foreground):
     app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8]:
-        assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_called_once_with(4096, config.SKIP_A_TAP_SECONDS)
-
-    # 실험 추적기의 후보 선택은 절대 돌지 않는다 — 이 화면은 표본이 아니다.
+    with _environment(foreground=foreground, a_hit=variant == "a", s_hit=variant == "s") as env:
+        for seq in range(1, (config.SKIP_TEXT_CONSENSUS if variant == "s" else 1) + 1):
+            _observe(app, seq)
+            env.clock.now += 0.4
+        assert _routes(env) == ["pad_a"]
+        assert env.sender.call_args.args == (GAME_HWND,)
+        _assert_no_foreground_or_legacy_input(env)
     app._skip_experiment.choose.assert_not_called()
     app._skip_s_experiment.choose.assert_not_called()
-    app._report_skip_experiment_outcome.assert_not_called()
-    assert app._skip_foreground_direct is True
-    assert app._skip_kind == "a"
-    assert any(
-        "[SKIP 직행] 전면" in str(call.args[0])
-        for call in app.queue_log.call_args_list
-    )
 
 
-def test_전면_직행은_긴_봉쇄를_걸지_않는다() -> None:
-    """실험 경로는 5.2초를 봉쇄한다. 직행은 재누름이 곧바로 돌아야 한다."""
+@pytest.mark.parametrize("learned", ["start", "a_hold", "attach_active_hold_a"])
+def test_old_learning_and_fifth_episode_cannot_trigger_experiments(learned):
     app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]:
-        app._try_skip(_screen(), manager)
-    assert app._skip_active_until - time.monotonic() <= 0.5
-
-
-def test_실험_몫_에피소드는_배경에서_기존_실험_경로가_돈다() -> None:
-    """N 번에 1번은 실험에 양보한다 — 배경 전달 가설을 계속 검증해야 하기 때문."""
-    app = _app()
-    # 다음 에피소드가 실험 차례가 되도록 일련번호를 맞춘다.
-    app._skip_ap_episode_index = config.SKIP_S_EXPERIMENT_EVERY - 1
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=999999)   # 다른 창이 전면
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8]:
-        assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_not_called()
-
-    assert app._skip_foreground_direct is False
-    assert app._skip_episode_is_direct is False
-    app._skip_experiment.choose.assert_called_once()
-
-
-def test_직행_몫_에피소드는_배경에서도_A_를_누른다() -> None:
-    """실험 봉쇄가 작동하는 경로(target_E)까지 굶기던 것이 근본 문제였다."""
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=999999)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
-        assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_called_once_with(4096, config.SKIP_A_TAP_SECONDS)
-        # ⚠️ 배경에서는 키보드 S(SendInput)를 절대 보내지 않는다 — 다른 앱 유출.
-        send_key.assert_not_called()
-
+    app._skip_ap_episode_index = 4
+    app._skip_episode_is_direct = False
+    app._skip_a_learned = learned
+    app._skip_experiment.learned = learned
+    app._skip_s_experiment.learned = learned
+    with _environment(foreground=OTHER_HWND) as env:
+        assert _observe(app)
+        assert _routes(env) == ["pad_a"]
+        _assert_no_foreground_or_legacy_input(env)
     assert app._skip_episode_is_direct is True
     app._skip_experiment.choose.assert_not_called()
-    assert any(
-        "[SKIP 직행] 배경" in str(call.args[0])
-        for call in app.queue_log.call_args_list
-    )
-
-
-def test_배경에서_오래_버텨도_키보드_S_는_안_나간다() -> None:
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=999999)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8] as send_key:
-        app._try_skip(_screen(), manager)
-        app._skip_foreground_policy.first_seen_at = (
-            time.monotonic() - config.SKIP_FOREGROUND_HOLD_AFTER_SECONDS - 1.0
-        )
-        app._try_skip(_screen(), manager)
-        send_key.assert_not_called()
-
-
-def test_전면이면_첫_발부터_키보드_S_를_같이_보낸다() -> None:
-    """2026-07-02 실측: 전면에서 통한 유일한 입력이 키보드 s '탭' 이었다.
-
-    패드 A 는 "탭·1s 홀드 모두 무시" 로 기록돼 있다. 그러니 키보드 S 를 뒤로 미루면
-    안 된다 — 첫 발에 둘 다 보낸다.
-    """
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
-        app._try_skip(_screen(), manager)
-        gamepad.assert_called_once_with(4096, config.SKIP_A_TAP_SECONDS)
-        send_key.assert_called_once()
-        assert send_key.call_args.args[0] == GAME_HWND
-        assert send_key.call_args.args[1] == gui.input_message.SCAN_S
-
-
-def test_정지_뒤에는_입력이_나가지_않는다() -> None:
-    app = _app()
-    app.stop_event = SimpleNamespace(is_set=lambda: True)
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
-        assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_not_called()
-        send_key.assert_not_called()
-
-
-def test_프롬프트가_사라지면_직행_상태가_정리된다() -> None:
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]:
-        app._try_skip(_screen(), manager)
-        assert app._skip_foreground_direct is True
-
-    gone = _patches(foreground_hwnd=GAME_HWND, a_hit=False)
-    with gone[0], gone[1], gone[2], gone[3], gone[4], gone[5], gone[6], gone[7], gone[8]:
-        assert app._try_skip(_screen(), manager) is False
-
-    assert app._skip_foreground_direct is False
-    assert app._skip_foreground_policy.presses == 0
-    assert app._skip_kind is None
-    # 전면 입력이 배경 후보의 성공으로 귀속되면 안 된다.
-    app._report_skip_experiment_outcome.assert_not_called()
-    assert any(
-        "[SKIP 직행] 소멸" in str(call.args[0])
-        for call in app.queue_log.call_args_list
-    )
-
-
-def test_설정_기본값_고정() -> None:
-    assert config.SKIP_FOREGROUND_DIRECT is True
-    assert 0.1 <= config.SKIP_FOREGROUND_REPRESS_SECONDS <= 1.0
-    # 0.0 = 첫 발부터 키보드 S. 이 값을 올리면 07-02 실측이 "통한다"고 기록한
-    # 유일한 입력을 다시 뒤로 미루는 것이라 회귀다.
-    assert config.SKIP_FOREGROUND_KEY_AFTER_SECONDS == 0.0
-    assert config.SKIP_FOREGROUND_MAX_PRESSES >= 60
-    assert config.SKIP_FOREGROUND_MAX_EPISODE_SECONDS >= 40.0
-    assert 0 < config.SKIP_S_EXPERIMENT_EVERY <= 20
-
-
-def test_일반_프롬프트도_전면이면_START_직행() -> None:
-    """같은 굶주림이 일반(하이라이트) 프롬프트에도 있었다 — 전면이면 바로 누른다."""
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    screen = np.zeros((720, 1280), dtype=np.uint8)
-    with patch.object(gui.winapi, "vg", object()), \
-        patch.object(gui.rank_ocr, "ocr_available", return_value=True), \
-        patch.object(gui.rank_ocr, "match_skip_a", return_value=(False, 0.1, None)), \
-        patch.object(gui.rank_ocr, "match_skip_s", return_value=(False, 0.1, None)), \
-        patch.object(
-            gui.rank_ocr, "classify_skip_prompt", return_value=(True, "escape_highlight")
-        ), \
-        patch.dict(
-            gui.input_gamepad.KEY_TO_GAMEPAD, {"a": 4096, "start": 16}, clear=False
-        ), \
-        patch.object(gui, "send_gamepad_button", return_value=True) as gamepad, \
-        patch.object(
-            gui.input_message, "get_foreground_hwnd", return_value=GAME_HWND
-        ):
-        for _ in range(config.SKIP_TEXT_CONSENSUS):
-            assert app._try_skip(screen, manager) is True
-
-    gamepad.assert_called_once_with(16)
-    # 실험 후보 선택은 돌지 않는다 — 전면이면 어차피 deferred 였다.
-    app._skip_generic_escape_highlight_experiment.choose.assert_not_called()
-    assert any(
-        "[SKIP 전면] 게임이 전면 → 일반 프롬프트" in str(call.args[0])
-        for call in app.queue_log.call_args_list
-    )
-
-
-def test_전면에서_누른_뒤_배경이_돼도_실험에_넘기지_않는다() -> None:
-    """전면 입력으로 사라진 컷신이 배경 후보의 '성공'으로 귀속되면 가짜 승자를 학습한다."""
-    app = _app()
-    manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]:
-        app._try_skip(_screen(), manager)
-    assert app._skip_foreground_direct is True
-
-    # 컷신 도중 사용자가 다른 창을 눌러 게임이 배경이 됐다.
-    app._skip_episode_is_direct = False      # 실험 몫이었다고 가정(최악의 경우)
-    bg = _patches(foreground_hwnd=999999)
-    with bg[0], bg[1], bg[2], bg[3], bg[4], bg[5], bg[6] as gamepad, bg[7], bg[8]:
-        assert app._try_skip(_screen(), manager) is True
-        gamepad.assert_not_called()          # 실험 몫이라 배경에서는 안 누른다
-
-    # 이 에피소드는 끝까지 직행 소유 — 실험이 후보를 고르지 않는다.
-    # (전면에서 누른 A 로 사라진 컷신이 배경 후보의 '성공' 으로 귀속되면 가짜 승자를
-    #  학습한다.)
-    app._skip_experiment.choose.assert_not_called()
     app._skip_s_experiment.choose.assert_not_called()
 
 
-def test_아주_오래_버티면_홀드로_승격한다() -> None:
+@pytest.mark.parametrize("foreground", [GAME_HWND, OTHER_HWND])
+def test_persistent_three_and_ten_second_prompt_stays_tap_only(foreground):
+    app = _app()
+    with _environment(foreground=foreground) as env:
+        for seq, elapsed in enumerate((0.0, 3.0, 10.0), 1):
+            env.clock.now = 100.0 + elapsed
+            assert _observe(app, seq)
+        assert _routes(env) == ["pad_a", "posted_s", "pad_a"]
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_stop_blocks_every_input():
+    app = _app()
+    app.stop_event = SimpleNamespace(is_set=lambda: True)
+    with _environment() as env:
+        assert not _observe(app)
+        env.sender.assert_not_called()
+        env.key.assert_not_called()
+        env.pad.assert_not_called()
+        env.win32.PostMessage.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [False, RuntimeError("keyboard delivery failed")])
+def test_inactive_failure_has_no_success_record_or_extra_fallback(failure):
+    app = _app()
+    with _environment() as env:
+        if isinstance(failure, Exception):
+            env.sender.side_effect = failure
+        else:
+            env.sender.side_effect = None
+            env.sender.return_value = SimpleNamespace(sent=False, route="pad_a", reason="failed")
+        assert _observe(app)
+        env.sender.assert_called_once()
+        assert app._skip_last_press is None
+        assert not any("전송됨 · 게임 수신/스킵 성공은 미확인" in str(call.args[0])
+                       for call in app.queue_log.call_args_list)
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_template_skip_without_ocr_or_pad_uses_posted_s_only():
+    app = _app()
+    with _environment(ocr=False, vg=False) as env:
+        assert _observe(app)
+        env.clock.now += 0.4
+        assert _observe(app, 2)
+        assert _routes(env) == ["posted_s", "posted_s"]
+        env.classify.assert_not_called()
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_plain_skip_requires_two_observations_and_never_start():
+    app = _app()
+    with _environment(a_hit=False, text=(True, None)) as env:
+        assert _observe(app, 1)
+        env.sender.assert_not_called()
+        env.clock.now += 0.4
+        assert _observe(app, 2)
+        assert _routes(env) == ["pad_a"]
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_same_reverse_and_during_input_frames_cannot_retry():
+    app = _app()
+    with _environment() as env:
+        def captured_during_input(_hwnd, **kwargs):
+            app._frame_seq = 5
+            return SimpleNamespace(sent=True, route=kwargs["route"], reason="sent")
+        env.sender.side_effect = captured_during_input
+        assert _observe(app, 1)
+        env.clock.now += 1.0
+        for seq in (1, 0, 4, 5):
+            assert not _observe(app, seq)
+        env.sender.assert_called_once()
+        env.match_a.assert_called_once()
+        assert _observe(app, 6)
+        assert _routes(env) == ["pad_a", "posted_s"]
+
+
+@pytest.mark.parametrize("first", ["template", "ocr"])
+def test_template_and_ocr_share_the_same_cooldown(first):
     app = _app()
     manager = SimpleNamespace(hwnd=GAME_HWND)
-    p = _patches(foreground_hwnd=GAME_HWND)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad, p[7], p[8] as send_key:
-        app._try_skip(_screen(), manager)
-        # 홀드 승격 시각을 넘기고, 저속 재누름 간격도 지난 상태로 만든다.
-        policy = app._skip_foreground_policy
-        policy.first_seen_at = (
-            time.monotonic() - config.SKIP_FOREGROUND_HOLD_AFTER_SECONDS - 5.0
-        )
-        policy.last_press_at = (
-            time.monotonic() - config.SKIP_FOREGROUND_SLOW_REPRESS_SECONDS - 1.0
-        )
-        app._try_skip(_screen(), manager)
-
-    # 마지막 패드 입력은 탭이 아니라 홀드 길이여야 한다.
-    assert gamepad.call_args.args[1] == config.SKIP_FOREGROUND_HOLD_SECONDS
-    assert send_key.call_args.args[2] == config.SKIP_FOREGROUND_HOLD_SECONDS
+    target = SimpleNamespace(name="target_E", key="s")
+    with _environment() as env:
+        app._frame_seq = 1
+        if first == "template":
+            assert app.dispatch_key_press(manager, target)
+            env.clock.now += 0.05
+            assert _observe(app, 2)
+        else:
+            assert _observe(app, 1)
+            app._frame_seq = 2
+            env.clock.now += 0.05
+            app.dispatch_key_press(manager, target)
+        env.sender.assert_called_once()
+        _assert_no_foreground_or_legacy_input(env)
 
 
-def test_보류된_패스는_5초_봉쇄를_걸지_않는다() -> None:
-    """입력이 0인 패스에서 5.2초를 얹으면 답을 아는 템플릿 경로까지 굶는다.
-
-    실측 2026-08-23: 15:06:26~15:08:12 **106초 동안 타겟 감지 0건**. 봉쇄가 풀린
-    순간 target_E([S] 키캡 → 패드 A)가 눌러 프롬프트가 끝났다.
-    """
-    from macroapp.skip_experiment import GuardedActionResult, SkipOutcome
-
+def test_non_skip_custom_a_stays_gamepad_confirm():
     app = _app()
-    app._skip_ap_episode_index = config.SKIP_S_EXPERIMENT_EVERY - 1  # 실험 몫
+    with _environment() as env:
+        assert app.dispatch_key_press(
+            SimpleNamespace(hwnd=GAME_HWND), SimpleNamespace(name="custom_confirm", key="a")
+        )
+        env.pad.assert_called_once_with(4096)
+        env.sender.assert_not_called()
+        env.key.assert_not_called()
+
+
+@pytest.mark.parametrize("previous_hint", ["escape", "any_key", "start", "escape_highlight"])
+def test_current_plain_skip_does_not_inherit_old_menu_hint(previous_hint):
+    app = _app()
+    app._skip_kind = "start"
+    app._skip_generic_hint = previous_hint
+    app._skip_generic_episode_hint = previous_hint
+    with _environment(a_hit=False, text=(True, None)) as env:
+        assert _observe(app, 1)
+        env.sender.assert_not_called()
+        env.clock.now += 0.4
+        assert _observe(app, 2)
+        assert _routes(env) == ["pad_a"]
+        _assert_no_foreground_or_legacy_input(env)
+
+
+@pytest.mark.parametrize("foreground", [GAME_HWND, OTHER_HWND])
+def test_auto_exit_starting_during_recognition_blocks_skip_tap(foreground):
+    app = _app()
+    app._exit_gate = SimpleNamespace(is_set=lambda: True)
+    with _environment(foreground=foreground) as env:
+        assert _observe(app, 1)
+        env.sender.assert_not_called()
+        env.key.assert_not_called()
+        env.pad.assert_not_called()
+        assert app._skip_last_press is None
+
+
+def test_cooldown_does_not_report_template_input_as_completed():
+    app = _app()
     manager = SimpleNamespace(hwnd=GAME_HWND)
-    deferred = GuardedActionResult(
-        attempted=False, action_ok=False, foreground_before=GAME_HWND,
-        foreground_after=GAME_HWND, foreground_samples=(GAME_HWND,),
-        invariant_ok=False, reason="target_already_foreground", elapsed_seconds=0.0,
-    )
-    app._skip_s_experiment.choose = Mock(return_value=("attach_char_s", None))
-    app._skip_s_experiment.record_attempt = Mock(
-        return_value=SkipOutcome("deferred", "attach_char_s", detail="target_already_foreground")
-    )
-    app._skip_experiment.choose = Mock(return_value=("attach_char_s", None))
-    app._skip_experiment.record_attempt = app._skip_s_experiment.record_attempt
+    target = SimpleNamespace(name="target_E", key="s")
+    with _environment() as env:
+        app._frame_seq = 1
+        assert app.dispatch_key_press(manager, target)
+        app._frame_seq = 2
+        env.clock.now += 0.05
+        assert not app.dispatch_key_press(manager, target)
+        env.sender.assert_called_once()
 
-    p = _patches(foreground_hwnd=999999)
-    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], \
-        patch.object(gui, "run_guarded_inactive_action", return_value=deferred):
-        assert app._try_skip(_screen(), manager) is True
 
-    remaining = app._skip_active_until - time.monotonic()
-    assert remaining <= 1.0, (
-        f"보류 패스가 {remaining:.2f}초를 봉쇄했다 — 템플릿 재시도가 굶는다"
-    )
+def test_prompt_disappearance_clears_tap_episode_without_learning():
+    app = _app()
+    with _environment() as env:
+        assert _observe(app, 1)
+        env.clock.now += 0.4
+        assert _observe(app, 2)
+        assert _routes(env) == ["pad_a", "posted_s"]
+        env.match_a.return_value = (False, 0.1, None)
+        env.clock.now += 0.4
+        assert not _observe(app, 3)
+        assert app._skip_foreground_direct is False
+        assert app._skip_foreground_policy.presses == 0
+        assert app._skip_kind is None
+        env.match_a.return_value = (True, 0.9, (10, 10))
+        env.clock.now += 0.4
+        assert _observe(app, 4)
+        assert _routes(env) == ["pad_a", "posted_s", "pad_a"]
+    app._report_skip_experiment_outcome.assert_not_called()
+
+
+def test_explicit_escape_highlight_keeps_separate_start_route():
+    app = _app()
+    with _environment(a_hit=False, text=(True, "escape_highlight")) as env:
+        for seq in range(1, config.SKIP_TEXT_CONSENSUS + 1):
+            assert _observe(app, seq)
+        env.pad.assert_called_once_with(16)
+        env.sender.assert_not_called()
+        env.key.assert_not_called()
+    app._skip_generic_escape_highlight_experiment.choose.assert_not_called()
+
+
+def test_cooldown_and_repeated_frame_do_not_advance_route_counter():
+    app = _app()
+    with _environment() as env:
+        assert _observe(app, 1)
+        assert app._skip_inactive_attempt == 1
+        env.clock.now += 0.05
+        assert not _observe(app, 1)
+        assert _observe(app, 2)
+        assert app._skip_inactive_attempt == 1
+        env.clock.now += 0.4
+        assert _observe(app, 3)
+        assert app._skip_inactive_attempt == 2
+        assert _routes(env) == ["pad_a", "posted_s"]
+
+
+def test_sender_cancellation_observes_stop_and_exit_gate():
+    app = _app()
+    cancelled_checks = []
+    stop = SimpleNamespace(value=False)
+    gate = SimpleNamespace(value=False)
+    app.stop_event = SimpleNamespace(is_set=lambda: stop.value)
+    app._exit_gate = SimpleNamespace(is_set=lambda: gate.value)
+    with _environment() as env:
+        def run_sender(_hwnd, **kwargs):
+            cancelled = kwargs["cancelled"]
+            cancelled_checks.append(cancelled())
+            stop.value = True
+            cancelled_checks.append(cancelled())
+            stop.value = False
+            gate.value = True
+            cancelled_checks.append(cancelled())
+            return SimpleNamespace(sent=False, route=kwargs["route"], reason="cancelled")
+        env.sender.side_effect = run_sender
+        assert _observe(app, 1)
+        # 호출부가 예외를 기록하고 삼키므로 콜백 밖에서 실제 관측을 검증한다.
+        assert cancelled_checks == [False, True, True]
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_busy_sender_lock_never_blocks_capture_or_advances_route():
+    app = _app()
+    occupied = SimpleNamespace(acquire=Mock(return_value=False), release=Mock())
+    app._skip_tap_lock = occupied
+    with _environment() as env:
+        assert app._send_skip_tap(SimpleNamespace(hwnd=GAME_HWND), frame_seq=1) is None
+        occupied.acquire.assert_called_once_with(blocking=False)
+        occupied.release.assert_not_called()
+        assert app._skip_inactive_attempt == 0
+        env.sender.assert_not_called()
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_missing_a_mapping_uses_posted_s_for_every_attempt():
+    app = _app()
+    with _environment() as env, patch.dict(gui.input_gamepad.KEY_TO_GAMEPAD, {}, clear=True):
+        for seq in (1, 2):
+            assert _observe(app, seq)
+            env.clock.now += 0.4
+        assert _routes(env) == ["posted_s", "posted_s"]
+        _assert_no_foreground_or_legacy_input(env)
+
+
+def test_production_skip_source_never_calls_activation_or_global_keyboard_apis():
+    import textwrap
+
+    prohibited = {
+        "SetForegroundWindow", "SetFocus", "SetActiveWindow", "AttachThreadInput",
+        "SendInput", "send_scancode_key", "send_scancode_to_foreground_window",
+        "bring_foreground", "_bring_to_foreground", "press_key_foreground",
+        "spoof_window_active", "spoof_window_active_component", "spoof_directinput_app_active",
+        "run_attached_to_window", "send_key_focus_attach", "send_key_focus_child",
+    }
+    for source in (
+        inspect.getsource(gui.AutomationApp._send_skip_tap),
+        inspect.getsource(skip_inactive),
+    ):
+        tree = ast.parse(textwrap.dedent(source))
+        called = {
+            item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+            for item in ast.walk(tree)
+            if isinstance(item, ast.Call) and isinstance(item.func, (ast.Attribute, ast.Name))
+        }
+        assert not called.intersection(prohibited)
