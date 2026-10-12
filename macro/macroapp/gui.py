@@ -5098,8 +5098,9 @@ class AutomationApp:
 
         - 근거는 OCR 힌트가 SKIP_DIRECT_START_HINTS 안에 있는가다(any_key/escape/
           escape_highlight/start). 이 형태들의 답은 START 로 이미 확정돼 있다.
-        - S/A와 맨 SKIP은 _foreground_direct_skip의 짧은 탭으로 처리한다.
-          이 메서드는 명시적인 ESC/아무 키/START 메뉴에만 사용한다.
+        - '[S]'/'(A)' 키 표시가 있는 컷신은 _foreground_direct_skip 의 짧은 탭이 처리한다.
+          키 표시가 없는 맨 '▷ SKIP' 은 SKIP_DIRECT_START_INCLUDES_UNKNOWN 일 때 여기서 START
+          로 넘긴다(1.0.48 회귀 되돌림, 2026-10-12 — 1.0.47 과 바이트 동일한 입력).
         - 연속 확인·재누름 간격은 AnyKeyStartPolicy(순수 로직)가 정한다.
         - 템플릿(target_F/G) 경로는 막지 않는다. 누른 직후 0.5초만 매칭을 멈춰 같은
           버튼이 두 스레드에서 겹쳐 나가는 것만 피한다 — 실험 경로(5.2초 봉쇄)와 달리
@@ -5510,9 +5511,16 @@ class AutomationApp:
                     self.queue_log(f"[SKIP 진단] 하단 프레임 저장: {diag_path.name}")
             except Exception:
                 pass
-        # S/A와 장치 글리프 없는 SKIP은 같은 탭이다. 모호한 SKIP을 START로
-        # 추측하지 않고 현재 관측만 사용한다. 자동 실험/오래된 학습을 타지 않는다.
-        plain_skip = bool(has_text and not is_a and not is_s and self._skip_generic_hint is None)
+        # '[S]'/'(A)' 키 표시가 있는 컷신만 S/A 탭 경로다(09-07 결정). 키 표시가 없는 맨
+        # '▷ SKIP' 은 SKIP_DIRECT_START_INCLUDES_UNKNOWN 이 켜져 있으면 S/A 탭으로 보내지 않고
+        # 아래 _anykey_direct_start 가 START 로 넘긴다 — 1.0.48 이 맨 SKIP 을 S/A 탭으로
+        # 가로채자 구매자 PC 에서 경기 종료 ▷ SKIP 이 멈췄다(2026-10-12 보고, 1.0.47 은 START 로
+        # 첫 입력에 넘어갔다). 이 가로채기를 막지 않으면 설정값만 되돌려도 고쳐지지 않는다.
+        plain_skip = bool(
+            has_text and not is_a and not is_s
+            and self._skip_generic_hint is None
+            and not SKIP_DIRECT_START_INCLUDES_UNKNOWN
+        )
         if self._foreground_direct_skip(
             now, is_a, is_s, manager=manager, plain=plain_skip, frame_seq=frame_seq
         ):

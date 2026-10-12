@@ -606,7 +606,12 @@ SKIP_DIRECT_START_HINTS = ("any_key", "escape", "start")
 # 증거 이미지를 다시 돌려 보니 OCR 원문은 "skip"(+선수 이름)뿐이고 esc/enter/아무키 토큰이
 # 없어 classify 가 (True, None) 을 내며, A/S/F/G 템플릿은 40/40 전부 미매칭이었다.
 # → 힌트 None 을 직행에서 빼면 '고치려던 화면'이 그대로 실험(5.2초 봉쇄)에 남는다.
-SKIP_DIRECT_START_INCLUDES_UNKNOWN = False  # 맨 SKIP은 S/A 탭 경로가 담당한다.
+# ⚠️ 2026-10-12 되돌림(1.0.48 회귀): 1.0.48 이 이 값을 False 로 바꿔 맨 '▷ SKIP' 을 S/A 탭
+# 경로로 보냈더니, 구매자가 "경기 끝나고 ▷ SKIP 에서 계속 멈춘다, 기존엔 잘 됐다" 고 보고했다
+# (스크린샷: 경기 종료 장면 우하단 ▷ SKIP, mAuto 1.0.48 실행 중). 1.0.47 로그 실측: 맨 SKIP 에
+# START 를 누른 에피소드 21개 중 12개가 첫 START 한 번에 끝났다(중앙값 0초).
+# → 맨 SKIP 은 다시 START. '[S]'/'(A)' 키 표시가 있는 컷신은 여전히 S/A 탭 경로다(09-07 결정 유지).
+SKIP_DIRECT_START_INCLUDES_UNKNOWN = True
 # ⚠️ escape_highlight(경기 후 하이라이트)는 **직행에서 뺀다.** 이 레포가 '아직 답을 못 찾은'
 # 형태로 기록해 둔 유일한 프롬프트다(전용 후보 카탈로그·전용 exit_confirm 5.0초·learned 강제
 # None). 맨 START 가 통한다는 증거가 없으므로 실험에 남긴다. 힌트가 None 이어도 화면이

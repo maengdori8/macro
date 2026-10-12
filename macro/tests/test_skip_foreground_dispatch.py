@@ -191,15 +191,20 @@ def test_template_skip_without_ocr_or_pad_uses_posted_s_only():
         _assert_no_foreground_or_legacy_input(env)
 
 
-def test_plain_skip_requires_two_observations_and_never_start():
+def test_plain_skip_requires_two_observations_then_start_not_tap():
+    """맨 ▷ SKIP 은 두 번 확인한 뒤 START — S/A 탭으로 새면 안 된다(2026-10-12 회귀)."""
     app = _app()
     with _environment(a_hit=False, text=(True, None)) as env:
         assert _observe(app, 1)
-        env.sender.assert_not_called()
+        env.pad.assert_not_called()
         env.clock.now += 0.4
         assert _observe(app, 2)
-        assert _routes(env) == ["pad_a"]
-        _assert_no_foreground_or_legacy_input(env)
+        env.sender.assert_not_called()            # S/A 탭 경로 안 탐
+        env.pad.assert_called_once_with(16)       # START
+        env.key.assert_not_called()               # 전역 키보드 SendInput 없음
+        env.win32.SetForegroundWindow.assert_not_called()
+        env.win32.SetFocus.assert_not_called()
+        env.candidate.assert_not_called()
 
 
 def test_same_reverse_and_during_input_frames_cannot_retry():
@@ -252,17 +257,25 @@ def test_non_skip_custom_a_stays_gamepad_confirm():
 
 @pytest.mark.parametrize("previous_hint", ["escape", "any_key", "start", "escape_highlight"])
 def test_current_plain_skip_does_not_inherit_old_menu_hint(previous_hint):
+    """에피소드에 남은 이전 메뉴 힌트가 있어도 맨 SKIP 은 S/A 탭으로 가지 않고 START 다.
+
+    이전 화면의 힌트는 현재 맨 SKIP 으로 이월하지 않는다(09-07 규칙). 그래서 낡은
+    escape_highlight 힌트도 START 를 막지 않는다 — 하이라이트 여부는 **현재 프레임**으로
+    다시 판정한다(어두운 하이라이트 요약이면 제외: test_skip_anykey 의
+    test_highlight_screen_stays_in_the_experiment_even_without_a_hint).
+    """
     app = _app()
     app._skip_kind = "start"
     app._skip_generic_hint = previous_hint
     app._skip_generic_episode_hint = previous_hint
     with _environment(a_hit=False, text=(True, None)) as env:
         assert _observe(app, 1)
-        env.sender.assert_not_called()
         env.clock.now += 0.4
         assert _observe(app, 2)
-        assert _routes(env) == ["pad_a"]
-        _assert_no_foreground_or_legacy_input(env)
+        env.sender.assert_not_called()
+        env.key.assert_not_called()
+        env.win32.SetForegroundWindow.assert_not_called()
+        env.pad.assert_called_once_with(16)
 
 
 @pytest.mark.parametrize("foreground", [GAME_HWND, OTHER_HWND])

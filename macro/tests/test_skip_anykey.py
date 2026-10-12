@@ -257,11 +257,14 @@ def test_a_or_s_template_match_never_takes_the_direct_path() -> None:
 
 
 def test_plain_skip_prompt_without_any_hint_goes_direct() -> None:
-    """맨 '▷ SKIP' — OCR 이 "skip" 만 읽어 힌트가 None 인 형태.
+    """맨 '▷ SKIP' — OCR 이 "skip" 만 읽어 힌트가 None 인 형태는 START 직행이다.
 
     실전 원장에서 generic 에피소드의 44%(104/236)가 이것이고, 증거 이미지 40장을 다시
-    돌려 보니 classify=(True,None)·A/S/F/G 템플릿 전부 미매칭이었다. 이게 직행에서
-    빠져 있으면 정작 구매자가 보고한 화면이 5.2초 봉쇄 실험에 그대로 남는다.
+    돌려 보니 classify=(True,None)·A/S/F/G 템플릿 전부 미매칭이었다.
+
+    ⚠️ 2026-10-12 회귀 고정: 1.0.48 이 이 화면을 S/A 탭 경로로 보냈더니 구매자 PC 에서
+    경기 종료 ▷ SKIP 이 멈췄다("기존엔 잘 됐다"). 1.0.47 로그에서는 START 한 번에 넘어간
+    에피소드가 21개 중 12개였다. S/A 탭 경로(run_inactive_skip_tap)로 새면 안 된다.
     """
 
     app = _app()
@@ -269,17 +272,12 @@ def test_plain_skip_prompt_without_any_hint_goes_direct() -> None:
     screen = np.zeros((720, 1280), dtype=np.uint8)
     p = _patches([(True, None)] * 2)
     with (p[0], p[1], p[2], p[3], p[4], p[5], p[6] as gamepad,
-          patch.object(gui, "run_inactive_skip_tap", return_value=SimpleNamespace(
-              sent=True, reason="sent"
-          )) as inactive):
+          patch.object(gui, "run_inactive_skip_tap") as inactive):
         assert app._try_skip(screen, manager)
-        inactive.assert_not_called()
         assert app._try_skip(screen, manager)
-    inactive.assert_called_once()
-    assert inactive.call_args.args == (123,)
-    assert inactive.call_args.kwargs["route"] == "pad_a"
-    gamepad.assert_not_called()
-    assert app._skip_kind == "a", "맨 ▷ SKIP 이 탭 경로로 가지 않았다"
+    inactive.assert_not_called()
+    gamepad.assert_called_once_with(16)
+    assert app._skip_kind == "anykey", "맨 ▷ SKIP 이 START 직행을 못 받았다"
     app._skip_generic_experiment.choose.assert_not_called()
     # 봉쇄는 0.5초 — 템플릿이 곧바로 재시도할 수 있어야 한다.
     assert app._skip_active_until - time.monotonic() <= 0.6
@@ -318,7 +316,8 @@ def test_highlight_screen_stays_in_the_experiment_even_without_a_hint() -> None:
     dark[int(720 * 0.12):int(720 * 0.74), int(1280 * 0.23):int(1280 * 0.77)] = 10
     assert app._direct_start_form(None, dark) is None
     bright = np.full((720, 1280), 200, dtype=np.uint8)
-    assert app._direct_start_form(None, bright) is None  # 맨 SKIP을 START로 추측하지 않는다.
+    # 하이라이트가 아닌 맨 SKIP 은 START 직행이다(1.0.48 회귀 되돌림, 2026-10-12).
+    assert app._direct_start_form(None, bright) == "plain"
     assert app._direct_start_form("escape_highlight", bright) is None
 
 
