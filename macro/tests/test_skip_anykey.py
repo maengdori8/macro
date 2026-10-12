@@ -314,7 +314,8 @@ def test_highlight_screen_stays_in_the_experiment_even_without_a_hint() -> None:
     # (완전 검정 1.00 은 캡처 실패/로딩이라 제외된다).
     dark = np.full((720, 1280), 200, dtype=np.uint8)
     dark[int(720 * 0.12):int(720 * 0.74), int(1280 * 0.23):int(1280 * 0.77)] = 10
-    assert app._direct_start_form(None, dark) is None
+    # 2026-10-12: 힌트 None 이면 하이라이트여도 직행(1.0.47 이 되찾기 경로로 실제로 하던 동작).
+    assert app._direct_start_form(None, dark) == "plain"
     bright = np.full((720, 1280), 200, dtype=np.uint8)
     # 하이라이트가 아닌 맨 SKIP 은 START 직행이다(1.0.48 회귀 되돌림, 2026-10-12).
     assert app._direct_start_form(None, bright) == "plain"

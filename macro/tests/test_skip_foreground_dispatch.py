@@ -417,3 +417,30 @@ def test_production_skip_source_never_calls_activation_or_global_keyboard_apis()
             if isinstance(item, ast.Call) and isinstance(item.func, (ast.Attribute, ast.Name))
         }
         assert not called.intersection(prohibited)
+
+
+
+def test_highlight_classified_plain_skip_gets_start_in_background():
+    """실제 경기 종료 ▷ SKIP(득점자 카드 화면)은 하이라이트로 판정된다(1.0.46 로그 6/6).
+
+    2026-10-12 회귀: 1.0.48 과 첫 핫픽스(4141a3f)는 이 화면에서 배경 START 0회로 실험에
+    갇혔다. 1.0.47 코드로 같은 조건을 돌리면 12초 동안 START 14회, 첫 START 약 1.2초였다.
+    """
+    app = _app()
+    frame = np.full((720, 1280), 200, dtype=np.uint8)
+    frame[int(720 * 0.12):int(720 * 0.74), int(1280 * 0.23):int(1280 * 0.77)] = 10
+    assert app._is_highlight_summary_context(frame)
+    with _environment(foreground=OTHER_HWND, a_hit=False, text=(True, None)) as env:
+        first = None
+        for seq in range(1, 31):              # 0.4초 간격 12초
+            app._frame_seq = seq
+            app._try_skip(frame, SimpleNamespace(hwnd=GAME_HWND), frame_seq=seq)
+            if first is None and any(c.args and c.args[0] == 16 for c in env.pad.call_args_list):
+                first = seq
+            env.clock.now += 0.4
+        starts = sum(1 for c in env.pad.call_args_list if c.args and c.args[0] == 16)
+        assert first is not None and first <= 3, f"첫 START 가 늦거나 없다: {first}"
+        assert starts >= 8, f"12초 동안 START {starts}회 — 재누름이 끊겼다"
+        env.sender.assert_not_called()        # S/A 탭으로 새지 않음
+        env.key.assert_not_called()           # 전역 키보드 입력 없음
+        env.win32.SetForegroundWindow.assert_not_called()

@@ -4963,19 +4963,19 @@ class AutomationApp:
         - **힌트 None 도 직행이다** — 이게 맨 '▷ SKIP'. OCR 이 "skip" 만 읽고 구분 토큰을
           못 낸 형태로, 실전 원장에서 generic 에피소드의 44%(104/236)를 차지한다. 여기서
           빼면 정작 구매자가 보고한 화면이 실험(5.2초 봉쇄)에 그대로 남는다.
-        - 단, **경기 후 하이라이트 화면은 제외**한다 — 이 레포가 '아직 답을 못 찾은'
-          형태로 기록해 둔 유일한 프롬프트라 맨 START 로 대체할 근거가 없다.
+        - ⚠️ **어두운 하이라이트 화면이어도 힌트 None 이면 직행이다**(2026-10-12). 예전엔
+          여기서 하이라이트를 뺐지만, 1.0.47 은 그 화면을 'start' 폴백 잠금 → 되찾기 경로로
+          결국 START 했다 — 1.0.47 코드를 그대로 돌린 재현: 하이라이트로 판정되는 맨 SKIP 에
+          12초 동안 START 14회, 첫 START 약 1.2초. 그 되찾기 경로는 1.0.48(2c9b239)의 프레임마다
+          힌트 초기화로 끊겼고, 실제 경기 종료 ▷ SKIP(득점자 카드 화면)은 하이라이트로 판정된다
+          (1.0.46 로그 6/6) → 여기서 빼면 그 화면은 START 0회로 실험에 갇힌다(같은 재현).
+          ESC 키캡이 보이는 명시적 하이라이트 프롬프트(escape_highlight)는 그대로 직행이 아니다
+          (그쪽은 target_F 템플릿이 START 를 누른다).
         """
 
         if hint in SKIP_DIRECT_START_HINTS:
             return hint
         if hint is None and SKIP_DIRECT_START_INCLUDES_UNKNOWN:
-            if screen_gray is not None:
-                try:
-                    if self._is_highlight_summary_context(screen_gray):
-                        return None
-                except Exception:  # noqa: BLE001 - 판정 실패는 '하이라이트 아님'으로 본다
-                    pass
             return "plain"
         return None
 
